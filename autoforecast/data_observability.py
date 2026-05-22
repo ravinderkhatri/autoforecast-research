@@ -19,8 +19,9 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from spec.forecast_spec import STATE_CODES
 
+from autoforecast.column_names import fresh_internal_names
 from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin
-from autoforecast.grid import canonical_key, time_literal
+from autoforecast.grid import canonical_key, read_time_parquet, time_literal
 from autoforecast.model_api import CheckReport, CheckResult, CheckStatus, DataFacts, RunIncident
 from autoforecast.panel import Panel, PanelError
 from autoforecast.profiling import ProfileError, profile
@@ -150,23 +151,47 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         facts = _empty_facts(as_of=cutoff, data_fingerprint=fingerprint)
         return CheckReport("data", facts, (_definition_failure(exc),))
 
-    raw = spark.read.parquet(panel.path)
+    raw = read_time_parquet(spark, panel.path, panel.time_col)
+    (
+        time_name,
+        valid_time_name,
+        duplicate_count_name,
+        duplicate_sum_name,
+        levels_name,
+        previous_name,
+        first_name,
+        last_name,
+        observed_name,
+        missing_name,
+    ) = fresh_internal_names(
+        raw.columns,
+        (
+            "_time_key",
+            "_valid_time_key",
+            "count",
+            "duplicates",
+            "levels",
+            "_previous",
+            "first",
+            "last",
+            "observed",
+            "missing",
+        ),
+    )
     time_key, valid_time = canonical_key(panel.time_col, cadence)
     if cadence.key_kind == "timestamp" and (
         raw.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
     ):
         valid_time = valid_time & F.lit(False)
-    prepared = raw.withColumn("_time_key", time_key).withColumn(
-        "_valid_time_key", valid_time
-    )
-    frame = prepared.filter(F.col("_time_key") <= time_literal(cutoff_point, cadence))
+    prepared = raw.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time)
+    frame = prepared.filter(F.col(time_name) <= time_literal(cutoff_point, cadence))
     schema = {field.name: field.dataType.simpleString() for field in raw.schema.fields}
     aggregate = frame.agg(
         F.count(F.lit(1)).alias("n_rows"),
         F.countDistinct(panel.series_col).alias("n_series"),
-        F.countDistinct("_time_key").alias("n_dates"),
-        F.min("_time_key").alias("first_date"),
-        F.max("_time_key").alias("last_date"),
+        F.countDistinct(time_name).alias("n_dates"),
+        F.min(time_name).alias("first_date"),
+        F.max(time_name).alias("last_date"),
         F.sum(F.col(panel.series_col).isNull().cast("long")).alias("null_series"),
         F.sum(F.col(panel.target_col).isNull().cast("long")).alias("null_target"),
     ).collect()[0]
@@ -217,13 +242,13 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         )
     )
     duplicate_row = (
-        frame.groupBy(panel.series_col, "_time_key")
-        .count()
-        .filter(F.col("count") > 1)
-        .agg(F.sum(F.col("count") - 1).alias("duplicates"))
+        frame.groupBy(panel.series_col, time_name)
+        .agg(F.count(F.lit(1)).alias(duplicate_count_name))
+        .filter(F.col(duplicate_count_name) > 1)
+        .agg(F.sum(F.col(duplicate_count_name) - 1).alias(duplicate_sum_name))
         .collect()[0]
     )
-    duplicate_count = int(duplicate_row["duplicates"] or 0)
+    duplicate_count = int(duplicate_row[duplicate_sum_name] or 0)
     checks.append(
         CheckResult(
             "one_value_per_date",
@@ -289,8 +314,8 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         )
         varying = (
             frame.groupBy(panel.series_col)
-            .agg(F.countDistinct(value_with_missingness).alias("levels"))
-            .filter(F.col("levels") > 1)
+            .agg(F.countDistinct(value_with_missingness).alias(levels_name))
+            .filter(F.col(levels_name) > 1)
             .count()
         )
         if varying:
@@ -366,23 +391,23 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
     # before the bounded comparison, just as the required-value check already does for null time
     # keys; otherwise Spark's null filtering would make malformed keys disappear silently.
     invalid_time_keys = prepared.filter(
-        ~F.coalesce(F.col("_valid_time_key"), F.lit(False))
+        ~F.coalesce(F.col(valid_time_name), F.lit(False))
     ).count()
     ordered = (
-        frame.filter(F.col("_valid_time_key"))
-        .select(panel.series_col, "_time_key")
+        frame.filter(F.col(valid_time_name))
+        .select(panel.series_col, time_name)
         .distinct()
         .withColumn(
-            "_previous",
-            F.lag("_time_key").over(Window.partitionBy(panel.series_col).orderBy("_time_key")),
+            previous_name,
+            F.lag(time_name).over(Window.partitionBy(panel.series_col).orderBy(time_name)),
         )
     )
     if cadence.unit == "H":
         phase_errors = ordered.filter(
-            F.col("_previous").isNotNull()
+            F.col(previous_name).isNotNull()
             & (
                 F.pmod(
-                    F.unix_timestamp("_time_key") - F.unix_timestamp("_previous"),
+                    F.unix_timestamp(time_name) - F.unix_timestamp(previous_name),
                     F.lit(3600 * cadence.multiplier),
                 )
                 != 0
@@ -394,10 +419,10 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         # run's phase authority; pairwise deltas alone accept a complete lattice shifted away
         # from that origin. Count every valid historical row that cannot belong to the run grid.
         phase_errors = frame.filter(
-            F.col("_valid_time_key")
+            F.col(valid_time_name)
             & (
                 F.pmod(
-                    F.datediff("_time_key", time_literal(cutoff_point, cadence)),
+                    F.datediff(time_name, time_literal(cutoff_point, cadence)),
                     F.lit(stride),
                 )
                 != 0
@@ -410,27 +435,27 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
     off_grid = invalid_time_keys + phase_errors
 
     per_series = ordered.groupBy(panel.series_col).agg(
-        F.min("_time_key").alias("first"),
-        F.max("_time_key").alias("last"),
-        F.count(F.lit(1)).alias("observed"),
+        F.min(time_name).alias(first_name),
+        F.max(time_name).alias(last_name),
+        F.count(F.lit(1)).alias(observed_name),
     )
     if cadence.unit == "H":
         expected = (
-            (F.unix_timestamp("last") - F.unix_timestamp("first"))
+            (F.unix_timestamp(last_name) - F.unix_timestamp(first_name))
             / F.lit(3600 * cadence.multiplier)
             + 1
         )
     elif cadence.unit in {"D", "W"}:
         stride = cadence.multiplier if cadence.unit == "D" else 7
-        expected = F.datediff("last", "first") / F.lit(stride) + 1
+        expected = F.datediff(last_name, first_name) / F.lit(stride) + 1
     elif cadence.unit == "M":
-        expected = F.round(F.months_between("last", "first")) + 1
+        expected = F.round(F.months_between(last_name, first_name)) + 1
     else:
-        expected = F.year("last") - F.year("first") + 1
+        expected = F.year(last_name) - F.year(first_name) + 1
     missing_row = per_series.agg(
-        F.sum(expected.cast("long") - F.col("observed")).alias("missing")
+        F.sum(expected.cast("long") - F.col(observed_name)).alias(missing_name)
     ).collect()[0]
-    missing_timestamps = max(0, int(missing_row["missing"] or 0))
+    missing_timestamps = max(0, int(missing_row[missing_name] or 0))
     missing_daily = missing_timestamps if panel.frequency == "D" else None
     checks.append(
         CheckResult(

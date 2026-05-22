@@ -11,8 +11,9 @@ import matplotlib
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
+from autoforecast.column_names import fresh_internal_names
 from autoforecast.frequency import TimePoint, advance, parse_frequency, parse_origin
-from autoforecast.grid import canonical_key, time_literal
+from autoforecast.grid import canonical_key, read_time_parquet, time_literal
 from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 
 matplotlib.use("Agg")  # headless: these are written to disk, never shown
@@ -54,21 +55,22 @@ def series_across_zero_rate_deciles(
     cadence = parse_frequency(panel.frequency)
     origin_point = parse_origin(origin, cadence)
     time_key, valid_time_key = canonical_key(panel.time_col, cadence)
-    source = spark.read.parquet(panel.path)
+    source = read_time_parquet(spark, panel.path, panel.time_col)
     if cadence.key_kind == "timestamp" and (
         source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
     ):
         raise ValueError(
             f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type"
         )
-    prepared = source.withColumn(
-        "__af_plot_time", time_key
-    ).withColumn("__af_plot_valid_time", valid_time_key)
-    if prepared.filter(~F.col("__af_plot_valid_time")).limit(1).count():
+    time_name, valid_time_name = fresh_internal_names(
+        source.columns, ("__af_plot_time", "__af_plot_valid_time")
+    )
+    prepared = source.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time_key)
+    if prepared.filter(~F.col(valid_time_name)).limit(1).count():
         raise ValueError(
             f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
         )
-    df = prepared.filter(F.col("__af_plot_time") <= time_literal(origin_point, cadence))
+    df = prepared.filter(F.col(time_name) <= time_literal(origin_point, cadence))
     if panel.has_exposure:
         df = df.filter(F.col(panel.exposure_col).isin(*sorted(ELIGIBLE_STATES)))
     rates = (df.groupBy(F.col(panel.series_col).alias("sid"))
@@ -191,7 +193,7 @@ def _collect_history(
     """
     cadence = parse_frequency(panel.frequency)
     lo, hi = advance(origin, cadence, -encoder_days), advance(origin, cadence, horizon)
-    source = spark.read.parquet(panel.path)
+    source = read_time_parquet(spark, panel.path, panel.time_col)
     if cadence.key_kind == "timestamp" and (
         source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
     ):
@@ -222,7 +224,7 @@ def _collect_forecast(
     forecast: Forecast, spark: SparkSession, ids: list[str]
 ) -> dict[str, list[tuple[TimePoint, float]]]:
     """Pull (date, yhat) for the chosen series only."""
-    rows = (spark.read.parquet(forecast.path)
+    rows = (read_time_parquet(spark, forecast.path, "date")
             .filter(F.col("series_id").isin(*ids))
             .select("series_id", "date", "yhat").orderBy("series_id", "date").collect())
     out: dict[str, list[tuple[TimePoint, float]]] = {}

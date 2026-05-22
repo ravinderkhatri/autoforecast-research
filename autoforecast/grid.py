@@ -22,13 +22,17 @@ that the deployed metric could not see, and it has to be IN the grid for the met
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import pathlib
 from collections.abc import Iterable
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructField, StructType, TimestampNTZType
 
+from autoforecast.column_names import fresh_internal_names
 from autoforecast.frequency import (
     Cadence,
     FrequencyError,
@@ -45,6 +49,7 @@ __all__ = [
     "canonical_key",
     "content_hash",
     "period_membership",
+    "read_time_parquet",
     "summarise",
     "time_literal",
 ]
@@ -52,6 +57,75 @@ __all__ = [
 
 class GridError(ValueError):
     """A grid was requested that would not describe what is actually being scored."""
+
+
+def read_time_parquet(
+    spark: SparkSession, path: str | pathlib.Path, time_col: str,
+) -> DataFrame:
+    """Read proven naive INT96 keys without assigning a session timezone or losing precision.
+
+    INT96 has no timezone annotation. Spark infers it as ``timestamp`` even when the writer's
+    embedded Arrow schema declares a naive timestamp. Keep unknown/aware timestamps unchanged
+    so ``canonical_key`` refuses them; only that explicit naive declaration permits an NTZ read.
+    """
+    frame = spark.read.parquet(str(path))
+    if time_col not in frame.columns or frame.schema[time_col].dataType.typeName() != "timestamp":
+        return frame
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from provenance.lineage import parquet_files
+
+    fragments = parquet_files(path)
+    units: list[tuple[pathlib.Path, str]] = []
+    for fragment in fragments:
+        with pq.ParquetFile(fragment) as part:
+            encoded = (part.metadata.metadata or {}).get(b"ARROW:schema")
+            if encoded is None:
+                return frame
+            try:
+                declared = pa.ipc.read_schema(
+                    pa.BufferReader(base64.b64decode(encoded, validate=True)),
+                )
+            except (pa.ArrowException, binascii.Error):
+                return frame
+            index = declared.get_field_index(time_col)
+            if index < 0:
+                return frame
+            field_type = declared.field(index).type
+            physical = [column for column in part.schema if column.path == time_col]
+            if (
+                not pa.types.is_timestamp(field_type)
+                or field_type.tz is not None
+                or len(physical) != 1
+                or physical[0].physical_type != "INT96"
+            ):
+                return frame
+            units.append((fragment, field_type.unit))
+
+    # Spark timestamps have microsecond precision. Check only legacy nanosecond columns, in
+    # bounded Arrow batches, before Spark could erase a sub-microsecond component. Coarser
+    # declared units already fit; they also retain their wider date range instead of ns overflow.
+    for fragment, unit in units:
+        if unit != "ns":
+            continue
+        with pq.ParquetFile(fragment, coerce_int96_timestamp_unit="ns") as part:
+            for batch in part.iter_batches(columns=[time_col], batch_size=65_536):
+                try:
+                    pc.cast(batch.column(0), pa.timestamp("us"), safe=True)
+                except pa.ArrowInvalid as error:
+                    raise GridError(
+                        "INT96 time keys would lose sub-microsecond precision",
+                    ) from error
+
+    schema = StructType([
+        StructField(field.name, TimestampNTZType(), field.nullable, field.metadata)
+        if field.name == time_col else field
+        for field in frame.schema.fields
+    ])
+    return spark.read.schema(schema).parquet(str(path))
 
 
 def build(
@@ -98,7 +172,7 @@ def build(
     key_type = "timestamp_ntz" if cadence.key_kind == "timestamp" else "date"
     dates = spark.createDataFrame([(day,) for day in period_dates], f"date {key_type}")
 
-    df = spark.read.parquet(str(panel_path))
+    df = read_time_parquet(spark, panel_path, time_col)
     if eligible_col is None:
         series = df.select(F.col(series_col).alias("series_id")).distinct()
         grid = series.crossJoin(F.broadcast(dates))
@@ -119,14 +193,15 @@ def build(
                 f"panel time column {time_col!r} contains a null, malformed, lossy, or "
                 f"off-anchor {cadence.code} key"
             )
-        window = df.withColumn("__af_grid_time", key).join(
+        (time_name,) = fresh_internal_names(df.columns, ("__af_grid_time",))
+        window = df.withColumn(time_name, key).join(
             F.broadcast(dates),
-            F.col("__af_grid_time") == dates["date"],
+            F.col(time_name) == dates["date"],
             "left_semi",
         )
         grid = (window.filter(F.col(eligible_col))
                 .select(F.col(series_col).alias("series_id"),
-                        F.col("__af_grid_time").alias("date"))
+                        F.col(time_name).alias("date"))
                 .distinct())
     n = grid.count()
     if n == 0:
@@ -140,7 +215,7 @@ def build(
 
 def summarise(grid_path: str | pathlib.Path, spark: SparkSession) -> DataFrame:
     """Summarize the grid size, series count, time span, and density."""
-    g = spark.read.parquet(str(grid_path))
+    g = read_time_parquet(spark, grid_path, "date")
     return g.agg(
         F.count(F.lit(1)).alias("n_cells"),
         F.countDistinct("series_id").alias("n_series"),
@@ -165,7 +240,7 @@ def content_hash(
     Raises:
         GridError: required columns are absent, keys are invalid, or keys are duplicated.
     """
-    raw = spark.read.parquet(str(grid_path))
+    raw = read_time_parquet(spark, grid_path, "date")
     missing = sorted({"series_id", "date"} - set(raw.columns))
     if missing:
         raise GridError(f"grid lacks required columns {missing}")
@@ -277,6 +352,6 @@ def agrees_with(grid_path: str | pathlib.Path, other_path: str | pathlib.Path,
     rather than assumed. Two derivations of the same rule drift the moment one is edited, and the
     resulting comparison is between a model and a metric that disagree about what exists.
     """
-    a = spark.read.parquet(str(grid_path)).select("series_id", "date")
-    b = spark.read.parquet(str(other_path)).select("series_id", "date")
+    a = read_time_parquet(spark, grid_path, "date").select("series_id", "date")
+    b = read_time_parquet(spark, other_path, "date").select("series_id", "date")
     return a.subtract(b).count(), b.subtract(a).count()

@@ -351,7 +351,7 @@ def freeze_benchmark(
     key_types = None
     internal = "__af_series_id"
     for name, path in sources.items():
-        frame = spark.read.parquet(str(path))
+        frame = grid.read_time_parquet(spark, path, panel.time_col)
         try:
             validate_column_names(frame.columns)
         except ValueError as error:

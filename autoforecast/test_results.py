@@ -21,7 +21,9 @@ from autoforecast.results import (
 )
 
 
-def _reader_boundary(tmp_path, monkeypatch, children, stages, benchmark=None):
+def _reader_boundary(
+    tmp_path, monkeypatch, children, stages, benchmark=None, *, source=None, temporal=None
+):
     """Isolate journal lookup while retaining reader byte and forecast authentication."""
     import autoforecast.results as reader
 
@@ -30,10 +32,11 @@ def _reader_boundary(tmp_path, monkeypatch, children, stages, benchmark=None):
         json.dumps(
             {
                 "schema": "autoforecast.forecast-campaign-resolved.v4",
-                "source": {},
+                "source": source or {},
                 "selection": {"metric": "rmse"},
                 "children": children,
                 "benchmark": benchmark,
+                **({"temporal": temporal} if temporal is not None else {}),
             }
         )
     )
@@ -54,10 +57,209 @@ def _reader_boundary(tmp_path, monkeypatch, children, stages, benchmark=None):
         ),
         state=lambda: {"stages": stages},
         verify_completed_outputs=lambda: None,
+        working_directory=tmp_path,
     )
     monkeypatch.setattr(reader.CampaignStore, "from_root", lambda _: store)
     monkeypatch.setattr(reader, "_completed_output", lambda root, stage, name: root / stage / name)
     return digest
+
+
+def test_empty_results_use_authenticated_campaign_frequency(tmp_path, monkeypatch):
+    _reader_boundary(
+        tmp_path, monkeypatch, [], [], temporal={"frequency": "H"}
+    )
+
+    results = read_results(tmp_path)
+
+    assert results.rows.num_rows == 0
+    assert results.metadata["frequency"] == "H"
+    assert results.rows.schema.field("target_date").type == pa.timestamp("us")
+
+
+@pytest.mark.parametrize("frequency", ["W", "7D"])
+def test_legacy_seven_day_results_require_the_verified_dataset_cadence(
+    tmp_path, monkeypatch, frequency
+):
+    contract = tmp_path / "dataset.yaml"
+    contract.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "dataset": {"id": "fixture", "panel": {
+            "series_col": "series_id",
+            "time_col": "date",
+            "target_col": "units",
+            "frequency": frequency,
+        }},
+    }))
+    source = {
+        "dataset_contract": contract.name,
+        "dataset_contract_sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
+    }
+    _reader_boundary(
+        tmp_path, monkeypatch, [], [], source=source, temporal={"step_days": 7}
+    )
+
+    results = read_results(tmp_path)
+
+    assert results.metadata["frequency"] == frequency
+    assert results.rows.schema.field("target_date").type == pa.date32()
+
+
+def test_verified_dataset_frequency_parses_the_authenticated_bytes(tmp_path, monkeypatch):
+    contract = tmp_path / "dataset.yaml"
+    contract.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "dataset": {"id": "fixture", "panel": {
+            "series_col": "series_id",
+            "time_col": "date",
+            "target_col": "units",
+            "frequency": "W",
+        }},
+    }))
+    raw = contract.read_bytes()
+    changed = raw.replace(b"frequency: W", b"frequency: D")
+    source = {
+        "dataset_contract": contract.name,
+        "dataset_contract_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    _reader_boundary(
+        tmp_path, monkeypatch, [], [], source=source, temporal={"step_days": 7}
+    )
+    original_read_bytes = type(contract).read_bytes
+    reads = 0
+
+    def changing_read_bytes(path):
+        nonlocal reads
+        if path.resolve() != contract.resolve():
+            return original_read_bytes(path)
+        reads += 1
+        return raw if reads == 1 else changed
+
+    monkeypatch.setattr(type(contract), "read_bytes", changing_read_bytes)
+
+    results = read_results(tmp_path)
+
+    assert reads == 1
+    assert results.metadata["frequency"] == "W"
+
+
+def test_campaign_and_verified_dataset_frequency_must_agree(tmp_path, monkeypatch):
+    contract = tmp_path / "dataset.yaml"
+    contract.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "dataset": {"id": "fixture", "panel": {
+            "series_col": "series_id",
+            "time_col": "date",
+            "target_col": "units",
+            "frequency": "D",
+        }},
+    }))
+    _reader_boundary(
+        tmp_path,
+        monkeypatch,
+        [],
+        [],
+        source={
+            "dataset_contract": contract.name,
+            "dataset_contract_sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
+        },
+        temporal={"frequency": "H"},
+    )
+
+    with pytest.raises(ValueError, match="frequency differs"):
+        read_results(tmp_path)
+
+
+def test_ambiguous_legacy_seven_day_results_do_not_guess(tmp_path, monkeypatch):
+    _reader_boundary(tmp_path, monkeypatch, [], [], temporal={"step_days": 7})
+
+    with pytest.raises(ValueError, match="verified dataset contract"):
+        read_results(tmp_path)
+
+
+def test_legacy_seven_day_results_reject_a_changed_dataset_contract(tmp_path, monkeypatch):
+    contract = tmp_path / "dataset.yaml"
+    contract.write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "dataset": {"id": "fixture", "panel": {
+            "series_col": "series_id",
+            "time_col": "date",
+            "target_col": "units",
+            "frequency": "W",
+        }},
+    }))
+    expected = hashlib.sha256(contract.read_bytes()).hexdigest()
+    _reader_boundary(
+        tmp_path,
+        monkeypatch,
+        [],
+        [],
+        source={
+            "dataset_contract": contract.name,
+            "dataset_contract_sha256": expected,
+        },
+        temporal={"step_days": 7},
+    )
+    contract.write_text(contract.read_text() + "# changed\n")
+
+    with pytest.raises(ValueError, match="contract identity differs"):
+        read_results(tmp_path)
+
+
+def test_completed_forecast_must_match_authenticated_campaign_frequency(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    from autoforecast.panel import Forecast
+    from provenance.lineage import directory_digest
+
+    child = {
+        "id": "validation",
+        "kind": "validation",
+        "model_id": "example",
+        "variant_id": "default",
+        "seed": 0,
+        "initialization": "fresh",
+        "origin": "2024-01-01",
+        "horizon": 1,
+    }
+    _reader_boundary(
+        tmp_path,
+        monkeypatch,
+        [child],
+        [{"id": "validation", "status": "completed", "attempts": 1}],
+        temporal={"frequency": "H"},
+    )
+    output = tmp_path / "validation"
+    forecast_dir = output / "forecast"
+    forecast_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"series_id": "a", "date": dt.date(2024, 1, 2), "yhat": 1.0}]
+        ),
+        forecast_dir / "part.parquet",
+    )
+    forecast = Forecast(
+        "seasonal_naive",
+        str(forecast_dir),
+        child["origin"],
+        1,
+        1,
+        {"emitted": 1},
+        frequency="D",
+    )
+    record = output / "forecast.json"
+    record.write_text(json.dumps(forecast.as_record()))
+    (output / "child-result.json").write_text(json.dumps({
+        **child,
+        "adapter": "seasonal_naive",
+        "run_path": str(output / "run"),
+        "forecast_record_path": str(record),
+        "forecast_record_sha256": hashlib.sha256(record.read_bytes()).hexdigest(),
+        "forecast_artifact_sha256": directory_digest(forecast_dir, suffixes=(".parquet",)),
+        "score": None,
+    }))
+
+    with pytest.raises(ValueError, match="forecast frequency differs"):
+        read_results(tmp_path)
 
 
 @pytest.mark.parametrize(

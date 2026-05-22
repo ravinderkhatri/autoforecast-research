@@ -13,8 +13,9 @@ from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
 from autoforecast._numeric import is_finite_real
+from autoforecast.column_names import fresh_internal_names
 from autoforecast.frequency import parse_frequency, period_points
-from autoforecast.grid import canonical_key, period_membership
+from autoforecast.grid import canonical_key, period_membership, read_time_parquet
 from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 from autoforecast.ranking import MissingForecastPolicy, finalize_forecast_on_grid
 from autoforecast.score import Score
@@ -138,7 +139,7 @@ def oracle_forecast(
             f"origin/frequency does not define a supported canonical period grid: {exc}"
         ) from exc
     panel.validate()
-    raw = spark.read.parquet(panel.path)
+    raw = read_time_parquet(spark, panel.path, panel.time_col)
     if cadence.key_kind == "timestamp" and (
         raw.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
     ):
@@ -146,18 +147,19 @@ def oracle_forecast(
             f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type"
         )
     time_key, valid_time_key = canonical_key(panel.time_col, cadence)
-    prepared = raw.withColumn("__af_oracle_time", time_key).withColumn(
-        "__af_oracle_valid_time", valid_time_key
+    time_name, valid_time_name = fresh_internal_names(
+        raw.columns, ("__af_oracle_time", "__af_oracle_valid_time")
     )
-    if prepared.filter(~F.col("__af_oracle_valid_time")).limit(1).count():
+    prepared = raw.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time_key)
+    if prepared.filter(~F.col(valid_time_name)).limit(1).count():
         raise HeadroomError(
             f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
         )
-    df = prepared.filter(period_membership("__af_oracle_time", dates, cadence))
+    df = prepared.filter(period_membership(time_name, dates, cadence))
     if panel.has_exposure:
         df = df.filter(F.col(panel.exposure_col).isin(*sorted(ELIGIBLE_STATES)))
     df = df.select(F.col(panel.series_col).alias("series_id"),
-                   F.col("__af_oracle_time").alias("date"),
+                   F.col(time_name).alias("date"),
                    F.col(panel.target_col).cast("double").alias("y"))
 
     if cadence.unit == "H":

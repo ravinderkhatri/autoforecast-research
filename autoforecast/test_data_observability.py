@@ -55,6 +55,52 @@ def _panel(path: pathlib.Path) -> Panel:
     ).validate()
 
 
+@pytest.mark.parametrize(
+    "series_col,time_col,target_col",
+    [
+        ("sid", "day", "_time_key"),
+        ("_time_key", "day", "value"),
+        ("sid", "day", "_valid_time_key"),
+        ("COUNT", "day", "value"),
+        ("LEVELS", "day", "value"),
+        ("FIRST", "day", "value"),
+        ("M", "__AF_PROFILE_TIME", "__AF_PROFILE_VALID_TIME"),
+    ],
+)
+def test_inspection_temporary_columns_cannot_collide_with_mapped_columns(
+    tmp_path, series_col: str, time_col: str, target_col: str
+) -> None:
+    spark = _spark()
+    source = tmp_path / f"collision-{series_col}-{time_col}-{target_col}"
+    rows = []
+    for offset, value in enumerate((1.0, 2.0)):
+        rows.append({
+            series_col: "a",
+            time_col: dt.date(2024, 1, 1) + dt.timedelta(days=offset),
+            target_col: value,
+            "feature": "x",
+        })
+    spark.createDataFrame(rows).write.parquet(str(source))
+    panel = Panel(
+        source,
+        series_col,
+        time_col,
+        target_col,
+        static=("feature",),
+    )
+
+    report = inspect_panel(panel, spark, as_of="2024-01-02")
+
+    assert isinstance(report, CheckReport)
+    assert report.accepted
+    assert report.facts.n_rows == 2
+    assert report.facts.n_series == 1
+    assert report.facts.n_dates == 2
+    assert report.facts.profile is not None
+    assert report.facts.profile.n_cells == 2
+    assert report.facts.profile.n_series == 1
+
+
 def test_run_incident_from_error_uses_the_first_nonblank_error_line() -> None:
     incident = run_incident_from_error(
         RuntimeError("\n  parquet footer is unreadable  \nlater diagnostic detail")

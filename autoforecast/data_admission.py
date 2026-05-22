@@ -52,8 +52,13 @@ def load_dataset_contract(path: str | pathlib.Path) -> DatasetContract:
     source = pathlib.Path(path)
     if source.is_symlink() or not source.is_file():
         raise DatasetContractError(f"dataset contract must be a regular file, not {source}")
+    return _load_dataset_contract_bytes(source.read_bytes(), source)
+
+
+def _load_dataset_contract_bytes(raw: bytes, source: pathlib.Path) -> DatasetContract:
+    """Parse dataset-contract bytes whose identity was authenticated by the caller."""
     try:
-        value = loads_exact_yaml(source.read_bytes())
+        value = loads_exact_yaml(raw)
     except ExactYAMLError as exc:
         raise DatasetContractError(f"invalid YAML in {source}: {exc}") from exc
     if type(value) is not dict or set(value) != {"schema_version", "dataset"}:

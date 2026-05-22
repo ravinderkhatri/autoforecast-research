@@ -22,7 +22,7 @@ from spec.forecast_spec import STATE_CODES
 
 from autoforecast._numeric import is_finite_real
 from autoforecast.frequency import Cadence, FrequencyError, parse_frequency, period_points
-from autoforecast.grid import canonical_key
+from autoforecast.grid import canonical_key, read_time_parquet
 from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 from autoforecast.score import Score
 
@@ -129,7 +129,7 @@ def score_forecast(
         [(point,) for point in allowed_dates], f"date {key_type}",
     )
 
-    fc = spark.read.parquet(forecast.path)
+    fc = read_time_parquet(spark, forecast.path, "date")
     required = {"series_id", "date", "yhat"}
     missing_columns = sorted(required - set(fc.columns))
     if missing_columns:
@@ -217,7 +217,7 @@ def score_forecast(
             "Only missing dates for known series can use the sparse-zero convention")
 
     if restrict_to is not None:
-        keep_raw = spark.read.parquet(restrict_to)
+        keep_raw = read_time_parquet(spark, restrict_to, "date")
         missing_keep = sorted({"series_id", "date"} - set(keep_raw.columns))
         if missing_keep:
             raise ScoreError(f"restrict_to lacks required columns {missing_keep}")
@@ -300,7 +300,7 @@ def _read_eligible_grid(
     spark: SparkSession,
 ) -> DataFrame:
     """Load and validate one origin's canonical eligible series-date set."""
-    raw = spark.read.parquet(path)
+    raw = read_time_parquet(spark, path, "date")
     required = {"series_id", "date"}
     missing = sorted(required - set(raw.columns))
     if missing:
@@ -341,7 +341,7 @@ def _join_actuals(
     the over-forecast-on-a-zero-day the deployed metric cannot see (`score.py`, defect 2). The
     join has to preserve those and let `missing_actual` decide what they mean.
     """
-    raw = spark.read.parquet(panel.path)
+    raw = read_time_parquet(spark, panel.path, panel.time_col)
     if raw.schema[panel.target_col].dataType.typeName() == "boolean":
         raise ScoreError(
             f"panel target {panel.target_col!r} must be numeric, not boolean. Casting True/False "

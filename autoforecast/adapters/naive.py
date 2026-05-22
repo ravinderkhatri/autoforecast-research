@@ -12,6 +12,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from autoforecast.adapters import _validate_span
+from autoforecast.column_names import fresh_internal_names
 from autoforecast.frequency import (
     advance,
     canonical_origin,
@@ -19,7 +20,7 @@ from autoforecast.frequency import (
     parse_origin,
     period_points,
 )
-from autoforecast.grid import canonical_key, period_membership, time_literal
+from autoforecast.grid import canonical_key, period_membership, read_time_parquet, time_literal
 from autoforecast.panel import Forecast, Panel
 
 REUSE_EXEMPTION = (
@@ -82,7 +83,7 @@ def seasonal_naive(
 
     cadence = parse_frequency(panel.frequency)
     time_key, valid_time_key = canonical_key(panel.time_col, cadence)
-    raw_source = spark.read.parquet(panel.path)
+    raw_source = read_time_parquet(spark, panel.path, panel.time_col)
     if cadence.key_kind == "timestamp" and (
         raw_source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
     ):
@@ -90,15 +91,18 @@ def seasonal_naive(
             f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type; "
             "timezone-sensitive timestamp storage is lossy for wall-clock keys"
         )
-    raw = raw_source.withColumn(
-        "__af_naive_time", time_key
-    ).withColumn("__af_naive_valid_time", valid_time_key)
-    if raw.filter(~F.col("__af_naive_valid_time")).limit(1).count():
+    time_name, valid_time_name = fresh_internal_names(
+        raw_source.columns, ("__af_naive_time", "__af_naive_valid_time")
+    )
+    raw = raw_source.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time_key)
+    if raw.filter(~F.col(valid_time_name)).limit(1).count():
         raise ValueError(
             f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
         )
-    source = _source_window(raw, panel, origin, m)
-    grid = _future_grid(spark, raw, panel, origin, horizon, m)
+    source = _source_window(raw, panel, origin, m, normalized_time_col=time_name)
+    grid = _future_grid(
+        spark, raw, panel, origin, horizon, m, normalized_time_col=time_name
+    )
 
     joined = grid.join(
         source,
@@ -141,7 +145,14 @@ def seasonal_naive(
         labelled.unpersist()
 
 
-def _source_window(raw: DataFrame, panel: Panel, origin: str, m: int) -> DataFrame:
+def _source_window(
+    raw: DataFrame,
+    panel: Panel,
+    origin: str,
+    m: int,
+    *,
+    normalized_time_col: str | None = None,
+) -> DataFrame:
     """The only history a seasonal naive can read: the `m` periods ending at `origin`.
 
     Writing `h = q*m + r` with `0 <= r < m`, the source date is `origin + r - m` when `r > 0` and
@@ -162,8 +173,8 @@ def _source_window(raw: DataFrame, panel: Panel, origin: str, m: int) -> DataFra
         advance(origin_point, cadence, offset) for offset in range(-(m - 1), 1)
     )
     history_key = (
-        F.col("__af_naive_time")
-        if "__af_naive_time" in raw.columns
+        F.col(normalized_time_col)
+        if normalized_time_col is not None
         else canonical_key(panel.time_col, cadence)[0]
     )
     cols = [
@@ -178,7 +189,14 @@ def _source_window(raw: DataFrame, panel: Panel, origin: str, m: int) -> DataFra
 
 
 def _future_grid(
-    spark: SparkSession, raw: DataFrame, panel: Panel, origin: str, horizon: int, m: int
+    spark: SparkSession,
+    raw: DataFrame,
+    panel: Panel,
+    origin: str,
+    horizon: int,
+    m: int,
+    *,
+    normalized_time_col: str | None = None,
 ) -> DataFrame:
     """One row per (series, future date), carrying the source date its value is copied from.
 
@@ -213,8 +231,8 @@ def _future_grid(
         F.col("source_date").cast(key_type).alias("source_date"),
     )
     history_key = (
-        F.col("__af_naive_time")
-        if "__af_naive_time" in raw.columns
+        F.col(normalized_time_col)
+        if normalized_time_col is not None
         else canonical_key(panel.time_col, cadence)[0]
     )
     series = (raw.filter(history_key <= time_literal(origin_point, cadence))

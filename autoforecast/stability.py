@@ -183,7 +183,7 @@ def measure(
 
     a = _validated_forecast_frame(earlier, spark, "earlier", "_before")
     b = _validated_forecast_frame(later, spark, "later", "_after")
-    raw_expected = spark.read.parquet(str(expected_overlap))
+    raw_expected = grid.read_time_parquet(spark, expected_overlap, "date")
     if cadence.key_kind == "timestamp" and (
         raw_expected.schema["date"].dataType.typeName() != "timestamp_ntz"
     ):
@@ -267,7 +267,7 @@ def _validated_forecast_frame(
     except ForecastError as exc:
         raise StabilityError(f"{label} forecast is invalid: {exc}") from exc
     try:
-        raw = spark.read.parquet(forecast.path)
+        raw = grid.read_time_parquet(spark, forecast.path, "date")
     except Exception as exc:
         raise StabilityError(f"cannot read {label} forecast {forecast.path}: {exc}") from exc
     missing = sorted({"series_id", "date", "yhat"} - set(raw.columns))

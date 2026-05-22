@@ -12,8 +12,9 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from spec.forecast_spec import ELIGIBLE_STATES
 
+from autoforecast.column_names import fresh_internal_names
 from autoforecast.frequency import parse_frequency, parse_origin
-from autoforecast.grid import canonical_key, time_literal
+from autoforecast.grid import canonical_key, read_time_parquet, time_literal
 
 __all__ = ["Profile", "ProfileError", "profile"]
 
@@ -165,7 +166,7 @@ def profile(
             f"as_of must be a canonical ISO date/time for frequency {frequency!r}, got {as_of!r}"
         ) from None
 
-    df = spark.read.parquet(str(panel_path))
+    df = read_time_parquet(spark, panel_path, time_col)
     needed = [c for c in (series_col, time_col, target_col, exposure_col, *coverage_cols) if c]
     missing = [c for c in needed if c not in df.columns]
     if missing:
@@ -178,15 +179,22 @@ def profile(
             f"{df.schema[time_col].dataType.simpleString()}"
         )
 
-    time_key, valid_time = canonical_key(time_col, cadence)
-    bounded = df.withColumn("__af_profile_time", time_key).withColumn(
-        "__af_profile_valid_time", valid_time
+    time_name, valid_time_name, mean_name, history_count_name = fresh_internal_names(
+        df.columns,
+        (
+            "__af_profile_time",
+            "__af_profile_valid_time",
+            "m",
+            "count",
+        ),
     )
-    if bounded.filter(~F.col("__af_profile_valid_time")).limit(1).count():
+    time_key, valid_time = canonical_key(time_col, cadence)
+    bounded = df.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time)
+    if bounded.filter(~F.col(valid_time_name)).limit(1).count():
         raise ProfileError(
             f"{time_col!r} contains a malformed, lossy, or off-anchor {cadence.code} time key"
         )
-    df = bounded.filter(F.col("__af_profile_time") <= time_literal(cutoff, cadence))
+    df = bounded.filter(F.col(time_name) <= time_literal(cutoff, cadence))
 
     eligible = (F.col(exposure_col).isin(*sorted(ELIGIBLE_STATES)) if exposure_col
                 else F.lit(True))
@@ -210,13 +218,21 @@ def profile(
     # extremes: one miskeyed row would otherwise set the whole figure, and the number is used to
     # decide whether RevIN is load-bearing.
     per_series = (df.filter(eligible).groupBy(series_col)
-                  .agg(F.avg(target_col).alias("m")).filter(F.col("m") > 0))
+                  .agg(F.avg(target_col).alias(mean_name)).filter(F.col(mean_name) > 0))
     bounds = per_series.agg(
-        F.expr("percentile_approx(m, 0.01)").alias("lo"),
-        F.expr("percentile_approx(m, 0.99)").alias("hi")).collect()[0]
+        F.percentile_approx(mean_name, 0.01).alias("lo"),
+        F.percentile_approx(mean_name, 0.99).alias("hi")).collect()[0]
     scale_range = float(bounds["hi"] / bounds["lo"]) if bounds["lo"] else float("inf")
-    history_bounds = (df.filter(eligible).groupBy(series_col).count().agg(
-        F.min("count").alias("minimum"), F.max("count").alias("maximum")).collect()[0])
+    history_bounds = (
+        df.filter(eligible)
+        .groupBy(series_col)
+        .agg(F.count(F.lit(1)).alias(history_count_name))
+        .agg(
+            F.min(history_count_name).alias("minimum"),
+            F.max(history_count_name).alias("maximum"),
+        )
+        .collect()[0]
+    )
 
     coverage = {c: float(agg[f"cov_{c}"] or 0.0) for c in coverage_cols}
     notes = _implications(float(agg["eligible_share"]), float(agg["zero_eligible"] or 0.0),

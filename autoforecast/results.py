@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 from dataclasses import dataclass
@@ -52,6 +53,70 @@ class CampaignResults:
     source_keys: pa.Table | None
 
 
+def _verified_dataset_frequency(
+    resolved: dict, working_directory: pathlib.Path | None, *, required: bool
+) -> str | None:
+    """Read only the pinned dataset contract when temporal evidence is ambiguous."""
+    source = resolved.get("source")
+    if type(source) is not dict:
+        if required:
+            raise ValueError("campaign frequency requires a verified dataset contract")
+        return None
+    relative = source.get("dataset_contract")
+    expected = source.get("dataset_contract_sha256")
+    if type(relative) is not str or type(expected) is not str or working_directory is None:
+        if required:
+            raise ValueError("campaign frequency requires a verified dataset contract")
+        return None
+    candidate = pathlib.Path(relative)
+    path = candidate if candidate.is_absolute() else working_directory / candidate
+    root = working_directory.resolve()
+    try:
+        resolved_path = path.resolve(strict=True)
+    except OSError:
+        if required:
+            raise ValueError("campaign frequency requires a verified dataset contract") from None
+        return None
+    if not resolved_path.is_file() or not resolved_path.is_relative_to(root):
+        raise ValueError("campaign dataset contract path is invalid")
+    raw = resolved_path.read_bytes()
+    if len(expected) != 64 or hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("campaign dataset contract identity differs")
+    from autoforecast.data_admission import _load_dataset_contract_bytes
+
+    contract = _load_dataset_contract_bytes(raw, resolved_path)
+    return parse_frequency(str(contract.panel_roles.get("frequency", "D"))).code
+
+
+def _resolved_frequency(resolved: dict, contract_frequency: str | None) -> str | None:
+    """Recover one cadence from authenticated temporal and dataset evidence."""
+    temporal = resolved.get("temporal")
+    if type(temporal) is not dict:
+        return contract_frequency
+    declared = temporal.get("frequency")
+    step_days = temporal.get("step_days")
+    if declared is not None:
+        if type(declared) is not str or step_days is not None:
+            raise ValueError("campaign temporal frequency is invalid")
+        frequency = parse_frequency(declared).code
+    elif step_days is not None:
+        if type(step_days) is not int or step_days < 1:
+            raise ValueError("campaign temporal step_days is invalid")
+        if step_days == 7:
+            if contract_frequency is None:
+                raise ValueError("legacy seven-day cadence requires a verified dataset contract")
+            frequency = contract_frequency
+            if frequency not in {"W", "7D"}:
+                raise ValueError("legacy seven-day cadence differs from the dataset contract")
+        else:
+            frequency = parse_frequency("D" if step_days == 1 else f"{step_days}D").code
+    else:
+        return contract_frequency
+    if contract_frequency is not None and frequency != contract_frequency:
+        raise ValueError("campaign frequency differs from the dataset contract")
+    return frequency
+
+
 def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
     """Verify journal/output hashes and identities before exposing forecasts or run metadata."""
     store = CampaignStore.from_root(campaign_root)
@@ -85,7 +150,7 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
             _completed_output(store.root, "final_score", "final-score.json")
         )
     source_keys = None
-    frequency = None
+    contract_frequency = None
     if benchmark:
         path, frozen = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
         if frozen["benchmark_id"] != benchmark["id"]:
@@ -95,7 +160,7 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
         target = load_dataset_contract(path.parent / "dataset.yaml").panel(
             path.parent / "selection"
         )
-        frequency = parse_frequency(target.frequency).code
+        contract_frequency = parse_frequency(target.frequency).code
         source_keys = pq.read_table(path.parent / "source-keys")
         metadata.update(
             {
@@ -111,6 +176,20 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
                 },
             }
         )
+    else:
+        temporal = resolved.get("temporal")
+        needs_contract = (
+            type(temporal) is dict
+            and temporal.get("frequency") is None
+            and temporal.get("step_days") == 7
+        )
+        working_directory = getattr(store, "working_directory", None)
+        contract_frequency = _verified_dataset_frequency(
+            resolved,
+            pathlib.Path(working_directory) if working_directory is not None else None,
+            required=needs_contract,
+        )
+    frequency = _resolved_frequency(resolved, contract_frequency)
     rows, runs = [], []
     children = {child["id"]: child for child in resolved["children"]}
     lock = None

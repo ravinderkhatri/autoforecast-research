@@ -14,6 +14,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from autoforecast.adapters import adapter_capabilities, known_adapter_names
+from autoforecast.column_names import fresh_internal_names
 from autoforecast.data_admission import get_model_input_contract
 from autoforecast.frequency import (
     advance,
@@ -22,7 +23,7 @@ from autoforecast.frequency import (
     parse_origin,
     period_points,
 )
-from autoforecast.grid import canonical_key, period_membership, time_literal
+from autoforecast.grid import canonical_key, period_membership, read_time_parquet, time_literal
 from autoforecast.model_api import (
     CheckReport,
     CheckResult,
@@ -235,21 +236,39 @@ def prepare_model_check_input(
     origin_point = parse_origin(run.origin, cadence)
     required = registration.required_history(panel, run)
     time_key, valid_time_key = canonical_key(panel.time_col, cadence)
-    panel_source = spark.read.parquet(panel.path)
+    panel_source = read_time_parquet(spark, panel.path, panel.time_col)
     if cadence.key_kind == "timestamp" and (
         panel_source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
     ):
         raise ValueError(
             f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type"
         )
-    panel_rows = panel_source.withColumn(
-        "__af_readiness_time", time_key
-    ).withColumn("__af_readiness_valid_time", valid_time_key)
-    if panel_rows.filter(~F.col("__af_readiness_valid_time")).limit(1).count():
+    (
+        time_name,
+        valid_time_name,
+        history_name,
+        dates_name,
+        window_dates_name,
+        last_date_name,
+    ) = fresh_internal_names(
+        panel_source.columns,
+        (
+            "__af_readiness_time",
+            "__af_readiness_valid_time",
+            "history",
+            "dates",
+            "window_dates",
+            "last_date",
+        ),
+    )
+    panel_rows = panel_source.withColumn(time_name, time_key).withColumn(
+        valid_time_name, valid_time_key
+    )
+    if panel_rows.filter(~F.col(valid_time_name)).limit(1).count():
         raise ValueError(
             f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
         )
-    point = F.col("__af_readiness_time")
+    point = F.col(time_name)
     raw = panel_rows.filter(point <= time_literal(origin_point, cadence))
     total = raw.select(panel.series_col).distinct().count()
     eligible = raw
@@ -262,22 +281,22 @@ def prepare_model_check_input(
         advance(origin_point, cadence, offset) for offset in range(-(required - 1), 1)
     )
     per_series = eligible.groupBy(panel.series_col).agg(
-        F.count(F.lit(1)).alias("history"),
-        F.count_distinct(point).alias("dates"),
+        F.count(F.lit(1)).alias(history_name),
+        F.count_distinct(point).alias(dates_name),
         F.count_distinct(
             F.when(period_membership(point, window_points, cadence), point)
-        ).alias("window_dates"),
-        F.max(point).alias("last_date"),
+        ).alias(window_dates_name),
+        F.max(point).alias(last_date_name),
     )
     eligible_series = per_series.count()
-    meets_history = per_series.filter(F.col("history") >= required).count()
-    irregular = per_series.filter(F.col("history") != F.col("dates")).count()
+    meets_history = per_series.filter(F.col(history_name) >= required).count()
+    irregular = per_series.filter(F.col(history_name) != F.col(dates_name)).count()
     complete: int | None = None
     if registration.requires_complete_window:
         complete = per_series.filter(
-            (F.col("history") >= required)
-            & (F.col("last_date") == time_literal(origin_point, cadence))
-            & (F.col("window_dates") == required)
+            (F.col(history_name) >= required)
+            & (F.col(last_date_name) == time_literal(origin_point, cadence))
+            & (F.col(window_dates_name) == required)
         ).count()
     training_examples = None
     positive_training_examples = None
@@ -321,14 +340,17 @@ def _shallow_training_evidence(panel_rows, panel: Panel, run: ResolvedRun) -> tu
         advance(origin_point, cadence, -run.horizon * index) for index in range(1, 9)
     )
     time_key, valid_time_key = canonical_key(panel.time_col, cadence)
-    keyed_rows = panel_rows.withColumn("__af_shallow_time", time_key).withColumn(
-        "__af_shallow_valid_time", valid_time_key
+    time_name, valid_time_name = fresh_internal_names(
+        panel_rows.columns, ("__af_shallow_time", "__af_shallow_valid_time")
     )
-    if keyed_rows.filter(~F.col("__af_shallow_valid_time")).limit(1).count():
+    keyed_rows = panel_rows.withColumn(time_name, time_key).withColumn(
+        valid_time_name, valid_time_key
+    )
+    if keyed_rows.filter(~F.col(valid_time_name)).limit(1).count():
         raise ValueError(
             f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
         )
-    time_key = F.col("__af_shallow_time")
+    time_key = F.col(time_name)
     total = 0
     positive = 0
     for origin in origins:

@@ -313,6 +313,38 @@ def test_baseline_repeats_period_values_without_truncating_cadence_keys(
     assert last.adapter == "last_value" and last.frequency == frequency
 
 
+def test_baselines_preserve_mapped_columns_that_match_temporary_names(tmp_path) -> None:
+    source = tmp_path / "colliding-panel"
+    spark().createDataFrame(
+        [
+            ("a", dt.date(2024, 1, 1), 10.0),
+            ("a", dt.date(2024, 1, 2), 20.0),
+        ],
+        "__AF_NAIVE_VALID_TIME string, day date, __AF_NAIVE_TIME double",
+    ).write.parquet(str(source))
+    described = Panel(
+        source,
+        "__AF_NAIVE_VALID_TIME",
+        "day",
+        "__AF_NAIVE_TIME",
+        season_length=2,
+    )
+
+    seasonal = seasonal_naive(
+        described, "2024-01-02", 2, spark=spark(), out_dir=tmp_path / "seasonal"
+    )
+    seasonal_rows = spark().read.parquet(seasonal.path).orderBy("date").collect()
+    assert [row["yhat"] for row in seasonal_rows] == [10.0, 20.0]
+    assert seasonal.n_series == 1
+
+    last = last_value(
+        described, "2024-01-02", 2, spark=spark(), out_dir=tmp_path / "last"
+    )
+    last_rows = spark().read.parquet(last.path).orderBy("date").collect()
+    assert [row["yhat"] for row in last_rows] == [20.0, 20.0]
+    assert last.n_series == 1
+
+
 @pytest.mark.parametrize(
     "frequency,origin,bad_key",
     [

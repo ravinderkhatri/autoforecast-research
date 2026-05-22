@@ -175,7 +175,9 @@ training, validation, and test windows.
   work with the baselines; count models can impose integer-target requirements.
 - Hourly Parquet keys use timezone-naive timestamps. Other cadences use dates; midnight
   timestamps are accepted only when conversion preserves the full time key. Each series/time
-  must appear once. Hourly values on the same day remain distinct observations.
+  must appear once. Hourly values on the same day remain distinct observations. Legacy INT96
+  timestamps require an embedded Arrow schema declaring timezone-naive values; otherwise,
+  convert the source to typed dates or timezone-naive timestamps before importing it.
 - The cohort is fixed from series present by the first validation origin in the selection
   source. The manifest reconciles all source series, exclusions, and the retained cohort.
 - Every retained series needs every required observation on its frequency grid. Gaps and null targets are

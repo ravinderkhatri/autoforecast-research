@@ -93,6 +93,47 @@ def test_tft_readiness_uses_complete_105_day_window_and_28_day_horizon() -> None
     assert registration.governed_horizon == 28
 
 
+@pytest.mark.parametrize(
+    "series_col,target_col,adapter",
+    [
+        ("__AF_READINESS_VALID_TIME", "__AF_READINESS_TIME", "last_value"),
+        ("history", "sales", "last_value"),
+        ("__AF_SHALLOW_VALID_TIME", "__AF_SHALLOW_TIME", "shallow_global"),
+    ],
+)
+def test_readiness_preserves_mapped_columns_that_match_temporary_names(
+    tmp_path, series_col: str, target_col: str, adapter: str
+) -> None:
+    spark = _spark()
+    source = tmp_path / f"collision-{adapter}-{series_col}"
+    start = dt.date(2024, 1, 1)
+    rows = [
+        {
+            series_col: "series",
+            "day": start + dt.timedelta(days=index),
+            target_col: float(index + 1),
+        }
+        for index in range(12)
+    ]
+    spark.createDataFrame(rows).write.parquet(str(source))
+    panel = Panel(source, series_col, "day", target_col, season_length=2)
+    origin = "2024-01-12"
+    data_checks = inspect_panel(panel, spark, as_of=origin)
+    assert isinstance(data_checks, CheckReport) and data_checks.accepted
+    run = create_resolved_run(
+        model_id=f"collision-{adapter}",
+        adapter=adapter,
+        origin=origin,
+        horizon=1,
+    )
+
+    prepared = prepare_model_check_input(panel, spark, data_checks.facts, run)
+
+    assert prepared.total_series == 1
+    assert prepared.eligible_series == 1
+    assert prepared.irregular_series == 0
+
+
 def test_create_resolved_run_refuses_noncanonical_origin_identity() -> None:
     adapter = known_adapter_names()[0]
     with pytest.raises(ValueError, match="canonical"):

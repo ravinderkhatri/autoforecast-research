@@ -505,7 +505,10 @@ def common_cells(
             f"forecasts span different (origin, horizon, frequency): {sorted(spans)}. "
             "Intersecting cells "
             "across different windows compares forecasts of different things")
-    frames = [spark.read.parquet(f.path).select("series_id", "date") for f in forecasts]
+    frames = [
+        grid.read_time_parquet(spark, f.path, "date").select("series_id", "date")
+        for f in forecasts
+    ]
     keep = reduce(lambda a, b: a.intersect(b), frames).distinct()
     out = str(pathlib.Path(out_dir))
     keep.write.mode("overwrite").parquet(out)
@@ -599,7 +602,7 @@ def _exact_grid_restrictions(
         horizon = next(iter(spans))[1]
         frequency = next(iter(spans))[2]
         path = eligible_grids[origin]
-        raw_grid = spark.read.parquet(path)
+        raw_grid = grid.read_time_parquet(spark, path, "date")
         missing_columns = sorted({"series_id", "date"} - set(raw_grid.columns))
         if missing_columns:
             raise SelectionError(
@@ -641,7 +644,7 @@ def _exact_grid_restrictions(
 
         for adapter in sorted(runs):
             forecast = runs[adapter][origin]
-            raw_forecast = spark.read.parquet(forecast.path)
+            raw_forecast = grid.read_time_parquet(spark, forecast.path, "date")
             missing_forecast_columns = sorted(
                 {"series_id", "date"} - set(raw_forecast.columns))
             if missing_forecast_columns:
@@ -683,7 +686,7 @@ def _canonical_grid(
     frequency: str,
 ) -> DataFrame:
     """Read one eligible grid into canonical join keys after validating its full contract."""
-    raw = spark.read.parquet(str(path))
+    raw = grid.read_time_parquet(spark, path, "date")
     missing = sorted({"series_id", "date"} - set(raw.columns))
     if missing:
         raise SelectionError(f"eligible grid for {origin} lacks required columns {missing}")
@@ -739,7 +742,7 @@ def _validated_source_frame(forecast: Forecast, spark: SparkSession) -> DataFram
                 f"not materialise its forecast artifact at {forecast.path!r}")
         return None
 
-    raw = spark.read.parquet(forecast.path)
+    raw = grid.read_time_parquet(spark, forecast.path, "date")
     missing = sorted({"series_id", "date", "yhat"} - set(raw.columns))
     if missing:
         raise SelectionError(

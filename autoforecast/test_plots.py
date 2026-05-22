@@ -7,6 +7,7 @@ selection is reproducible, that intermittency is actually spanned, and that a fi
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import pathlib
 import sys
@@ -101,6 +102,29 @@ def test_the_selection_cannot_see_the_held_out_period() -> None:
 def test_a_series_with_too_little_history_is_not_offered() -> None:
     # min_history above anything M5 can supply must yield nothing rather than a useless plot.
     assert series_across_zero_rate_deciles(panel(), spark(), ORIGIN, n=8, min_history=10**6) == []
+
+
+def test_series_selection_preserves_mapped_columns_that_match_temporary_names(tmp_path) -> None:
+    source = tmp_path / "colliding-panel"
+    spark().createDataFrame(
+        [
+            ("series", dt.date(2024, 1, 1), 0.0),
+            ("series", dt.date(2024, 1, 2), 2.0),
+        ],
+        "__AF_PLOT_VALID_TIME string, day date, __AF_PLOT_TIME double",
+    ).write.parquet(str(source))
+    described = Panel(
+        source,
+        "__AF_PLOT_VALID_TIME",
+        "day",
+        "__AF_PLOT_TIME",
+    )
+
+    picked = series_across_zero_rate_deciles(
+        described, spark(), "2024-01-02", n=1, min_history=1
+    )
+
+    assert picked == [("series", 0.5)]
 
 
 def test_diagnostic_plot_writes_a_png_for_a_real_forecast() -> None:

@@ -109,6 +109,24 @@ def test_build_applies_effective_dated_eligibility_per_cell() -> None:
         ("a", "2024-01-04"), ("a", "2024-01-06"), ("b", "2024-01-05")}
 
 
+@pytest.mark.parametrize("role", ["series", "eligible"])
+def test_effective_grid_keeps_mapped_columns_that_match_its_temporary_name(tmp_path, role):
+    series_col = "__af_grid_time" if role == "series" else "id"
+    eligible_col = "__AF_GRID_TIME" if role == "eligible" else "eligible"
+    path = tmp_path / "panel"
+    (spark().read.parquet(str(source()))
+     .withColumnRenamed("id", series_col)
+     .withColumnRenamed("eligible", eligible_col)
+     .write.parquet(str(path)))
+    output = grid.build(
+        path, ORIGIN, HORIZON, spark(), tmp_path / "grid",
+        series_col=series_col, time_col="day", eligible_col=eligible_col,
+    )
+    keys = {(row["series_id"], str(row["date"]))
+            for row in spark().read.parquet(str(output)).collect()}
+    assert keys == {("a", "2024-01-04"), ("a", "2024-01-06"), ("b", "2024-01-05")}
+
+
 def test_build_materialises_the_declared_integral_day_cadence() -> None:
     path = grid.build(
         source(), ORIGIN, 2, spark(), tempfile.mkdtemp(),
