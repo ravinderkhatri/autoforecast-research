@@ -29,9 +29,7 @@ jobs:
         run: |
           uv lock --check
           uv export --frozen --no-hashes --no-emit-project --group ci \
-            --extra timeseries --extra plots --extra catalog --extra classical --extra shallow \
-            --extra tft --extra hpo-optuna --extra hpo-ray --extra mlflow-tracking \
-            --extra custom-torch --output-file "$RUNNER_TEMP/constraints.txt"
+            --extra shallow --extra tft --extra custom-torch --output-file "$RUNNER_TEMP/constraints.txt"
           uv pip install --system --no-deps --constraint "$RUNNER_TEMP/constraints.txt" \
             torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
@@ -40,7 +38,7 @@ jobs:
           python -m scripts.verify_public_release --wheel "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl"
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
             --build-constraints "$RUNNER_TEMP/constraints.txt" \
-            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[timeseries,plots,catalog,classical,shallow,tft,hpo-optuna,hpo-ray,mlflow-tracking,custom-torch]"
+            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[shallow,tft,custom-torch]"
           uv pip check --system
           python - <<'PY'
           import importlib.metadata
@@ -98,7 +96,7 @@ jobs:
       - name: Build and install wheel
         run: |
           uv lock --check
-          uv export --frozen --no-hashes --no-emit-project --group ci --extra timeseries --extra plots \
+          uv export --frozen --no-hashes --no-emit-project --group ci \
             --output-file "$RUNNER_TEMP/constraints.txt"
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
             --build-constraints "$RUNNER_TEMP/constraints.txt" --group ci
@@ -107,8 +105,35 @@ jobs:
           uv venv --python "$(command -v python)" "$RUNNER_TEMP/timeseries-env"
           uv pip install --python "$RUNNER_TEMP/timeseries-env/bin/python" \
             --constraint "$RUNNER_TEMP/constraints.txt" --build-constraints "$RUNNER_TEMP/constraints.txt" \
-            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[timeseries,plots]"
+            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl"
           uv pip check --python "$RUNNER_TEMP/timeseries-env/bin/python"
+      - name: Verify standard installation capabilities
+        working-directory: ${{ runner.temp }}
+        run: |
+          env -u PYTHONPATH timeseries-env/bin/python - <<'PY'
+          import importlib.util
+          import numpy as np
+          import optuna
+          from mlflow.tracking import MlflowClient
+          from ray import tune
+          from statsforecast.models import AutoETS, AutoTheta, CrostonClassic
+          from autoforecast.model_runtime import check_runtime
+
+          assert check_runtime("builtin").available
+          assert check_runtime("classical").available
+          for module in ("torch", "lightgbm", "autogluon", "timesfm"):
+              assert importlib.util.find_spec(module) is None, module
+          y = np.tile(np.arange(1, 8, dtype=float), 4)
+          for model in (AutoETS(season_length=7), AutoTheta(season_length=7), CrostonClassic()):
+              predictions = model.forecast(y=y, h=7)["mean"]
+              assert predictions.shape == (7,) and np.isfinite(predictions).all()
+          study = optuna.create_study()
+          study.optimize(lambda trial: trial.suggest_int("x", 1, 1), n_trials=1)
+          assert study.best_value == 1
+          assert tune.TuneConfig(num_samples=1).num_samples == 1
+          assert MlflowClient is not None
+          print("Standard install: statistical forecasts and Optuna trial passed; Ray and tracking import; no extra model libraries.")
+          PY
       - name: Verify installed package outside checkout
         env:
           FORECAST_SPARK_CORES: '2'

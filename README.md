@@ -22,7 +22,7 @@ git clone https://github.com/ravinderkhatri/autoforecast-research.git
 cd autoforecast-research
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install '.[timeseries,plots]'
+python -m pip install .
 ```
 
 Set `JAVA_HOME` to your Java 17 installation if it is not already configured. For a small local
@@ -33,44 +33,36 @@ export FORECAST_SPARK_CORES=2
 export FORECAST_SPARK_MEMORY=1g
 ```
 
-The `timeseries` extra includes the local data/runtime dependencies. The two built-in baselines
-need neither a GPU nor a model download. Additional model libraries are optional.
+The standard install includes data preparation, result plots, the model catalog, HPO with
+Optuna and Ray, and MLflow tracking libraries. It also includes seasonal-naive and last-value
+baselines plus AutoETS, AutoTheta and Croston. These models need neither a GPU nor a model
+download. External tracking is used only when you configure it.
 
-### Choose your installation size
+### Choose additional models
 
-Run these commands from the cloned repository. The base package has no required third-party
-dependencies; runnable forecasting needs the `timeseries` extra. Add only the model runtimes
-you plan to use:
+The standard install is the lighter option. Add only the model libraries you plan to use;
+every option keeps the same workflow, HPO and tracking capabilities. Run these commands from
+the cloned repository:
 
 | Installation | Command |
 |---|---|
-| Package only, without optional libraries | `python -m pip install .` |
-| Lightweight baseline forecasting | `python -m pip install '.[timeseries]'` |
-| Baselines with result plots | `python -m pip install '.[timeseries,plots]'` |
-| AutoETS, AutoTheta and Croston | `python -m pip install '.[timeseries,classical]'` |
-| Global LightGBM model | `python -m pip install '.[timeseries,shallow]'` |
-| MFT, SFT, HMFNet and PACT | `python -m pip install '.[timeseries,custom-torch]'` |
-| TFT, TFT-Q and TFT-HNB | `python -m pip install '.[timeseries,tft]'` |
-| AutoGluon model collection | `python -m pip install '.[timeseries,autogluon-zoo]'` |
+| Standard: basic and statistical models, HPO and tracking | `python -m pip install .` |
+| Add global LightGBM | `python -m pip install '.[shallow]'` |
+| Add MFT, SFT, HMFNet and PACT | `python -m pip install '.[custom-torch]'` |
+| Add TFT, TFT-Q and TFT-HNB | `python -m pip install '.[tft]'` |
+| Add the AutoGluon model collection | `python -m pip install '.[autogluon-zoo]'` |
 
-For the broad model installation, including plotting and the model catalog:
+Install all compatible model families together:
 
 ```bash
-python -m pip install '.[timeseries,plots,catalog,classical,shallow,custom-torch,tft,autogluon-zoo,timesfm]'
+python -m pip install '.[shallow,custom-torch,tft,autogluon-zoo,timesfm]'
 ```
 
 For a standalone TimesFM 2.5 environment:
 
 ```bash
 python3.12 -m venv ../autoforecast-timesfm2-env
-../autoforecast-timesfm2-env/bin/python -m pip install '.[timeseries,timesfm]'
-```
-
-HPO and tracking are separate choices. Add `hpo-optuna` or `hpo-ray` for the selected tuning
-backend, and `mlflow-tracking` when using MLflow. For example:
-
-```bash
-python -m pip install '.[timeseries,custom-torch,hpo-optuna,mlflow-tracking]'
+../autoforecast-timesfm2-env/bin/python -m pip install '.[timesfm]'
 ```
 
 Installing a runtime does not select a model or download its pretrained weights. Choose the
@@ -326,7 +318,7 @@ target, feature, and history requirements; use a compatible adapter for other fr
 
 ### Use a study from Python
 
-Install the `timeseries` extra and start a supported Spark session. The study interface
+Install the package and start a supported Spark session. The study interface
 works in notebooks, scripts and jobs. It borrows that session and never stops it. Set the
 experiment project once; its existing `.autoforecast/benchmarks` directory is the local
 study registry:
@@ -430,7 +422,7 @@ must have usable history by the tuning origin. The tuning window uses the select
 outer validation and test labels never select HPO parameters. Missingness and metric rules
 are the same at every boundary.
 
-Install the model's runtime extra and `hpo-optuna` or `hpo-ray`. Copy its profile from
+Install the model's extra if needed; both HPO backends are included by default. Copy its profile from
 `configs/models/` into your project's `models/` catalog. If the profile declares an
 `implementation.config`, copy that configuration to the same relative path in your project.
 Its SHA-256 must still match the profile. Choose a history length and training budget that fit
@@ -537,7 +529,7 @@ refused. Use a fresh output directory for each rescoring operation.
 
 ## Models and M5
 
-The maintained model catalog is in `configs/models/`. Optional extras include `classical`,
+The maintained model catalog is in `configs/models/`. Additional model extras include
 `shallow`, `custom-torch`, `tft`, `autogluon-zoo`, and `timesfm`. Install only the runtime for your selected model.
 
 The custom model families include MFT, SFT, HMFNet, PACT, TFT-Q, and TFT-HNB.

@@ -10,28 +10,39 @@ readme = "README.md"
 # The optional AutoGluon runtime currently supports through Python 3.13. Keep the project range
 # honest so a lock cannot claim the all-model environment works on a newer interpreter.
 requires-python = ">=3.12,<3.14"
-dependencies = []
+# The standard install includes the shared workflow, statistical models, HPO and tracking.
+# Extra model libraries remain opt-in below.
+dependencies = [
+    "PyYAML==6.0.3",
+    "pyspark==4.2.0",
+    "pyarrow==24.0.0",
+    "numpy==2.5.3",
+    "pandas==2.3.3",
+    "psutil==7.2.2",
+    "matplotlib==3.11.1",
+    "statsforecast==2.0.1",
+    "optuna==5.0.0",
+    "ray[tune]==2.58.0",
+    "mlflow-skinny==3.13.0",
+]
 
 [project.scripts]
 autoforecast = "autoforecast.cli:main"
 
 [project.optional-dependencies]
+# Existing workflow extra names remain compatible aliases; their libraries are now standard.
 timeseries = ["PyYAML==6.0.3", "pyspark==4.2.0", "pyarrow==24.0.0", "numpy==2.5.3", "pandas==2.3.3", "psutil==7.2.2"]
 plots = ["matplotlib==3.11.1"]
 # Optional dataset acquisition and frame libraries.
 data = ["kaggle", "pandas", "pyarrow", "numpy"]
-# Spark stays optional because the catalog and static contracts must work without a JVM. Every
-# executable adapter run uses this extra, including the all-model smoke environment.
+# Importing catalog/static contracts does not start a JVM; forecasting execution requires Java.
 spark = ["pyspark>=4,<5", "pyarrow>=24,<26"]
-# Declarative candidate-catalog loading. This remains opt-in: existing governed runners keep
-# their registered Python contracts and do not acquire a YAML runtime dependency.
+# Declarative candidate-catalog loading is included in the standard install.
 catalog = ["PyYAML==6.0.3"]
-# HPO backends stay optional: a catalog read never imports a distributed runtime, while a governed
-# study installs exactly the backend it declares. Both consume the same model-YAML schema.
+# Both HPO backends are installed by default and consume the same model-YAML schema.
 hpo-optuna = ["PyYAML==6.0.3", "optuna==5.0.0"]
 hpo-ray = ["PyYAML==6.0.3", "ray[tune]==2.58.0"]
-# Optional one-way export of completed AutoForecast Run Bundles to a customer-managed MLflow.
-# Training, admission, selection and ranking never import this extra.
+# Tracking libraries are standard; export to a customer-managed MLflow remains opt-in at runtime.
 mlflow-tracking = ["mlflow-skinny==3.13.0", "psutil==7.2.2"]
 # Durable overnight supervision needs process-tree RSS enforcement even when MLflow is disabled.
 campaign = ["psutil==7.2.2"]
