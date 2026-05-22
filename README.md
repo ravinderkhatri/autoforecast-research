@@ -283,14 +283,15 @@ and any supplied weights and scales. Training loss remains model-specific. Final
 the selected update budget without test labels. These native adapters retain their daily-data,
 target, feature, and history requirements; use a compatible adapter for other frequencies.
 
-### Use a study from a notebook
+### Use a study from Python
 
-Install the `timeseries` extra and start a supported Spark session. The notebook interface
-borrows that session and never stops it. Set the experiment project once; its existing
-`.autoforecast/benchmarks` directory is the local study registry:
+Install the `timeseries` extra and start a supported Spark session. The study interface
+works in notebooks, scripts and jobs. It borrows that session and never stops it. Set the
+experiment project once; its existing `.autoforecast/benchmarks` directory is the local
+study registry:
 
 ```python
-from autoforecast.notebook import load_study
+from autoforecast.study import load_study
 from autoforecast.project import experiment_project
 
 with experiment_project("/absolute/path/to/my-experiment"):
@@ -318,11 +319,11 @@ the caller's session is not active. An absent ID in an existing registry raises
 `FileNotFoundError`; access failures and changed artifacts remain separate errors.
 Loading never creates a study.
 
-For setup shared across notebook cells, bind these arguments once with standard Python:
+For setup shared across notebook cells or functions, bind these arguments once with standard Python:
 
 ```python
 from functools import partial
-from autoforecast.notebook import load_study as _load_study
+from autoforecast.study import load_study as _load_study
 
 load_study = partial(_load_study, registry_root="/path/to/registry", spark=spark)
 study = load_study(study_id)  # Later cells need only the ID; close study when finished.
@@ -357,21 +358,22 @@ correct origin, horizon, cadence, target estimand, series count and emitted-cell
 each Forecast. Every frozen series/date cell is required, even where actuals are missing.
 Duplicate, missing, extra, or wrong-stage predictions are rejected.
 
-Run the complete [notebook example](scripts/notebook_study_example.py) from outside the checkout:
+Run the complete [study example](scripts/study_example.py) from outside the checkout:
 
 ```bash
-python -m scripts.notebook_study_example /absolute/path/to/new-notebook-example
+python -m scripts.study_example /absolute/path/to/new-study-example
 ```
 
 It creates two tiny series with unequal history starts, freezes them using `freeze_benchmark`,
 loads the generated ID, accesses all roles and ranges, converts ordinary Spark predictions
 to Forecast objects, and scores both stages. It performs no model training or paid compute.
 
-Each check writes a new `notebook-runs/run-...` directory beside the registry, retaining
+Each check writes a new `study-runs/run-...` directory beside the registry, retaining
 forecasts, per-series scores, coverage, study/model/run IDs and artifact hashes. The existing
 scorer controls unavailable scores and WRMSSE weights. The result records verified input
-identities; it cannot prove which data arbitrary notebook code trained on. It is a notebook
-forecast check, not a registered model or managed campaign result for `read_results`.
+identities; it cannot prove which data external model code trained on. The result records
+`training_provenance` as `unverified_external`. This forecast check does not register a model
+or create a managed campaign result for `read_results`.
 
 ### Tune within a study
 

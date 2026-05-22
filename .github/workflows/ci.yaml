@@ -141,11 +141,11 @@ jobs:
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
         run: env -u PYTHONPATH "$RUNNER_TEMP/timeseries-env/bin/python" -m scripts.verify_study_release "$RUNNER_TEMP/study-project"
-      - name: Notebook study example
+      - name: Study interface example
         if: matrix.frequency == 'D' && matrix.input == 'parquet' && matrix.python == '3.12'
         working-directory: ${{ runner.temp }}
         env:
           FORECAST_SPARK_CORES: '2'
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
-        run: env -u PYTHONPATH "$RUNNER_TEMP/timeseries-env/bin/python" -m scripts.notebook_study_example "$RUNNER_TEMP/notebook-project"
+        run: env -u PYTHONPATH "$RUNNER_TEMP/timeseries-env/bin/python" -m scripts.study_example "$RUNNER_TEMP/study-interface-project"

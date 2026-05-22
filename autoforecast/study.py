@@ -1,4 +1,4 @@
-"""Borrow a Spark runtime to use an existing frozen study from a model notebook."""
+"""Load frozen study data and check forecasts from Python."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def load_study(
 ) -> Study:
     """Load an existing ID from the project's .autoforecast/benchmarks registry.
 
-    Use ``experiment_project`` once for the notebook, or supply ``registry_root``.
+    Use ``experiment_project`` once for the session, or supply ``registry_root``.
     Spark must be supplied or active. The returned context manager owns its private
     snapshots, never the caller's session. Close it after using its dataframes.
     """
@@ -57,16 +57,16 @@ def load_study(
     if record["study_id"] != study_id:
         raise BenchmarkError("study identity changed while loading")
     if len(record["recipe"]["validation_origins"]) != 1:
-        raise BenchmarkError("notebook studies require exactly one validation origin")
+        raise BenchmarkError("load_study requires exactly one validation origin")
     session = spark if spark is not None else SparkSession.getActiveSession()
     if session is None:
         raise ValueError("Supply a supported Spark session or activate one before load_study")
-    return Study(path, sha, session, tempfile.TemporaryDirectory(prefix="autoforecast-notebook-"))
+    return Study(path, sha, session, tempfile.TemporaryDirectory(prefix="autoforecast-study-"))
 
 
 @dataclasses.dataclass(frozen=True)
 class Study:
-    """Read-only study settings and stage data; notebook training itself is not attested."""
+    """Read-only study settings and stage data; external training itself is not attested."""
 
     _path: pathlib.Path = dataclasses.field(repr=False)
     _sha256: str = dataclasses.field(repr=False)
@@ -86,7 +86,7 @@ class Study:
         self.close()
 
     def close(self) -> None:
-        """Release notebook snapshots; returned lazy dataframes must no longer be used."""
+        """Release study snapshots; returned lazy dataframes must no longer be used."""
         if not self._closed:
             object.__setattr__(self, "_closed", True)
             self._snapshots.cleanup()
@@ -125,7 +125,7 @@ class Study:
         path = self._path.parent / "dataset.yaml"
         payload = path.read_bytes()
         if hashlib.sha256(payload).hexdigest() != record["dataset_sha256"]:
-            raise BenchmarkError("dataset contract changed before notebook use")
+            raise BenchmarkError("dataset contract changed before study use")
         return _load_dataset_contract_bytes(payload, path).panel(
             artifact_path(self._path, record, "selection"),
         )
@@ -169,7 +169,7 @@ class Study:
         expected = record["artifacts"][role]
         if destination.exists():
             if directory_digest(destination, suffixes=(".parquet",)) != expected:
-                raise BenchmarkError("notebook snapshot changed")
+                raise BenchmarkError("study snapshot changed")
         else:
             snapshot_parquet_directory(
                 artifact_path(self._path, record, role), destination,
@@ -184,7 +184,7 @@ class Study:
                 time_literal(start, cadence), time_literal(end, cadence),
             ))
         if directory_digest(destination, suffixes=(".parquet",)) != expected:
-            raise BenchmarkError("notebook snapshot changed")
+            raise BenchmarkError("study snapshot changed")
         self._record(data=True)
         return frame
 
@@ -226,7 +226,7 @@ class Study:
 
         Forecast Parquet uses ``series_id``, ``date`` and ``yhat``. IDs must match
         ``series_mapping``; dates use the study cadence. All frozen cells are required.
-        This checks predictions and records input identities, not notebook training code.
+        This checks predictions and records input identities, not external training code.
         """
         if not isinstance(model_id, str) or not model_id.strip():
             raise ValueError("model_id must be a non-blank string")
@@ -236,7 +236,7 @@ class Study:
         forecasts = {stage: Forecast.from_record(value.as_record()) for stage, value in (
             ("validation", validation_forecasts), ("test", testing_forecasts),
         )}
-        runs = self._path.parent.parent.parent / "notebook-runs"
+        runs = self._path.parent.parent.parent / "study-runs"
         runs.mkdir(parents=True, exist_ok=True)
         output = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=runs))
         try:
@@ -256,7 +256,7 @@ class Study:
                     metric=recipe["metric"],
                 )
                 if fixed["study"]["sha256"] != self._sha256:
-                    raise BenchmarkError("study changed before notebook scoring")
+                    raise BenchmarkError("study changed before scoring")
                 directory = output / stage
                 directory.mkdir()
                 sha = directory_digest(forecast.path, suffixes=(".parquet",))
@@ -281,7 +281,7 @@ class Study:
                 fixed = evidence["evaluation_contract"]
                 if (directory_digest(forecast.path, suffixes=(".parquet",))
                         != evidence["forecast_artifact_sha256"]):
-                    raise BenchmarkError("retained notebook forecasts changed before scoring")
+                    raise BenchmarkError("retained study forecasts changed before scoring")
                 # The single-forecast scorer snapshots all inputs before its first Spark call.
                 # There is no comparison/ranking prepass that can reread mutable predictions.
                 score = score_study(
@@ -301,20 +301,20 @@ class Study:
                 for name in ("forecast", "scoring"):
                     if (hashlib.sha256(pathlib.Path(stage[name]).read_bytes()).hexdigest()
                             != stage[name + "_sha256"]):
-                        raise BenchmarkError("retained notebook evidence changed during scoring")
+                        raise BenchmarkError("retained study evidence changed during scoring")
                 retained = output / stage_name
                 series = stage["score"]["series_scores"]
                 if (directory_digest(retained / "forecasts", suffixes=(".parquet",))
                         != stage["forecast_artifact_sha256"]
                         or directory_digest(series["path"], suffixes=(".parquet",))
                         != series["sha256"]):
-                    raise BenchmarkError("retained notebook artifacts changed during scoring")
+                    raise BenchmarkError("retained study artifacts changed during scoring")
             result = {
-                "schema": "autoforecast.notebook-check.v1", "study_id": record["study_id"],
+                "schema": "autoforecast.study-check.v1", "study_id": record["study_id"],
                 "study": {"path": str(self._path), "sha256": self._sha256},
                 "model_id": model_id, "run_id": output.name,
                 "verified_input_artifacts": record["artifacts"],
-                "training_provenance": "unverified_notebook", "managed_campaign": False,
+                "training_provenance": "unverified_external", "managed_campaign": False,
                 **stages, "result_path": str(output / "result.json"),
             }
             (output / "result.json").write_text(

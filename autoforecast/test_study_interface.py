@@ -1,4 +1,4 @@
-"""Notebook boundaries reuse frozen populations, stage slices and the shared scorer."""
+"""Study interface boundaries reuse frozen populations, stage slices and the shared scorer."""
 
 import dataclasses
 import datetime as dt
@@ -15,13 +15,14 @@ import pytest
 import yaml
 from pyspark.sql import SparkSession
 from pyspark.sql.readwriter import DataFrameReader
-from scripts.notebook_study_example import example_forecast
+from scripts.study_example import example_forecast
 
-from autoforecast import benchmark, notebook
+from autoforecast import benchmark
+from autoforecast import study as study_api
 from autoforecast.frequency import canonical_origin, parse_origin
-from autoforecast.notebook import load_study
 from autoforecast.panel import Forecast
 from autoforecast.project import experiment_project
+from autoforecast.study import load_study
 from autoforecast.study_scoring import score_study
 from autoforecast.test_study import inputs
 from provenance.lineage import directory_digest
@@ -29,7 +30,7 @@ from provenance.lineage import directory_digest
 
 @pytest.fixture(scope="module")
 def spark():
-    session = (SparkSession.builder.master("local[2]").appName("test_notebook_study")
+    session = (SparkSession.builder.master("local[2]").appName("test_study_interface")
                .config("spark.sql.shuffle.partitions", "2")
                .config("spark.ui.enabled", "false")
                .config("spark.ui.showConsoleProgress", "false").getOrCreate())
@@ -44,7 +45,7 @@ def frozen(request, tmp_path_factory, spark):
     # Population: A/B retained, one late series excluded, four cells per comparison.
     # The hourly client uses different source keys, column names and calendar dates.
     client, policy = request.param
-    root = tmp_path_factory.mktemp(f"notebook-{client}-{policy}")
+    root = tmp_path_factory.mktemp(f"study-{client}-{policy}")
     contract, sources, recipe = inputs(root, actual_missing=policy)
     contract_record = yaml.safe_load(contract.read_text())
     rows = pq.read_table(sources["selection"]).to_pylist()
@@ -90,7 +91,7 @@ def frozen(request, tmp_path_factory, spark):
     return root, manifest, recipe
 
 
-def test_notebook_stage_slices_ranges_keys_and_borrowed_runtime(frozen, spark):
+def test_study_interface_stage_slices_ranges_keys_and_borrowed_runtime(frozen, spark):
     root, manifest, recipe = frozen
     before = directory_digest(manifest.parent)
     with experiment_project(root), load_study(manifest.parent.name) as study:
@@ -152,7 +153,7 @@ def test_notebook_stage_slices_ranges_keys_and_borrowed_runtime(frozen, spark):
     assert directory_digest(manifest.parent) == before
 
 
-def test_notebook_scores_match_direct_scorer_and_retain_run_identities(frozen, spark, tmp_path):
+def test_study_interface_scores_match_direct_scorer_and_retain_run_identities(frozen, spark, tmp_path):
     _, manifest, recipe = frozen
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         validation = example_forecast(study, spark, tmp_path / "val", "validation")
@@ -179,17 +180,21 @@ def test_notebook_scores_match_direct_scorer_and_retain_run_identities(frozen, s
                 assert hashlib.sha256(pathlib.Path(result[name]).read_bytes()).hexdigest() == result[name + "_sha256"]
             retained = Forecast.from_record(json.loads(pathlib.Path(result["forecast"]).read_text()))
             assert directory_digest(retained.path, suffixes=(".parquet",)) == result["forecast_artifact_sha256"]
+        assert results[0]["schema"] == "autoforecast.study-check.v1"
+        assert pathlib.Path(results[0]["result_path"]).parent.parent == (
+            manifest.parent.parent.parent / "study-runs"
+        )
         assert results[0]["study_id"] == study.study_id
         assert results[0]["model_id"] == "external-model"
         assert results[0]["verified_input_artifacts"] == json.loads(manifest.read_text())["artifacts"]
         assert results[0]["study"] == {"path": str(manifest),
                                        "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}
-        assert results[0]["training_provenance"] == "unverified_notebook"
+        assert results[0]["training_provenance"] == "unverified_external"
         assert not results[0]["managed_campaign"]
         assert json.loads(pathlib.Path(results[0]["result_path"]).read_text()) == results[0]
 
 
-def test_notebook_unknown_access_and_changed_artifacts_are_distinct(frozen, spark, tmp_path, monkeypatch):
+def test_study_interface_unknown_access_and_changed_artifacts_are_distinct(frozen, spark, tmp_path, monkeypatch):
     _, manifest, _ = frozen
     with pytest.raises(FileNotFoundError, match="Unknown study_id"):
         load_study("0" * 64, registry_root=tmp_path, spark=spark)
@@ -230,7 +235,7 @@ def test_notebook_unknown_access_and_changed_artifacts_are_distinct(frozen, spar
 
 
 @pytest.mark.parametrize("change", ["origin", "horizon", "frequency", "missing", "extra", "duplicate", "series", "estimand"])
-def test_notebook_rejects_incorrect_forecast_contract(frozen, spark, tmp_path, change):
+def test_study_interface_rejects_incorrect_forecast_contract(frozen, spark, tmp_path, change):
     _, manifest, _ = frozen
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         forecast = example_forecast(study, spark, tmp_path / "predictions", "validation")
@@ -253,14 +258,14 @@ def test_notebook_rejects_incorrect_forecast_contract(frozen, spark, tmp_path, c
             shutil.rmtree(forecast.path)
             pathlib.Path(forecast.path).mkdir()
             pq.write_table(pa.Table.from_pylist(rows), pathlib.Path(forecast.path) / "part.parquet")
-        runs = manifest.parent.parent.parent / "notebook-runs"
+        runs = manifest.parent.parent.parent / "study-runs"
         before = set(runs.iterdir()) if runs.exists() else set()
         with pytest.raises(ValueError):
             study.run_validation(validation_forecasts=forecast, testing_forecasts=testing, model_id="bad")
         assert set(runs.iterdir()) == before
 
 
-def test_notebook_rejects_multiple_validation_origins(tmp_path, spark):
+def test_study_interface_rejects_multiple_validation_origins(tmp_path, spark):
     contract, sources, recipe = inputs(tmp_path)
     recipe["validation_origins"] = ["2024-01-03", "2024-01-05"]
     manifest = benchmark.freeze_benchmark(contract_path=contract, sources=sources, recipe=recipe,
@@ -270,7 +275,7 @@ def test_notebook_rejects_multiple_validation_origins(tmp_path, spark):
 
 
 @pytest.mark.parametrize("policy,scale", [("zero", None), ("mask", 4.0)])
-def test_notebook_keeps_undefined_wrmsse_and_frozen_weights(tmp_path, spark, policy, scale):
+def test_study_interface_keeps_undefined_wrmsse_and_frozen_weights(tmp_path, spark, policy, scale):
     from autoforecast.test_study import scoring_references
     contract, sources, recipe = inputs(tmp_path, actual_missing=policy)
     recipe["metric"] = "wrmsse"
@@ -290,14 +295,14 @@ def test_notebook_keeps_undefined_wrmsse_and_frozen_weights(tmp_path, spark, pol
         assert sorted(row["normalized_weight"] for row in per_series) == pytest.approx([9/23, 14/23])
 
 
-def test_notebook_requires_supplied_or_active_session(frozen, monkeypatch):
+def test_study_interface_requires_supplied_or_active_session(frozen, monkeypatch):
     _, manifest, _ = frozen
     monkeypatch.setattr(SparkSession, "getActiveSession", lambda: None)
     with pytest.raises(ValueError, match="Spark session"):
         load_study(manifest.parent.name, registry_root=manifest.parent.parent)
 
 
-def test_notebook_supplied_session_takes_precedence(frozen, spark, monkeypatch):
+def test_study_interface_supplied_session_takes_precedence(frozen, spark, monkeypatch):
     _, manifest, _ = frozen
     def unexpected_lookup():
         raise AssertionError("supplied session must take precedence")
@@ -309,19 +314,19 @@ def test_notebook_supplied_session_takes_precedence(frozen, spark, monkeypatch):
         assert study.training_data.count() == 8
 
 
-def test_notebook_rejects_identity_changed_while_loading(frozen, spark, monkeypatch):
+def test_study_interface_rejects_identity_changed_while_loading(frozen, spark, monkeypatch):
     _, manifest, _ = frozen
     verified_path, record = benchmark.verify_benchmark(manifest)
     def changed(path, expected_sha256):
         assert path == manifest
         assert expected_sha256 == hashlib.sha256(manifest.read_bytes()).hexdigest()
         return verified_path, {**record, "study_id": "b" * 64}
-    monkeypatch.setattr(notebook, "verify_benchmark", changed)
+    monkeypatch.setattr(study_api, "verify_benchmark", changed)
     with pytest.raises(benchmark.BenchmarkError, match="identity changed while loading"):
         load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark)
 
 
-def test_notebook_rejects_invalid_model_names_and_swapped_valid_stages(frozen, spark, tmp_path):
+def test_study_interface_rejects_invalid_model_names_and_swapped_valid_stages(frozen, spark, tmp_path):
     _, manifest, _ = frozen
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         validation = example_forecast(study, spark, tmp_path / "validation", "validation").validate()
@@ -334,9 +339,9 @@ def test_notebook_rejects_invalid_model_names_and_swapped_valid_stages(frozen, s
 
 
 @pytest.mark.parametrize("changed_stage", ["validation", "test"])
-def test_notebook_reauthenticates_between_scores(frozen, spark, tmp_path, monkeypatch, changed_stage):
+def test_study_interface_reauthenticates_between_scores(frozen, spark, tmp_path, monkeypatch, changed_stage):
     _, manifest, _ = frozen
-    original = notebook.score_study
+    original = study_api.score_study
     raw = manifest.read_bytes()
     def changed(*args, **kwargs):
         result = original(*args, **kwargs)
@@ -346,8 +351,8 @@ def test_notebook_reauthenticates_between_scores(frozen, spark, tmp_path, monkey
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         validation = example_forecast(study, spark, tmp_path / "validation", "validation")
         testing = example_forecast(study, spark, tmp_path / "testing", "test")
-        monkeypatch.setattr(notebook, "score_study", changed)
-        runs = manifest.parent.parent.parent / "notebook-runs"
+        monkeypatch.setattr(study_api, "score_study", changed)
+        runs = manifest.parent.parent.parent / "study-runs"
         before = set(runs.iterdir()) if runs.exists() else set()
         try:
             with pytest.raises(benchmark.BenchmarkError, match="changed"):
@@ -357,7 +362,7 @@ def test_notebook_reauthenticates_between_scores(frozen, spark, tmp_path, monkey
             manifest.write_bytes(raw)
 
 
-def test_notebook_authenticates_dataset_and_private_snapshot(frozen, spark):
+def test_study_interface_authenticates_dataset_and_private_snapshot(frozen, spark):
     _, manifest, _ = frozen
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         dataset = manifest.parent / "dataset.yaml"
@@ -375,7 +380,7 @@ def test_notebook_authenticates_dataset_and_private_snapshot(frozen, spark):
             _ = study.training_data
 
 
-def test_notebook_snapshot_rejects_changes_during_copy(frozen, spark, monkeypatch):
+def test_study_interface_snapshot_rejects_changes_during_copy(frozen, spark, monkeypatch):
     _, manifest, _ = frozen
     record = json.loads(manifest.read_text())
     part = next(benchmark.artifact_path(manifest, record, "selection").rglob("*.parquet"))
@@ -397,9 +402,9 @@ def test_notebook_snapshot_rejects_changes_during_copy(frozen, spark, monkeypatc
 
 
 @pytest.mark.parametrize("artifact", ["forecasts", "forecast.json", "scoring", "series-scores"])
-def test_notebook_rejects_retained_forecast_changes_after_scoring(frozen, spark, tmp_path, monkeypatch, artifact):
+def test_study_interface_rejects_retained_forecast_changes_after_scoring(frozen, spark, tmp_path, monkeypatch, artifact):
     _, manifest, _ = frozen
-    compare = notebook.score_study
+    compare = study_api.score_study
     def changed(*args, **kwargs):
         result = compare(*args, **kwargs)
         output = pathlib.Path(kwargs["output_dir"])
@@ -418,15 +423,15 @@ def test_notebook_rejects_retained_forecast_changes_after_scoring(frozen, spark,
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         validation = example_forecast(study, spark, tmp_path / "validation", "validation")
         testing = example_forecast(study, spark, tmp_path / "testing", "test")
-        monkeypatch.setattr(notebook, "score_study", changed)
-        runs = manifest.parent.parent.parent / "notebook-runs"
+        monkeypatch.setattr(study_api, "score_study", changed)
+        runs = manifest.parent.parent.parent / "study-runs"
         before = set(runs.iterdir()) if runs.exists() else set()
-        with pytest.raises(benchmark.BenchmarkError, match="retained notebook .* changed"):
+        with pytest.raises(benchmark.BenchmarkError, match="retained study .* changed"):
             study.run_validation(validation_forecasts=validation, testing_forecasts=testing, model_id="change")
         assert set(runs.iterdir()) == before
 
 
-def test_notebook_preserves_registry_path_integrity(frozen, spark, tmp_path):
+def test_study_interface_preserves_registry_path_integrity(frozen, spark, tmp_path):
     _, manifest, _ = frozen
     link = tmp_path / "registry-link"
     link.symlink_to(manifest.parent.parent, target_is_directory=True)
@@ -441,7 +446,7 @@ def test_notebook_preserves_registry_path_integrity(frozen, spark, tmp_path):
         load_study(manifest.parent.name, registry_root=tmp_path / "missing-registry", spark=spark)
 
 
-def test_notebook_failed_context_entry_releases_snapshots(frozen, spark):
+def test_study_interface_failed_context_entry_releases_snapshots(frozen, spark):
     _, manifest, _ = frozen
     study = load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark)
     _ = study.training_data
@@ -488,7 +493,7 @@ def test_closed_study_cannot_reopen_or_remove_a_reused_directory(frozen, spark):
 @pytest.mark.parametrize("role,property_name", [
     ("selection", "training_data"), ("source-keys", "series_starts"),
 ])
-def test_notebook_authenticates_private_bytes_after_spark_read(
+def test_study_interface_authenticates_private_bytes_after_spark_read(
     frozen, spark, monkeypatch, role, property_name,
 ):
     _, manifest, _ = frozen
@@ -508,9 +513,9 @@ def test_notebook_authenticates_private_bytes_after_spark_read(
     assert observed
 
 
-def test_notebook_captures_both_forecasts_before_either_score(frozen, spark, tmp_path, monkeypatch):
+def test_study_interface_captures_both_forecasts_before_either_score(frozen, spark, tmp_path, monkeypatch):
     _, manifest, recipe = frozen
-    score = notebook.score_study
+    score = study_api.score_study
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         validation = example_forecast(study, spark, tmp_path / "validation", "validation")
         testing = example_forecast(study, spark, tmp_path / "testing", "test")
@@ -525,7 +530,7 @@ def test_notebook_captures_both_forecasts_before_either_score(frozen, spark, tmp
                     pq.write_table(table.set_column(column, "yhat", pa.array([100.0] * len(table))), part)
                 observed.append(testing.path)
             return result
-        monkeypatch.setattr(notebook, "score_study", changed)
+        monkeypatch.setattr(study_api, "score_study", changed)
         result = study.run_validation(validation_forecasts=validation, testing_forecasts=testing, model_id="capture")
         assert observed
         assert directory_digest(testing.path, suffixes=(".parquet",)) != expected
@@ -537,7 +542,7 @@ def test_notebook_captures_both_forecasts_before_either_score(frozen, spark, tmp
 @pytest.mark.parametrize("fail", [False, True])
 @pytest.mark.parametrize("default_only", [False, True])
 def test_example_main_preserves_a_borrowed_session(spark, tmp_path, monkeypatch, fail, default_only):
-    from scripts import notebook_study_example as example
+    from scripts import study_example as example
     seen = []
     def exercise(project, session):
         seen.append((project, session))
@@ -547,7 +552,7 @@ def test_example_main_preserves_a_borrowed_session(spark, tmp_path, monkeypatch,
     if default_only:
         monkeypatch.setattr(SparkSession, "getActiveSession", lambda: None)
     monkeypatch.setattr(example, "run_example", exercise)
-    monkeypatch.setattr(sys, "argv", ["notebook_study_example", str(tmp_path / "project")])
+    monkeypatch.setattr(sys, "argv", ["study_example", str(tmp_path / "project")])
     if fail:
         with pytest.raises(RuntimeError, match="example failure"):
             example.main()
@@ -564,7 +569,7 @@ def test_example_main_preserves_a_bare_spark_context(tmp_path, fail):
 import sys
 from pyspark import SparkConf, SparkContext
 from pyspark.sql import SparkSession
-from scripts import notebook_study_example as example
+from scripts import study_example as example
 
 context = SparkContext(conf=SparkConf().setMaster('local[1]').setAppName('caller-context')
                        .set('spark.ui.enabled', 'false'))
@@ -601,7 +606,7 @@ def test_example_main_stops_its_owned_session(tmp_path, fail):
 import sys
 from pyspark import SparkContext
 from pyspark.sql import SparkSession
-from scripts import notebook_study_example as example
+from scripts import study_example as example
 
 assert SparkContext._active_spark_context is None
 assert SparkSession.getActiveSession() is None

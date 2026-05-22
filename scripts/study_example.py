@@ -1,4 +1,4 @@
-"""Freeze a tiny study, load its ID and check notebook forecasts without model training."""
+"""Freeze a tiny study, load its ID and check forecasts without model training."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ import yaml
 from autoforecast import resources
 from autoforecast.benchmark import freeze_benchmark, verify_benchmark
 from autoforecast.frequency import canonical_origin, period_points
-from autoforecast.notebook import Study
-from autoforecast.notebook import load_study as _load_study
 from autoforecast.panel import Forecast
+from autoforecast.study import Study
+from autoforecast.study import load_study as _load_study
 from pyspark import SparkContext
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -27,7 +27,7 @@ from pyspark.sql import types as T
 def example_forecast(
     study: Study, spark: SparkSession, output: pathlib.Path, stage: str,
 ) -> Forecast:
-    """Stand in for a notebook's predictions using a constant, without reading actuals."""
+    """Stand in for a model's predictions using a constant, without reading actuals."""
     if stage not in {"validation", "test"}:
         raise ValueError("stage must be validation or test")
     recipe, panel = study.recipe, study.panel
@@ -44,7 +44,7 @@ def example_forecast(
     predictions = keys.crossJoin(dates).withColumn("yhat", F.lit(2.0))
     predictions.write.parquet(str(output))
     return Forecast(
-        adapter="notebook-example", path=str(output), origin=origin_text, horizon=horizon,
+        adapter="study-example", path=str(output), origin=origin_text, horizon=horizon,
         n_series=study.n_series, disposition={"emitted": study.n_series * horizon},
         target_estimand=panel.target_estimand, frequency=panel.frequency,
     )
@@ -60,7 +60,7 @@ def run_example(project: pathlib.Path, spark: SparkSession) -> dict:
     )
     contract = project / "dataset.yaml"
     contract.write_text(yaml.safe_dump({
-        "schema_version": 1, "dataset": {"id": "notebook-example", "panel": {
+        "schema_version": 1, "dataset": {"id": "study-example", "panel": {
             "series_col": "shop", "time_col": "day", "target_col": "units",
             "frequency": "D", "season_length": 2, "target_estimand": "observed_nonnegative",
         }},
@@ -90,7 +90,7 @@ def run_example(project: pathlib.Path, spark: SparkSession) -> dict:
         ),
     )
     study_id = verify_benchmark(frozen)[1]["study_id"]
-    # Bind the notebook environment once; model cells then need only the study ID.
+    # Bind the environment once; model code then needs only the study ID.
     load_study = partial(_load_study, registry_root=registry, spark=spark)
     with load_study(study_id) as study:
         for stage in ("training", "validation", "refit", "testing"):
@@ -115,7 +115,7 @@ def main() -> int:
     parser.add_argument("project", type=pathlib.Path, help="new directory for this example")
     args = parser.parse_args()
     spark, owned = resources._acquire_embedded_spark_runtime(
-        SparkSession, SparkContext, app_name="notebook-study-example",
+        SparkSession, SparkContext, app_name="study-example",
         profile_factory=lambda: resources.SparkProfile(
             cores=2, driver_memory="1g", shuffle_partitions=2, worker_reuse=True,
             series_per_partition=1, python_worker_budget_gb=1.0,
