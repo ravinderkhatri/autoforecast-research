@@ -9,6 +9,8 @@ Start with CSV or Parquet. Column names and series keys are configurable; M5 is 
 benchmark, not a required data format. Data and outputs stay local unless you explicitly configure
 an external tracking service.
 
+![AutoForecast workflow: bring time-series data, validate and freeze a benchmark, compare models, refit, score a separate test period, and inspect verified results.](assets/autoforecast-overview.svg)
+
 ## Requirements and installation
 
 - Python 3.12 or 3.13 on Linux or macOS.
