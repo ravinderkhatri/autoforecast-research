@@ -78,11 +78,11 @@ def _verified_dataset_frequency(
     return parse_frequency(str(contract.panel_roles.get("frequency", "D"))).code
 
 
-def _resolved_frequency(resolved: dict, contract_frequency: str | None) -> str | None:
+def _resolved_frequency(resolved: dict, contract_frequency: str | None) -> str:
     """Recover one cadence from authenticated temporal and dataset evidence."""
     temporal = resolved.get("temporal")
     if type(temporal) is not dict:
-        return contract_frequency
+        raise ValueError("campaign temporal requires frequency without step_days")
     declared = temporal.get("frequency")
     if type(declared) is not str or "step_days" in temporal:
         raise ValueError("campaign temporal requires frequency without step_days")

@@ -77,6 +77,47 @@ def test_campaign_precision_is_explicit_or_uses_current_default(tmp_path: pathli
             subject.load_forecast_campaign_request(path)
 
 
+@pytest.mark.parametrize("precision", ["32-true", "16-mixed"])
+@pytest.mark.parametrize("writer", ["child", "hpo"])
+def test_generated_run_request_preserves_campaign_precision(
+    tmp_path: pathlib.Path, precision: str, writer: str
+) -> None:
+    resolved: dict[str, object] = {
+        "compute": {"precision": precision},
+        "source": {
+            "dataset_contract": "configs/datasets/synthetic_daily.yaml",
+            "model_catalog": "configs/models",
+        },
+        "selection": {"missing_actual": "no_data", "metric": "rmse"},
+        "tracking": {"mlflow": False},
+        "template_features": {"calendar_events": [], "event_max_support": 30},
+    }
+    path = tmp_path / f"{writer}-request.yaml"
+    if writer == "child":
+        subject._write_child_request(  # noqa: SLF001
+            path,
+            resolved,
+            {
+                "id": "v0fs0o0",
+                "model_id": "seasonal_naive",
+                "origin": "2024-01-31",
+                "horizon": 7,
+            },
+            evaluation=True,
+        )
+    else:
+        subject._write_hpo_request(  # noqa: SLF001
+            path,
+            resolved,
+            model_id="seasonal_naive",
+            origin=dt.date(2024, 1, 31),
+            horizon=7,
+        )
+    request = subject.load_run_request(path)
+    assert request.schema_version == 3
+    assert request.precision == precision
+
+
 @pytest.mark.parametrize("version", [1, 2, 3, 4, 5, True])
 def test_campaign_rejects_obsolete_versions(tmp_path, version):
     path = tmp_path / "request.yaml"
@@ -3797,6 +3838,51 @@ def test_child_result_rejects_failed_or_numerically_invalid_evidence(
             "training_data_sha256": "a" * 64,
             "score": -1.0,
             "runtime_seconds": -2.0,
+        }
+    )
+    path = tmp_path / "child-result.json"
+    path.write_text(subject._json(record), encoding="utf-8")  # noqa: SLF001
+    with pytest.raises(subject.ForecastCampaignError, match="identity/status"):
+        subject._validated_child_result(  # noqa: SLF001
+            {}, child, path, require_score=True, completed=False
+        )
+
+
+def test_child_result_rejects_obsolete_v3_literal(tmp_path: pathlib.Path) -> None:
+    child = {
+        "id": "v0fs0o0",
+        "kind": "validation",
+        "candidate_id": "seasonal_naive",
+        "model_id": "seasonal_naive",
+        "variant_id": "default",
+        "adapter": "seasonal_naive",
+        "parameter_mode": "defaults",
+        "initialization": "fresh",
+        "seed": 0,
+        "origin": "2024-01-14",
+        "horizon": 2,
+        "budget": {},
+        "parent_stage": None,
+    }
+    record = {field: None for field in subject._CHILD_RESULT_FIELDS}  # noqa: SLF001
+    record.update(
+        {
+            "schema": "autoforecast.forecast-campaign-child-result.v3",
+            "status": "completed",
+            "kind": child["kind"],
+            "child_id": child["id"],
+            "candidate_id": child["candidate_id"],
+            "model_id": child["model_id"],
+            "variant_id": child["variant_id"],
+            "adapter": child["adapter"],
+            "parameter_mode": child["parameter_mode"],
+            "initialization": child["initialization"],
+            "seed": child["seed"],
+            "origin": child["origin"],
+            "horizon": child["horizon"],
+            "budget": child["budget"],
+            "training_data_sha256": "a" * 64,
+            "runtime_seconds": 1.0,
         }
     )
     path = tmp_path / "child-result.json"

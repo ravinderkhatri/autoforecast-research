@@ -36,7 +36,7 @@ def _reader_boundary(
                 "selection": {"metric": "rmse"},
                 "children": children,
                 "benchmark": benchmark,
-                **({"temporal": temporal} if temporal is not None else {}),
+                "temporal": {"frequency": "D"} if temporal is None else temporal,
             }
         )
     )
@@ -178,6 +178,26 @@ def test_results_reject_obsolete_step_days_even_with_frequency(tmp_path, monkeyp
     _reader_boundary(tmp_path, monkeypatch, [], [], temporal=temporal)
     with pytest.raises(ValueError, match="frequency without step_days"):
         read_results(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        {"schema": "autoforecast.forecast-campaign-resolved.v4"},
+        {"schema": "autoforecast.forecast-campaign-resolved.v5"},
+        {"temporal": None},
+        {"temporal": True},
+        {"temporal": 1},
+        {"temporal": 1.0},
+        {"temporal": "D"},
+        {"temporal": []},
+    ],
+)
+def test_current_results_require_a_temporal_mapping(resolved):
+    import autoforecast.results as reader
+
+    with pytest.raises(ValueError, match="frequency without step_days"):
+        reader._resolved_frequency(resolved, "D")  # noqa: SLF001
 
 
 def test_results_reject_a_changed_dataset_contract(tmp_path, monkeypatch):
@@ -372,6 +392,7 @@ def test_initialization_parent_is_not_validation_evidence(
         [
             {"id": "parent", "status": "completed", "attempts": 1},
         ],
+        temporal={"frequency": frequency},
     )
     parent = tmp_path / "parent"
     forecast_dir = parent / "forecast"
@@ -442,6 +463,7 @@ def test_initialization_parent_is_not_validation_evidence(
         tmp_path, monkeypatch, [child],
         [{"id": "parent", "status": "completed", "attempts": 1}],
         {"id": "benchmark", "path": str(benchmark_path), "sha256": "a" * 64, "evaluations": {}},
+        temporal={"frequency": "W" if frequency == "D" else "D"},
     )
     with pytest.raises(ValueError, match="forecast frequency differs"):
         read_results(tmp_path)
@@ -571,6 +593,7 @@ def test_failed_run_without_fake_forecast(tmp_path):
                 "schema": "autoforecast.forecast-campaign-resolved.v4",
                 "source": {},
                 "selection": {"metric": "rmse"},
+                "temporal": {"frequency": "D"},
                 "children": [
                     {
                         "id": "v0",
