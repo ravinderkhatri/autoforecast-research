@@ -201,6 +201,16 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+all-models = [
+    { name = "autogluon-timeseries" },
+    { name = "lightgbm" },
+    { name = "lightning" },
+    { name = "pandas" },
+    { name = "pytorch-forecasting" },
+    { name = "tensorboard" },
+    { name = "timesfm", extra = ["torch"] },
+    { name = "torch" },
+]
 autogluon-zoo = [
     { name = "autogluon-timeseries" },
 ]
@@ -273,6 +283,7 @@ ci = [
 
 [package.metadata]
 requires-dist = [
+    { name = "autoforecast", extras = ["shallow", "custom-torch", "tft", "autogluon-zoo", "timesfm"], marker = "extra == 'all-models'" },
     { name = "autogluon-timeseries", marker = "extra == 'autogluon-zoo'", specifier = ">=1.4,<2" },
     { name = "kaggle", marker = "extra == 'data'" },
     { name = "lightgbm", marker = "extra == 'shallow'", specifier = ">=4,<5" },
@@ -315,7 +326,7 @@ requires-dist = [
     { name = "timesfm", extras = ["torch"], marker = "extra == 'timesfm'", git = "https://github.com/google-research/timesfm.git?rev=2f1625c208cf99bd4c9f6650d54796d8f88486f8" },
     { name = "torch", marker = "extra == 'custom-torch'", specifier = ">=2.5,<3" },
 ]
-provides-extras = ["timeseries", "plots", "data", "spark", "catalog", "hpo-optuna", "hpo-ray", "mlflow-tracking", "campaign", "classical", "custom-torch", "shallow", "tft", "autogluon-zoo", "timesfm"]
+provides-extras = ["all-models", "timeseries", "plots", "data", "spark", "catalog", "hpo-optuna", "hpo-ray", "mlflow-tracking", "campaign", "classical", "custom-torch", "shallow", "tft", "autogluon-zoo", "timesfm"]
 
 [package.metadata.requires-dev]
 ci = [

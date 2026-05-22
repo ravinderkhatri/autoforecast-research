@@ -41,13 +41,15 @@ download. External tracking is used only when you configure it.
 
 ### Choose additional models
 
-The standard install is the lighter option. Add only the model libraries you plan to use;
+The standard install is the lighter option and already includes basic and statistical models.
+Use Python package extras to add selected model families or the full compatible stack;
 every option keeps the same workflow, HPO and tracking capabilities. Run these commands from
 the cloned repository:
 
 | Installation | Command |
 |---|---|
 | Standard: basic and statistical models, HPO and tracking | `python -m pip install .` |
+| All compatible model families | `python -m pip install '.[all-models]'` |
 | Add global LightGBM | `python -m pip install '.[shallow]'` |
 | Add MFT, SFT, HMFNet and PACT | `python -m pip install '.[custom-torch]'` |
 | Add TFT, TFT-Q and TFT-HNB | `python -m pip install '.[tft]'` |
@@ -60,9 +62,10 @@ run `brew install libomp`, as described in the
 Install all compatible model families together:
 
 ```bash
-python -m pip install '.[shallow,custom-torch,tft,autogluon-zoo,timesfm]'
+python -m pip install '.[all-models]'
 ```
 
+The `all-models` extra combines `shallow`, `custom-torch`, `tft`, `autogluon-zoo`, and `timesfm`.
 For a standalone TimesFM 2.5 environment:
 
 ```bash
@@ -73,6 +76,9 @@ python3.12 -m venv ../autoforecast-timesfm2-env
 Installing a runtime does not select a model or download its pretrained weights. Choose the
 model in the experiment configuration; its data, frequency, device and weight requirements
 still apply. The TimesFM extra installs a pinned source revision and require Git.
+
+These are standard [Python packaging extras](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/#dependencies-optional-dependencies),
+not custom installer flags. With uv, use `uv sync --extra all-models`.
 
 ## Run the example
 

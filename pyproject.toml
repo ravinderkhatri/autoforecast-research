@@ -30,6 +30,8 @@ dependencies = [
 autoforecast = "autoforecast.cli:main"
 
 [project.optional-dependencies]
+# Convenience extra combines the existing model families without duplicating their requirements.
+all-models = ["autoforecast[shallow,custom-torch,tft,autogluon-zoo,timesfm]"]
 # Existing workflow extra names remain compatible aliases; their libraries are now standard.
 timeseries = ["PyYAML==6.0.3", "pyspark==4.2.0", "pyarrow==24.0.0", "numpy==2.5.3", "pandas==2.3.3", "psutil==7.2.2"]
 plots = ["matplotlib==3.11.1"]

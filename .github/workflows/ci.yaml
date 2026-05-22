@@ -180,8 +180,13 @@ jobs:
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
         run: env -u PYTHONPATH "$RUNNER_TEMP/timeseries-env/bin/python" -m scripts.study_example "$RUNNER_TEMP/study-interface-project"
-  installed-timesfm:
+  installed-models:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        extra: [timesfm, all-models]
+    env:
+      MODEL_EXTRA: ${{ matrix.extra }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -190,28 +195,36 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
         with:
           version: '0.11.32'
-      - name: Install standalone TimesFM in isolation
+      - name: Install selected model extra in isolation
         run: |
-          uv export --frozen --no-hashes --no-emit-project --group ci --extra timesfm \
+          uv export --frozen --no-hashes --no-emit-project --group ci --extra "$MODEL_EXTRA" \
             --output-file "$RUNNER_TEMP/constraints.txt"
-          uv venv --python "$(command -v python)" "$RUNNER_TEMP/timesfm-env"
-          uv pip install --python "$RUNNER_TEMP/timesfm-env/bin/python" --torch-backend cpu \
+          uv venv --python "$(command -v python)" "$RUNNER_TEMP/models-env"
+          uv pip install --python "$RUNNER_TEMP/models-env/bin/python" --torch-backend cpu \
             --constraint "$RUNNER_TEMP/constraints.txt" --build-constraints "$RUNNER_TEMP/constraints.txt" \
-            '.[timesfm]'
-          uv pip check --python "$RUNNER_TEMP/timesfm-env/bin/python"
+            ".[${MODEL_EXTRA}]"
+          uv pip check --python "$RUNNER_TEMP/models-env/bin/python"
       - name: Verify provider API without downloading weights
         working-directory: ${{ runner.temp }}
         run: |
-          env -u PYTHONPATH timesfm-env/bin/python - <<'PY'
+          env -u PYTHONPATH models-env/bin/python - <<'PY'
+          import importlib
           import importlib.metadata
+          import os
           import torch
-          import timesfm
           from autoforecast.model_runtime import check_runtime
 
-          assert check_runtime("timesfm").available
-          assert callable(timesfm.TimesFM_2p5_200M_torch.from_pretrained)
-          assert callable(timesfm.ForecastConfig)
+          if os.environ["MODEL_EXTRA"] == "timesfm":
+              import timesfm
+              assert check_runtime("timesfm").available
+              assert callable(timesfm.TimesFM_2p5_200M_torch.from_pretrained)
+              assert callable(timesfm.ForecastConfig)
+          else:
+              for runtime in ("builtin", "classical", "shallow", "custom_torch", "tft", "autogluon_zoo"):
+                  assert check_runtime(runtime).available, runtime
+              for module in ("statsforecast", "lightgbm", "tensorboard", "lightning", "pytorch_forecasting", "autogluon.timeseries", "peft"):
+                  importlib.import_module(module)
           assert torch.__version__.endswith("+cpu"), torch.__version__
           assert not any(d.metadata['Name'].startswith('nvidia-') for d in importlib.metadata.distributions())
-          print("Standalone TimesFM provider API and CPU backend are available; weights were not downloaded.")
+          print("Selected model libraries and CPU backend are available; weights were not downloaded.")
           PY
