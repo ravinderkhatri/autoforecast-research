@@ -61,6 +61,11 @@ def test_preflight_refuses_borrowed_runtime_without_changes(command, monkeypatch
 )
 def test_preflight_stops_owned_runtime_on_every_exit(command, monkeypatch, outcome):
     spark = mock.Mock()
+    successor = object()
+    context = SimpleNamespace(_active_spark_context=spark)
+    monkeypatch.setattr(cli, "SparkContext", context)
+    # A caller may create its own context as soon as stop releases Spark's creation lock.
+    spark.stop.side_effect = lambda: setattr(context, "_active_spark_context", successor)
     acquire = mock.Mock(return_value=spark)
     monkeypatch.setattr(cli.resources, "acquire_local_runtime", acquire)
     contract = mock.Mock()
@@ -90,5 +95,6 @@ def test_preflight_stops_owned_runtime_on_every_exit(command, monkeypatch, outco
 
     acquire.assert_called_once()
     spark.stop.assert_called_once()
+    assert context._active_spark_context is successor
     if outcome != "load_error":
         inspect.assert_called_once_with(contract.panel.return_value, spark, as_of="2024-01-01")
