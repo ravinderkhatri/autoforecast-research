@@ -23,13 +23,15 @@ from autoforecast.test_pact_revision import _config as pact_config
 pytest_plugins = ["autoforecast.test_study"]
 
 
-@pytest.fixture(scope="module")
-def native_study(tmp_path_factory, spark):
+@pytest.fixture(scope="module", params=["rmse", "mae", "wape"])
+def native_study(tmp_path_factory, spark, request):
     """Two retained series, 126 days each, no exclusions; 14 cells per forecast boundary."""
-    return freeze_native_study(tmp_path_factory.mktemp("native-shared-study"), spark)
+    return freeze_native_study(
+        tmp_path_factory.mktemp("native-shared-study"), spark, metric=request.param,
+    )
 
 
-def freeze_native_study(root, spark, *, horizon=7, price=False):
+def freeze_native_study(root, spark, *, horizon=7, price=False, metric="rmse"):
     """Freeze two complete series with two missing validation actuals and optional known price."""
     start = dt.date(2024, 1, 1)
     rows = [{
@@ -57,7 +59,7 @@ def freeze_native_study(root, spark, *, horizon=7, price=False):
         "final_train_cutoff": (start + dt.timedelta(days=111 + horizon)).isoformat(),
         "final_test_horizon": horizon, "history_policy": "fixed", "new_series_policy": "error",
         "target_unit": "counts", "feature_availability": {"price": "price_known_at"} if price else {},
-        "metric": "rmse",
+        "metric": metric,
         "actual_missing": "mask",
     }
     path = benchmark.freeze_benchmark(
@@ -74,6 +76,7 @@ def freeze_native_study(root, spark, *, horizon=7, price=False):
 def test_native_study_selects_scores_refits_and_replays(native_study, tmp_path, spark, variant):
     path, record = native_study
     recipe = record["recipe"]
+    metric = recipe["metric"]
     origin, horizon = recipe["validation_origins"][0], recipe["validation_horizon"]
     contract_path = path.parent / "dataset.yaml"
     dataset = load_dataset_contract(contract_path)
@@ -90,7 +93,7 @@ def test_native_study_selects_scores_refits_and_replays(native_study, tmp_path, 
     )
     assert max(pq.read_table(training)["date"].to_pylist()).isoformat() == origin
     fixed = benchmark.evaluation_contract(
-        path, stage="validation", origin=origin, horizon=horizon, metric="rmse",
+        path, stage="validation", origin=origin, horizon=horizon, metric=metric,
     )
     evaluation_path = tmp_path / "evaluation.json"
     evaluation_path.write_text(json.dumps(fixed))
@@ -111,7 +114,8 @@ def test_native_study_selects_scores_refits_and_replays(native_study, tmp_path, 
         validation_panel, forecast, spark, contract=fixed, output_dir=tmp_path / "score",
     )
     assert score["n_scored"] == 12 and score["n_dropped_no_data"] == 2
-    assert selected["validation"][-1]["mean_rmse"] == pytest.approx(score["rmse"], rel=1e-6)
+    assert selected["selection_metric"] == metric
+    assert selected["validation"][-1][f"mean_{metric}"] == pytest.approx(score[metric], rel=1e-6)
 
     cutoff = recipe["final_train_cutoff"]
     final_input = tmp_path / "refit-input"

@@ -66,6 +66,7 @@ def main() -> int:
     parser.add_argument("project", type=pathlib.Path)
     parser.add_argument("--model-profile", type=pathlib.Path, required=True)
     parser.add_argument("--implementation-config", type=pathlib.Path, required=True)
+    parser.add_argument("--metric", choices=("rmse", "mae", "wape"), default="mae")
     args = parser.parse_args()
     project = args.project.resolve()
     print(
@@ -96,13 +97,18 @@ def main() -> int:
         "validation_origins": [day(111)], "validation_horizon": 7,
         "final_train_cutoff": day(118), "final_test_horizon": 7,
         "history_policy": "fixed", "new_series_policy": "error", "target_unit": "counts",
-        "feature_availability": {}, "metric": "rmse", "actual_missing": "mask",
+        "feature_availability": {}, "metric": args.metric, "actual_missing": "mask",
     }
     (project / "recipe.json").write_text(json.dumps(recipe))
     profile = yaml.safe_load(args.model_profile.read_text())
     assert profile["model"]["id"] == profile["model"]["adapter"] == "sft"
     implementation = args.implementation_config.read_bytes()
     assert hashlib.sha256(implementation).hexdigest() == profile["implementation"]["sha256"]
+    # The frozen study overrides this valid recipe field without changing its provenance.
+    implementation_config = json.loads(implementation)
+    implementation_config["selection_metric"] = "wrmsse"
+    implementation = (json.dumps(implementation_config, indent=2) + "\n").encode()
+    profile["implementation"]["sha256"] = hashlib.sha256(implementation).hexdigest()
     (project / "implementation.json").write_bytes(implementation)
     profile["implementation"]["config"] = "implementation.json"
     compact = {
@@ -127,7 +133,7 @@ def main() -> int:
         "training_start", "validation_origins", "validation_horizon",
         "final_train_cutoff", "final_test_horizon",
     )})
-    campaign["selection"].update(metric="rmse", missing_actual="no_data")
+    campaign["selection"].update(metric=args.metric, missing_actual="no_data")
     campaign["compute"].update(device="cpu", batch_size=2, precision="32-true")
     for budget in campaign["budgets"].values():
         budget.update(maximum_epochs=2, patience=2)

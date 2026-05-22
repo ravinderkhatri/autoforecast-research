@@ -4018,7 +4018,10 @@ def _selected_update_budget(
             )
             or (expected_metric is not None and metric != expected_metric)
             or type(config) is not dict
-            or config.get("selection_metric") not in (metric, "auto")
+            or config.get("selection_metric") not in (
+                {"auto", "rmse", "wrmsse"}
+                if contract.get("study_evaluation") is not None else {metric, "auto"}
+            )
             or type(config.get("patience")) is not int
             or config.get("patience") != patience
             or not is_finite_real(config.get("early_stopping_absolute_min_delta"))
@@ -5159,10 +5162,11 @@ def _locked_selected_update_budget(
     expected_metric = selection.get("metric") if type(selection) is dict else None
     if type(expected_metric) is not str:
         raise ForecastCampaignError("fixed-budget selection metric is missing")
-    # MAE/WAPE rank the externally scored candidates; the rolling trainer still
-    # selects its optimizer frontier on RMSE when no RMSE/WRMSSE metric was requested.
+    # Shared studies select the optimizer frontier using their frozen metric.
+    # Standalone MAE/WAPE ranking retains the rolling trainer's RMSE frontier.
     rolling_frontier_metric = (
-        expected_metric if expected_metric in {"rmse", "wrmsse"} else "rmse"
+        expected_metric
+        if "study_id" in resolved or expected_metric in {"rmse", "wrmsse"} else "rmse"
     )
     compute = resolved.get("compute")
     batch_size = compute.get("batch_size") if type(compute) is dict else None

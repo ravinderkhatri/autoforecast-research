@@ -319,7 +319,7 @@ def verify_validation_ledger(
     """Reject an impossible fixed-validation prefix, including delayed coverage slots."""
     if (
         type(slots) is not list or type(evaluations) is not list
-        or metric not in {"rmse", "wrmsse", "uniform_hierarchy_rmsse"}
+        or metric not in {"rmse", "mae", "wape", "wrmsse", "uniform_hierarchy_rmsse"}
         or type(validation_interval_updates) is not int or validation_interval_updates < 1
         or type(budget_updates) is not int or budget_updates < 1
         or type(last_update) is not int or not 0 <= last_update <= budget_updates

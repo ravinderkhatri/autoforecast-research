@@ -89,12 +89,13 @@ def test_sampler_replay_rejects_producer_impossible_journal(tamper):
         rolling_training.replay_sampler_journal(changed, **kwargs)
 
 
-def test_uniform_hierarchy_validation_ledger_can_resume():
+@pytest.mark.parametrize("metric", ["rmse", "mae", "wape", "wrmsse", "uniform_hierarchy_rmsse"])
+def test_validation_ledger_can_resume_with_the_selected_metric(metric):
     verify_validation_ledger(
         [{"update": 1, "covered_series": 2, "trainable_series": 2,
           "evaluated": True}],
-        [{"update": 1, "mean_uniform_hierarchy_rmsse": 0.25}],
-        metric="uniform_hierarchy_rmsse", validation_interval_updates=1,
+        [{"update": 1, f"mean_{metric}": 0.25}],
+        metric=metric, validation_interval_updates=1,
         budget_updates=2, last_update=1, trainable_series=2,
     )
 
@@ -1031,14 +1032,30 @@ def test_fixed_holdout_resume_rejects_forged_sampler_rng(
     assert not (root / "recovery").exists()
 
 
+@pytest.mark.parametrize("study_metric", [None, "mae", "wape"])
 def test_fixed_holdout_resume_uses_nondefault_validation_cadence(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, study_metric,
 ) -> None:
     configure_training_runtime("cpu", 1)
     def make():
-        return _coverage_delayed_fixed_trainer(
+        trainer = _coverage_delayed_fixed_trainer(
             two_steps_per_epoch=True, validation_every_epochs=2,
         )
+        if study_metric is not None:
+            from autoforecast.study_validation import StudyValidation
+
+            origin = trainer.data.cutoff.isoformat()
+            study = StudyValidation(
+                json.dumps({"study_id": "b" * 64, "boundary": f"validation/{origin}/2/D",
+                            "metric_policy": {"metric": study_metric, "actual_missing": "mask"}}),
+                "a" * 64, trainer.data.series_ids,
+                np.array([[1.0, 0.0], [2.0, 4.0]]),
+                np.array([[True, False], [True, True]]),
+            )
+            trainer.training_contract = RollingTrainingContract(
+                mode="fixed_validation", fixed_validation=ValidationWindow.from_study(origin, study),
+            )
+        return trainer
     control_model, control = make().fit(lambda _: None)
     root = tmp_path / "nondefault-cadence"
     original_save = TrainingRun.save
@@ -1060,6 +1077,7 @@ def test_fixed_holdout_resume_uses_nondefault_validation_cadence(
         resumed_model, resumed = make().fit(run.log, run=run)
     assert resumed["validation"] == control["validation"]
     assert resumed["validation_slots"] == control["validation_slots"]
+    assert resumed["selection_metric"] == (study_metric or "rmse")
     equal(control_model.state_dict(), resumed_model.state_dict())
 
 
