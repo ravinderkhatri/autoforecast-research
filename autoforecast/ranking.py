@@ -53,9 +53,6 @@ from autoforecast.score import Score
 from autoforecast.score_spark import MissingActual, score_forecast
 from provenance.lineage import directory_digest, parquet_files
 
-eligible_grid_content_hash = grid.content_hash
-"""Backward-compatible harness name for the model-neutral grid content digest."""
-
 RANKABLE = ("mae", "sum_abs_error", "absolute_error_pct_of_volume")
 """Score fields a ranking may order by. All are LOWER-IS-BETTER and all are defined at zero.
 
@@ -566,7 +563,7 @@ def _require_complete_grid_mapping(
                 f"eligible_grids[{origin!r}] must be a non-blank Parquet path")
         out[origin] = str(path)
         try:
-            actual_hash = eligible_grid_content_hash(path, spark)
+            actual_hash = grid.content_hash(path, spark)
         except Exception as exc:
             raise SelectionError(
                 f"cannot hash eligible grid for {origin} at {path!s}: {exc}") from exc
@@ -981,7 +978,7 @@ def finalize_forecast_on_grid(
     if missing_forecast_policy == "error":
         return forecast.validate(), None
     try:
-        actual_hash = eligible_grid_content_hash(eligible_grid, spark)
+        actual_hash = grid.content_hash(eligible_grid, spark)
     except Exception as exc:
         raise SelectionError(
             f"cannot hash eligible grid for {forecast.origin} at {eligible_grid!s}: {exc}") from exc

@@ -6,7 +6,6 @@
     "autoforecast/cli.py",
     "autoforecast/project.py",
     "autoforecast/results.py",
-    "scripts/verify_daily_release.py",
     "autoforecast/campaign.py",
     "autoforecast/campaign_child.py",
     "autoforecast/campaign_launchd.py",

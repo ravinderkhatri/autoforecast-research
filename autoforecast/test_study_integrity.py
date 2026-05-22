@@ -7,7 +7,6 @@ import hashlib
 import json
 import math
 import pathlib
-import shutil
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -54,19 +53,19 @@ def _part(path: pathlib.Path) -> pathlib.Path:
     return path if path.is_file() else next(path.glob("*.parquet"))
 
 
-def test_resolve_study_rejects_a_legacy_v1_benchmark(tmp_path):
-    """A study ID must not authenticate a recipe-v1 benchmark."""
-    from autoforecast.test_benchmark import _frozen_example
-
-    legacy_path, legacy, _ = _frozen_example(tmp_path)
+def test_resolve_study_rejects_obsolete_schema_before_artifact_reads(tmp_path, monkeypatch):
+    """An obsolete format fails at admission, before identity or artifact reads."""
     registry = tmp_path / "registry"
-    target = registry / legacy["benchmark_id"]
-    target.parent.mkdir(parents=True)
-    shutil.copytree(legacy_path.parent, target)
-
-    with pytest.raises(benchmark.BenchmarkError, match="version-2 study"):
-        benchmark.resolve_study(registry, legacy["benchmark_id"])
-    assert benchmark.verify_benchmark(target / "benchmark.json")[1] == legacy
+    identity = "a" * 64
+    target = registry / identity
+    target.mkdir(parents=True)
+    (target / "benchmark.json").write_text(json.dumps({
+        "schema": "autoforecast.frozen-benchmark.v1",
+    }))
+    monkeypatch.setattr(benchmark, "_identity", lambda *_: pytest.fail("read obsolete identity"))
+    monkeypatch.setattr(benchmark, "directory_digest", lambda *_a, **_k: pytest.fail("read artifacts"))
+    with pytest.raises(benchmark.BenchmarkError, match="unsupported benchmark schema"):
+        benchmark.resolve_study(registry, identity)
 
 
 @pytest.mark.parametrize("metric,policy", [("wrmsse", "zero"), ("rmse", "zero"), ("rmse", "mask")])

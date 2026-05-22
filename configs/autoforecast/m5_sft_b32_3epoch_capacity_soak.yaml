@@ -2,7 +2,7 @@
 # At the measured ~21 seconds/update, six required selection/refit epochs need about 33 hours.
 # Keep a 48-hour per-stage ceiling so this diagnostic can prove all six epochs rather than
 # failing mid-refit for an undersized wall-clock budget.
-schema_version: 5
+schema_version: 6
 forecast_campaign:
   name: m5-sft-b32-3epoch-capacity-soak
   purpose: capacity_diagnostic
@@ -75,6 +75,7 @@ forecast_campaign:
       early_stopping_absolute_min_delta: 0.000001
       early_stopping_relative_min_delta: 0.0
   compute:
+    precision: 32-true
     device: cpu
     batch_size: 32
     gradient_microbatch_size: 32

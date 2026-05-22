@@ -1,7 +1,8 @@
 # Functional/example request only.  The CLI supplies the immutable local/GCS snapshot reference;
 # credentials and mutable database URLs never belong in this source-controlled request.
-schema_version: 2
+schema_version: 3
 run:
+  precision: 32-true
   name: m5-baseline-evaluation
   dataset_contract: configs/datasets/m5_daily.yaml
   model_catalog: configs/models

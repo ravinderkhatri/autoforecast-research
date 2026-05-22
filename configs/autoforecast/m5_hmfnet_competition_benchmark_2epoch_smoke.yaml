@@ -1,6 +1,6 @@
 # Non-claim-bearing two-epoch end-to-end smoke of the established HMFNet benchmark.
 # It differs from m5_hmfnet_competition_benchmark.yaml only in name and epoch ceilings.
-schema_version: 5
+schema_version: 6
 forecast_campaign:
   name: m5-hmfnet-competition-benchmark-2epoch-smoke
   purpose: single_model_benchmark
@@ -66,6 +66,7 @@ forecast_campaign:
       early_stopping_absolute_min_delta: 0.000001
       early_stopping_relative_min_delta: 0.0
   compute:
+    precision: 32-true
     device: cpu
     batch_size: 32
     gradient_microbatch_size: 32

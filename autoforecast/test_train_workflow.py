@@ -21,6 +21,7 @@ from autoforecast.train_workflow import (
     ModelOutcome,
     RunRequest,
     RunSummary,
+    TrainWorkflowError,
     load_run_request,
     run_training_workflow,
 )
@@ -86,8 +87,9 @@ def test_request_yaml_accepts_all_models_without_a_runtime_data_path(
 ) -> None:
     request_path = tmp_path / "run.yaml"
     request_path.write_text(
-        """schema_version: 1
+        """schema_version: 3
 run:
+  precision: 32-true
   name: functional-run
   dataset_contract: configs/datasets/m5_daily.yaml
   model_catalog: configs/models
@@ -147,7 +149,7 @@ def test_run_request_refuses_duplicate_yaml_keys_and_boolean_version(
     try:
         load_run_request(request_path)
     except ValueError as error:
-        assert "schema_version 1, 2, or 3" in str(error)
+        assert "schema_version 3" in str(error)
     else:
         raise AssertionError("run request accepted bool as an integer schema version")
 
@@ -155,8 +157,9 @@ def test_run_request_refuses_duplicate_yaml_keys_and_boolean_version(
 def test_run_request_refuses_coerced_paths_and_noncanonical_origin(
     tmp_path: pathlib.Path,
 ) -> None:
-    template = """schema_version: 1
+    template = """schema_version: 3
 run:
+  precision: 32-true
   name: functional-run
   dataset_contract: VALUE
   model_catalog: configs/models
@@ -183,8 +186,9 @@ run:
 def test_run_request_preserves_an_exact_hour_origin(tmp_path: pathlib.Path) -> None:
     request_path = tmp_path / "run.yaml"
     request_path.write_text(
-        """schema_version: 1
+        """schema_version: 3
 run:
+  precision: 32-true
   name: hourly-run
   dataset_contract: configs/datasets/hourly.yaml
   model_catalog: configs/models
@@ -204,8 +208,9 @@ run:
 def test_sft_request_makes_evaluation_semantics_explicit(tmp_path: pathlib.Path) -> None:
     request_path = tmp_path / "run.yaml"
     request_path.write_text(
-        """schema_version: 2
+        """schema_version: 3
 run:
+  precision: 32-true
   name: functional-run
   dataset_contract: configs/datasets/m5_daily.yaml
   model_catalog: configs/models
@@ -229,8 +234,9 @@ run:
 def test_sft_request_accepts_the_explicit_m5_wrmsse_metric(tmp_path: pathlib.Path) -> None:
     request_path = tmp_path / "run.yaml"
     request_path.write_text(
-        """schema_version: 2
+        """schema_version: 3
 run:
+  precision: 32-true
   name: m5-private-replay
   dataset_contract: configs/datasets/m5_daily.yaml
   model_catalog: configs/models
@@ -254,8 +260,9 @@ def test_sft_request_can_require_a_separate_post_training_score_input(
 ) -> None:
     request_path = tmp_path / "run.yaml"
     request_path.write_text(
-        """schema_version: 2
+        """schema_version: 3
 run:
+  precision: 32-true
   name: m5-private-replay
   dataset_contract: configs/datasets/m5_daily.yaml
   model_catalog: configs/models
@@ -278,24 +285,21 @@ run:
     assert evaluation.evidence_role == "archived_private_replay_not_blind"
 
 
-def test_m5_sft_score_only_requests_do_not_rewrite_frozen_mft_requests() -> None:
+def test_current_m5_score_only_requests_keep_labels_outside_training() -> None:
     root = pathlib.Path(__file__).resolve().parent.parent
     for stem in ("m5_public_holdout", "m5_private_evaluation"):
-        frozen = yaml.safe_load(
-            (root / "configs/autoforecast" / f"{stem}_deep_v1.yaml").read_text()
-        )
-        current = yaml.safe_load(
-            (root / "configs/autoforecast" / f"{stem}_deep_v2.yaml").read_text()
-        )
-        assert set(frozen["run"]["evaluation"]) == {"missing_actual", "metric"}
-        assert current["run"]["evaluation"]["input_mode"] == "post_training_score_only"
+        request = load_run_request(root / "configs/autoforecast" / f"{stem}_deep_v2.yaml")
+        assert request.evaluation is not None
+        assert request.evaluation.input_mode == "post_training_score_only"
+        assert request.precision == "32-true"
 
 
 def test_sft_request_binds_a_source_controlled_calendar_event_recipe(tmp_path: pathlib.Path) -> None:
     request_path = tmp_path / "run.yaml"
     request_path.write_text(
-        """schema_version: 2
+        """schema_version: 3
 run:
+  precision: 32-true
   name: calendar-functional-run
   dataset_contract: configs/datasets/m5_daily.yaml
   model_catalog: configs/models
@@ -319,33 +323,31 @@ run:
     assert request.calendar_events == (("Memorial", "2016-05-30", None),)
 
 
-def test_mft_request_refuses_sft_calendar_features(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("version", [1, 2, True])
+def test_run_request_rejects_obsolete_versions_before_loading_dependencies(tmp_path, version):
     request_path = tmp_path / "run.yaml"
-    request_path.write_text(
-        """schema_version: 1
-run:
-  name: calendar-functional-run
-  dataset_contract: configs/datasets/m5_daily.yaml
-  model_catalog: configs/models
-  models: [seasonal_naive]
-  origin: '2016-05-22'
-  horizon: 28
-  tracking:
-    mlflow: {enabled: false}
-  features:
-    calendar_events:
-      max_support: 30
-      events: []
-""",
-        encoding="utf-8",
+    root = pathlib.Path(__file__).resolve().parent.parent
+    value = yaml.safe_load(
+        (root / "configs/autoforecast/examples/synthetic_seasonal_naive.yaml").read_text()
     )
-
-    try:
+    value["schema_version"] = version
+    request_path.write_text(yaml.safe_dump(value))
+    with pytest.raises(TrainWorkflowError, match="schema_version 3"):
         load_run_request(request_path)
-    except ValueError as error:
-        assert "exact run mapping" in str(error)
+
+
+@pytest.mark.parametrize("precision", ["32-true", "16-mixed", [], {}, None, True])
+def test_run_request_requires_a_supported_precision(tmp_path, precision):
+    root = pathlib.Path(__file__).resolve().parent.parent
+    value = yaml.safe_load((root / "configs/autoforecast/examples/synthetic_seasonal_naive.yaml").read_text())
+    value["run"]["precision"] = precision
+    path = tmp_path / "run.yaml"
+    path.write_text(yaml.safe_dump(value))
+    if precision in ("32-true", "16-mixed"):
+        assert load_run_request(path).precision == precision
     else:
-        raise AssertionError("schema version 1 accepted version 2 calendar features")
+        with pytest.raises(TrainWorkflowError, match="run.precision"):
+            load_run_request(path)
 
 
 def test_data_failure_blocks_every_model_and_publishes_a_report(tmp_path: pathlib.Path) -> None:

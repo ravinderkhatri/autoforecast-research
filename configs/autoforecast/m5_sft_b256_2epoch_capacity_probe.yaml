@@ -1,7 +1,8 @@
 # Isolated capacity probe for the frozen M5 SFT architecture at its production batch size.
 # This is diagnostic only: one seed and origin, two epochs, and no automatic retry.
-schema_version: 4
+schema_version: 6
 forecast_campaign:
+  purpose: forecast_campaign
   name: m5-sft-b256-2epoch-capacity-probe
   dataset:
     contract: configs/datasets/m5_daily.yaml
@@ -72,6 +73,7 @@ forecast_campaign:
       early_stopping_absolute_min_delta: 0.000001
       early_stopping_relative_min_delta: 0.0
   compute:
+    precision: 32-true
     device: cpu
     batch_size: 256
     gradient_microbatch_size: 256

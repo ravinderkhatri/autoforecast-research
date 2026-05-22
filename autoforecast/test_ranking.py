@@ -490,7 +490,7 @@ def test_rank_binds_every_cached_run_to_the_manifest_and_its_horizon() -> None:
     grids = {origin: f"/grid/{origin}" for origin in ALL_ORIGINS}
     with mock.patch.object(ranking.registry, "get"), \
             mock.patch.object(ranking.registry, "handicaps", return_value={}), \
-            mock.patch.object(ranking, "eligible_grid_content_hash",
+            mock.patch.object(grid, "content_hash",
                               return_value=frozen_hash), \
             mock.patch.object(ranking, "run_over_origins", side_effect=fake_runs), \
             mock.patch.object(ranking, "_exact_grid_restrictions",
@@ -919,7 +919,7 @@ def test_governed_rank_refuses_grid_bytes_different_from_the_manifest() -> None:
     frozen_hash = "a" * 64
     m = manifest(grid_hashes={origin: frozen_hash for origin in ALL_ORIGINS})
     paths = {origin: f"/grid/{origin}" for origin in ALL_ORIGINS}
-    with mock.patch.object(ranking, "eligible_grid_content_hash", return_value="b" * 64):
+    with mock.patch.object(grid, "content_hash", return_value="b" * 64):
         try:
             ranking._require_complete_grid_mapping(m, paths, object())
         except ranking.SelectionError as exc:

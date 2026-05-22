@@ -1,6 +1,6 @@
 # Full-population, two-epoch TFT-Q/TFT-HNB capacity and scoring diagnostic.
 # Both arms get one window per series and independent validation-loss checkpoint selection.
-schema_version: 5
+schema_version: 6
 forecast_campaign:
   name: m5-tft-tft-loss-2epoch
   purpose: forecast_campaign
@@ -67,6 +67,7 @@ forecast_campaign:
       early_stopping_absolute_min_delta: 0.000001
       early_stopping_relative_min_delta: 0.0
   compute:
+    precision: 32-true
     device: mps
     batch_size: 32
     gradient_microbatch_size: null

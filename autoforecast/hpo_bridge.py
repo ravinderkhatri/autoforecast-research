@@ -238,7 +238,7 @@ class ForecastTrialBridge:
             contract = load_dataset_contract(self.project_root / request.dataset_contract)
             if contract.required_series_count is not None:
                 raise HPOError(
-                    "shared-study inner HPO windows are not frozen; use the strict HPO workflow"
+                    "shared-study inner HPO windows are not frozen; use standalone HPO"
                 )
             cadence = parse_frequency(str(contract.panel_roles.get("frequency", "D")))
             definition = descriptor(study.tuning.adapter)

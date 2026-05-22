@@ -1,6 +1,6 @@
 # One independent M5 train/validation/refit/test benchmark for HMFNet.
 # Run after SFT; this campaign always produces HMFNet's own validation and test WRMSSE.
-schema_version: 5
+schema_version: 6
 forecast_campaign:
   name: m5-hmfnet-competition-benchmark
   purpose: single_model_benchmark
@@ -66,6 +66,7 @@ forecast_campaign:
       early_stopping_absolute_min_delta: 0.000001
       early_stopping_relative_min_delta: 0.0
   compute:
+    precision: 32-true
     device: cpu
     batch_size: 32
     gradient_microbatch_size: 32

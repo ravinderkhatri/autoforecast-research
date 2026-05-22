@@ -35,6 +35,19 @@ def test_value_keeps_cell_and_hierarchy_metric_families_distinct():
     assert _value(zero_volume, "wape") is None
 
 
+def test_obsolete_fixed_evaluation_is_rejected_before_data_reads(tmp_path: pathlib.Path) -> None:
+    forecast = Forecast("model", str(tmp_path / "absent"), "2024-01-01", 1, 1, {"emitted": 1})
+    with pytest.raises(EvaluationError, match="current frozen study contract"):
+        compare_run_forecasts(
+            Panel(str(tmp_path / "absent"), "id", "date", "qty"), {"model": forecast},
+            None, missing_actual="no_data", metric="rmse", output_dir=tmp_path / "evaluation",
+            fixed_contract={
+                "schema": "autoforecast.fixed-evaluation.v1",
+                "metric_policy": {"metric": "rmse", "missing_actual": "error", "fallback": "none"},
+            },
+        )
+
+
 @pytest.mark.skipif(not os.environ.get("JAVA_HOME"), reason="Spark requires JAVA_HOME")
 def test_completed_forecasts_get_an_honest_common_cell_comparison(tmp_path: pathlib.Path) -> None:
     spark = (SparkSession.builder.master("local[1]").appName("test_run_evaluation")

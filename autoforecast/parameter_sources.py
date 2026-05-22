@@ -526,9 +526,7 @@ def _training_controls_are_valid(record: dict[str, object]) -> bool:
     relative_delta = record.get("early_stopping_relative_min_delta")
     schema = record.get("schema")
     precision_valid = (
-        schema == "autoforecast.training-controls.v1"
-        and set(record) == expected
-        or schema == "autoforecast.training-controls.v2"
+        schema == "autoforecast.training-controls.v2"
         and set(record) == expected | {"requested_precision", "effective_precision"}
         and record.get("requested_precision") in ("32-true", "16-mixed")
         and record.get("effective_precision") in (
@@ -556,8 +554,6 @@ def _training_controls_are_valid(record: dict[str, object]) -> bool:
 def _training_controls_match_candidate(record: dict[str, object], candidate: Candidate) -> bool:
     if not _training_controls_are_valid(record):
         return False
-    if record["schema"] == "autoforecast.training-controls.v1":
-        return True
     return record["effective_precision"] == effective_precision(
         candidate.adapter, cast(str, record["requested_precision"])
     )
@@ -1229,17 +1225,8 @@ def _selected_source_commit(
         "early_stopping_relative_min_delta": training_controls.get(
             "early_stopping_relative_min_delta"
         ),
-        **(
-            {"precision": training_controls.get("effective_precision")}
-            if training_controls.get("schema") == "autoforecast.training-controls.v2" else {}
-        ),
+        "precision": training_controls.get("effective_precision"),
     }
-    if (
-        expected_protocol is not None
-        and "precision" in expected_protocol
-        and training_controls.get("schema") == "autoforecast.training-controls.v1"
-    ):
-        observed_protocol["precision"] = effective_precision(candidate.adapter, "32-true")
     if (
         not _training_controls_match_candidate(training_controls, candidate)
         or expected_protocol is not None

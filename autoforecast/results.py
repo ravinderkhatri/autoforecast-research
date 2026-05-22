@@ -50,19 +50,15 @@ class CampaignResults:
 
 
 def _verified_dataset_frequency(
-    resolved: dict, working_directory: pathlib.Path | None, *, required: bool
+    resolved: dict, working_directory: pathlib.Path | None
 ) -> str | None:
-    """Read only the pinned dataset contract when temporal evidence is ambiguous."""
+    """Check the pinned dataset cadence when its source contract is available."""
     source = resolved.get("source")
     if type(source) is not dict:
-        if required:
-            raise ValueError("campaign frequency requires a verified dataset contract")
         return None
     relative = source.get("dataset_contract")
     expected = source.get("dataset_contract_sha256")
     if type(relative) is not str or type(expected) is not str or working_directory is None:
-        if required:
-            raise ValueError("campaign frequency requires a verified dataset contract")
         return None
     candidate = pathlib.Path(relative)
     path = candidate if candidate.is_absolute() else working_directory / candidate
@@ -70,8 +66,6 @@ def _verified_dataset_frequency(
     try:
         resolved_path = path.resolve(strict=True)
     except OSError:
-        if required:
-            raise ValueError("campaign frequency requires a verified dataset contract") from None
         return None
     if not resolved_path.is_file() or not resolved_path.is_relative_to(root):
         raise ValueError("campaign dataset contract path is invalid")
@@ -90,24 +84,9 @@ def _resolved_frequency(resolved: dict, contract_frequency: str | None) -> str |
     if type(temporal) is not dict:
         return contract_frequency
     declared = temporal.get("frequency")
-    step_days = temporal.get("step_days")
-    if declared is not None:
-        if type(declared) is not str or step_days is not None:
-            raise ValueError("campaign temporal frequency is invalid")
-        frequency = parse_frequency(declared).code
-    elif step_days is not None:
-        if type(step_days) is not int or step_days < 1:
-            raise ValueError("campaign temporal step_days is invalid")
-        if step_days == 7:
-            if contract_frequency is None:
-                raise ValueError("legacy seven-day cadence requires a verified dataset contract")
-            frequency = contract_frequency
-            if frequency not in {"W", "7D"}:
-                raise ValueError("legacy seven-day cadence differs from the dataset contract")
-        else:
-            frequency = parse_frequency("D" if step_days == 1 else f"{step_days}D").code
-    else:
-        return contract_frequency
+    if type(declared) is not str or "step_days" in temporal:
+        raise ValueError("campaign temporal requires frequency without step_days")
+    frequency = parse_frequency(declared).code
     if contract_frequency is not None and frequency != contract_frequency:
         raise ValueError("campaign frequency differs from the dataset contract")
     return frequency
@@ -137,7 +116,6 @@ def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) ->
     if resolved_sha256 != expected:
         raise ValueError("campaign configuration changed")
     if resolved.get("schema") not in {
-        "autoforecast.forecast-campaign-resolved.v3",
         "autoforecast.forecast-campaign-resolved.v4",
         "autoforecast.forecast-campaign-resolved.v5",
     }:
@@ -149,7 +127,7 @@ def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) ->
         "resolved_sha256": expected,
         "source": resolved["source"],
         "metric_contract": resolved["selection"],
-        "comparison_scope": "fixed_benchmark" if benchmark else "legacy_exploratory",
+        "comparison_scope": "fixed_benchmark" if benchmark else "exploratory",
     }
     stages = cast(list[dict], store.state()["stages"])
     completed = {item["id"] for item in stages if item["status"] == "completed"}
@@ -200,17 +178,10 @@ def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) ->
                 coverage=frozen["coverage_identities"], history_counts=frozen["counts"],
             )
     else:
-        temporal = resolved.get("temporal")
-        needs_contract = (
-            type(temporal) is dict
-            and temporal.get("frequency") is None
-            and temporal.get("step_days") == 7
-        )
         working_directory = getattr(store, "working_directory", None)
         contract_frequency = _verified_dataset_frequency(
             resolved,
             pathlib.Path(working_directory) if working_directory is not None else None,
-            required=needs_contract,
         )
     frequency = _resolved_frequency(resolved, contract_frequency)
     rows, runs, series_scores = [], [], []

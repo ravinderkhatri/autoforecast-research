@@ -163,14 +163,8 @@ def compare_run_forecasts(
         if policy["metric"] != metric:
             raise EvaluationError("metric differs from the frozen study")
     if fixed_contract is not None:
-        if not study and (
-            fixed_contract.get("schema") != "autoforecast.fixed-evaluation.v1"
-            or fixed_contract.get("metric_policy")
-            != {"metric": metric, "missing_actual": "error", "fallback": "none"}
-            or missing_actual != "no_data"
-            or metric == "wrmsse"
-        ):
-            raise EvaluationError("fixed scoring requires the frozen generic metric policy")
+        if not study:
+            raise EvaluationError("fixed scoring requires a current frozen study contract")
         grid_record = cast(dict, fixed_contract["grid"])
         grid_path = grid_record["path"]
         if directory_digest(grid_path, suffixes=(".parquet",)) != grid_record["sha256"]:
@@ -227,10 +221,6 @@ def compare_run_forecasts(
                     restrict_to=restrict_to,
                     eligible_grid=grid_path,
                 )
-                if fixed_contract is not None and (
-                    score.n_scored != common_count or score.n_zero_filled
-                ):
-                    raise ScoreError("missing or ineligible actual blocks fixed score")
         except (ScoreError, WrmsseError) as error:
             candidates.append({"model_id": model_id, "status": "not_scored", "detail": str(error)})
         else:

@@ -1,5 +1,6 @@
-schema_version: 2
+schema_version: 3
 run:
+  precision: 32-true
   name: synthetic-seasonal-naive
   dataset_contract: configs/datasets/synthetic_daily.yaml
   model_catalog: configs/models
