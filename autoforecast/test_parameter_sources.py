@@ -240,7 +240,12 @@ study:
     lockfile.write_text("version = 1\n", encoding="utf-8")
     contract_path = project / "configs/datasets/example.yaml"
     contract_path.parent.mkdir(parents=True)
-    contract_path.write_text("schema_version: 1\n", encoding="utf-8")
+    contract_path.write_text(
+        "schema_version: 1\ndataset:\n  id: example-data\n  panel:\n"
+        "    series_col: series_id\n    time_col: date\n    target_col: target\n"
+        "    frequency: D\n    season_length: 7\n"
+        "    target_estimand: observed_nonnegative\n", encoding="utf-8",
+    )
     run_request_path = project / "configs/autoforecast/hpo.yaml"
     run_request_path.parent.mkdir(parents=True)
     run_request_path.write_text(

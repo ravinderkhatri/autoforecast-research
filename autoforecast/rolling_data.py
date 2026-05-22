@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
@@ -16,6 +17,9 @@ import pyarrow.dataset as ds
 from spec.forecast_spec import ForecastDataSpec
 
 from autoforecast.panel import Panel, period_days
+
+if TYPE_CHECKING:
+    from autoforecast.study_validation import StudyValidation
 
 GLOBAL_LEFT_PADDING_CONTRACT = "masked_observed_counts_global_left_padding_v1"
 
@@ -29,6 +33,24 @@ class ValidationWindow:
     observed: np.ndarray
     physical_state: np.ndarray | None = None
     objective_mask: np.ndarray | None = None
+    study: StudyValidation | None = None
+
+    @classmethod
+    def from_study(
+        cls, origin: str, study: StudyValidation, *, route_lower_bound_to_exact: bool = False,
+    ) -> ValidationWindow:
+        """Retain the frozen scoring mask while enforcing the native count-model domain."""
+        values = study.target
+        if (not np.isfinite(values).all() or np.any(values < 0)
+                or np.any(values > 2**24) or np.any(values != np.floor(values))):
+            raise ValueError("fixed validation targets must be finite integer counts in [0, 2**24]")
+        target = values.astype(np.float32)
+        physical = (np.where(study.observed, 0, 2).astype(np.int8)
+                    if route_lower_bound_to_exact else None)
+        for array in (target, physical):
+            if array is not None:
+                array.setflags(write=False)
+        return cls(origin, target, study.observed, physical, study=study)
 
     @classmethod
     def read(

@@ -165,6 +165,56 @@ def test_study_registration_reuses_bytes_and_rejects_changed_rules(tmp_path, spa
     assert new_path != path
 
 
+@pytest.mark.parametrize("policy,scored", [("zero", 4), ("mask", 2)])
+def test_study_freezes_inner_tuning_population_and_missingness(tmp_path, spark, policy, scored):
+    # Population: the same A/B cohort as outer validation; four inner target cells.
+    # A on day 4 is null and B on day 5 is absent; the late series remains excluded.
+    path = freeze(
+        tmp_path, spark, actual_missing=policy,
+        mutate=lambda recipe: recipe.update(tuning_windows=[{"origin": "2024-01-03", "horizon": 2}]),
+    )
+    _, record = benchmark.verify_benchmark(path)
+    fixed = benchmark.evaluation_contract(
+        path, stage="tuning", origin="2024-01-03", horizon=2, metric="rmse",
+    )
+    assert fixed["actuals"]["role"] == "selection"
+    assert fixed["actuals"]["sha256"] == record["artifacts"]["selection"]
+    assert fixed["grid"]["n_cells"] == 4
+    assert fixed["coverage"]["counts"] == {
+        "expected": 4, "originally_missing": 2, "scored": scored,
+        "zero_filled": 2 if policy == "zero" else 0,
+        "excluded": 2 if policy == "mask" else 0,
+    }
+    with pytest.raises(benchmark.BenchmarkError, match="boundary absent"):
+        benchmark.evaluation_contract(
+            path, stage="tuning", origin="2024-01-02", horizon=2, metric="rmse",
+        )
+    changed = copy.deepcopy(record)
+    changed["recipe"]["tuning_windows"][0]["horizon"] = 1
+    with pytest.raises(benchmark.BenchmarkError, match="grid inventory"):
+        benchmark._validate_manifest(changed)
+
+
+@pytest.mark.parametrize("windows", [
+    None, [], {}, [True], [{"origin": "2024-01-03", "horizon": True}],
+    [{"origin": "2024-01-03", "horizon": 0}],
+    [{"origin": "2024-01-03", "horizon": 3}],
+    [{"origin": "2023-12-31", "horizon": 2}],
+    [{"origin": "2024-01-02", "horizon": 2}],  # B has not reached its declared start.
+    [{"origin": "2024-01-03", "horizon": 1}, {"origin": "2024-01-03", "horizon": 2}],
+    [{"origin": "2024-01-04", "horizon": 1}, {"origin": "2024-01-03", "horizon": 2}],
+    [{"origin": "2024-01-03", "horizon": 2, "metric": "mae"}],
+])
+def test_study_rejects_invalid_inner_windows_before_runtime(tmp_path, windows):
+    contract, sources, recipe = inputs(tmp_path)
+    recipe["tuning_windows"] = windows
+    with pytest.raises(benchmark.BenchmarkError):
+        benchmark.freeze_benchmark(
+            contract_path=contract, sources=sources, recipe=recipe,
+            output_root=tmp_path / "frozen", spark=object(),
+        )
+
+
 def test_obsolete_recipe_is_rejected_before_runtime(tmp_path):
     contract, sources, recipe = inputs(tmp_path)
     recipe["schema_version"] = 1
@@ -413,10 +463,34 @@ def test_study_compilation_preserves_identity_roles_and_safe_training_slices(tmp
     assert benchmark.MISSING_COLUMN not in spark.read.parquet(str(destination)).columns
     assert max(pq.read_table(destination)["day"].to_pylist()).isoformat() == recipe["validation_origins"][0]
     assert hashlib.sha256(path.read_bytes()).hexdigest() == resolved["benchmark"]["sha256"]
-    # Fixed manual parameters work; HPO-derived sources cannot claim these outer windows.
+    # Fixed manual parameters work; HPO cannot add an inner window after study freeze.
     profile = project / "models/shallow_global/model.yaml"
     profile.parent.mkdir()
     profile.write_bytes((campaign.ROOT / "configs/models/global/shallow_global/model.yaml").read_bytes())
+    outer_origin = dt.date.fromisoformat(recipe["validation_origins"][0])
+    inner_origin = outer_origin - dt.timedelta(days=recipe["validation_horizon"])
+    history = [recipe["training_start"], inner_origin.isoformat()]
+    outer_targets = [(outer_origin + dt.timedelta(days=offset)).isoformat()
+                     for offset in (1, recipe["validation_horizon"])]
+    study = {
+        "id": "undeclared-inner-window", "model_config": "models/shallow_global/model.yaml",
+        "backend": "optuna", "direction": "minimize", "objective": "validation/objective",
+        "max_trials": 1, "top_k": 1, "seed": 7,
+        "comparability_fingerprint": record["study_id"], "evaluator": "builtin",
+        "data": {
+            "id": "frozen-selection", "fingerprint": record["artifacts"]["selection"],
+            "observed_date_range": [recipe["training_start"], recipe["final_train_cutoff"]],
+            "training_date_range": history, "validation_date_range": list(history),
+            "validation_target_date_range": [
+                (inner_origin + dt.timedelta(days=1)).isoformat(), outer_origin.isoformat(),
+            ],
+            "test_date_range": outer_targets, "test_target_date_range": list(outer_targets),
+            "training_series": record["cohort_series_count"],
+            "validation_series": record["cohort_series_count"], "test": "reserved_not_evaluated",
+        },
+    }
+    (project / "hpo.yaml").write_text(yaml.safe_dump({"schema_version": 1, "study": study}))
+    assert not record["recipe"].get("tuning_windows")
     request["forecast_campaign"]["models"]["candidates"] = [
         {"model_id": "shallow_global", "parameters": {"mode": "defaults"}},
     ]
@@ -425,7 +499,7 @@ def test_study_compilation_preserves_identity_roles_and_safe_training_slices(tmp
         if mode == "manual":
             parameters["values"] = {"model.num_leaves": 31}
         else:
-            parameters["study_config"] = "not-opened.yaml"
+            parameters["study_config"] = "hpo.yaml"
             if mode == "reuse_tuned":
                 parameters["selection"] = "not-opened-selection.json"
         request["forecast_campaign"]["models"]["candidates"][0]["parameters"] = parameters
@@ -443,7 +517,7 @@ def test_study_compilation_preserves_identity_roles_and_safe_training_slices(tmp
                 assert value["parameter_profiles"][0]["mode"] == "manual"
                 assert value["parameter_profiles"][0]["resolution"]["effective_parameters"]["model.num_leaves"] == 31
             else:
-                with pytest.raises(campaign.ForecastCampaignError, match="inner HPO windows"):
+                with pytest.raises(campaign.ForecastCampaignError, match="tuning window frozen"):
                     campaign.compile_forecast_campaign(request_path, **arguments)
                 assert not (project / mode).exists()
 

@@ -55,9 +55,11 @@ DESCRIPTORS = {
     ),
     "tft_q": AdapterDescriptor(
         "tft_q", "fit_predict_quantile", "tft", "tft_q", "typed", ("autolog", "lightning"),
+        supports_shared_studies=True,
     ),
     "tft_hnb": AdapterDescriptor(
         "tft_q", "fit_predict_hnb", "tft", "tft_q", "typed", ("autolog", "lightning"),
+        supports_shared_studies=True,
     ),
     "autogluon_zoo": AdapterDescriptor(
         "zoo", "fit_predict", "autogluon_zoo", "one", consumes_exposure=False,
@@ -86,6 +88,7 @@ DESCRIPTORS = {
         ("reporter", "none"),
         target_estimands=("sales_given_availability", "unconstrained_demand"),
         handles_right_censoring=True,
+        supports_shared_studies=True,
     ),
     "hmfnet": AdapterDescriptor(
         "mft",
@@ -96,6 +99,7 @@ DESCRIPTORS = {
         ("reporter", "none"),
         target_estimands=("sales_given_availability", "unconstrained_demand"),
         handles_right_censoring=True,
+        supports_shared_studies=True,
     ),
     "pact": AdapterDescriptor(
         "mft",
@@ -104,6 +108,7 @@ DESCRIPTORS = {
         "mft",
         "typed",
         ("reporter", "none"),
+        supports_shared_studies=True,
     ),
 }
 

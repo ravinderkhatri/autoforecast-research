@@ -282,7 +282,7 @@ def validate_recipe(recipe: dict) -> None:
     if recipe["schema_version"] != 2:
         raise BenchmarkError("preparation recipe schema_version must be 2")
     required = expected | {"metric"}
-    optional = {"frequency", "history_missing", "actual_missing", "series_starts"}
+    optional = {"frequency", "history_missing", "actual_missing", "series_starts", "tuning_windows"}
     if not required <= set(recipe) or set(recipe) - required - optional:
         raise BenchmarkError("preparation recipe requires documented study fields")
     if recipe.get("history_missing", "zero") != "zero":
@@ -339,6 +339,27 @@ def validate_recipe(recipe: dict) -> None:
         invalid = True
     if invalid:
         raise BenchmarkError("invalid training/validation/testing boundaries")
+    earliest_origin = origins[0]
+    if "tuning_windows" in recipe:
+        windows = recipe["tuning_windows"]
+        if type(windows) is not list or not windows:
+            raise BenchmarkError("tuning_windows must be a nonempty list of origin/horizon records")
+        tuning_origins = []
+        for window in windows:
+            if (type(window) is not dict or set(window) != {"origin", "horizon"}
+                    or type(window["horizon"]) is not int or window["horizon"] < 1):
+                raise BenchmarkError("each tuning window requires an origin and positive horizon")
+            origin = _recipe_point(window["origin"], cadence)
+            try:
+                if not start <= origin < advance(origin, cadence, window["horizon"]) <= origins[0]:
+                    raise BenchmarkError("tuning targets must precede all outer validation targets")
+            except (FrequencyError, OverflowError) as error:
+                raise BenchmarkError("invalid tuning window boundary") from error
+            _inclusive_period_count(start, origin, cadence, label="tuning window")
+            tuning_origins.append(origin)
+        if tuning_origins != sorted(set(tuning_origins)):
+            raise BenchmarkError("tuning windows must have unique, sorted origins")
+        earliest_origin = tuning_origins[0]
     for label, point in [
         *(('validation window', origin) for origin in origins),
         ("final training window", cutoff),
@@ -363,9 +384,30 @@ def validate_recipe(recipe: dict) -> None:
                 raise BenchmarkError("duplicate declared series start")
             seen.add(values)
             first = _recipe_point(entry["start"], cadence)
-            if not start <= first <= origins[0]:
+            if not start <= first <= earliest_origin:
                 raise BenchmarkError("series starts must lie within history and the first origin")
             _inclusive_period_count(start, first, cadence, label="series history start")
+
+
+def study_windows(recipe: dict) -> list[tuple[str, str, int]]:
+    """Enumerate all frozen selection and test boundaries from a validated recipe."""
+    return [
+        ("tuning", window["origin"], window["horizon"])
+        for window in recipe.get("tuning_windows", [])
+    ] + [
+        ("validation", origin, recipe["validation_horizon"])
+        for origin in recipe["validation_origins"]
+    ] + [("test", recipe["final_train_cutoff"], recipe["final_test_horizon"])]
+
+
+def _actuals_role(stage: str) -> str:
+    """Keep inner selection labels bound to the pre-outer selection snapshot."""
+    try:
+        return {
+            "tuning": "selection", "validation": "validation_score", "test": "final_score",
+        }[stage]
+    except KeyError as error:
+        raise BenchmarkError("unknown study evaluation stage") from error
 
 
 def freeze_benchmark(
@@ -433,7 +475,7 @@ def _freeze_benchmark(
     start = _recipe_point(recipe["training_start"], cadence)
     origins = [_recipe_point(day, cadence) for day in recipe["validation_origins"]]
     cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
-    horizon, test_horizon = recipe["validation_horizon"], recipe["final_test_horizon"]
+    test_horizon = recipe["final_test_horizon"]
     end = advance(cutoff, cadence, test_horizon)
     if contract_path.is_symlink() or not contract_path.is_file():
         raise BenchmarkError("dataset contract must be a regular file")
@@ -620,7 +662,9 @@ def _freeze_benchmark(
             )
         for feature, known_at in availability.items():
             known_time = F.expr(f"try_cast(`{known_at}` as timestamp_ntz)")
-            first_origin = grid.time_literal(origins[0], cadence).cast("timestamp_ntz")
+            first_origin = grid.time_literal(
+                _recipe_point(study_windows(recipe)[0][1], cadence), cadence,
+            ).cast("timestamp_ntz")
             if (
                 known_at not in retained.columns
                 or retained.filter(
@@ -712,9 +756,8 @@ def _freeze_benchmark(
         grids = {}
         coverage = {}
         coverage_identities = {}
-        for stage, origin, span in [("validation", o, horizon) for o in origins] + [
-            ("test", cutoff, test_horizon)
-        ]:
+        for stage, origin_text, span in study_windows(recipe):
+            origin = _recipe_point(origin_text, cadence)
             origin_text = canonical_origin(origin, cadence)
             key = boundary(stage, origin_text, span, cadence.code)
             relative = "grids/" + key
@@ -734,7 +777,7 @@ def _freeze_benchmark(
                 "sha256": directory_digest(path, suffixes=(".parquet",)),
                 "n_cells": final_count * span,
             }
-            actuals = frames["validation_score" if stage == "validation" else "final_score"]
+            actuals = frames[_actuals_role(stage)]
             cells = actuals.filter(
                 F.col(panel.time_col).between(
                     grid.time_literal(advance(origin, cadence, 1), cadence),
@@ -870,9 +913,7 @@ def _prepare_scoring_references(path, key_map, keys, recipe, spark):
     if frame.filter(invalid_weight | invalid_scale).limit(1).count():
         raise BenchmarkError("scoring references contain invalid weights or scales")
     cadence = _recipe_cadence(recipe)
-    boundaries = [("validation", origin, recipe["validation_horizon"])
-                  for origin in recipe["validation_origins"]]
-    boundaries.append(("test", recipe["final_train_cutoff"], recipe["final_test_horizon"]))
+    boundaries = study_windows(recipe)
     declared = spark.createDataFrame([
         (stage, origin, boundary(stage, origin, horizon, cadence.code))
         for stage, origin, horizon in boundaries
@@ -1011,17 +1052,8 @@ def _validate_manifest(record: object) -> dict:
         if not (0 <= values["originally_missing"] <= required
                 and values["zero_filled"] == values["originally_missing"]):
             raise BenchmarkError("study history filling counts do not reconcile")
-    boundaries = {
-        boundary(
-            "validation", origin, recipe["validation_horizon"], cadence.code
-        ): recipe["validation_horizon"]
-        for origin in recipe["validation_origins"]
-    }
-    boundaries[boundary(
-        "test", recipe["final_train_cutoff"], recipe["final_test_horizon"], cadence.code
-    )] = (
-        recipe["final_test_horizon"]
-    )
+    boundaries = {boundary(stage, origin, span, cadence.code): span
+                  for stage, origin, span in study_windows(recipe)}
     grids = mapping(record["grids"], boundaries, "grid inventory")
     identities = mapping(record["grid_identities"], boundaries, "grid identity inventory")
     for key, horizon in boundaries.items():
@@ -1145,7 +1177,7 @@ def _evaluation_contract_from_record(
     path = path.resolve()
     if metric != record["recipe"]["metric"]:
         raise BenchmarkError("metric differs from the frozen study")
-    role = "validation_score" if stage == "validation" else "final_score"
+    role = _actuals_role(stage)
     return {
         "schema": "autoforecast.fixed-evaluation.v2",
         "benchmark_id": record["benchmark_id"], "study_id": record["study_id"],

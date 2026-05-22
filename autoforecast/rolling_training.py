@@ -333,6 +333,11 @@ class RollingTrainingContract:
                 )
             ):
                 raise ValueError("fixed validation arrays are invalid")
+            if window.study is not None and (
+                not np.array_equal(window.target, window.study.target)
+                or not np.array_equal(window.observed, window.study.observed)
+            ):
+                raise ValueError("fixed validation differs from its frozen study")
         elif self.fixed_validation is not None:
             raise ValueError("only fixed_validation may carry holdout labels")
         if self.mode == "fixed_refit":
@@ -349,6 +354,9 @@ class RollingTrainingContract:
                 None if self.fixed_validation is None else self.fixed_validation.origin
             ),
             "fixed_update_budget": self.fixed_update_budget,
+            **({"study_evaluation": self.fixed_validation.study.as_record()}
+               if self.fixed_validation is not None and self.fixed_validation.study is not None
+               else {}),
         }
 
 
@@ -1209,8 +1217,8 @@ class RollingTrainer:
         sync()
         transfer_started = time.perf_counter()
         key = (origin, device)
+        holdout = self.training_contract.fixed_validation
         if key not in self._validation_targets:
-            holdout = self.training_contract.fixed_validation
             if holdout is not None:
                 if holdout.origin != origin:
                     raise ValueError("fixed validation origin differs from the requested window")
@@ -1298,11 +1306,19 @@ class RollingTrainer:
                     raise ValueError("nonfinite/negative validation prediction or NLL")
                 sync()
                 timings["prediction_assembly_seconds"] = time.perf_counter() - assembly_started
+                shared_study = holdout is not None and holdout.study is not None
+                backend = "numpy" if shared_study else self.config.validation_backend
                 if progress:
                     progress.validation_status(
-                        f"scoring with {self.config.validation_backend} backend"
+                        f"scoring with {backend} backend"
                     )
-                if self.config.validation_backend == "numpy":
+                if holdout is not None and holdout.study is not None:
+                    metric_started = time.perf_counter()
+                    result = holdout.study.score(prediction.cpu().numpy())
+                    if result[holdout.study.metric] is None:
+                        raise ValueError("study checkpoint selection metric is unavailable")
+                    timings["numpy_metric_seconds"] = time.perf_counter() - metric_started
+                elif self.config.validation_backend == "numpy":
                     transfer_started = time.perf_counter()
                     prediction_numpy, target_numpy = prediction.cpu().numpy(), y.cpu().numpy()
                     mask_numpy = mask.cpu().numpy() if metric is None else None
@@ -1340,7 +1356,7 @@ class RollingTrainer:
                     float(nll_sum / nll_mask.sum()) if self.validation_values else None
                 )
                 result["nll_observed_cells"] = int(nll_mask.sum()) if self.validation_values else 0
-                result["backend"] = self.config.validation_backend
+                result["backend"] = backend
         finally:
             for module, flag in flags:
                 module.training = flag
@@ -1468,7 +1484,10 @@ class RollingTrainer:
             if c.selection_metric == "auto"
             else c.selection_metric
         )
-        use_hierarchy_metric = metric_name == "wrmsse"
+        study = (None if contract.fixed_validation is None else contract.fixed_validation.study)
+        if study is not None:
+            metric_name = study.metric
+        use_hierarchy_metric = metric_name == "wrmsse" and study is None
         hierarchy_weighting = (
             ("revenue" if data.price.shape[1] else "uniform")
             if c.hierarchy_weighting == "auto"

@@ -89,12 +89,13 @@ def test_sampler_replay_rejects_producer_impossible_journal(tamper):
         rolling_training.replay_sampler_journal(changed, **kwargs)
 
 
-def test_uniform_hierarchy_validation_ledger_can_resume():
+@pytest.mark.parametrize("metric", ["rmse", "mae", "wape", "wrmsse", "uniform_hierarchy_rmsse"])
+def test_validation_ledger_can_resume_with_the_selected_metric(metric):
     verify_validation_ledger(
         [{"update": 1, "covered_series": 2, "trainable_series": 2,
           "evaluated": True}],
-        [{"update": 1, "mean_uniform_hierarchy_rmsse": 0.25}],
-        metric="uniform_hierarchy_rmsse", validation_interval_updates=1,
+        [{"update": 1, f"mean_{metric}": 0.25}],
+        metric=metric, validation_interval_updates=1,
         budget_updates=2, last_update=1, trainable_series=2,
     )
 
@@ -159,7 +160,10 @@ def test_feature_state_callbacks_must_be_paired(revision_data):
 
 
 @pytest.mark.parametrize("precision", ["32-true", "16-mixed"])
-def test_shared_trainer_exposes_model_agnostic_training_and_validation_regions(precision):
+@pytest.mark.parametrize("study_metric", [None, "wrmsse"])
+def test_shared_trainer_exposes_model_agnostic_training_and_validation_regions(
+    precision, study_metric,
+):
     class SpyProfiler:
         def __init__(self):
             self.begun = []
@@ -202,6 +206,21 @@ def test_shared_trainer_exposes_model_agnostic_training_and_validation_regions(p
         np.ones((2, 2), dtype=np.float32),
         np.ones((2, 2), dtype=bool),
     )
+    study = None
+    if study_metric is not None:
+        from autoforecast.study_validation import StudyValidation
+
+        study = StudyValidation(
+            json.dumps({
+                "study_id": "b" * 64,
+                "boundary": f"validation/{data.cutoff.isoformat()}/2/D",
+                "metric_policy": {"metric": "wrmsse", "actual_missing": "mask"},
+            }), "a" * 64, data.series_ids,
+            np.array([[1.0, 0.0], [2.0, 4.0]]),
+            np.array([[True, False], [True, True]]),
+            np.array([1.0, 3.0]), np.array([1.0, 4.0]),
+        )
+        holdout = ValidationWindow.from_study(data.cutoff.isoformat(), study)
     config = small_config(
         "v2",
         encoder_days=7,
@@ -270,7 +289,15 @@ def test_shared_trainer_exposes_model_agnostic_training_and_validation_regions(p
     profiler = SpyProfiler()
     trainer.performance_profiler = profiler
     records = []
-    _, summary = trainer.fit(records.append)
+    model, summary = trainer.fit(records.append)
+    if study is not None:
+        with torch.no_grad():
+            expected = study.score(model(torch.ones(2)).double().numpy())
+        assert summary["selection_metric"] == "wrmsse"
+        assert summary["training_contract"]["study_evaluation"] == study.as_record()
+        assert summary["validation"][0]["mean_wrmsse"] == pytest.approx(expected["wrmsse"])
+        validation = next(record["validation"] for record in records if "validation" in record)
+        assert validation[data.cutoff.isoformat()]["observed_cells"] == 3
     if precision == "16-mixed":
         assert summary["precision"] == "16-mixed"
         assert summary["selected_updates"] == summary["steps_per_epoch"]
@@ -1005,14 +1032,30 @@ def test_fixed_holdout_resume_rejects_forged_sampler_rng(
     assert not (root / "recovery").exists()
 
 
+@pytest.mark.parametrize("study_metric", [None, "mae", "wape"])
 def test_fixed_holdout_resume_uses_nondefault_validation_cadence(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, study_metric,
 ) -> None:
     configure_training_runtime("cpu", 1)
     def make():
-        return _coverage_delayed_fixed_trainer(
+        trainer = _coverage_delayed_fixed_trainer(
             two_steps_per_epoch=True, validation_every_epochs=2,
         )
+        if study_metric is not None:
+            from autoforecast.study_validation import StudyValidation
+
+            origin = trainer.data.cutoff.isoformat()
+            study = StudyValidation(
+                json.dumps({"study_id": "b" * 64, "boundary": f"validation/{origin}/2/D",
+                            "metric_policy": {"metric": study_metric, "actual_missing": "mask"}}),
+                "a" * 64, trainer.data.series_ids,
+                np.array([[1.0, 0.0], [2.0, 4.0]]),
+                np.array([[True, False], [True, True]]),
+            )
+            trainer.training_contract = RollingTrainingContract(
+                mode="fixed_validation", fixed_validation=ValidationWindow.from_study(origin, study),
+            )
+        return trainer
     control_model, control = make().fit(lambda _: None)
     root = tmp_path / "nondefault-cadence"
     original_save = TrainingRun.save
@@ -1034,6 +1077,7 @@ def test_fixed_holdout_resume_uses_nondefault_validation_cadence(
         resumed_model, resumed = make().fit(run.log, run=run)
     assert resumed["validation"] == control["validation"]
     assert resumed["validation_slots"] == control["validation_slots"]
+    assert resumed["selection_metric"] == (study_metric or "rmse")
     equal(control_model.state_dict(), resumed_model.state_dict())
 
 

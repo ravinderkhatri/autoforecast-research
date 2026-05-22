@@ -7,6 +7,7 @@ test targets during selection.
 
 from __future__ import annotations
 
+import hashlib
 import pathlib
 import shutil
 from dataclasses import dataclass, field
@@ -63,6 +64,7 @@ def _require_exact_validation_population(
     metric: str,
     validation_series: int,
     horizon: int,
+    fixed_contract: dict | None = None,
 ) -> dict[str, object]:
     """Return the score only when every trial is evaluated on the same frozen grid."""
     candidates = comparison.get("candidates")
@@ -94,7 +96,26 @@ def _require_exact_validation_population(
         and _same_int(ranking_record.get("n_common_cells"), expected_cells)
         and ranking_record.get("order") == [model_id]
     )
-    if metric == "wrmsse":
+    if fixed_contract is not None:
+        from autoforecast.study_scoring import verify_study_evaluation
+
+        _, study = verify_study_evaluation(fixed_contract)
+        counts = fixed_contract["coverage"]["counts"]
+        exact = exact and (
+            comparison.get("comparison_kind") == "fixed_benchmark"
+            and comparison.get("evaluation_contract") == fixed_contract
+            and fixed_contract["boundary"].startswith("tuning/")
+            and study["cohort_series_count"] == validation_series
+            and fixed_contract["metric_policy"]["metric"] == metric
+            and score.get("metric_definition") == fixed_contract["metric_policy"]
+            and score.get("coverage") == counts
+            and _same_int(counts["expected"], expected_cells)
+            and _same_int(score.get("n_scored"), counts["scored"])
+            and _same_int(score.get("n_dropped_ineligible"), 0)
+            and _same_int(score.get("n_dropped_no_data"), counts["excluded"])
+            and _same_int(score.get("n_zero_filled"), counts["zero_filled"])
+        )
+    elif metric == "wrmsse":
         scored_by_level = score.get("n_series_scored")
         dropped_by_level = score.get("n_series_dropped")
         exact = exact and (
@@ -166,6 +187,8 @@ class ForecastTrialBridge:
     evaluation_data_fingerprint: str | None = None
     source_data_path: pathlib.Path = field(kw_only=True)
     source_data_fingerprint: str = field(kw_only=True)
+    evaluation_contract_path: pathlib.Path | None = None
+    evaluation_contract_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("epochs", "timeout_seconds", "patience", "batch_size"):
@@ -221,6 +244,23 @@ class ForecastTrialBridge:
             or set(self.source_data_fingerprint) - set("0123456789abcdef")
         ):
             raise HPOError("builtin HPO requires a source data path and fingerprint")
+        if (self.evaluation_contract_path is None) != (self.evaluation_contract_sha256 is None):
+            raise HPOError("HPO study evaluation requires both path and digest")
+
+    def _evaluation_contract(self) -> dict | None:
+        if self.evaluation_contract_path is None:
+            return None
+        from autoforecast._exact_json import loads_exact_json
+        from autoforecast.study_scoring import verify_study_evaluation
+
+        raw = self.evaluation_contract_path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != self.evaluation_contract_sha256:
+            raise HPOError("HPO study evaluation contract changed")
+        contract = loads_exact_json(raw)
+        if type(contract) is not dict:
+            raise HPOError("HPO study evaluation contract must be an object")
+        verify_study_evaluation(contract)
+        return contract
 
     def _request(self, study: HPOStudySpec) -> RunRequest:
         request = load_run_request(self.request_path)
@@ -236,9 +276,10 @@ class ForecastTrialBridge:
             raise HPOError("study validation target range is invalid")
         try:
             contract = load_dataset_contract(self.project_root / request.dataset_contract)
-            if contract.required_series_count is not None:
+            fixed = self._evaluation_contract()
+            if (contract.required_series_count is None) != (fixed is None):
                 raise HPOError(
-                    "shared-study inner HPO windows are not frozen; use standalone HPO"
+                    "shared-study HPO requires an authenticated frozen tuning window"
                 )
             cadence = parse_frequency(str(contract.panel_roles.get("frequency", "D")))
             definition = descriptor(study.tuning.adapter)
@@ -253,6 +294,14 @@ class ForecastTrialBridge:
             start, end = (parse_origin(item, cadence) for item in target_range)
             origin = parse_origin(request.origin, cadence)
             expected = period_points(origin, cadence, request.horizon)
+            if fixed is not None and (
+                fixed["boundary"] != f"tuning/{request.origin}/{request.horizon}/{cadence.code}"
+                or fixed["metric_policy"]["metric"] != request.evaluation.metric
+                or fixed["actuals"]["sha256"] != self.source_data_fingerprint
+                or contract.required_series_count != study.data["training_series"]
+                or contract.required_series_count != study.data["validation_series"]
+            ):
+                raise HPOError("HPO evaluation differs from its frozen study boundary")
         except HPOError:
             raise
         except (DatasetContractError, FrequencyError, PanelError, ValueError) as error:
@@ -265,6 +314,7 @@ class ForecastTrialBridge:
 
     def __call__(self, request: TrialRequest) -> TrialOutcome:
         run_definition = self._request(request.study)
+        fixed = self._evaluation_contract()
         candidate = self.candidate
         if candidate is None:
             raise HPOError("builtin HPO execution requires a frozen model candidate")
@@ -358,6 +408,11 @@ class ForecastTrialBridge:
             # A study can execute many trials. Its caller may emit one study-level notice, but
             # a trial must never produce a Slack/email burst by inheriting the ordinary CLI sink.
             notifications_enabled=False,
+            **({
+                "training_mode": "fixed_validation",
+                "evaluation_contract_path": self.evaluation_contract_path,
+                "evaluation_contract_sha256": self.evaluation_contract_sha256,
+            } if fixed is not None else {}),
         )
         runs = _published_run_groups(output_root)
         if exit_code != 0 or len(runs) != 1:
@@ -440,6 +495,7 @@ class ForecastTrialBridge:
             metric=metric,
             validation_series=validation_series,
             horizon=run_definition.horizon,
+            fixed_contract=fixed,
         )
         objective = _objective_value(score, metric)
         request.attempt.write_json(
@@ -453,6 +509,11 @@ class ForecastTrialBridge:
                 "validation_data_fingerprint": observed_validation_fingerprint,
                 "source_data_fingerprint": declared["fingerprint"],
                 "test_metrics": "not_evaluated",
+                **({"study_evaluation": {
+                    "study_id": fixed["study_id"], "boundary": fixed["boundary"],
+                    "evaluation_contract_sha256": self.evaluation_contract_sha256,
+                    "metric_policy": fixed["metric_policy"],
+                }} if fixed is not None else {}),
             },
         )
         return TrialOutcome(objective, {f"validation/{metric}": objective})

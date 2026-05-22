@@ -1,4 +1,4 @@
-"""Naming boundaries: public identity, loss routing, and saved Python import paths."""
+"""Naming boundaries: public identity, loss routing, and current Python import paths."""
 
 import importlib
 
@@ -49,15 +49,10 @@ def test_tft_named_variants(name, loss, width, monkeypatch):
         registry._reset_for_test()
 
 
-@pytest.mark.parametrize(("old_module", "new_module", "old_type", "new_type"), [
-    ("forecast.models.multibranch_hurdle_nb.v2", "forecast.models.mft.sft", "V2Model", "SFTModel"),
-    ("forecast.models.multibranch_hurdle_nb.v3", "forecast.models.mft.hmfnet", "V3Model", "HMFNetModel"),
-    ("forecast.models.multibranch_hurdle_nb.v5", "forecast.models.mft.pact", "V5Model", "PACTModel"),
-    ("autoforecast.v3_features", "autoforecast.hmfnet_features", "V3Config", "HMFNetConfig"),
-    ("autoforecast.v5_features", "autoforecast.pact_features", "V5Config", "PACTConfig"),
+@pytest.mark.parametrize(("module", "model"), [
+    ("forecast.models.mft.sft", "SFTModel"),
+    ("forecast.models.mft.hmfnet", "HMFNetModel"),
+    ("forecast.models.mft.pact", "PACTModel"),
 ])
-def test_saved_model_imports_resolve_to_same_types(old_module, new_module, old_type, new_type):
-    legacy = importlib.import_module(old_module)
-    current = importlib.import_module(new_module)
-    assert legacy is current
-    assert getattr(legacy, old_type) is getattr(current, new_type)
+def test_current_model_types_import_without_compatibility_modules(module, model):
+    assert getattr(importlib.import_module(module), model).__module__ == module

@@ -39,8 +39,10 @@
     "autoforecast/tabular.py",
     "scripts/verify_public_release.py",
     "autoforecast/study_scoring.py",
+    "autoforecast/study_validation.py",
     "autoforecast/rescore.py",
     "scripts/verify_study_release.py",
+    "scripts/verify_native_study_release.py",
     "provenance/lineage.py",
     "autoforecast/score_spark.py"
   ]

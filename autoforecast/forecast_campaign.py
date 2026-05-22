@@ -989,15 +989,13 @@ def _campaign_hpo_study(
     if source.study_config is None:
         raise ForecastCampaignError("HPO parameter mode requires a study config")
     study_path = _source_path(source.study_config, "HPO study config")
-    tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", study_path.relative_to(_root()).as_posix()],
-        cwd=_root(),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if tracked.returncode != 0:
-        raise ForecastCampaignError("HPO study config must be committed source input")
+    if not installed_mode():
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", study_path.relative_to(_root()).as_posix()],
+            cwd=_root(), capture_output=True, text=True, check=False,
+        )
+        if tracked.returncode != 0:
+            raise ForecastCampaignError("HPO study config must be committed source input")
     try:
         study = load_hpo_study(study_path, project_root=_root())
     except (HPOError, ValueError) as error:
@@ -1040,6 +1038,41 @@ def _study_record(study: HPOStudySpec) -> dict[str, object]:
         "path": study.source_path.relative_to(_root()).as_posix(),
         "sha256": study.source_sha256,
         "max_trials": study.max_trials,
+    }
+
+
+def _hpo_study_evaluation(study: HPOStudySpec, benchmark: dict, metric: str) -> dict:
+    """Require the inner HPO window to be an authenticated, pre-frozen study boundary."""
+    from autoforecast.benchmark import _evaluation_contract_from_record, verify_benchmark
+
+    path, record = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+    cadence = parse_frequency(record["recipe"].get("frequency", "D"))
+    start, end = (parse_origin(value, cadence)
+                  for value in cast(list[str], study.data["validation_target_date_range"]))
+    origin = advance(start, cadence, -1)
+    horizon = _period_span(start, end, cadence, "HPO validation target range") + 1
+    if {"origin": canonical_origin(origin, cadence), "horizon": horizon} not in (
+        record["recipe"].get("tuning_windows", [])
+    ):
+        raise ForecastCampaignError("HPO requires a tuning window frozen in the shared study")
+    if (study.data["training_series"] != record["cohort_series_count"]
+            or study.data["validation_series"] != record["cohort_series_count"]
+            or study.data["training_date_range"] != [
+                record["recipe"]["training_start"], canonical_origin(origin, cadence),
+            ]):
+        raise ForecastCampaignError("HPO training history or population differs from the study")
+    return _evaluation_contract_from_record(
+        path, record, stage="tuning", origin=canonical_origin(origin, cadence),
+        horizon=horizon, metric=metric,
+    )
+
+
+def _study_selection_identity(fixed: dict) -> dict[str, object]:
+    """Bind the exact contract sent to a native trainer or HPO worker."""
+    return {
+        "study_id": fixed["study_id"], "boundary": fixed["boundary"],
+        "evaluation_contract_sha256": _sha_bytes(_json(fixed).encode()),
+        "metric_policy": fixed["metric_policy"],
     }
 
 
@@ -1131,6 +1164,8 @@ def _parameter_profiles(
     frequency: str,
     dataset_contract_sha256: str,
     features: dict[str, object] | None,
+    benchmark: dict | None = None,
+    library: dict | None = None,
 ) -> list[dict[str, object]]:
     expected_protocol = {
         "metric": request.metric,
@@ -1146,6 +1181,7 @@ def _parameter_profiles(
         "gradient_microbatch_size": request.compute.gradient_microbatch_size,
         "early_stopping_absolute_min_delta": request.validation_budget.absolute_min_delta,
         "early_stopping_relative_min_delta": request.validation_budget.relative_min_delta,
+        **({"library": library} if library is not None else {}),
     }
     profiles: list[dict[str, object]] = []
     for index, (model_id, source) in enumerate(
@@ -1175,6 +1211,9 @@ def _parameter_profiles(
                     frequency=frequency,
                 )
                 study_record = _study_record(study)
+                if benchmark is not None:
+                    fixed = _hpo_study_evaluation(study, benchmark, request.metric)
+                    candidate_protocol["study_evaluation"] = _study_selection_identity(fixed)
                 if source.mode == "tune":
                     resolution = None
                     tune_stage = f"t{index:02d}"
@@ -1267,13 +1306,6 @@ def compile_forecast_campaign(
             raise ForecastCampaignError("dataset contract differs from the frozen benchmark")
     study = benchmark is not None and benchmark["schema"] == STUDY_SCHEMA
     hierarchy_wrmsse = request.metric == "wrmsse" and not study
-    if study and any(
-        source.mode not in {"defaults", "manual"} for source in request.parameter_sources
-    ):
-        raise ForecastCampaignError(
-            "shared studies require defaults or manual fixed parameters: inner HPO windows "
-            "and reused HPO selections are not frozen in this study contract"
-        )
     template_path = (
         None if request.template is None else _source_path(request.template, "run template")
     )
@@ -1360,8 +1392,7 @@ def compile_forecast_campaign(
         for model_id in request.model_ids:
             if not descriptor(candidates[model_id].adapter).supports_shared_studies:
                 raise ForecastCampaignError(
-                    f"campaign model {model_id!r} does not support shared studies; "
-                    "native checkpoint selection is supported only in standalone campaigns"
+                    f"campaign model {model_id!r} does not support shared studies"
                 )
     unsupported = sorted(
         model_id
@@ -1384,7 +1415,7 @@ def compile_forecast_campaign(
             candidates[model_id].adapter in _FIXED_BUDGET_ADAPTERS
             for model_id in request.model_ids
         )
-        and request.metric not in {"rmse", "wrmsse"}
+        and not study and request.metric not in {"rmse", "wrmsse"}
     ):
         raise ForecastCampaignError(
             "fixed-budget benchmark selection requires RMSE or WRMSSE"
@@ -1545,6 +1576,10 @@ def compile_forecast_campaign(
         frequency=cadence.code,
         dataset_contract_sha256=contract_sha256,
         features=template_features,
+        benchmark=(
+            {"path": str(benchmark_path), "sha256": benchmark_sha256} if study else None
+        ),
+        library=cast(dict | None, source.get("library")),
     )
     capability: list[dict[str, object]] = []
     children: list[dict[str, object]] = []
@@ -1729,6 +1764,9 @@ def compile_forecast_campaign(
             raise ForecastCampaignError("campaign inputs differ from frozen benchmark")
         contracts = {}
         boundaries = [
+            ("tuning", window["origin"], window["horizon"])
+            for window in recipe.get("tuning_windows", [])
+        ] + [
             ("validation", o.isoformat(), request.validation_horizon)
             for o in request.validation_origins
         ] + [("test", request.final_train_cutoff.isoformat(), request.final_test_horizon)]
@@ -1844,7 +1882,8 @@ def compile_forecast_campaign(
                     "parameter-resolution.json",
                     "hpo",
                     "hpo-training-panel",
-                    "hpo-validation-panel",
+                    ("evaluation-contract.json"
+                     if "study_id" in resolved else "hpo-validation-panel"),
                     "hpo-run-request.yaml",
                 ],
                 resources_record=request.compute.resources(),
@@ -2331,6 +2370,7 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
         "gradient_microbatch_size": compute["gradient_microbatch_size"],
         "early_stopping_absolute_min_delta": validation_budget["early_stopping_absolute_min_delta"],
         "early_stopping_relative_min_delta": validation_budget["early_stopping_relative_min_delta"],
+        **({"library": source["library"]} if "library" in source else {}),
     }
     profile_ids: list[str] = []
     for index, raw in enumerate(profiles):
@@ -2401,6 +2441,11 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
             )
             if not _same_exact(study_record, _study_record(study)):
                 raise ForecastCampaignError("resolved HPO study identity changed")
+            if "study_id" in resolved:
+                fixed = _hpo_study_evaluation(
+                    study, cast(dict, resolved["benchmark"]), cast(str, selection["metric"]),
+                )
+                candidate_protocol["study_evaluation"] = _study_selection_identity(fixed)
         elif study_value is not None:
             raise ForecastCampaignError("non-HPO parameter mode has inactive study fields")
         resolution = profile["resolution"]
@@ -2420,6 +2465,10 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
                 )
                 if cast(dict[str, object], validated["source"])["kind"] != mode:
                     raise ForecastCampaignError("parameter resolution mode differs")
+                if mode == "reuse_selection" and not _same_exact(
+                    cast(dict, validated["source"])["protocol"], candidate_protocol,
+                ):
+                    raise ForecastCampaignError("reused HPO protocol differs from the campaign")
                 validated_resolution = validated
         except ParameterSourceError as error:
             raise ForecastCampaignError(
@@ -2811,6 +2860,11 @@ def _child_parameter_resolution(
             or record_source["study_config_sha256"] != study["sha256"]
         ):
             raise ForecastCampaignError("tuned parameters differ from the configured study")
+        _, observed_spec = _variant_spec_identity(
+            candidate, "tune", None, study, cast(dict, record_source["protocol"]),
+        )
+        if observed_spec != profile["variant_spec_sha256"]:
+            raise ForecastCampaignError("tuned HPO protocol differs from the frozen campaign")
         return record
     return _validated_parameter_record(
         profile["resolution"], candidate, expected_mode=profile["mode"]
@@ -2888,6 +2942,16 @@ def run_tune_parameters(
     start, end = (parse_origin(value, cadence) for value in target)
     horizon = _period_span(start, end, cadence, "HPO validation target range") + 1
     origin = advance(start, cadence, -1)
+    fixed = (
+        _hpo_study_evaluation(
+            study, cast(dict, resolved["benchmark"]),
+            cast(str, cast(dict, resolved["selection"])["metric"]),
+        ) if "study_id" in resolved else None
+    )
+    evaluation_contract_path = None
+    if fixed is not None:
+        evaluation_contract_path = attempt_dir / "evaluation-contract.json"
+        evaluation_contract_path.write_text(_json(fixed))
     request_path = attempt_dir / "hpo-run-request.yaml"
     _write_hpo_request(request_path, resolved, model_id=model_id, origin=origin, horizon=horizon)
     data_record = cast(dict[str, object], cast(dict[str, object], resolved["data"])["selection"])
@@ -2947,18 +3011,17 @@ def run_tune_parameters(
             str, cast(dict[str, object], resolved["source"])["dataset_contract_sha256"],
         ),
     )
-    validation_path = attempt_dir / "hpo-validation-panel"
-    validation_fingerprint = _materialize_panel_range(
-        data_path,
-        validation_path,
-        contract_path=contract_path,
-        # Point metrics use only target dates, but WRMSSE also needs pre-origin demand history
-        # for scale and revenue weights. This panel remains evaluation-only and ends at the
-        # validation target boundary, so final/test labels are still physically absent.
-        start=declared_validation_history[0],
-        end=target[1],
-        expected_source_sha256=cast(str, data_record["sha256"]),
-    )
+    if fixed is not None:
+        validation_path = pathlib.Path(fixed["actuals"]["path"])
+        validation_fingerprint = fixed["actuals"]["sha256"]
+    else:
+        validation_path = attempt_dir / "hpo-validation-panel"
+        validation_fingerprint = _materialize_panel_range(
+            data_path, validation_path, contract_path=contract_path,
+            # Standalone M5 scoring needs pre-origin history for scale and revenue weights.
+            start=declared_validation_history[0], end=target[1],
+            expected_source_sha256=cast(str, data_record["sha256"]),
+        )
     budget = cast(dict[str, object], cast(dict[str, object], resolved["budgets"])["validation"])
     compute = cast(dict[str, object], resolved["compute"])
     # The bridge names study-owned slices with the study label; their fingerprints remain proof.
@@ -2993,6 +3056,10 @@ def run_tune_parameters(
         evaluation_data_fingerprint=validation_fingerprint,
         source_data_path=data_path,
         source_data_fingerprint=cast(str, data_record["sha256"]),
+        evaluation_contract_path=evaluation_contract_path,
+        evaluation_contract_sha256=(
+            _sha_file(evaluation_contract_path) if evaluation_contract_path is not None else None
+        ),
     )
     hpo_root = attempt_dir / "hpo"
     tracking_uri = (
@@ -3040,6 +3107,10 @@ def run_tune_parameters(
                 "precision": effective_precision(
                     candidate.adapter, cast(str, compute["precision"])
                 ),
+                **({"study_evaluation": _study_selection_identity(fixed)}
+                   if fixed is not None else {}),
+                **({"library": cast(dict, resolved["source"])["library"]}
+                   if "library" in cast(dict, resolved["source"]) else {}),
             },
         )
     except (HPOError, ParameterSourceError, ValueError) as error:
@@ -3832,6 +3903,12 @@ def _selected_update_budget(
         )
         series_count = record.get("n_series") if type(record) is dict else None
         examples = series_count
+        study_selection = contract.get("study_evaluation") is not None
+        metric_policy = (
+            contract["study_evaluation"].get("metric_policy")
+            if type(contract.get("study_evaluation")) is dict else None
+        )
+        study_metric = metric_policy.get("metric") if type(metric_policy) is dict else None
         if (
             type(batch_size) is not int
             or batch_size < 1
@@ -3847,8 +3924,20 @@ def _selected_update_budget(
             or (not is_finite_real(training.get("early_stopping_min_delta")))
             or (training.get("early_stopping_min_delta") != absolute_delta)
             or (relative_delta != 0)
-            or (expected_metric is not None and expected_metric != "wrmsse")
+            or (
+                not study_selection
+                and expected_metric is not None
+                and (expected_metric != "wrmsse")
+            )
             or (expected_loss_kind not in {"quantile", "v3_hurdle_nb"})
+            or (
+                study_selection
+                and (
+                    study_metric not in {"rmse", "mae", "wape", "wrmsse"}
+                    or training.get("selection_metric") != study_metric
+                    or (expected_metric is not None and study_metric != expected_metric)
+                )
+            )
             or (not _same_exact(training.get("validation"), training.get("epoch_log")))
         ):
             raise ForecastCampaignError(
@@ -3858,23 +3947,31 @@ def _selected_update_budget(
         epochs: list[int] = []
         updates: list[int] = []
         scores: list[torch.Tensor] = []
-        loss_dtype = torch.float32 if expected_loss_kind == "quantile" else torch.float64
+        loss_dtype = (
+            torch.float32 if not study_selection and expected_loss_kind == "quantile"
+            else torch.float64
+        )
+        score_key = "study_score" if study_selection else "val_loss"
+        dtype_key = f"{score_key}_dtype"
         for row in validation:
             if (
                 type(row) is not dict
                 or type(row.get("epoch")) is not int
                 or type(row.get("updates")) is not int
-                or type(row.get("val_loss")) is not float
-                or not is_finite_real(row.get("val_loss"))
-                or row["val_loss"] < 0
-                or type(row.get("val_loss_dtype")) is not str
-                or row["val_loss_dtype"] != str(loss_dtype)
+                or type(row.get(score_key)) is not float
+                or not is_finite_real(row.get(score_key))
+                or row[score_key] < 0
+                or type(row.get(dtype_key)) is not str
+                or row[dtype_key] != str(loss_dtype)
+                or (study_selection and (
+                    row.get("val_loss") is not None or row.get("val_loss_dtype") is not None
+                ))
             ):
                 raise ForecastCampaignError(
                     "TFT-Q/TFT-HNB selection validation history is invalid"
                 )
-            typed_loss = torch.tensor(row["val_loss"], dtype=loss_dtype)
-            if not bool(torch.isfinite(typed_loss)) or float(typed_loss) != row["val_loss"]:
+            typed_loss = torch.tensor(row[score_key], dtype=loss_dtype)
+            if not bool(torch.isfinite(typed_loss)) or float(typed_loss) != row[score_key]:
                 raise ForecastCampaignError(
                     "TFT-Q/TFT-HNB validation loss is not representable"
                 )
@@ -3915,10 +4012,16 @@ def _selected_update_budget(
         validation_every = config.get("validation_every_epochs") if type(config) is dict else None
         if (
             type(metric) is not str
-            or metric not in {"rmse", "wrmsse"}
+            or metric not in (
+                {"rmse", "mae", "wape", "wrmsse"}
+                if contract.get("study_evaluation") is not None else {"rmse", "wrmsse"}
+            )
             or (expected_metric is not None and metric != expected_metric)
             or type(config) is not dict
-            or config.get("selection_metric") not in (metric, "auto")
+            or config.get("selection_metric") not in (
+                {"auto", "rmse", "wrmsse"}
+                if contract.get("study_evaluation") is not None else {metric, "auto"}
+            )
             or type(config.get("patience")) is not int
             or config.get("patience") != patience
             or not is_finite_real(config.get("early_stopping_absolute_min_delta"))
@@ -4173,6 +4276,19 @@ def _verify_revision_checkpoint_binding(
         "rolling_backtest" if resolved.get("purpose") == "capacity_diagnostic"
         else "fixed_validation" if child["kind"] == "validation" else "fixed_refit"
     )
+    expected_study = None
+    if "study_id" in resolved and mode == "fixed_validation":
+        fixed = _fixed_evaluation(
+            resolved, "validation", cast(str, child["origin"]), cast(int, child["horizon"]),
+        )
+        assert fixed is not None
+        expected_study = _study_selection_identity(fixed)
+    training_contract = training.get("training_contract")
+    observed_study = (
+        training_contract.get("study_evaluation") if type(training_contract) is dict else None
+    )
+    if not _same_exact(observed_study, expected_study):
+        raise ForecastCampaignError("native checkpoint study selection evidence differs")
     if child["adapter"] in _ROLLING_BUDGET_ADAPTERS:
         from autoforecast.model_execution import (
             REVISION_MODEL_PARAMETERS,
@@ -4269,6 +4385,7 @@ def _verify_revision_checkpoint_binding(
         "loss_kind": loss_kind, "precision": precision, "training_mode": mode,
         "fixed_update_budget": fixed_budget, "max_epochs": budget["maximum_epochs"],
         "panel_sha256": training_digest,
+        **({"study_evaluation": expected_study} if expected_study is not None else {}),
     }
     profile = {
         "variant": LOSS_VARIANTS[loss_kind], "loss_kind": loss_kind,
@@ -5045,10 +5162,11 @@ def _locked_selected_update_budget(
     expected_metric = selection.get("metric") if type(selection) is dict else None
     if type(expected_metric) is not str:
         raise ForecastCampaignError("fixed-budget selection metric is missing")
-    # MAE/WAPE rank the externally scored candidates; the rolling trainer still
-    # selects its optimizer frontier on RMSE when no RMSE/WRMSSE metric was requested.
+    # Shared studies select the optimizer frontier using their frozen metric.
+    # Standalone MAE/WAPE ranking retains the rolling trainer's RMSE frontier.
     rolling_frontier_metric = (
-        expected_metric if expected_metric in {"rmse", "wrmsse"} else "rmse"
+        expected_metric
+        if "study_id" in resolved or expected_metric in {"rmse", "wrmsse"} else "rmse"
     )
     compute = resolved.get("compute")
     batch_size = compute.get("batch_size") if type(compute) is dict else None

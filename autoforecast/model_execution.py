@@ -347,23 +347,12 @@ def resolve_revision_rolling_config(
     if type(raw) is not dict:
         raise ExecutionPlanError("revision implementation config must be one JSON object")
     expected_variant = REVISION_VARIANTS[candidate.adapter]
-    legacy_fields = ROLLING_CONFIG_FIELDS - {"v5", "series_loss_weighting"}
-    legacy_pact_fields = ROLLING_CONFIG_FIELDS - {"series_loss_weighting"}
-    if set(raw) != ROLLING_CONFIG_FIELDS and not (
-        expected_variant != "v5" and set(raw) == legacy_fields
-        or expected_variant == "v5" and set(raw) == legacy_pact_fields
-    ):
+    if set(raw) != ROLLING_CONFIG_FIELDS:
         raise ExecutionPlanError(
             "revision implementation config must fully serialize RollingConfig; "
             f"missing={sorted(ROLLING_CONFIG_FIELDS - set(raw))}, "
             f"extra={sorted(set(raw) - ROLLING_CONFIG_FIELDS)}"
         )
-    if "v5" not in raw or "series_loss_weighting" not in raw:
-        raw = {
-            **raw,
-            "v5": raw.get("v5"),
-            "series_loss_weighting": raw.get("series_loss_weighting", "uniform"),
-        }
     if raw.get("variant") != expected_variant:
         raise ExecutionPlanError("revision implementation config and adapter variant disagree")
     integer_fields = set(model) - {"demand_dropout", "covariate_dropout"}

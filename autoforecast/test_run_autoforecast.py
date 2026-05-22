@@ -706,11 +706,19 @@ selection_lock:
     "sft", "hmfnet", "pact", "tft_q", "tft_hnb",
 ])
 @pytest.mark.parametrize("metric,policy", [("wrmsse", "zero"), ("rmse", "zero"), ("rmse", "mask")])
-def test_shared_study_refuses_native_checkpoint_adapters_before_runtime(
+def test_shared_study_refuses_an_adapter_without_declared_support_before_runtime(
     tmp_path, monkeypatch, adapter, metric, policy,
 ):
     candidates = discover_candidates(runner.ROOT / "configs/models")
     candidate = next(item for item in candidates if item.adapter == adapter)
+    from autoforecast import adapter_contracts
+    original_descriptor = adapter_contracts.descriptor
+    assert original_descriptor(adapter).supports_shared_studies
+    monkeypatch.setattr(
+        adapter_contracts, "descriptor", lambda name: dataclasses.replace(
+            original_descriptor(name), supports_shared_studies=False,
+        ),
+    )
     request_path = runner.ROOT / "configs/autoforecast/m5_tft_q_reference_smoke.yaml"
     request = dataclasses.replace(runner.load_run_request(request_path),
                                   models=(candidate.id,), evaluation=None)

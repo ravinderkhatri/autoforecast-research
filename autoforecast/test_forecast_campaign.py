@@ -4318,3 +4318,118 @@ def test_revision_checkpoint_is_parsed_from_its_hashed_read(
     })
     assert training["selected_updates"] == 1
     assert reads == 1
+
+
+@pytest.mark.parametrize("adapter", ["sft", "hmfnet", "pact"])
+@pytest.mark.parametrize("metric", ["mae", "wape"])
+def test_shared_study_outer_lock_uses_the_frozen_metric(adapter, metric, monkeypatch):
+    """A shared-study SFT/HMFNet/PACT lock must not substitute RMSE."""
+    resolved = {
+        "purpose": "research_campaign",
+        "study_id": "a" * 64,
+        "selection": {"metric": metric},
+        "compute": {"batch_size": 2},
+    }
+    chosen = {"candidate_id": "candidate", "initialization": "fresh"}
+    results = [{
+        **chosen,
+        "adapter": adapter,
+        "model_id": adapter,
+        "selected": 1,
+        "parameter_resolution": {"effective_parameters": {}},
+    }]
+    monkeypatch.setattr(
+        subject,
+        "_campaign_candidate",
+        lambda *_: SimpleNamespace(
+            implementation_config_bytes=b'{"validation_every_epochs":1}'
+        ),
+    )
+    observed = []
+
+    def selected_budget(result, expected_metric, *_args, **_kwargs):
+        observed.append(expected_metric)
+        return result["selected"]
+
+    monkeypatch.setattr(subject, "_selected_update_budget", selected_budget)
+    monkeypatch.setattr(subject, "_governed_rolling_selection_origins", lambda *_: ("day",))
+    monkeypatch.setattr(subject, "_rolling_selection_objective_masks", lambda *_: {"day": True})
+    monkeypatch.setattr(
+        subject, "_verify_rolling_selection_journal",
+        lambda _result, metric, *_args, **_kwargs: observed.append(metric),
+    )
+
+    assert subject._locked_selected_update_budget(resolved, chosen, results) == 1
+    assert observed == [metric, metric]
+
+
+@pytest.mark.parametrize("adapter", ["sft", "hmfnet", "pact"])
+@pytest.mark.parametrize(("metric", "configured_metric"), [
+    ("rmse", "wrmsse"),
+    ("wrmsse", "rmse"),
+    ("mae", "rmse"),
+    ("mae", "wrmsse"),
+    ("wape", "rmse"),
+    ("wape", "wrmsse"),
+])
+def test_shared_study_verifier_treats_recipe_metric_as_inactive(
+    tmp_path, adapter, metric, configured_metric,
+):
+    """The authenticated study overrides, rather than rewrites, the old recipe field."""
+    checkpoint = tmp_path / "selection.pt"
+    training = {
+        "config": {
+            "epochs": 3,
+            "patience": 2,
+            "validation_every_epochs": 1,
+            "selection_metric": configured_metric,
+            "early_stopping_absolute_min_delta": 0.0,
+            "early_stopping_relative_min_delta": 0.0,
+        },
+        "epochs_per_phase": 3,
+        "steps_per_epoch": 1,
+        "selected_updates": 1,
+        "selection_metric": metric,
+        "validation_origins": ("2024-01-21",),
+        "training_contract": {
+            "mode": "fixed_validation",
+            "validation_origin": "2024-01-21",
+            "fixed_update_budget": None,
+            "study_evaluation": {
+                "study_id": "b" * 64,
+                "boundary": "validation/2024-01-21/7/D",
+                "metric_policy": {"metric": metric},
+            },
+        },
+        "validation": [
+            {"update": update, f"mean_{metric}": 1.0}
+            for update in (1, 2, 3)
+        ],
+        "validation_slots": [
+            {
+                "update": update,
+                "covered_series": 2,
+                "trainable_series": 2,
+                "evaluated": True,
+            }
+            for update in (1, 2, 3)
+        ],
+    }
+    torch.save({"training": training}, checkpoint)
+    raw = checkpoint.read_bytes()
+    result = {
+        "adapter": adapter,
+        "origin": "2024-01-21",
+        "budget": {
+            "maximum_epochs": 3,
+            "patience": 2,
+            "early_stopping_absolute_min_delta": 0.0,
+            "early_stopping_relative_min_delta": 0.0,
+        },
+        "checkpoint": {
+            "path": str(checkpoint),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        },
+    }
+
+    assert subject._selected_update_budget(result, metric) == 1

@@ -3623,6 +3623,8 @@ def fit_predict_revision(
     training_mode: str = "rolling_backtest",
     validation_panel: Panel | None = None,
     fixed_update_budget: int | None = None,
+    evaluation_contract_path: str | None = None,
+    evaluation_contract_sha256: str | None = None,
     precision: str = "32-true",
     performance_profile: dict[str, object] | None = None,
     performance_profile_dir: str | None = None,
@@ -3660,6 +3662,12 @@ def fit_predict_revision(
         raise ValueError("revision configuration must be validated before fitting")
     if precision not in ("32-true", "16-mixed"):
         raise ValueError("revision precision must be 32-true or 16-mixed")
+    if (evaluation_contract_path is None) != (evaluation_contract_sha256 is None):
+        raise ValueError("study evaluation path and digest must be supplied together")
+    if evaluation_contract_path is not None and (
+        training_mode != "fixed_validation" or validation_panel is None
+    ):
+        raise ValueError("study checkpoint selection requires a separate fixed validation panel")
     try:
         parsed_origin = dt.date.fromisoformat(origin)
     except (TypeError, ValueError) as exc:
@@ -3687,6 +3695,24 @@ def fit_predict_revision(
     if destination.exists() and not resume_training_checkpoint:
         raise ValueError("revision output already exists; use a fresh directory")
     root = pathlib.Path(__file__).resolve().parents[2]
+    from autoforecast.executable_source import (
+        SOURCE_MANIFEST_FILENAME,
+        validate_executable_source_snapshot,
+    )
+    from autoforecast.project import installed_library_identity
+
+    build_manifest = root / "autoforecast/_build.json"
+    library_identity = installed_library_identity().as_record() if build_manifest.is_file() else None
+    snapshot_manifest = root / SOURCE_MANIFEST_FILENAME
+    if snapshot_manifest.is_file():
+        snapshot = validate_executable_source_snapshot(load_exact_json(snapshot_manifest))
+        if snapshot["root"] != str(root):
+            raise ValueError("revision source snapshot belongs to a different root")
+        if snapshot["manifest"]["schema"] == "autoforecast.installed-executable-source.v1":
+            library_identity = installed_library_identity().as_record()
+            if snapshot["manifest"]["library"] != library_identity:
+                raise ValueError("revision source snapshot differs from the installed library")
+            build_manifest = snapshot_manifest
     code_directories = [root / name for name in ("autoforecast", "forecast", "spec", "provenance")]
     sources = [
         pathlib.Path(panel.path).resolve(),
@@ -3694,8 +3720,8 @@ def fit_predict_revision(
         *([pathlib.Path(calendar_path).resolve()] if calendar_path else []),
         *code_directories,
         root / "scripts/run_multibranch_revision.py",
-        root / "pyproject.toml",
-        root / "uv.lock",
+        *([build_manifest] if library_identity is not None
+          else [root / "pyproject.toml", root / "uv.lock"]),
     ]
     if any(
         destination == p or p in destination.parents or destination in p.parents for p in sources
@@ -3786,13 +3812,25 @@ def fit_predict_revision(
         features = feature_type(panel, data, config, calendar_path, data_spec)
     validation_window = None
     if validation_panel is not None:
-        validation_window = ValidationWindow.read(
-            validation_panel,
-            origin,
-            horizon,
-            data.series_ids,
-            route_lower_bound_to_exact=config.variant == "v5",
-        )
+        if evaluation_contract_path is not None:
+            from autoforecast.study_validation import StudyValidation
+
+            assert evaluation_contract_sha256 is not None
+            study = StudyValidation.read(
+                evaluation_contract_path, evaluation_contract_sha256,
+                panel=validation_panel, origin=origin, horizon=horizon, series_ids=data.series_ids,
+            )
+            validation_window = ValidationWindow.from_study(
+                origin, study, route_lower_bound_to_exact=config.variant == "v5",
+            )
+        else:
+            validation_window = ValidationWindow.read(
+                validation_panel,
+                origin,
+                horizon,
+                data.series_ids,
+                route_lower_bound_to_exact=config.variant == "v5",
+            )
         if config.variant == "v5":
             from autoforecast.pact_features import build_future_segments
 
@@ -3851,6 +3889,7 @@ def fit_predict_revision(
         training_contract=training_contract.as_record(),
         **({"precision": precision} if precision != "32-true" else {}),
         inputs=before,
+        **({"library": library_identity} if library_identity is not None else {}),
         panel=dataclasses.asdict(panel),
         series_ids=list(data.series_ids),
         levels=[list(level) for level in levels],
@@ -3888,7 +3927,10 @@ def fit_predict_revision(
             str(p): directory_digest(p, suffixes=(".py",) if p in code_directories else ())
             for p in sources
         }
-        if current != before:
+        if current != before or (
+            library_identity is not None
+            and installed_library_identity().as_record() != library_identity
+        ):
             raise ValueError("input/source changed during run; refusing checkpoint/publication")
 
     with (
@@ -4096,6 +4138,8 @@ def fit_predict_revision_adapter(
     fixed_update_budget: int | None = None,
     validation_metric: str | None = None,
     precision: str = "32-true",
+    evaluation_contract_path: str | None = None,
+    evaluation_contract_sha256: str | None = None,
 ) -> Forecast:
     """Run a registered revision while retaining native evidence in the run bundle.
 
@@ -4170,7 +4214,7 @@ def fit_predict_revision_adapter(
         if validation_data_path is None
         else replace(panel, path=str(pathlib.Path(validation_data_path).resolve()))
     )
-    if validation_metric == "wrmsse":
+    if validation_metric == "wrmsse" and evaluation_contract_path is None:
         from autoforecast.benchmarks.m5 import M5_LEVELS
 
         validation_levels = M5_LEVELS
@@ -4186,6 +4230,8 @@ def fit_predict_revision_adapter(
         training_mode=training_mode,
         validation_panel=validation_panel,
         fixed_update_budget=fixed_update_budget,
+        evaluation_contract_path=evaluation_contract_path,
+        evaluation_contract_sha256=evaluation_contract_sha256,
         precision=precision,
         performance_profile=(None if profile_config is None else profile_config.as_record()),
         performance_profile_dir=(
