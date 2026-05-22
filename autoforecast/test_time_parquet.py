@@ -9,12 +9,13 @@ import pyarrow.parquet as pq
 import pytest
 from pyspark.sql import SparkSession
 
-from autoforecast import grid, plots
+from autoforecast import forecast_campaign, grid, plots, ranking
 from autoforecast.adapters.naive import seasonal_naive
 from autoforecast.data_observability import inspect_panel
 from autoforecast.frequency import parse_frequency
 from autoforecast.panel import Forecast, ForecastError, Panel, PanelError
-from autoforecast.score_spark import score_forecast
+from autoforecast.parquet_time import ParquetTimeError, validate_parquet_time_storage
+from autoforecast.score_spark import ScoreError, score_forecast
 
 
 @pytest.fixture(scope="module")
@@ -35,6 +36,100 @@ def _write(path, values, *, unit="us", timezone=None, store_schema=True, int96=T
         pa.table({"when": pa.array(values, type=pa.timestamp(unit, tz=timezone))}),
         path, use_deprecated_int96_timestamps=int96, store_schema=store_schema,
     )
+
+
+@pytest.fixture
+def corrupt_ns_int96(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    path = source / "part.parquet"
+    values = pa.array(
+        [1_704_067_200_000_000_000 + 1_000 * index for index in range(10_000)],
+        type=pa.timestamp("ns"),
+    )
+    pq.write_table(
+        pa.table({"series_id": ["a"] * len(values), "date": values,
+                  "yhat": [1.0] * len(values)}),
+        path, use_deprecated_int96_timestamps=True, compression="gzip",
+        write_page_checksum=True,
+    )
+    with pq.ParquetFile(path) as part:
+        column = part.metadata.row_group(0).column(1)
+        start = column.dictionary_page_offset
+        if start is None or start < 0:
+            start = column.data_page_offset
+        position = start + column.total_compressed_size // 2
+    damaged = bytearray(path.read_bytes())
+    damaged[position] ^= 0xFF
+    path.write_bytes(damaged)
+    # The footer remains readable; the real compressed time page fails while scanning.
+    with pq.ParquetFile(path) as part:
+        assert part.schema.column(1).physical_type == "INT96"
+        with pytest.raises(OSError):
+            list(part.iter_batches(columns=["date"]))
+    panel = Panel(source, "series_id", "date", "yhat", frequency="H")
+    forecast = Forecast(
+        "external", source, "2024-01-01T00:00:00", len(values), 1,
+        {"emitted": len(values)}, frequency="H",
+    )
+    return panel, forecast
+
+
+def test_corrupt_ns_int96_page_uses_public_storage_error_contracts(
+    spark, tmp_path, corrupt_ns_int96,
+):
+    panel, forecast = corrupt_ns_int96
+    expected = r"could not read INT96 time column 'date'"
+    with pytest.raises(ParquetTimeError, match=expected):
+        validate_parquet_time_storage(panel.path, "date")
+    with pytest.raises(PanelError, match=expected):
+        panel.validate()
+    with pytest.raises(ForecastError, match=expected):
+        forecast.validate()
+    with pytest.raises(grid.GridError, match=expected):
+        grid.read_time_parquet(spark, panel.path, "date")
+    with pytest.raises(grid.GridError, match=expected):
+        grid.summarise(panel.path, spark, frequency="H")
+    with pytest.raises(grid.GridError, match=expected):
+        grid.agrees_with(panel.path, panel.path, spark, frequency="H")
+    common = tmp_path / "common"
+    with pytest.raises(ranking.SelectionError, match=expected):
+        ranking.common_cells([forecast], spark, common)
+    assert not common.exists()
+
+    contract = tmp_path / "hourly.yaml"
+    contract.write_text(
+        "schema_version: 1\ndataset:\n  id: corrupt-int96\n  panel:\n"
+        "    series_col: series_id\n    time_col: date\n    target_col: yhat\n"
+        "    frequency: H\n    season_length: 2\n",
+        encoding="utf-8",
+    )
+    source = Path(panel.path)
+    digest = forecast_campaign.directory_digest(source, suffixes=(".parquet",))
+    with pytest.raises(PanelError, match=expected):
+        forecast_campaign._panel_range_facts(source, contract_path=contract)  # noqa: SLF001
+    training = tmp_path / "training"
+    with pytest.raises(PanelError, match=expected):
+        forecast_campaign._materialize_training_panel(  # noqa: SLF001
+            source, training, contract_path=contract, origin=forecast.origin, horizon=1,
+            training_start=None, expected_source_sha256=digest,
+        )
+    assert not training.exists()
+    evaluation = tmp_path / "evaluation"
+    with pytest.raises(PanelError, match=expected):
+        forecast_campaign._materialize_panel_range(  # noqa: SLF001
+            source, evaluation, contract_path=contract, start=None, end=forecast.origin,
+            expected_source_sha256=digest,
+        )
+    assert not evaluation.exists()
+
+
+def test_scorer_wraps_int96_precision_scan_io_failure_as_score_error(
+    spark, corrupt_ns_int96,
+):
+    panel, forecast = corrupt_ns_int96
+    with pytest.raises(ScoreError, match=r"could not read INT96 time column 'date'"):
+        score_forecast(panel, forecast, spark, missing_actual="no_data")
 
 
 @pytest.mark.parametrize("zone", ["UTC", "Asia/Kolkata"])

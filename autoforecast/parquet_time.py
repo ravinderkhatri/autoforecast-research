@@ -130,11 +130,18 @@ def _require_microsecond_int96(
         try:
             with pq.ParquetFile(fragment, coerce_int96_timestamp_unit="ns") as part:
                 for batch in part.iter_batches(columns=[time_col], batch_size=65_536):
-                    pc.cast(batch.column(0), pa.timestamp("us"), safe=True)
-        except pa.ArrowInvalid as error:
+                    try:
+                        pc.cast(batch.column(0), pa.timestamp("us"), safe=True)
+                    except pa.ArrowInvalid as error:
+                        raise ParquetTimeError(
+                            f"INT96 time column {time_col!r} in {fragment} would lose "
+                            "sub-microsecond precision"
+                        ) from error
+        except ParquetTimeError:
+            raise
+        except (OSError, pa.ArrowException) as error:
             raise ParquetTimeError(
-                f"INT96 time column {time_col!r} in {fragment} would lose sub-microsecond "
-                "precision"
+                f"could not read INT96 time column {time_col!r} in {fragment}: {error}"
             ) from error
 
 
