@@ -795,12 +795,9 @@ def _freeze_benchmark(
                 raise BenchmarkError("prepared actuals do not cover the frozen forecast grid")
             missing_cells = cells.filter(F.col(MISSING_COLUMN))
             if recipe["actual_missing"] == "error" and missing_cells.limit(1).count():
-                examples = [row.asDict() for row in missing_cells.select(
-                    internal, panel.time_col,
-                ).limit(5).collect()]
                 raise BenchmarkError(
                     f"{key}: scoring requires complete actuals; expected={final_count * span}, "
-                    f"missing={missing_cells.count()}, examples={examples}. "
+                    f"missing={missing_cells.count()}. "
                     "Correct the source data or explicitly select actual_missing=mask."
                 )
             names = ("expected", "originally_missing", "zero_filled", "excluded", "scored")

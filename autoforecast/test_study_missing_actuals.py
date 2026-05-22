@@ -16,14 +16,14 @@ import yaml
 from autoforecast import benchmark
 from autoforecast.data_admission import load_dataset_contract
 from autoforecast.panel import Forecast
-from autoforecast.score_spark import MissingActualError, ScoreError
+from autoforecast.score_spark import MissingActualError
 from autoforecast.study_scoring import _score_study_snapshot, score_study
 from autoforecast.study_validation import StudyValidation
 
 pytest_plugins = ["autoforecast.test_study"]
 
 
-def prepare(root, spark, *, policy=None, missing="complete"):
+def prepare(root, spark, *, policy=None, missing="complete", series_b="B"):
     """Population: A and B, three dates each, six required cells; no exclusions."""
     root.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -34,7 +34,7 @@ def prepare(root, spark, *, policy=None, missing="complete"):
                                      else 6 <= day <= 8 if missing == "all" else False)
             if absent and missing != "null":
                 continue
-            rows.append({"item": sid, "day": dt.date(2026, 10, day),
+            rows.append({"item": series_b if sid == "B" else sid, "day": dt.date(2026, 10, day),
                          "units": None if absent else value})
     source = root / "observations.parquet"
     pq.write_table(pa.Table.from_pylist(rows), source)
@@ -54,7 +54,8 @@ def prepare(root, spark, *, policy=None, missing="complete"):
         recipe["actual_missing"] = policy
     refs = root / "references.parquet"
     pq.write_table(pa.Table.from_pylist([
-        {"keys": {"item": sid}, "stage": stage, "origin": origin, "weight": weight, "scale": 1.0}
+        {"keys": {"item": series_b if sid == "B" else sid}, "stage": stage,
+         "origin": origin, "weight": weight, "scale": 1.0}
         for sid, weight in (("A", 80.0), ("B", 20.0))
         for stage, origin in (("validation", "2026-10-05"), ("test", "2026-10-08"))
     ]), refs)
@@ -83,8 +84,11 @@ def scoring_inputs(manifest, root):
 
 @pytest.mark.parametrize("missing", ["absent", "null", "all"])
 def test_default_refuses_even_one_missing_actual_at_registration(tmp_path, spark, missing):
+    private_id = "private-series-identifier"
     with pytest.raises(benchmark.BenchmarkError, match="requires complete actuals") as error:
-        prepare(tmp_path, spark, missing=missing)
+        prepare(tmp_path, spark, missing=missing, series_b=private_id)
+    assert private_id not in str(error.value)
+    assert repr(dt.date(2026, 10, 7)) not in str(error.value)
     assert "expected=6" in str(error.value)
     assert f"missing={3 if missing == 'all' else 1}" in str(error.value)
     assert not list((tmp_path / "frozen").glob("*/benchmark.json"))
@@ -153,10 +157,12 @@ def test_spark_and_checkpoint_scores_preserve_missingness_and_fixed_weights(
 
 
 def test_mask_refuses_an_entirely_missing_series_without_redistributing_weight(tmp_path, spark):
-    manifest = prepare(tmp_path, spark, policy="mask", missing="all")
+    private_id = "private-series-identifier"
+    manifest = prepare(tmp_path, spark, policy="mask", missing="all", series_b=private_id)
     contract, panel, forecast = scoring_inputs(manifest, tmp_path)
-    with pytest.raises(ScoreError, match="every retained series"):
+    with pytest.raises(MissingActualError, match="every retained series") as error:
         score_study(panel, forecast, spark, contract=contract, output_dir=tmp_path / "score")
+    assert private_id not in str(error.value)
 
 
 def test_missing_policy_defaults_and_history_never_impute(tmp_path):

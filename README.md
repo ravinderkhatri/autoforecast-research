@@ -331,8 +331,8 @@ series and every tuning, validation, and test boundary:
 
 Weights and scales are supplied by the caller and frozen with the study. The score is
 `sum(weight * sqrt(MSE / scale)) / sum(weight)`. Under masking, each series' MSE uses its
-observed cells. If any retained series has no scoreable actuals or an undefined scale, WRMSSE
-is unavailable. Weights are never redistributed.
+observed cells. If any retained series has no scoreable actuals, WRMSSE raises an error.
+An undefined scale makes WRMSSE unavailable. Weights are never redistributed.
 
 The `sft`, `hmfnet`, `pact`, `tft_q`, `tft_hnb`, `timesfm_hnb`, and `timesfm_v8`
 adapters select checkpoints with the study metric, including its original missing-value mask

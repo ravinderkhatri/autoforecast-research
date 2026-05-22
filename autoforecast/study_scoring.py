@@ -153,10 +153,9 @@ def _score_study_snapshot(
         "metric_definition": policy,
     }
     if policy["metric"] == "wrmsse":
-        empty = per_series.filter(F.col("scored") == 0).select("series_id").limit(5).collect()
-        if empty:
+        if per_series.filter(F.col("scored") == 0).limit(1).count():
             raise MissingActualError(
-                f"WRMSSE requires observations for every retained series; empty={empty}"
+                "WRMSSE requires observations for every retained series"
             )
         references = spark.read.parquet(str(snapshots["references"]))
         references = references.filter(F.col("boundary") == contract["boundary"])
