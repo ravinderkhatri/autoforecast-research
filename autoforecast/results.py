@@ -12,7 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from autoforecast._exact_json import load_exact_json as _load_exact_json
-from autoforecast.benchmark import verify_benchmark
+from autoforecast.benchmark import artifact_path, verify_benchmark
 from autoforecast.campaign import CampaignStore
 from autoforecast.forecast_campaign import (
     _completed_output,
@@ -51,6 +51,7 @@ class CampaignResults:
     runs: tuple[dict, ...]
     metadata: dict
     source_keys: pa.Table | None
+    series_scores: pa.Table | None = None
 
 
 def _verified_dataset_frequency(
@@ -158,10 +159,10 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
         from autoforecast.data_admission import load_dataset_contract
 
         target = load_dataset_contract(path.parent / "dataset.yaml").panel(
-            path.parent / "selection"
+            artifact_path(path, frozen, "selection")
         )
         contract_frequency = parse_frequency(target.frequency).code
-        source_keys = pq.read_table(path.parent / "source-keys")
+        source_keys = pq.read_table(artifact_path(path, frozen, "source-keys"))
         metadata.update(
             {
                 "benchmark_id": benchmark["id"],
@@ -171,11 +172,20 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
                 "cohort_series_count": frozen["cohort_series_count"],
                 "evaluations": benchmark["evaluations"],
                 "actual_snapshots": {
-                    role: {"path": str(path.parent / role), "sha256": frozen["artifacts"][role]}
-                    for role in ("selection", "final_training", "final_score")
+                    role: {"path": str(artifact_path(path, frozen, role)),
+                           "sha256": frozen["artifacts"][role]}
+                    for role in ("selection", "final_training", "validation_score", "final_score")
+                    if role in frozen["artifacts"]
                 },
             }
         )
+        if "study_id" in frozen:
+            metadata.update(
+                study_id=frozen["study_id"], metric_contract=frozen["metric_definition"],
+                missing_policies=frozen["policies"],
+                history_starts=frozen["recipe"]["series_starts"],
+                coverage=frozen["coverage_identities"], history_counts=frozen["counts"],
+            )
     else:
         temporal = resolved.get("temporal")
         needs_contract = (
@@ -190,7 +200,7 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
             required=needs_contract,
         )
     frequency = _resolved_frequency(resolved, contract_frequency)
-    rows, runs = [], []
+    rows, runs, series_scores = [], [], []
     children = {child["id"]: child for child in resolved["children"]}
     lock = None
     lock_sha256 = None
@@ -274,6 +284,39 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
         ):
             raise ValueError("forecast artifact digest changed")
         run_id = pathlib.Path(result["run_path"]).name
+        if "study_id" in metadata:
+            comparison_path = None
+            if stage_name == "test" and "final_score" in completed:
+                comparison_path = (
+                    _completed_output(store.root, "final_score", "final-score.json").parent
+                    / "evaluation/candidate-comparison.json"
+                )
+                comparison_sha = metadata["final_score"]["comparison_sha256"]
+            elif stage_name == "validation":
+                comparison_path = (
+                    pathlib.Path(result["run_path"]) / "evaluation/candidate-comparison.json"
+                )
+                comparison_sha = result["comparison_sha256"]
+            if comparison_path is not None:
+                if hashlib.sha256(comparison_path.read_bytes()).hexdigest() != comparison_sha:
+                    raise ValueError("study comparison changed")
+                comparison = load_exact_json(comparison_path)
+                for candidate in comparison["candidates"]:
+                    evidence = candidate.get("score", {}).get("series_scores")
+                    if evidence is None:
+                        raise ValueError("study comparison lacks per-series scores and coverage")
+                    if (directory_digest(evidence["path"], suffixes=(".parquet",))
+                            != evidence["sha256"]):
+                        raise ValueError("study per-series scores changed")
+                    table = pq.read_table(evidence["path"])
+                    for name, value in {
+                        "study_id": metadata["study_id"], "model_id": result["model_id"],
+                        "variant_id": result["variant_id"], "run_id": run_id,
+                        "stage": stage_name, "origin": result["origin"],
+                    }.items():
+                        table = table.append_column(name, pa.array([value] * table.num_rows))
+                    series_scores.append(table)
+
         runs.append(
             {
                 **base,
@@ -310,7 +353,10 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
     identities = [(r["run_id"], r["series_id"], r["target_date"]) for r in rows]
     if len(set(identities)) != len(identities):
         raise ValueError("duplicate result cell identity")
-    return CampaignResults(table, tuple(runs), metadata, source_keys)
+    return CampaignResults(
+        table, tuple(runs), metadata, source_keys,
+        pa.concat_tables(series_scores) if series_scores else None,
+    )
 
 
 def export_results(results: CampaignResults, output: pathlib.Path) -> pathlib.Path:
@@ -329,6 +375,10 @@ def export_results(results: CampaignResults, output: pathlib.Path) -> pathlib.Pa
         stream = pa.BufferOutputStream()
         pq.write_table(results.source_keys, stream)
         payloads["source-keys.parquet"] = stream.getvalue().to_pybytes()
+    if results.series_scores is not None:
+        stream = pa.BufferOutputStream()
+        pq.write_table(results.series_scores, stream)
+        payloads["series-scores.parquet"] = stream.getvalue().to_pybytes()
     output.mkdir(parents=True, exist_ok=True)
     publish_bytes_set(output, payloads)
     return output

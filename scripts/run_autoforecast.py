@@ -1301,6 +1301,10 @@ def run_request(
         if (request_path.read_bytes() != request_bytes
                 or contract_path.read_bytes() != contract_bytes):
             raise TrainWorkflowError("request or dataset configuration changed before training")
+        if (fixed_contract is not None
+                and fixed_contract.get("schema") == "autoforecast.fixed-evaluation.v2"):
+            from autoforecast.study_scoring import verify_study_evaluation
+            verify_study_evaluation(fixed_contract)
         for item in selected:
             if item.source_path.read_bytes() != item.source_bytes:
                 raise TrainWorkflowError("model profile changed before training")
@@ -1327,7 +1331,8 @@ def run_request(
         )
         spark.sparkContext.setLogLevel("ERROR")
     try:
-        panel = load_dataset_contract(contract_path).panel(data_path)
+        dataset_contract = load_dataset_contract(contract_path)
+        panel = dataset_contract.panel(data_path)
         with preflight_progress.step("Inspect and validate the governed data panel", spark=spark):
             preflight_progress.operation(
                 "Check schema, dates, targets, duplicates, hierarchy, and coverage"
@@ -1376,6 +1381,20 @@ def run_request(
                     model_input = prepare_model_check_input(
                         panel, spark, data_outcome.facts, resolved
                     )
+                    required_count = dataset_contract.required_series_count
+                    if required_count is not None and (
+                        model_input.total_series != required_count
+                        or model_input.eligible_series != required_count
+                        or model_input.series_meeting_history != required_count
+                        or model_input.series_with_complete_window not in (None, required_count)
+                    ):
+                        execution_blockers[candidate.id] = (
+                            f"Study requires all {required_count} frozen series before fitting; "
+                            f"{model_input.series_meeting_history} meet the model's "
+                            f"{model_input.required_history}-period minimum history. "
+                            "Short histories or incomplete windows cannot be silently dropped."
+                        )
+                        continue
                     model_checks = run_model_checks(model_input)
                     checked[candidate.id] = (
                         model_input,

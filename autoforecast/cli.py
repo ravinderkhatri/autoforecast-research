@@ -10,12 +10,16 @@ import pathlib
 from autoforecast.frequency import advance, parse_frequency
 
 
-def create_example(project: pathlib.Path, *, frequency: str = "D") -> None:
+def create_example(
+    project: pathlib.Path, *, frequency: str = "D", recipe_version: int = 2,
+) -> None:
     """Write a deterministic, non-client example without any repository resources."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     import yaml
 
+    if recipe_version not in (1, 2):
+        raise ValueError("example recipe_version must be 1 or 2")
     cadence = parse_frequency(frequency)
     starts = {
         "H": dt.datetime(2024, 1, 1),
@@ -68,7 +72,7 @@ def create_example(project: pathlib.Path, *, frequency: str = "D") -> None:
         },
     )
     recipe = {
-        "schema_version": 1,
+        "schema_version": recipe_version,
         "source_keys": ["shop", "sku"],
         "training_start": points[0].isoformat(),
         "validation_origins": [points[20].isoformat(), points[27].isoformat()],
@@ -80,6 +84,8 @@ def create_example(project: pathlib.Path, *, frequency: str = "D") -> None:
         "target_unit": "units",
         "feature_availability": {},
     }
+    if recipe_version == 2:
+        recipe["metric"] = "rmse"
     if cadence.code != "D":
         recipe["frequency"] = cadence.code
     (project / "recipe.json").write_text(json.dumps(recipe, indent=2) + "\n")
@@ -142,7 +148,7 @@ def create_example(project: pathlib.Path, *, frequency: str = "D") -> None:
                 "initialization_arms": ["fresh"],
                 "selection": {
                     "metric": "rmse",
-                    "missing_actual": "no_data",
+                    "missing_actual": "sparse_zero" if recipe_version == 2 else "no_data",
                     "direction": "minimize",
                     "tie_break": [
                         "mean_score",
@@ -175,6 +181,7 @@ def prepare(
     contract_path: pathlib.Path,
     sources: dict[str, pathlib.Path],
     output_root: pathlib.Path,
+    *, study_id: str | None = None, scoring_references: pathlib.Path | None = None,
 ) -> pathlib.Path:
     """Own one preparation runtime; return the verified benchmark manifest."""
     from pyspark import SparkContext
@@ -201,7 +208,7 @@ def prepare(
             sources=sources,
             recipe=recipe,
             output_root=output_root,
-            spark=spark,
+            spark=spark, study_id=study_id, scoring_references=scoring_references,
         )
     finally:
         from scripts.run_autoforecast import _shutdown_owned_preflight_runtime
@@ -223,7 +230,7 @@ def run_campaign(
     from mlops._safe_files import publish_bytes_set
 
     from autoforecast._exact_yaml import loads_exact_yaml
-    from autoforecast.benchmark import read_benchmark_manifest
+    from autoforecast.benchmark import artifact_path, read_benchmark_manifest
     from autoforecast.campaign import CampaignStore, CampaignSupervisor
     from autoforecast.forecast_campaign import (
         compile_forecast_campaign,
@@ -240,6 +247,10 @@ def run_campaign(
     contract = project / parsed.contract
     if hashlib.sha256(contract.read_bytes()).hexdigest() != benchmark["contract_sha256"]:
         raise ValueError("request dataset contract differs from preparation")
+    if "study_id" in benchmark:
+        request["forecast_campaign"]["selection"]["missing_actual"] = (
+            "sparse_zero" if benchmark["recipe"]["actual_missing"] == "zero" else "no_data"
+        )
     request["forecast_campaign"]["dataset"]["contract"] = (
         (benchmark_path.parent / "dataset.yaml").relative_to(project).as_posix()
     )
@@ -254,9 +265,9 @@ def run_campaign(
         compiled = compile_forecast_campaign(
             request_path,
             benchmark_path=benchmark_path,
-            selection_data_path=benchmark_path.parent / "selection",
-            final_training_data_path=benchmark_path.parent / "final_training",
-            final_score_data_path=benchmark_path.parent / "final_score",
+            selection_data_path=artifact_path(benchmark_path, benchmark, "selection"),
+            final_training_data_path=artifact_path(benchmark_path, benchmark, "final_training"),
+            final_score_data_path=artifact_path(benchmark_path, benchmark, "final_score"),
             compiled_root=project / ".autoforecast/compiled",
         )
         store = CampaignStore.open_or_create(
@@ -294,13 +305,22 @@ def main() -> int:
     freeze.add_argument("--recipe", type=pathlib.Path, default=pathlib.Path("recipe.json"))
     freeze.add_argument("--contract", type=pathlib.Path, default=pathlib.Path("dataset.yaml"))
     freeze.add_argument("--source", type=pathlib.Path, help="one prepared snapshot for all roles")
-    for role in ("selection", "final-training", "final-score"):
+    for role in ("selection", "final-training", "validation-score", "final-score"):
         freeze.add_argument(f"--{role}", type=pathlib.Path)
+    freeze.add_argument("--study-id", help="verify registration against an existing study")
+    freeze.add_argument("--scoring-references", type=pathlib.Path)
     run = commands.add_parser("run", help="resume validation, selection, refit, and test scoring")
     run.add_argument("--project-root", type=pathlib.Path, required=True)
     run.add_argument("--request", type=pathlib.Path, default=pathlib.Path("campaign.yaml"))
-    run.add_argument("--benchmark", type=pathlib.Path, required=True)
+    lookup = run.add_mutually_exclusive_group(required=True)
+    lookup.add_argument("--benchmark", type=pathlib.Path)
+    lookup.add_argument("--study-id")
     run.add_argument("--output-root", type=pathlib.Path, default=pathlib.Path(".autoforecast/runs"))
+    rescore = commands.add_parser("rescore", help="score retained forecasts against a new study")
+    rescore.add_argument("--project-root", type=pathlib.Path, required=True)
+    rescore.add_argument("--campaign", type=pathlib.Path, required=True)
+    rescore.add_argument("--study-id", required=True)
+    rescore.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "import-csv":
@@ -316,27 +336,62 @@ def main() -> int:
             print(args.project.resolve())
         else:
             project = args.project_root.resolve(strict=True)
-            if args.command == "freeze":
+            if args.command == "rescore":
+                from pyspark import SparkContext
+                from pyspark.sql import SparkSession
+                from scripts.run_autoforecast import _shutdown_owned_preflight_runtime
+
+                from autoforecast import resources
+                from autoforecast.benchmark import resolve_study
+                from autoforecast.rescore import rescore_campaign
+
+                study_path, _ = resolve_study(project / ".autoforecast/benchmarks", args.study_id)
+                spark = resources.acquire_local_runtime(
+                    SparkSession, SparkContext, profile=resources.spark_profile(python_udfs=False),
+                    app_name="autoforecast_rescore",
+                )
+                try:
+                    spark.sparkContext.setLogLevel("ERROR")
+                    print(rescore_campaign(project / args.campaign, study_path,
+                                           project / args.output, spark))
+                finally:
+                    _shutdown_owned_preflight_runtime(spark)
+            elif args.command == "freeze":
+                from autoforecast._exact_json import load_exact_json
+                recipe = load_exact_json(project / args.recipe)
+                if type(recipe) is not dict:
+                    raise ValueError("preparation recipe must be an object")
+                roles = ["selection", "final_training", "final_score"]
+                if recipe.get("schema_version") == 2:
+                    roles.append("validation_score")
                 sources = {
                     role: getattr(args, role) or args.source
-                    for role in ("selection", "final_training", "final_score")
+                    for role in roles
                 }
                 if any(path is None for path in sources.values()):
-                    parser.error("provide --source or all three role paths")
+                    parser.error("provide --source or every recipe role path")
                 benchmark = prepare(
                     project,
                     project / args.recipe,
                     project / args.contract,
                     {role: project / path for role, path in sources.items()},
                     project / ".autoforecast/benchmarks",
+                    study_id=args.study_id,
+                    scoring_references=(project / args.scoring_references
+                                        if args.scoring_references else None),
                 )
                 print(benchmark)
             else:
+                from autoforecast.benchmark import resolve_study
+                benchmark_path = (
+                    resolve_study(project / ".autoforecast/benchmarks", args.study_id)[0]
+                    if args.study_id else project / args.benchmark
+                )
                 print(
                     run_campaign(
                         project=project,
                         request_path=project / args.request,
-                        benchmark_path=project / args.benchmark,
+                        benchmark_path=benchmark_path,
                         output_root=project / args.output_root,
                     )
                 )

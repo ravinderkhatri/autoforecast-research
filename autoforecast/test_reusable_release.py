@@ -42,7 +42,7 @@ def spark():
 
 def _inputs(tmp_path):
     project = tmp_path / "project"
-    create_example(project)
+    create_example(project, recipe_version=1)
     recipe = json.loads((project / "recipe.json").read_text())
     return (
         project,
@@ -160,7 +160,7 @@ def test_freeze_rejects_duplicate_source_observations(tmp_path, spark):
 
 def test_freeze_rejects_a_weekly_source_row_off_the_declared_phase(tmp_path, spark):
     project = tmp_path / "project"
-    create_example(project, frequency="W")
+    create_example(project, frequency="W", recipe_version=1)
     recipe = json.loads((project / "recipe.json").read_text())
     sources = {role: project / "data" for role in ("selection", "final_training", "final_score")}
     table = pq.read_table(project / "data")
@@ -294,7 +294,7 @@ def test_fixed_grid_accepts_the_explicit_month_end_alias(tmp_path, spark):
     from autoforecast.adapters.naive import seasonal_naive
 
     project = tmp_path / "project"
-    create_example(project, frequency="M")
+    create_example(project, frequency="M", recipe_version=1)
     contract = yaml.safe_load((project / "dataset.yaml").read_text())
     contract["dataset"]["panel"]["frequency"] = "ME"
     (project / "dataset.yaml").write_text(yaml.safe_dump(contract, sort_keys=False))

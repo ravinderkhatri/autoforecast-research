@@ -418,7 +418,7 @@ def test_initialization_parent_is_not_validation_evidence(
     frozen = {
         "benchmark_id": "benchmark", "recipe": {"target_unit": "units"},
         "key_types": {}, "cohort_series_count": 1,
-        "artifacts": {role: "a" * 64 for role in ("selection", "final_training", "final_score")},
+        "artifacts": {role: "a" * 64 for role in ("selection", "final_training", "final_score", "source-keys")},
     }
     (tmp_path / "dataset.yaml").write_text(yaml.safe_dump({
         "schema_version": 1,
@@ -530,7 +530,8 @@ def test_reader_retains_selection_actual_snapshot_for_revised_history(tmp_path, 
         "recipe": {"target_unit": "units", "history_policy": "revised_snapshot"},
         "key_types": {},
         "cohort_series_count": 1,
-        "artifacts": {"selection": "1" * 64, "final_training": "2" * 64, "final_score": "3" * 64},
+        "artifacts": {"selection": "1" * 64, "final_training": "2" * 64, "final_score": "3" * 64,
+                      "source-keys": "4" * 64},
     }
     (tmp_path / "source-keys").mkdir()
     pq.write_table(
@@ -546,7 +547,7 @@ def test_reader_retains_selection_actual_snapshot_for_revised_history(tmp_path, 
     assert result.metadata["target_estimand"] == "observed_nonnegative"
     assert result.metadata["actual_snapshots"] == {
         role: {"path": str(tmp_path / role), "sha256": digest}
-        for role, digest in frozen["artifacts"].items()
+        for role, digest in frozen["artifacts"].items() if role != "source-keys"
     }
 
 

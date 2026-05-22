@@ -103,7 +103,7 @@ Create the example project as a template, then replace its data and edit these f
 | File | What to change |
 |---|---|
 | `dataset.yaml` | Dataset ID; series, time, and target columns; frequency; season length; optional feature roles. |
-| `recipe.json` | Source key columns, training start, validation origins, horizons, final cutoff, target unit. |
+| `recipe.json` | Source keys, history starts, origins, horizons, cutoff, target unit, missing-value policies, and metric. |
 | `campaign.yaml` | Matching dates, candidates, scoring metric, compute limits, and training budgets. |
 | `models/*/model.yaml` | Model profiles selected by the campaign. |
 
@@ -180,8 +180,16 @@ training, validation, and test windows.
   convert the source to typed dates or timezone-naive timestamps before importing it.
 - The cohort is fixed from series present by the first validation origin in the selection
   source. The manifest reconciles all source series, exclusions, and the retained cohort.
-- Every retained series needs every required observation on its frequency grid. Gaps and null targets are
-  errors. A reported zero is an observation; an absent row is never filled with zero.
+- New studies use recipe version 2. `history_missing` and `actual_missing` default to `zero`.
+  Absent expected rows and null targets are filled with zero after the declared history start.
+  Original missingness is retained. A recorded zero remains an observed value. NaN, infinity,
+  negative targets, duplicate rows, and invalid keys are errors, not missing values.
+- Set `actual_missing` to `mask` to exclude originally missing actuals from both validation
+  and test metrics. Forecasts must still cover every expected cell. Coverage reports include
+  expected, originally missing, zero-filled, excluded, and scored counts for every series.
+- Every model must meet its minimum history and window requirements for the whole frozen
+  cohort before fitting. A model cannot silently drop short series.
+- Existing version-1 recipes and manifests retain their strict gap and null-target errors.
 - New series default to an error. The explicit `exclude_after_first_origin` recipe policy
   excludes series absent from the initial cohort and records the count.
 - `history_policy: fixed` requires overlapping history to agree across snapshots.
@@ -193,19 +201,84 @@ Separate snapshots can be supplied explicitly:
 
 ```bash
 autoforecast freeze --project-root my-experiment \
-  --selection data/selection --final-training data/training --final-score data/labels
+  --selection data/selection --final-training data/training \
+  --validation-score data/validation-actuals --final-score data/test-actuals
 ```
 
 Parquet directories must contain `.parquet` parts, optionally under Hive partition directories.
 Hidden completion markers are ignored. Visible sidecars, summary metadata, streaming logs,
 links, and special files are refused so every reader-visible observation is authenticated.
 
-Signed targets, missing-value imputation, raw warehouse feeds, and cloud
-execution are outside this release workflow. Use `observed_nonnegative` for measured quantities,
+Signed targets, learned imputation, raw warehouse feeds, and cloud execution are outside this
+release workflow. Use `observed_nonnegative` for measured quantities,
 including fractional values such as energy use. The two built-in baselines support this target.
 Use `sales_given_availability` for observed retail sales. Optional retail models declare their
 supported targets and reject incompatible inputs; none of these observed-target contracts
 infers unobserved demand.
+
+## Freeze a reusable study
+
+The four logical data roles distinguish fitting history from scoring actuals. Validation uses
+`validation_score`, not the refit target. Test labels stay outside fitting and model selection.
+`--source` assigns one input snapshot to all four roles. Identical prepared roles share storage;
+the manifest records their logical identities and physical paths.
+
+A version-2 recipe must declare `metric` (`rmse`, `mae`, `wape`, or `wrmsse`). To give retained
+series different usable history starts, add an exact source-key map and a derivation rule:
+
+```json
+"series_starts": {
+  "rule": "Usable history declared from records available at the first validation origin",
+  "values": [
+    {"keys": {"shop": "a|b", "sku": 1}, "start": "2024-01-01"},
+    {"keys": {"shop": "a", "sku": 2}, "start": "2024-01-08"}
+  ]
+}
+```
+
+Declare every retained series exactly once. Starts must lie between `training_start` and the
+first validation origin and align with the frequency. Preparation never pads before them.
+Without this map, every series uses `training_start`. The first observed row is not treated as
+proof of a launch date. Feed completeness, launch/delist rules, and missingness reasons remain
+caller responsibilities.
+
+The manifest's `study_id` binds the cohort, declared starts, prepared values, original missing
+flags, windows, policies, and metric definition. It is separate from model-run, HPO-study, and
+MLflow identifiers. Version-2 studies currently use fixed model parameters. Inner HPO has its
+own validation windows and remains on the existing strict workflow; it is refused for these
+studies because those extra windows are not part of this frozen contract. Existing HPO records
+are not changed. Reuse a verified study by ID:
+
+```bash
+autoforecast run --project-root my-experiment --study-id STUDY_ID
+```
+
+IDs resolve existing manifests under `.autoforecast/benchmarks`; they never create or infer a
+study. Creation requires explicit input data and a recipe. Repeating `freeze` with
+`--study-id STUDY_ID` verifies that the inputs reproduce that contract. Changed labels or rules
+require a new identity; existing artifacts are never overwritten.
+
+RMSE, MAE, and WAPE aggregate the available cells under the declared policy. A series with no
+scoreable cells has an unavailable score, and an empty aggregate is also unavailable. WAPE is
+unavailable when total actual volume is zero. An unavailable validation score cannot select a
+model; an unavailable held-out test score is reported without changing the selection.
+
+Study `wrmsse` uses a single-level weighted mean of per-series RMSSE. It does not use M5's
+hierarchy. Supply `--scoring-references references.parquet` with one row for every retained
+series and every validation/test boundary:
+
+| Column | Value |
+|---|---|
+| `keys` | Struct containing the recipe's source-key names and exact types |
+| `stage` | `validation` or `test` |
+| `origin` | Canonical origin string at the declared frequency |
+| `weight` | Finite non-negative weight; positive total at each boundary |
+| `scale` | Mean squared naive-change scale; zero or null means undefined |
+
+Weights and scales are supplied by the caller and frozen with the study. The score is
+`sum(weight * sqrt(MSE / scale)) / sum(weight)`. Under masking, each series' MSE uses its
+observed cells. If any retained series has no scoreable actuals or an undefined scale, WRMSSE
+is unavailable. Weights are never redistributed.
 
 ## Inspect results
 
@@ -225,13 +298,27 @@ comparison_plot(results, series_id=results.rows['series_id'][0].as_py(),
                 output=Path('comparison.png'))
 ```
 
-Generic fixed-population scoring supports RMSE, MAE, and WAPE. All candidates at a scoring
-boundary must return the same keys; missing predictions or actuals cannot reduce the denominator.
+All candidates at a scoring boundary must return the same forecast keys. The study freezes
+actual coverage independently of model output. Exports include `series-scores.parquet` with
+per-run scores and coverage, including zero-coverage series.
 Result reading and resume reject changed retained artifacts. The synthetic example checks the
 pipeline, not real-world predictive accuracy.
 
 The exported `target_date` column retains timestamps for hourly forecasts and dates for the
 other cadences. Plots use those same forecast periods, including calendar month and year boundaries.
+
+To score existing forecasts against revised actuals, freeze a new study with matching forecast
+boundaries and cohort, then write a separate post-hoc result:
+
+```bash
+autoforecast rescore --project-root my-experiment \
+  --campaign /path/to/original/campaign --study-id NEW_STUDY_ID \
+  --output rescored-results
+```
+
+The output retains original run/model/forecast identities and both study identities. It does
+not refit models or replace the original selection and scores. Changed forecast grids are
+refused. Use a fresh output directory for each rescoring operation.
 
 ## Models and M5
 

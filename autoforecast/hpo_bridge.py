@@ -236,6 +236,10 @@ class ForecastTrialBridge:
             raise HPOError("study validation target range is invalid")
         try:
             contract = load_dataset_contract(self.project_root / request.dataset_contract)
+            if contract.required_series_count is not None:
+                raise HPOError(
+                    "shared-study inner HPO windows are not frozen; use the strict HPO workflow"
+                )
             cadence = parse_frequency(str(contract.panel_roles.get("frequency", "D")))
             definition = descriptor(study.tuning.adapter)
             if not frequency_is_supported(

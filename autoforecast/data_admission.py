@@ -41,6 +41,7 @@ class DatasetContract:
     id: str
     panel_roles: dict[str, Any]
     source_path: pathlib.Path
+    required_series_count: int | None = None
 
     def panel(self, path: str | pathlib.Path) -> Panel:
         """Build a Panel for an explicit runtime path; never commit the data location."""
@@ -67,15 +68,23 @@ def _load_dataset_contract_bytes(raw: bytes, source: pathlib.Path) -> DatasetCon
         )
     if (
         type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
+        or value["schema_version"] not in (1, 2)
         or type(value["dataset"]) is not dict
     ):
         raise DatasetContractError(
-            "dataset contract requires schema_version: 1 and a dataset mapping"
+            "dataset contract requires schema_version: 1 or 2 and a dataset mapping"
         )
     dataset = value["dataset"]
-    if set(dataset) != {"id", "panel"} or type(dataset["id"]) is not str or not dataset["id"]:
+    expected = {"id", "panel"}
+    if value["schema_version"] == 2:
+        expected.add("required_series_count")
+    if set(dataset) != expected or type(dataset["id"]) is not str or not dataset["id"]:
         raise DatasetContractError("dataset requires non-blank id and a panel mapping")
+    required_series_count = dataset.get("required_series_count")
+    if value["schema_version"] == 2 and (
+        type(required_series_count) is not int or required_series_count < 1
+    ):
+        raise DatasetContractError("required_series_count must be a positive integer")
     roles = dataset["panel"]
     if type(roles) is not dict:
         raise DatasetContractError("dataset.panel must be a mapping")
@@ -96,7 +105,7 @@ def _load_dataset_contract_bytes(raw: bytes, source: pathlib.Path) -> DatasetCon
         Panel.from_record({"path": ".", **normalised}).validate_column_names()
     except PanelError as exc:
         raise DatasetContractError(str(exc)) from exc
-    return DatasetContract(dataset["id"], normalised, source)
+    return DatasetContract(dataset["id"], normalised, source, required_series_count)
 
 
 @dataclass(frozen=True)

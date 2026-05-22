@@ -52,6 +52,8 @@ def score_forecast(
     naive_mae: float | None = None,
     restrict_to: str | None = None,
     eligible_grid: str | None = None,
+    original_missing_column: str | None = None,
+    series_scores_path: str | None = None,
 ) -> Score:
     """Score a forecast against the panel's actuals, on eligible cells only.
 
@@ -242,7 +244,10 @@ def score_forecast(
             "restrict_to date",
         ).distinct()
         fc = fc.join(keep, ["series_id", "date"], "inner")
-    joined = _join_actuals(fc, panel, panel_cadence, spark)
+    if (original_missing_column is not None
+            and (eligible_grid is None or series_scores_path is None)):
+        raise ScoreError("original missingness requires a fixed grid and per-series score output")
+    joined = _join_actuals(fc, panel, panel_cadence, spark, original_missing_column)
     actual = F.col("_actual")
     bad_actual = (joined.filter(
         F.col("_actual_present")
@@ -273,7 +278,7 @@ def score_forecast(
     agg = joined.agg(*_aggregations(panel, missing_actual, grid is not None)).collect()[0]
 
     n = int(agg["n_scored"])
-    if n == 0:
+    if n == 0 and original_missing_column is None:
         raise ScoreError(
             "no eligible cell survived: every forecast cell was ineligible or had no actual. "
             f"ineligible={agg['n_ineligible']}, no_data={agg['n_no_data']}"
@@ -286,16 +291,22 @@ def score_forecast(
         raise ScoreError(
             f"{forecast.adapter}: finite cells overflowed the aggregate error/volume; the "
             "requested score is not representable as float64")
+    if series_scores_path is not None:
+        joined.groupBy("series_id").agg(
+            F.count("*").alias("expected"),
+            F.count(F.when(F.col("_actual_present").isNull(), 1)).alias("originally_missing"),
+            *_aggregations(panel, missing_actual, grid is not None),
+        ).write.parquet(series_scores_path)
     return Score(
         n_scored=n,
         n_dropped_ineligible=int(agg["n_ineligible"]),
         n_dropped_no_data=int(agg["n_no_data"]),
         n_zero_filled=int(agg["n_zero_filled"]),
-        mae=sae / n,
-        rmse=(sse / n) ** 0.5,
-        bias=se / n,
+        mae=sae / n if n else 0.0,
+        rmse=(sse / n) ** 0.5 if n else 0.0,
+        bias=se / n if n else 0.0,
         bias_pct_of_volume=(se / vol) if vol else None,
-        mase=((sae / n) / naive_mae) if naive_mae is not None else None,
+        mase=((sae / n) / naive_mae) if naive_mae is not None and n else None,
         sum_abs_error=sae,
         sum_squared_error=sse,
         sum_error=se,
@@ -348,6 +359,7 @@ def _join_actuals(
     panel: Panel,
     cadence: Cadence,
     spark: SparkSession,
+    original_missing_column: str | None = None,
 ) -> DataFrame:
     """Left-join emitted forecast cells to the panel's actuals.
 
@@ -367,7 +379,15 @@ def _join_actuals(
             F.col(panel.target_col).alias("_raw_actual")]
     if panel.has_exposure:
         cols.append(F.col(panel.exposure_col).alias("_state"))
-    cols.append(F.lit(True).alias("_actual_present"))
+    if original_missing_column is not None:
+        if (original_missing_column not in raw.columns
+                or raw.schema[original_missing_column].dataType.typeName() != "boolean"):
+            raise ScoreError("prepared actuals lack the original-missing boolean indicator")
+        flag = F.col(original_missing_column)
+        cols.append(flag.alias("_original_missing"))
+        cols.append(F.when(~flag, F.lit(True)).alias("_actual_present"))
+    else:
+        cols.append(F.lit(True).alias("_actual_present"))
     actuals = raw.select(*cols)
     actuals = _normalise_key(
         actuals, "_raw_date", cadence, f"panel time column {panel.time_col!r}", output="_date",
@@ -377,6 +397,11 @@ def _join_actuals(
                                       F.col("date").alias("_f_date")),
                             (F.col("_sid") == F.col("_f_sid"))
                             & (F.col("_date") == F.col("_f_date")), "left_semi")
+    if original_missing_column is not None:
+        flag, actual = F.col("_original_missing"), F.col("_actual")
+        if (relevant.filter(flag.isNull() | (flag & (actual.isNull() | (actual != 0))))
+                .limit(1).count()):
+            raise ScoreError("original-missing indicator requires a zero-filled target")
     if relevant.groupBy("_sid", "_date").count().filter(F.col("count") != 1).limit(1).count():
         raise ScoreError(
             "panel contains duplicate actual (series, date) keys in the forecast window; the join "

@@ -36,7 +36,12 @@ from mlops._safe_files import (
     _create_fresh_directory,
     publish_bytes_set,
 )
-from mlops.provenance import ProvenanceError, capture_source_identity, validate_data_reference
+from mlops.provenance import (
+    ProvenanceError,
+    capture_source_identity,
+    local_data_reference,
+    validate_data_reference,
+)
 
 from autoforecast import resources
 from autoforecast._exact_json import ExactJSONError, load_exact_json, loads_exact_json
@@ -146,12 +151,13 @@ def _json(value: object) -> str:
         raise ForecastCampaignError(f"campaign evidence is not finite JSON: {error}") from error
 
 
-def _metric_summary_banner(metric: str, validation: float, test: float) -> str:
+def _metric_summary_banner(metric: str, validation: float, test: float | None) -> str:
     """Render the final validation/test metric pair as one prominent terminal line."""
     name = metric.upper()
+    test_text = f"{test:.6f}" if test is not None else "unavailable"
     body = (
         f" FINAL {name} SUMMARY | Validation {name}: {validation:.6f} | "
-        f"Test {name}: {test:.6f} "
+        f"Test {name}: {test_text} "
     )
     columns = shutil.get_terminal_size(fallback=(120, 24)).columns
     width = max(len(body) + 12, min(max(columns, 80), 160))
@@ -1738,10 +1744,23 @@ def compile_forecast_campaign(
         },
     }
     if benchmark_path is not None:
-        from autoforecast.benchmark import _evaluation_contract_from_record, verify_benchmark
+        from autoforecast.benchmark import (
+            _evaluation_contract_from_record,
+            artifact_path,
+            verify_benchmark,
+        )
         benchmark_sha256 = _sha_file(benchmark_path)
         benchmark_path, benchmark = verify_benchmark(benchmark_path, benchmark_sha256)
         recipe = benchmark["recipe"]
+        if "study_id" in benchmark and any(p["tune_stage"] is not None for p in parameter_profiles):
+            raise ForecastCampaignError(
+                "shared studies require fixed parameters: inner HPO windows are not frozen "
+                "in this study contract; use the existing strict workflow for inner tuning"
+            )
+        if ("study_id" in benchmark and request.missing_actual != (
+            "sparse_zero" if recipe["actual_missing"] == "zero" else "no_data"
+        )):
+            raise ForecastCampaignError("campaign missing-actual policy differs from frozen study")
         if (parse_frequency(recipe.get("frequency", "D")).code != cadence.code
             or recipe["validation_origins"]
             != cast(dict, resolved["temporal"])["validation_origins"]
@@ -1768,6 +1787,16 @@ def compile_forecast_campaign(
             contracts[value["boundary"]] = value
         resolved["benchmark"] = {"id": benchmark["benchmark_id"], "path": str(benchmark_path),
                                  "sha256": benchmark_sha256, "evaluations": contracts}
+        if "study_id" in benchmark:
+            resolved["study_id"] = benchmark["study_id"]
+            cast(dict, resolved["data"])["validation_score"] = {
+                "path": str(artifact_path(benchmark_path, benchmark, "validation_score")),
+                "sha256": benchmark["artifacts"]["validation_score"],
+                "snapshot_id": benchmark["study_id"] + "-validation-score",
+                "reference": local_data_reference(
+                    artifact_path(benchmark_path, benchmark, "validation_score"), authority="study",
+                ),
+            }
     elif installed_mode():
         raise ForecastCampaignError("installed campaigns require a frozen benchmark")
     resolved_payload = _json(resolved).encode()
@@ -1884,7 +1913,9 @@ def compile_forecast_campaign(
             "parameter-resolution.json",
         ]
         if child["kind"] == "validation" and request.purpose != "capacity_diagnostic":
-            required_outputs.append("evaluation-panel")
+            required_outputs.append(
+                "evaluation-contract.json" if "study_id" in resolved else "evaluation-panel"
+            )
         stages.append(
             _stage(
                 child_id,
@@ -2481,11 +2512,17 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
 def _fixed_evaluation(resolved: dict, stage: str, origin: str, horizon: int) -> dict | None:
     if "benchmark" not in resolved:
         return None
-    from autoforecast.benchmark import boundary, verify_benchmark
+    from autoforecast.benchmark import _evaluation_contract_from_record, boundary, verify_benchmark
     benchmark = resolved["benchmark"]
-    verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+    path, record = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
     cadence = _resolved_cadence(resolved)
-    return benchmark["evaluations"][boundary(stage, origin, horizon, cadence.code)]
+    contract = benchmark["evaluations"][boundary(stage, origin, horizon, cadence.code)]
+    if contract != _evaluation_contract_from_record(
+        path, record, stage=stage, origin=origin, horizon=horizon,
+        metric=contract["metric_policy"]["metric"],
+    ):
+        raise ForecastCampaignError("evaluation contract differs from frozen benchmark")
+    return contract
 
 
 def _load_resolved(path: pathlib.Path, expected_sha: str) -> dict[str, object]:
@@ -2494,6 +2531,12 @@ def _load_resolved(path: pathlib.Path, expected_sha: str) -> dict[str, object]:
     )
     _verify_resolved_source(resolved)
     _verify_resolved_parameter_profiles(resolved)
+    if "benchmark" in resolved:
+        from autoforecast.benchmark import verify_benchmark
+        benchmark = cast(dict, resolved["benchmark"])
+        _, record = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+        if resolved.get("study_id") != record.get("study_id"):
+            raise ForecastCampaignError("shared study identity differs from the benchmark")
     return resolved
 
 
@@ -2601,6 +2644,9 @@ def _materialize_training_panel(
     rows = 0
     try:
         for batch in dataset.scanner(filter=condition, batch_size=131072).to_batches():
+            from autoforecast.benchmark import MISSING_COLUMN
+            if MISSING_COLUMN in batch.schema.names:
+                batch = batch.drop_columns([MISSING_COLUMN]).replace_schema_metadata(None)
             if panel.known_future:
                 # Arrow generates compute kernels at runtime; its stubs omit these exports.
                 future = pc.greater(  # pyright: ignore[reportAttributeAccessIssue]
@@ -3117,6 +3163,23 @@ def _score_value(comparison: dict[str, object], metric: str, model_id: str) -> f
     if not is_finite_real(raw) or float(raw) < 0:
         raise ForecastCampaignError("child score is absent or non-finite")
     return float(raw)
+
+
+def _test_score_value(comparison: dict, metric: str, model_id: str, fixed: dict | None):
+    """An empty held-out score is reportable; it never becomes a selection score."""
+    if fixed is not None and comparison.get("evaluation_contract") != fixed:
+        raise ForecastCampaignError("test comparison differs from its frozen evaluation")
+    candidates = comparison.get("candidates")
+    if (fixed is not None and fixed.get("schema") == "autoforecast.fixed-evaluation.v2"
+            and type(candidates) is list and len(candidates) == 1
+            and candidates[0].get("model_id") == model_id
+            and candidates[0].get("status") == "unavailable"
+            and type(candidates[0].get("score")) is dict
+            and candidates[0]["score"].get(metric) is None
+            and candidates[0]["score"].get("metric_definition") == fixed["metric_policy"]
+            and comparison.get("ranking") is None):
+        return None
+    return _score_value(comparison, metric, model_id)
 
 
 _CHILD_RESULT_FIELDS = {
@@ -4652,7 +4715,9 @@ def _run_generic_child(
         # separately authenticated final-training snapshot.  Reusing ``source_path`` here
         # silently produced 28 null target days and then retrained the same doomed child.
         with input_progress.step("Authenticate and materialize the validation slice"):
-            evaluation_record = cast(dict[str, object], data["final_training"])
+            evaluation_record = cast(
+                dict[str, object], data.get("validation_score", data["final_training"]),
+            )
             evaluation_source_path = _verify_data(evaluation_record, "final training data")
             temporal = cast(dict[str, object], resolved["temporal"])
             cadence = _resolved_cadence(resolved)
@@ -4661,15 +4726,18 @@ def _run_generic_child(
                 cadence,
                 cast(int, child["horizon"]),
             )
-            evaluation_path = attempt_dir / "evaluation-panel"
-            _materialize_panel_range(
-                evaluation_source_path,
-                evaluation_path,
-                contract_path=contract_path,
-                start=cast(str | None, temporal["training_start"]),
-                end=canonical_origin(target_end, cadence),
-                expected_source_sha256=cast(str, evaluation_record["sha256"]),
-            )
+            if "study_id" in resolved:
+                evaluation_path = evaluation_source_path
+            else:
+                evaluation_path = attempt_dir / "evaluation-panel"
+                _materialize_panel_range(
+                    evaluation_source_path,
+                    evaluation_path,
+                    contract_path=contract_path,
+                    start=cast(str | None, temporal["training_start"]),
+                    end=canonical_origin(target_end, cadence),
+                    expected_source_sha256=cast(str, evaluation_record["sha256"]),
+                )
         command.extend(
             [
                 "--evaluation-data-path",
@@ -5493,6 +5561,9 @@ def score_final(
     from pyspark import SparkContext
     from pyspark.sql import SparkSession
 
+    fixed = _fixed_evaluation(
+        resolved, "test", cast(str, score_input["origin"]), cast(int, score_input["horizon"]),
+    )
     score_progress = PipelineProgress("Final test scoring", 2, phase_key="score")
     with score_progress.step("Start the bounded Spark scoring runtime"):
         spark = resources.acquire_local_runtime(
@@ -5501,8 +5572,8 @@ def score_final(
         )
         spark.sparkContext.setLogLevel("ERROR")
     try:
-        with score_progress.step("Calculate and publish test WRMSSE", spark=spark):
-            score_progress.operation("Join the sealed forecast to test labels and calculate WRMSSE")
+        with score_progress.step("Calculate and publish the test score", spark=spark):
+            score_progress.operation("Score the sealed forecast against its declared test actuals")
             comparison_path = compare_run_forecasts(
                 panel,
                 {cast(str, final_result["model_id"]): forecast},
@@ -5510,15 +5581,14 @@ def score_final(
                 missing_actual=cast(Any, score_input["missing_actual"]),
                 metric=cast(Any, score_input["metric"]),
                 output_dir=attempt_dir / "evaluation",
-                fixed_contract=_fixed_evaluation(resolved, "test",
-                    cast(str, score_input["origin"]), cast(int, score_input["horizon"])),
+                fixed_contract=fixed,
             )
     finally:
         with contextlib.suppress(Exception):
             spark.stop()
     comparison = cast(dict[str, object], json.loads(comparison_path.read_text()))
-    score = _score_value(
-        comparison, cast(str, score_input["metric"]), cast(str, final_result["model_id"])
+    score = _test_score_value(
+        comparison, cast(str, score_input["metric"]), cast(str, final_result["model_id"]), fixed,
     )
     if (
         directory_digest(score_snapshot, suffixes=(".parquet",)) != score_data["sha256"]
@@ -5529,7 +5599,7 @@ def score_final(
         raise ForecastCampaignError("stage-owned scoring inputs changed while evaluation ran")
     record = {
         "schema": FINAL_SCORE_SCHEMA,
-        "status": "scored",
+        "status": "scored" if score is not None else "unavailable",
         "resolved_sha256": resolved_sha,
         "selection_lock_sha256": _sha_file(lock_path),
         "final_fit_result_sha256": _sha_file(final_result_path),
@@ -5616,12 +5686,13 @@ def replay_report(
         "sha256": score_data["sha256"],
     }
     numeric_score = final_score["score"]
+    unavailable = "study_id" in resolved and numeric_score is None
     comparison_path = final_score_path.parent / "evaluation" / "candidate-comparison.json"
     retained_forecast = final_score_path.parent / "scoring-inputs" / "forecast"
     retained_actuals = final_score_path.parent / "scoring-inputs" / "actuals"
     if (
         final_score["schema"] != FINAL_SCORE_SCHEMA
-        or final_score["status"] != "scored"
+        or final_score["status"] != ("unavailable" if unavailable else "scored")
         or final_score["resolved_sha256"] != resolved_sha
         or final_score["selection_lock_sha256"] != _sha_file(lock_path)
         or final_score["final_fit_result_sha256"] != _sha_file(final_fit_path)
@@ -5637,8 +5708,7 @@ def replay_report(
         or final_score["origin"] != score_input["origin"]
         or final_score["horizon"] != score_input["horizon"]
         or final_score["metric"] != score_input["metric"]
-        or not is_finite_real(numeric_score)
-        or float(numeric_score) < 0
+        or (not unavailable and (not is_finite_real(numeric_score) or float(numeric_score) < 0))
         or not _is_sha256(final_score["comparison_sha256"])
         or _sha_file(comparison_path) != final_score["comparison_sha256"]
         or directory_digest(retained_forecast, suffixes=(".parquet",))
@@ -5648,9 +5718,11 @@ def replay_report(
     ):
         raise ForecastCampaignError("final score record differs from its sealed evidence")
     comparison = cast(dict[str, object], load_exact_json(comparison_path))
-    if _score_value(
-        comparison, cast(str, final_score["metric"]), cast(str, final_score["model_id"])
-    ) != float(numeric_score):
+    if _test_score_value(
+        comparison, cast(str, final_score["metric"]), cast(str, final_score["model_id"]),
+        _fixed_evaluation(resolved, "test", cast(str, final_score["origin"]),
+                          cast(int, final_score["horizon"])),
+    ) != numeric_score:
         raise ForecastCampaignError("final score value differs from its candidate comparison")
     forecast_path = pathlib.Path(cast(str, final_fit["forecast_record_path"]))
     checks = {
@@ -5705,6 +5777,7 @@ def replay_report(
         f"<td>{html.escape(str(item['score_stddev']))}</td></tr>"
         for item in cast(list[dict[str, object]], summary["candidates"])
     )
+    display_test_score = final_score["score"] if final_score["score"] is not None else "unavailable"
     (attempt_dir / "report.html").write_text(
         "<!doctype html><meta charset='utf-8'><title>Forecast campaign</title>"
         "<style>body{font:14px system-ui;margin:32px}table{border-collapse:collapse}"
@@ -5714,7 +5787,7 @@ def replay_report(
         f"<b>{html.escape(str(chosen['variant_id']))}</b> with "
         f"{html.escape(str(chosen['initialization']))}. Final "
         f"{html.escape(str(final_score['metric']))}: "
-        f"<b>{html.escape(str(final_score['score']))}</b>.</p>"
+        f"<b>{html.escape(str(display_test_score))}</b>.</p>"
         "<p>MLflow and TensorBoard are optional read-only views; the files linked by this "
         "campaign journal are authoritative.</p>"
         "<table><tr><th>Model</th><th>Variant</th><th>Initialization</th>"
@@ -5726,7 +5799,8 @@ def replay_report(
         _metric_summary_banner(
             cast(str, final_score["metric"]),
             float(cast(float | int, chosen["mean_score"])),
-            float(cast(float | int, final_score["score"])),
+            (None if final_score["score"] is None
+             else float(cast(float | int, final_score["score"]))),
         ),
         file=sys.stderr,
         flush=True,
