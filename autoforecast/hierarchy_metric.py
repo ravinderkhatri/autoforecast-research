@@ -13,7 +13,6 @@ import numpy as np
 import torch
 
 from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin, period_points
-from autoforecast.parquet_time import validate_parquet_time_storage
 
 
 def read_forecast_grid(
@@ -36,6 +35,8 @@ def read_forecast_grid(
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
+
+    from autoforecast.parquet_time import validate_parquet_time_storage
 
     if (
         type(horizon) is not int

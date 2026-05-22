@@ -445,3 +445,33 @@ def test_read_forecast_grid_keeps_wide_year_int96_and_hive_dates(tmp_path):
         str(partitioned), ("a",), "2024-01-01", 1, series_col="id",
         time_col="date", value_col="value",
     ), [[4.0]])
+
+
+def test_hierarchy_arithmetic_does_not_require_optional_arrow():
+    import subprocess
+    import sys
+
+    code = """
+import importlib.abc
+import sys
+import numpy as np
+import torch
+
+for name in list(sys.modules):
+    if name == 'pyarrow' or name.startswith('pyarrow.'):
+        del sys.modules[name]
+
+class NoArrow(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'pyarrow' or fullname.startswith('pyarrow.'):
+            raise ModuleNotFoundError('optional Arrow unavailable', name=fullname)
+
+sys.meta_path.insert(0, NoArrow())
+from autoforecast.hierarchy_metric import HierarchyMetric
+metric = HierarchyMetric.build(
+    {}, np.array([[1., 2., 4.], [2., 4., 8.]]), None, ((),), weighting='uniform',
+)
+assert metric.n_bottom == 2
+assert not any(name == 'pyarrow' or name.startswith('pyarrow.') for name in sys.modules)
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
