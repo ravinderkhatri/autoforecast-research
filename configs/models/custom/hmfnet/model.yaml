@@ -1,0 +1,52 @@
+schema_version: 2
+model:
+  id: hmfnet
+  adapter: hmfnet
+  family: mft
+  runtime: custom_torch
+  status: candidate
+  tags: [autoforecast, development, revision, hmfnet]
+implementation:
+  config: configs/experiments/multibranch_revisions/hmfnet_campaign_default.json
+  sha256: e20d48f5384180d8ee17838ddd4f8ae35ed4759d1ba778b2119fafc1d020b454
+hyperparameters:
+  model.encoder_days:
+    default: 364
+    valid: {kind: int, low: 28, high: 1911, step: 7}
+    search: {kind: categorical, values: [112, 364, 728, 1911]}
+  model.d_model:
+    default: 64
+    valid: {kind: int, low: 8, high: 512, step: 8}
+    search: {kind: categorical, values: [32, 64, 96, 128]}
+  model.n_heads:
+    default: 4
+    valid: {kind: int, low: 1, step: 1}
+    search: {kind: categorical, values: [2, 4, 8]}
+  model.trunk_stages:
+    default: 2
+    valid: {kind: int, low: 1, step: 1}
+    search: {kind: categorical, values: [1, 2, 4]}
+  model.covariate_dropout:
+    default: 0.2
+    valid: {kind: float, low: 0.0, high: 0.95, log: false}
+    search: {kind: categorical, values: [0.0, 0.2, 0.4]}
+  training.learning_rate:
+    default: 0.0003
+    valid: {kind: float, low: 0.000001, high: 0.01, log: false}
+    search: {kind: float, low: 0.00003, high: 0.003, log: true}
+  training.train_stride:
+    default: 28
+    valid: {kind: int, low: 1, high: 112, step: 1}
+    search: {kind: categorical, values: [7, 14, 28]}
+  training.train_windows:
+    default: 52
+    valid: {kind: int, low: 1, high: 128, step: 1}
+    search: {kind: categorical, values: [13, 26, 52]}
+  training.series_loss_weighting:
+    default: uniform
+    valid: {kind: categorical, values: [uniform, revenue, output_gradient]}
+    search: {kind: categorical, values: [uniform]}
+constraints:
+  - kind: divisible
+    dividend: model.d_model
+    divisor: model.n_heads

@@ -1,0 +1,76 @@
+# Paired TFT-Q/TFT-HNB loss comparison. Each arm selects its own update budget on its 28-day
+# validation loss; public WRMSSE compares the arms on the common M5 panel.
+schema_version: 5
+forecast_campaign:
+  name: m5-tft-tft-loss-comparison
+  purpose: forecast_campaign
+  dataset:
+    contract: configs/datasets/m5_daily.yaml
+    selection:
+      source_uri: local://m5-public-selection-v1
+      sha256: 45d30ac412299ebec02c7309632866cfa6bcc3093e3f111681eacc0285a6ceb3
+    final_training:
+      source_uri: local://m5-final-training-v1
+      sha256: 85863858f3b598416c1fd469cba0c7f4491111c41f30f99e1b56335061cd36da
+    final_score:
+      source_uri: kaggle://m5/organizer-private-replay-v1
+      sha256: bdf914961d667cbb0fe94e24024c8d4be879401d9de5572467ed782701cd0cba
+  models:
+    catalog: configs/models
+    candidates:
+      # TFT-Q: original reference-profile quantile head and quantile loss.
+      - model_id: tft_q
+        parameters:
+          mode: defaults
+      # TFT-HNB: same TFT backbone, HMFNet's active hurdle-count objective.
+      - model_id: tft_hnb
+        parameters:
+          mode: manual
+          values:
+            model.loss_kind: v3_hurdle_nb
+            model.output_size: 3
+  temporal:
+    training_start: null
+    initialization_origin: null
+    validation_origins: ["2016-04-24"]
+    validation_horizon: 28
+    final_train_cutoff: "2016-05-22"
+    final_test_horizon: 28
+  seeds: [0]
+  initialization_arms: [fresh]
+  selection:
+    metric: wrmsse
+    missing_actual: no_data
+    direction: minimize
+    tie_break: [mean_score, score_stddev, model_id, variant_id, initialization]
+  final_evidence_role: archived_private_replay_not_blind
+  budgets:
+    initialization:
+      maximum_epochs: 50000
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 2
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+    validation:
+      maximum_epochs: 50000
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 2
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+    final_fit:
+      maximum_epochs: 50000
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 2
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+  compute:
+    device: mps
+    batch_size: 32
+    gradient_microbatch_size: null
+    memory_gib: 16
+    min_free_disk_gib: 10
+  tracking:
+    mlflow: false

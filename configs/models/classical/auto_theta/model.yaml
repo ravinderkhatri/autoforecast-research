@@ -1,0 +1,8 @@
+schema_version: 1
+model:
+  id: auto_theta
+  adapter: auto_theta
+  family: classical
+  runtime: classical
+  status: candidate
+  tags: [autoforecast, development, classical]

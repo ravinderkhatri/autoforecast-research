@@ -1,0 +1,8 @@
+schema_version: 1
+model:
+  id: seasonal_naive
+  adapter: seasonal_naive
+  family: baseline
+  runtime: builtin
+  status: candidate
+  tags: [autoforecast, development, baseline]

@@ -1,0 +1,84 @@
+{
+  "variant": "v2",
+  "encoder_days": 112,
+  "d_model": 16,
+  "n_heads": 4,
+  "trunk_stages": 1,
+  "decoder_layers": 1,
+  "history_attention_layers": 1,
+  "commercial_attention_layers": 1,
+  "commercial_attention_heads": 2,
+  "event_kernel_layers": 1,
+  "demand_dropout": 0.1,
+  "covariate_dropout": 0.2,
+  "factor_rank": 0,
+  "factor_draws": 1,
+  "train_windows": 3,
+  "train_stride": 28,
+  "max_updates": 1200,
+  "epochs": 2,
+  "batch_size": 1024,
+  "evaluate_every": 100,
+  "patience": 3,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.0001,
+  "gradient_clip": 1,
+  "mean_loss_weight": 0.2,
+  "hierarchy_loss_weight": 0.1,
+  "hierarchy_every": 30,
+  "hierarchy_epsilon": 1e-8,
+  "event_penalty_weight": 0.0001,
+  "price_penalty_weight": 0,
+  "event_max_support": 14,
+  "excess_floor": 0.000001,
+  "seed": 42,
+  "device": "cpu",
+  "torch_threads": 2,
+  "max_array_bytes": 1500000000,
+  "aggregate_history": true,
+  "head": "hurdle_negbin",
+  "patch_size": 7,
+  "selection_metric": "wrmsse",
+  "mean_weighting": "revenue",
+  "series_loss_weighting": "uniform",
+  "hierarchy_weighting": "revenue",
+  "observation_contract": "complete_recorded_sales_prelaunch_zeros_v1",
+  "identity_columns": [
+    "item_id",
+    "store_id"
+  ],
+  "aggregate_columns": [
+    "store_id",
+    "dept_id"
+  ],
+  "baseline_columns": [
+    "dept_id"
+  ],
+  "event_pool_columns": [
+    "dept_id"
+  ],
+  "calendar_group_column": "state_id",
+  "cycles": [
+    [
+      "weekly",
+      7,
+      3
+    ],
+    [
+      "monthly",
+      30.4375,
+      2
+    ],
+    [
+      "annual",
+      365.25,
+      3
+    ]
+  ],
+  "validation_every_epochs": 1,
+  "validation_backend": "torch",
+  "checkpoint_every_updates": 5,
+  "checkpoint_every_seconds": 300,
+  "checkpoint_keep_last": 2,
+  "progress": "plain"
+}
