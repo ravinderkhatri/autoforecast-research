@@ -92,6 +92,11 @@ output checksum as part of its source identity. The importer refuses
 conflicting output files. Use typed Parquet directly when you need additional features or
 integral keys. The CSV convenience importer reads the selected observations into memory.
 
+Mapped CSV headers and all Parquet column names must match `[A-Za-z_][A-Za-z0-9_]*`.
+For example, rename `meter.id` to `meter_id` and `daily usage` to `daily_usage` before import.
+Names beginning with `__af_` are reserved for prepared data. Series key values must be nonblank;
+string IDs such as `001` and integral IDs such as `0` are valid.
+
 Map this example in `dataset.yaml`:
 
 ```yaml

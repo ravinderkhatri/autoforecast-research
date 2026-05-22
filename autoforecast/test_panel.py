@@ -152,6 +152,36 @@ def test_validate_refuses_a_missing_path() -> None:
     raise AssertionError("accepted a path that does not exist")
 
 
+@pytest.mark.parametrize("role,value", [
+    ("series_col", "meter.id"), ("time_col", "day date"), ("target_col", "energy`kwh"),
+    ("exposure_col", "state.value"), ("oos_col", "stock.out"),
+    ("known_future", ("future.value",)), ("past_only", ("past.value",)),
+    ("static", ("store.name",)), ("static_reals", ("store.area",)),
+    ("price_col", "price.value"), ("promo_col", "promo.value"),
+    ("factor_group", "group.id"), ("product_col", "product.id"),
+    ("store_col", "store.id"), ("category_col", "category.id"),
+    ("status_prob_cols", {"exact": "exact.prob", "lower_bound": "pl", "unobserved": "pu"}),
+])
+def test_mapped_column_identifiers_fail_before_parquet_read(tmp_path, role, value):
+    path = tmp_path / "invalid.parquet"
+    path.touch()  # Opening this as Parquet would fail before the intended diagnostic.
+    defaults = dict(path=path, series_col="id", time_col="date", target_col="qty")
+    panel = Panel(**{**defaults, role: value})
+    with pytest.raises(PanelError, match="ASCII identifiers"):
+        panel.validate()
+
+
+def test_internal_identifiers_and_semantic_aliases_remain_valid():
+    panel = _structural_panel(known_future=("sell_price",), price_col="sell_price")
+    panel.validate()
+    dataclasses.replace(panel, series_col="__af_series_id").validate_column_names()
+
+
+def test_plan_identifiers_are_validated_at_construction():
+    with pytest.raises(PanelError, match="ASCII identifiers"):
+        PlanSource("/plan", "valid.date", "known_at", price_col="price")
+
+
 def test_validate_refuses_one_column_in_two_roles() -> None:
     try:
         _structural_panel(exposure_col="qty").validate()

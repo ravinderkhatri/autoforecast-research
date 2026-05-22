@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import email.parser
 import fnmatch
 import hashlib
 import io
@@ -25,6 +26,12 @@ ROOT_FILES = {
     "uv.lock",
     "pyrightconfig.json",
     "pyrightconfig.governed.json",
+    "LICENSE",
+    "COPYING",
+    "NOTICE",
+    "LICENSE.txt",
+    "COPYING.txt",
+    "NOTICE.txt",
 }
 PRIVATE_PATH = re.compile(r"(^|/)(conversations?|transcripts?|sessions?|chats?)(/|[._-])", re.I)
 ATTRIBUTION = re.compile(
@@ -43,6 +50,8 @@ def tracked_inventory(root: pathlib.Path) -> tuple[set[str], dict]:
     """Only maintained code, configuration, CI and the public README are distributable."""
     if pathlib.Path(git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve() != root:
         raise ValueError("public inventory requires the repository root")
+    if git(root, "rev-parse", "--is-shallow-repository").strip() == b"true":
+        raise ValueError("public inventory requires full Git history")
     config = tomllib.loads((root / "pyproject.toml").read_text())
     roots = {
         pattern.removesuffix("*")
@@ -99,6 +108,13 @@ def verify_wheel(root: pathlib.Path, wheel: pathlib.Path, names: set[str], confi
         )
     project = config["project"]
     info = f"{project['name'].replace('-', '_')}-{project['version']}.dist-info"
+    licenses = set()
+    for pattern in project.get("license-files", []):
+        matched = {name for name in names if fnmatch.fnmatchcase(name, pattern)}
+        if not matched:
+            raise ValueError(f"declared license pattern has no tracked file: {pattern}")
+        licenses.update(matched)
+    license_members = {f"{info}/licenses/{name}": name for name in licenses}
     metadata = {
         f"{info}/{name}"
         for name in (
@@ -113,7 +129,7 @@ def verify_wheel(root: pathlib.Path, wheel: pathlib.Path, names: set[str], confi
         members = archive.namelist()
         if len(set(members)) != len(members):
             raise ValueError("wheel has duplicate members")
-        wanted = expected | metadata | {"autoforecast/_build.json"}
+        wanted = expected | metadata | license_members.keys() | {"autoforecast/_build.json"}
         if set(members) != wanted:
             raise ValueError(
                 f"wheel inventory differs: extra={sorted(set(members) - wanted)}, "
@@ -122,6 +138,17 @@ def verify_wheel(root: pathlib.Path, wheel: pathlib.Path, names: set[str], confi
         for name in expected:
             if archive.read(name) != (root / name).read_bytes():
                 raise ValueError(f"wheel source differs from tracked source: {name}")
+        for member, source in license_members.items():
+            if archive.read(member) != (root / source).read_bytes():
+                raise ValueError(f"wheel license differs from tracked source: {source}")
+        headers = email.parser.BytesParser().parsebytes(archive.read(f"{info}/METADATA"))
+        if sorted(headers.get_all("License-File", [])) != sorted(licenses):
+            raise ValueError("wheel license metadata differs from declared files")
+        if (
+            isinstance(project.get("license"), str)
+            and headers.get("License-Expression") != project["license"]
+        ):
+            raise ValueError("wheel license expression differs from project metadata")
         code = {
             name: hashlib.sha256(archive.read(name)).hexdigest()
             for name in expected

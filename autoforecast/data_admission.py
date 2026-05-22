@@ -86,6 +86,10 @@ def load_dataset_contract(path: str | pathlib.Path) -> DatasetContract:
             if type(normalised[name]) is not list:
                 raise DatasetContractError(f"dataset.panel.{name} must be a YAML list")
             normalised[name] = tuple(normalised[name])
+    try:
+        Panel.from_record({"path": ".", **normalised}).validate_column_names()
+    except PanelError as exc:
+        raise DatasetContractError(str(exc)) from exc
     return DatasetContract(dataset["id"], normalised, source)
 
 

@@ -231,19 +231,47 @@ def _cgroup_cpu_limit() -> int | None:
 
 
 def _physical_memory() -> tuple[int, str]:
-    """Physical RAM in bytes and where the number came from."""
-    meminfo = pathlib.Path("/proc/meminfo")
-    if meminfo.exists():
-        for line in meminfo.read_text().splitlines():
+    """Read physical RAM, falling back when an OS probe is unavailable or denied."""
+    try:
+        for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemTotal:"):
-                return int(line.split()[1]) * 1024, "/proc/meminfo"
-    if shutil.which("sysctl"):                      # macOS
-        out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True)
-        if out.returncode == 0 and out.stdout.strip().isdigit():
-            return int(out.stdout.strip()), "sysctl hw.memsize"
+                total = int(line.split()[1]) * 1024
+                if total > 0:
+                    return total, "/proc/meminfo"
+    except (OSError, ValueError, IndexError):
+        pass
+    if shutil.which("sysctl"):  # macOS; restricted processes may be denied this query.
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0:
+                total = int(out.stdout.strip())
+                if total > 0:
+                    return total, "sysctl hw.memsize"
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size > 0 and pages > 0:
+            return page_size * pages, "os.sysconf"
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        import psutil
+
+        total = psutil.virtual_memory().total
+        if type(total) is int and total > 0:
+            return total, "psutil.virtual_memory"
+    except (ImportError, OSError, ValueError, NotImplementedError):
+        pass
     raise ResourceError(
-        "cannot determine the machine's memory. Sizing Spark by guess is how a run inherits "
-        "another machine's limits -- set FORECAST_SPARK_MEMORY explicitly instead")
+        "cannot determine total physical memory from /proc/meminfo, sysctl, os.sysconf, or "
+        "psutil. Allow a system memory probe or pass a verified "
+        "MachineProfile(total_ram_bytes=..., cores=..., source=...) to spark_profile(machine=...). "
+        "FORECAST_SPARK_MEMORY sets only the JVM heap; it cannot supply the total memory budget"
+    )
 
 
 def detect() -> MachineProfile:

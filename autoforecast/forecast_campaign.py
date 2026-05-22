@@ -1608,8 +1608,9 @@ def compile_forecast_campaign(
         },
     }
     if benchmark_path is not None:
-        from autoforecast.benchmark import evaluation_contract, verify_benchmark
-        benchmark_path, benchmark = verify_benchmark(benchmark_path)
+        from autoforecast.benchmark import _evaluation_contract_from_record, verify_benchmark
+        benchmark_sha256 = _sha_file(benchmark_path)
+        benchmark_path, benchmark = verify_benchmark(benchmark_path, benchmark_sha256)
         recipe = benchmark["recipe"]
         if (recipe["validation_origins"] != cast(dict, resolved["temporal"])["validation_origins"]
             or recipe["validation_horizon"] != request.validation_horizon
@@ -1628,12 +1629,13 @@ def compile_forecast_campaign(
             for o in request.validation_origins
         ] + [("test", request.final_train_cutoff.isoformat(), request.final_test_horizon)]
         for stage, origin, span in boundaries:
-            value = evaluation_contract(
-                benchmark_path, stage=stage, origin=origin, horizon=span, metric=request.metric
+            value = _evaluation_contract_from_record(
+                benchmark_path, benchmark, stage=stage, origin=origin, horizon=span,
+                metric=request.metric
             )
             contracts[value["boundary"]] = value
         resolved["benchmark"] = {"id": benchmark["benchmark_id"], "path": str(benchmark_path),
-                                 "sha256": _sha_file(benchmark_path), "evaluations": contracts}
+                                 "sha256": benchmark_sha256, "evaluations": contracts}
     elif installed_mode():
         raise ForecastCampaignError("installed campaigns require a frozen benchmark")
     resolved_payload = _json(resolved).encode()

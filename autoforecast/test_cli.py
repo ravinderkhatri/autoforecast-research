@@ -90,3 +90,33 @@ def test_run_rejects_malformed_dataset_mapping(tmp_path, field, value):
         "run", "--project-root", project, "--benchmark", "absent.json",
     ), "dataset")
     assert not (project / ".autoforecast").exists()
+
+
+@pytest.mark.parametrize("column", ["meter.id", "meter id", "meter`id", "mètre", "__af_id"])
+def test_csv_refuses_unsupported_mapped_headers_before_output(tmp_path, column):
+    source = tmp_path / "input.csv"
+    source.write_text(f"{column},date,value\n001,2024-01-01,1\n")
+    output = tmp_path / "output.parquet"
+    assert_input_error(cli(
+        "import-csv", source, output, "--id-columns", column,
+        "--date-column", "date", "--target-column", "value",
+    ), "rename")
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("source", ["dataset", "recipe"])
+def test_freeze_refuses_unsupported_identifiers_before_spark(tmp_path, source):
+    project = tmp_path / "project"
+    create_example(project)
+    if source == "dataset":
+        path = project / "dataset.yaml"
+        record = yaml.safe_load(path.read_text())
+        record["dataset"]["panel"]["target_col"] = "energy.kwh"
+        path.write_text(yaml.safe_dump(record))
+    else:
+        path = project / "recipe.json"
+        record = json.loads(path.read_bytes())
+        record["source_keys"] = ["meter.id"]
+        path.write_text(json.dumps(record))
+    assert_input_error(cli("freeze", "--project-root", project, "--source", "data"), "rename")
+    assert not (project / ".autoforecast").exists()

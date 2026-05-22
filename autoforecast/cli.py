@@ -164,11 +164,13 @@ def prepare(
     from autoforecast import resources
     from autoforecast._exact_json import load_exact_json
     from autoforecast.benchmark import freeze_benchmark, validate_recipe
+    from autoforecast.data_admission import load_dataset_contract
 
     recipe = load_exact_json(recipe_path)
     if type(recipe) is not dict:
         raise ValueError("preparation recipe must be an object")
     validate_recipe(recipe)
+    load_dataset_contract(contract_path)
     profile = resources.spark_profile(python_udfs=False)
     spark = resources.acquire_local_runtime(
         SparkSession, SparkContext, profile=profile, app_name="autoforecast_prepare"
@@ -202,7 +204,7 @@ def run_campaign(
     from mlops._safe_files import publish_bytes_set
 
     from autoforecast._exact_yaml import loads_exact_yaml
-    from autoforecast.benchmark import verify_benchmark
+    from autoforecast.benchmark import read_benchmark_manifest
     from autoforecast.campaign import CampaignStore, CampaignSupervisor
     from autoforecast.forecast_campaign import (
         compile_forecast_campaign,
@@ -211,7 +213,7 @@ def run_campaign(
     from autoforecast.project import experiment_project
 
     parsed = load_forecast_campaign_request(request_path)
-    benchmark_path, benchmark = verify_benchmark(benchmark_path)
+    benchmark_path, benchmark = read_benchmark_manifest(benchmark_path)
     original = request_path.read_bytes()
     request = loads_exact_yaml(original)
     if type(request) is not dict:

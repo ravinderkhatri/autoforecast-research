@@ -359,3 +359,63 @@ def test_benchmark_identity_survives_parquet_layout_changes(frozen, tmp_path):
     )
     path.write_text(json.dumps(record))
     assert benchmark.verify_benchmark(path)[1]["benchmark_id"] == record["benchmark_id"]
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t\n\r", "\u00a0", "\u2003", "\u2028", "\x1c", "\u3000"])
+def test_freeze_rejects_blank_string_source_keys_from_typed_parquet(tmp_path, spark, blank):
+    project, recipe, sources = _inputs(tmp_path)
+    rows = pq.read_table(project / "data").to_pylist()
+    rows = [{**row, "shop": blank if row["sku"] == 1 else row["shop"]} for row in rows]
+    pq.write_table(pa.Table.from_pylist(rows), project / "data/observations.parquet")
+    with pytest.raises(ValueError, match="blank string key"):
+        _freeze(project, recipe, sources, spark)
+
+
+@pytest.mark.parametrize("name", ["__af_series_id", "__af_unused"])
+def test_freeze_rejects_reserved_raw_columns_even_when_unmapped(tmp_path, spark, name):
+    project, recipe, sources = _inputs(tmp_path)
+    table = pq.read_table(project / "data")
+    table = table.append_column(name, pa.array(["reserved"] * table.num_rows))
+    pq.write_table(table, project / "data/observations.parquet")
+    with pytest.raises(benchmark.BenchmarkError, match="__af_ are reserved"):
+        _freeze(project, recipe, sources, spark)
+
+
+@pytest.mark.parametrize("time_column", ["count", "last"])
+def test_count_and_last_columns_freeze_and_run_a_baseline_with_integral_zero_keys(
+    tmp_path, spark, time_column,
+):
+    from autoforecast.adapters.naive import seasonal_naive
+
+    project, recipe, sources = _inputs(tmp_path)
+    contract = yaml.safe_load((project / "dataset.yaml").read_text())
+    contract["dataset"]["panel"]["time_col"] = time_column
+    (project / "dataset.yaml").write_text(yaml.safe_dump(contract))
+    rows = pq.read_table(project / "data").to_pylist()
+    rows = [{**{key: value for key, value in row.items() if key != "day"}, time_column: row["day"],
+             "sku": 0 if row["sku"] == 1 else row["sku"]} for row in rows]
+    pq.write_table(pa.Table.from_pylist(rows), project / "data/observations.parquet")
+    path = _freeze(project, recipe, sources, spark)
+    record = benchmark.verify_benchmark(path)[1]
+    assert record["cohort_series_count"] == 2 and record["excluded_new_series"] == 0
+    assert 0 in pq.read_table(path.parent / "source-keys")["sku"].to_pylist()
+    panel = load_dataset_contract(path.parent / "dataset.yaml").panel(path.parent / "selection")
+    forecast = seasonal_naive(
+        panel, recipe["validation_origins"][-1], 7, spark=spark, out_dir=tmp_path / "forecast",
+    )
+    predictions = pq.read_table(forecast.path)
+    assert forecast.n_series == 2 and predictions.num_rows == 14
+    assert sorted(predictions["yhat"].to_pylist()) == sorted([*range(3, 10), *range(4, 11)])
+
+
+def test_last_time_column_reports_missing_observations_without_alias_collision(tmp_path, spark):
+    project, recipe, sources = _inputs(tmp_path)
+    contract = yaml.safe_load((project / "dataset.yaml").read_text())
+    contract["dataset"]["panel"]["time_col"] = "last"
+    (project / "dataset.yaml").write_text(yaml.safe_dump(contract))
+    rows = pq.read_table(project / "data").to_pylist()
+    rows = [{**{key: value for key, value in row.items() if key != "day"}, "last": row["day"]}
+            for row in rows if not (row["sku"] == 1 and row["day"] == dt.date(2024, 1, 7))]
+    pq.write_table(pa.Table.from_pylist(rows), project / "data/observations.parquet")
+    with pytest.raises(benchmark.BenchmarkError, match="internal/leading=1, trailing=0"):
+        _freeze(project, recipe, sources, spark)

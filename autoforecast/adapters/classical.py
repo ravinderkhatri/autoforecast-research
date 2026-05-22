@@ -77,35 +77,6 @@ EMITTED = "emitted"
 DECLINED_NO_HISTORY = "declined_no_eligible_history"
 DECLINED_SHORT_HISTORY = "declined_history_below_model_minimum"
 
-SERIES_PER_PARTITION = resources.spark_profile().series_per_partition
-"""How many series one Python worker fits at a time.
-
-Fugue partitions by `unique_id` and inherits the INPUT frame's partitioning, so without this the
-adapter's memory per worker is decided by how the panel happens to be laid out on disk. On M5
-partitioned by store, that is ~3,000 series and ~5.9M rows in one pandas frame per worker; running
-all ten stores crashed the Python workers outright ("Python worker exited unexpectedly",
-SocketException: Connection reset -- the OOM signature, since the worker dies before it can raise).
-
-DERIVED FROM THE MACHINE by `resources.spark_profile()`, from the memory left to the Python
-workers after the heap, divided by the concurrent workers. A constant here is a ceiling everywhere:
-100 was chosen on a 16 GB laptop and, shipped to a 34 GB box, left it running at the laptop's
-limits.
-The cost is more tasks -- normally the right trade, because a task is cheap and a dead worker
-takes the whole job.
-
-IT IS AN ENVIRONMENT VARIABLE because "a task is cheap" stops being true when Spark is also
-configured NOT to reuse Python workers: each task then pays a fresh interpreter plus a numpy and
-statsforecast import. Measured on a 34 GB box at 100 series with reuse off, AutoETS took about an
-hour per origin on 30,490 series while the JVM held 2.3 GB of the 34 available -- the memory
-settings were doing nothing except multiplying startup cost. A machine with headroom should say
-so rather than inherit a smaller machine's limit.
-
-MEASURED, after 250 was still too many. A standalone AutoETS run over all ten stores succeeded at
-250 on an idle 16 GB machine (1,690s, 30,490 series). The same setting crashed inside the full
-Phase 2 run, because by the time AutoETS starts the JVM heap has grown through the naive and
-Croston stages and there is less left for the Python workers. A per-partition size that only works
-when nothing else has run is not a setting, it is a coincidence.
-"""
 DECLINED_NO_FORECAST = "declined_no_forecast_at_that_date"
 
 
@@ -169,13 +140,14 @@ def forecast_with(
             f"no series has {floor} eligible observations at or before {origin}, which is "
             f"{model}'s minimum. Nothing can be fitted")
 
-    # Repartition by series so each Python worker fits a bounded number of them. See
-    # SERIES_PER_PARTITION -- inheriting the panel's layout is what killed the first full run.
+    # Size workers at execution time, so importing or registering models needs no host probes.
+    # Repartition by series instead of inheriting potentially oversized disk partitions.
+    series_per_partition = resources.spark_profile().series_per_partition
     # Enough tasks to keep every core fed several times over, then narrowed by the per-partition
     # ceiling. The adapter is the only place that knows n_fitted, so the parallelism half of the
     # rule can only be applied here.
     by_parallelism = spark.sparkContext.defaultParallelism * resources.TASKS_PER_CORE
-    by_size = -(-n_fitted // SERIES_PER_PARTITION)
+    by_size = -(-n_fitted // series_per_partition)
     parts = max(spark.sparkContext.defaultParallelism, by_parallelism, by_size)
     raw = StatsForecast(models=[spec.build(panel.season_length)], freq="D").forecast(
         h=horizon, df=train.repartition(parts, "unique_id"))

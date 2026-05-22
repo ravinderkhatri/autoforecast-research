@@ -130,7 +130,16 @@ def test_public_release_inventory_rejects_commit_attribution(clean_wheel, tmp_pa
     root = tmp_path / "repo"
     shutil.copytree(original, root)
     commit(root, "Public source\n\nCo-" + "authored-by: automation <test@example.invalid>")
+    commit(root, "Clean later commit")
     with pytest.raises(ValueError, match="commit history"):
+        tracked_inventory(root)
+
+
+def test_public_release_inventory_refuses_shallow_history(clean_wheel, tmp_path):
+    original, _ = clean_wheel
+    root = tmp_path / "shallow"
+    command(tmp_path, "git", "clone", "--depth", "1", original.as_uri(), str(root))
+    with pytest.raises(ValueError, match="full Git history"):
         tracked_inventory(root)
 
 
@@ -191,3 +200,68 @@ def test_build_refuses_stale_python_modules(clean_wheel, tmp_path):
     )
     assert result.returncode != 0
     assert "stale Python modules" in result.stderr
+
+
+@pytest.fixture(scope="module")
+def legal_wheel(clean_wheel, tmp_path_factory):
+    original, _ = clean_wheel
+    root = tmp_path_factory.mktemp("synthetic-legal") / "repo"
+    shutil.copytree(original, root)
+    for name in ("LICENSE", "COPYING", "NOTICE"):
+        (root / name).write_text(f"Synthetic test fixture {name}; no license grant.\n")
+    config = root / "pyproject.toml"
+    config.write_text(
+        config.read_text().replace(
+            "[project]\n",
+            '[project]\nlicense = "LicenseRef-Test-Only"\n'
+            'license-files = ["LICENSE", "COPYING", "NOTICE"]\n',
+        )
+    )
+    commit(root)
+    command(root, sys.executable, "setup.py", "bdist_wheel", "--dist-dir", "dist")
+    return root, next((root / "dist").glob("*.whl"))
+
+
+def test_release_wheel_preserves_declared_synthetic_legal_files(legal_wheel):
+    root, wheel = legal_wheel
+    names, config = tracked_inventory(root)
+    verify_wheel(root, wheel, names, config)
+    with zipfile.ZipFile(wheel) as archive:
+        for name in ("LICENSE", "COPYING", "NOTICE"):
+            assert (
+                archive.read(f"autoforecast-0.1.0.dist-info/licenses/{name}")
+                == (root / name).read_bytes()
+            )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "changed", "metadata", "expression"])
+def test_release_wheel_rejects_legal_file_or_metadata_changes(legal_wheel, tmp_path, mutation):
+    root, wheel = legal_wheel
+    changed = tmp_path / "changed.whl"
+    member = "autoforecast-0.1.0.dist-info/licenses/LICENSE"
+    with zipfile.ZipFile(wheel) as original, zipfile.ZipFile(changed, "w") as modified:
+        for name in original.namelist():
+            payload = original.read(name)
+            if name == member and mutation == "missing":
+                continue
+            if name == member and mutation == "changed":
+                payload += b"changed\n"
+            if name.endswith("/METADATA") and mutation == "metadata":
+                payload = payload.replace(b"License-File: LICENSE\n", b"")
+            if name.endswith("/METADATA") and mutation == "expression":
+                payload = payload.replace(b"LicenseRef-Test-Only", b"LicenseRef-Other-Test")
+            modified.writestr(name, payload)
+    names, config = tracked_inventory(root)
+    with pytest.raises(ValueError, match="wheel (inventory|license)"):
+        verify_wheel(root, changed, names, config)
+
+
+def test_release_wheel_requires_each_declared_legal_file(legal_wheel, tmp_path):
+    original, wheel = legal_wheel
+    root = tmp_path / "missing-legal"
+    shutil.copytree(original, root)
+    (root / "LICENSE").unlink()
+    commit(root)
+    names, config = tracked_inventory(root)
+    with pytest.raises(ValueError, match="declared license pattern has no tracked file"):
+        verify_wheel(root, wheel, names, config)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib
 import os
 import pathlib
+import subprocess
 import sys
 import threading
 from types import SimpleNamespace
@@ -604,6 +605,138 @@ def test_a_machine_too_small_to_run_on_is_refused() -> None:
 def test_os_reserve_rejects_boolean_and_unrepresentable_numbers(reserve: object) -> None:
     with pytest.raises(ResourceError, match="finite non-negative number"):
         spark_profile(machine(8, 4), os_reserve_gb=reserve)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def blocked_memory_probes(monkeypatch: pytest.MonkeyPatch):
+    """Make every host probe unavailable unless the individual test enables it."""
+    import autoforecast.resources as res
+
+    read_text = pathlib.Path.read_text
+
+    def missing_meminfo(path, *args, **kwargs):
+        if str(path) == "/proc/meminfo":
+            raise FileNotFoundError("not a Linux host")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", missing_meminfo)
+    monkeypatch.setattr(res.shutil, "which", lambda _: "/usr/sbin/sysctl")
+    monkeypatch.setattr(res.subprocess, "run", mock.Mock(
+        return_value=SimpleNamespace(returncode=1, stdout="", stderr="Operation not permitted"),
+    ))
+    monkeypatch.setattr(res.os, "sysconf", mock.Mock(side_effect=ValueError("unsupported")),
+                        raising=False)
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    return res
+
+
+@pytest.mark.parametrize("failure", [
+    SimpleNamespace(returncode=1, stdout="", stderr="Operation not permitted"),
+    PermissionError("sysctl execution denied"),
+    subprocess.TimeoutExpired("sysctl", 5),
+    SimpleNamespace(returncode=0, stdout="0", stderr=""),
+    SimpleNamespace(returncode=0, stdout="not memory", stderr=""),
+])
+def test_physical_memory_falls_back_when_sysctl_is_denied(
+    blocked_memory_probes, monkeypatch: pytest.MonkeyPatch, failure,
+) -> None:
+    res = blocked_memory_probes
+    sysctl = mock.Mock(side_effect=failure) if isinstance(failure, Exception) else mock.Mock(
+        return_value=failure)
+    monkeypatch.setattr(res.subprocess, "run", sysctl)
+    sysconf = mock.Mock(side_effect={"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 2 * 1024**2}.__getitem__)
+    monkeypatch.setattr(res.os, "sysconf", sysconf)
+    assert res._physical_memory() == (8 * _GB, "os.sysconf")
+    sysctl.assert_called_once()
+    assert sysconf.call_args_list == [mock.call("SC_PAGE_SIZE"), mock.call("SC_PHYS_PAGES")]
+
+
+@pytest.mark.parametrize("unavailable", [ValueError("unsupported"), OSError("denied"), -1, 0])
+def test_physical_memory_uses_psutil_when_sysconf_is_unavailable(
+    blocked_memory_probes, monkeypatch: pytest.MonkeyPatch, unavailable,
+) -> None:
+    res = blocked_memory_probes
+    sysconf = mock.Mock(side_effect=unavailable) if isinstance(unavailable, Exception) else mock.Mock(
+        return_value=unavailable)
+    monkeypatch.setattr(res.os, "sysconf", sysconf)
+    virtual_memory = mock.Mock(return_value=SimpleNamespace(total=12 * _GB))
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(virtual_memory=virtual_memory))
+    assert res._physical_memory() == (12 * _GB, "psutil.virtual_memory")
+    virtual_memory.assert_called_once_with()
+
+
+@pytest.mark.parametrize("probe", ["proc", "sysctl"])
+def test_physical_memory_prefers_a_valid_primary_probe(
+    blocked_memory_probes, monkeypatch: pytest.MonkeyPatch, probe: str,
+) -> None:
+    res = blocked_memory_probes
+    if probe == "proc":
+        monkeypatch.setattr(pathlib.Path, "read_text", lambda _: "MemTotal:       8388608 kB\n")
+    else:
+        monkeypatch.setattr(res.subprocess, "run", mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout=str(8 * _GB)),
+        ))
+    monkeypatch.setattr(res.os, "sysconf", mock.Mock(side_effect=AssertionError("unneeded fallback")))
+    expected_source = "/proc/meminfo" if probe == "proc" else "sysctl hw.memsize"
+    assert res._physical_memory() == (8 * _GB, expected_source)
+
+
+@pytest.mark.parametrize("psutil_value", [None, 0, -1, True, OSError("denied")])
+def test_spark_profile_override_does_not_emit_an_impossible_remediation(
+    blocked_memory_probes, monkeypatch: pytest.MonkeyPatch, psutil_value,
+) -> None:
+    res = blocked_memory_probes
+    if psutil_value is not None:
+        probe = (mock.Mock(side_effect=psutil_value) if isinstance(psutil_value, Exception)
+                 else mock.Mock(return_value=SimpleNamespace(total=psutil_value)))
+        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(virtual_memory=probe))
+    monkeypatch.setenv("FORECAST_SPARK_MEMORY", "1g")
+    with pytest.raises(ResourceError, match="cannot determine total physical memory") as caught:
+        res.spark_profile()
+    message = str(caught.value)
+    assert "MachineProfile(total_ram_bytes=" in message
+    assert "FORECAST_SPARK_MEMORY sets only the JVM heap" in message
+    assert "set FORECAST_SPARK_MEMORY explicitly instead" not in message
+
+
+def test_fallback_memory_detection_still_honors_cgroup_limits(
+    blocked_memory_probes, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    res = blocked_memory_probes
+    monkeypatch.setattr(res.os, "sysconf", {"SC_PAGE_SIZE": 4096,
+                                          "SC_PHYS_PAGES": 8 * 1024**2}.__getitem__)
+    monkeypatch.setattr(res, "_cgroup_memory_limit", lambda: 4 * _GB)
+    monkeypatch.setattr(res, "_cgroup_cpu_limit", lambda: 2)
+    monkeypatch.setattr(res.os, "cpu_count", lambda: 16)
+    actual = res.detect()
+    assert actual == MachineProfile(4 * _GB, 2, "cgroup, cpu=cgroup")
+    sized = res.spark_profile(actual, honor_env=False)
+    assert sized.python_worker_budget_gb + float(sized.driver_memory.rstrip("g")) == 2.0
+
+
+def test_spark_profile_override_works_after_a_denied_probe(
+    blocked_memory_probes, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    res = blocked_memory_probes
+    monkeypatch.setattr(res.os, "sysconf", {"SC_PAGE_SIZE": 4096,
+                                          "SC_PHYS_PAGES": 2 * 1024**2}.__getitem__)
+    monkeypatch.setattr(res, "_cgroup_memory_limit", lambda: None)
+    monkeypatch.setattr(res, "_cgroup_cpu_limit", lambda: None)
+    monkeypatch.setattr(res.os, "cpu_count", lambda: 2)
+    monkeypatch.setenv("FORECAST_SPARK_MEMORY", "1g")
+    monkeypatch.setenv("FORECAST_SPARK_CORES", "1")
+    profile = res.spark_profile()
+    assert profile.driver_memory == "1g"
+    assert profile.cores == 1
+    assert profile.python_worker_budget_gb == 5.0
+
+
+def test_explicit_machine_profile_does_not_need_memory_probes(
+    blocked_memory_probes,
+) -> None:
+    res = blocked_memory_probes
+    profile = res.spark_profile(MachineProfile(8 * _GB, 2, "verified total"), honor_env=False)
+    assert profile.python_worker_budget_gb + float(profile.driver_memory.rstrip("g")) == 6.0
 
 
 def test_detection_returns_something_plausible_for_this_machine() -> None:

@@ -24,6 +24,8 @@ import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 import pyarrow.types as patypes
 
+from autoforecast.column_names import validate_column_names
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 # noqa: E402 -- sys.path must be extended before the spec can be imported.
 from spec.forecast_spec import ELIGIBLE_STATES, ObservationState  # noqa: E402
@@ -76,6 +78,13 @@ class PlanSource:
     def __post_init__(self) -> None:
         if self.price_col is None and self.promo_col is None:
             raise PanelError("a plan source must carry a price or a promotion column")
+        try:
+            validate_column_names(c for c in (
+                self.valid_date_col, self.known_at_col, self.snapshot_col,
+                self.price_col, self.promo_col,
+            ) if c is not None)
+        except ValueError as exc:
+            raise PanelError(str(exc)) from exc
         object.__setattr__(self, "path", str(self.path))
 
 
@@ -154,10 +163,8 @@ class Panel:
             sold quantity. ``unconstrained_demand`` is latent demand and may be requested only
             from an adapter that explicitly handles right-censored observations. This role is
             carried through every Forecast so a metric cannot compare different quantities.
-        season_length: Periods in one seasonal cycle. Default 7 because both datasets this
-            repository has measured are DAILY -- M5 (Walmart, public) and the estate profiled in
-            `the configured dataset contract` -- and retail demand at daily grain is dominated by day-of-week.
-            A non-daily panel must set it; nothing infers it.
+        season_length: Periods in one seasonal cycle. Default 7 represents a weekly cycle
+            in daily observations. Other cycles must be declared; nothing infers them.
     """
 
     path: str
@@ -258,6 +265,14 @@ class Panel:
             self.category_col,
         ) if c is not None)
         return tuple(dict.fromkeys(cols))
+
+    def validate_column_names(self) -> None:
+        """Validate mapped identifiers without opening data or starting a runtime."""
+        try:
+            names = list(self.role_columns)
+            validate_column_names(names)
+        except (TypeError, KeyError, AttributeError, ValueError) as exc:
+            raise PanelError(f"invalid panel column mapping: {exc}") from exc
 
     def validate(self) -> Panel:
         """Refuse a panel that does not describe its own Parquet. Returns self so it can chain.
@@ -404,6 +419,7 @@ class Panel:
                 f"roles: {collisions}"
             )
 
+        self.validate_column_names()
         roles = self.role_columns
         schema = pq.read_schema(_any_fragment(p))
         present = set(schema.names) | _partition_columns(p)

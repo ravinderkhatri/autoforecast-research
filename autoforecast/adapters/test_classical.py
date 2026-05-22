@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 
@@ -116,6 +118,50 @@ def run(model: str, **kw):
     fc = forecast_with(model, p, kw.pop("origin", ORIGIN), kw.pop("horizon", HORIZON),
                        spark=spark(), out_dir=d)
     return fc, spark().read.parquet(d)
+
+
+def test_classical_import_and_registration_do_not_size_the_host() -> None:
+    script = """
+from unittest import mock
+from autoforecast import resources
+with mock.patch.object(resources, "detect", side_effect=AssertionError("host was sized")):
+    from autoforecast.adapters import classical, register_defaults
+    registered = register_defaults(only=("classical",))
+    assert set(classical.MODELS).issubset(registered)
+"""
+    completed = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
+                               capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_classical_partition_size_uses_the_current_runtime_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop at the model handoff; no Spark session or forecast is required for sizing."""
+    class ReachedForecast(Exception):
+        pass
+
+    train = mock.Mock()
+    train.select.return_value.distinct.return_value.count.return_value = 1001
+    runtime = mock.Mock()
+    runtime.sparkContext.defaultParallelism = 1
+    model = mock.Mock()
+    model.forecast.side_effect = ReachedForecast
+    monkeypatch.setenv("PYSPARK_PYTHON", sys.executable)
+    monkeypatch.setenv("FORECAST_SPARK_MEMORY", "1g")
+    monkeypatch.setenv("FORECAST_SPARK_CORES", "1")
+    with mock.patch.object(classical, "_eligible_history", return_value=train), \
+            mock.patch.object(classical, "_long_enough", return_value=train), \
+            mock.patch.object(classical, "StatsForecast", return_value=model), \
+            mock.patch.object(classical.resources, "detect", return_value=
+                              classical.resources.MachineProfile(8 * 1024**3, 2, "test")):
+        for size, expected_partitions in ((50, 21), (25, 41)):
+            monkeypatch.setenv("FORECAST_SERIES_PER_PARTITION", str(size))
+            with pytest.raises(ReachedForecast):
+                classical.forecast_with("croston", _panel_contract(), ORIGIN, HORIZON,
+                                        spark=runtime, out_dir="unused")
+            train.repartition.assert_called_with(expected_partitions, "unique_id")
+    assert model.forecast.call_count == 2
 
 
 def test_forecast_with_croston_accounts_for_every_cell_on_real_m5() -> None:
