@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import tempfile
 from dataclasses import dataclass
 from typing import cast
 
@@ -12,7 +13,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from autoforecast._exact_json import load_exact_json as _load_exact_json
-from autoforecast.benchmark import artifact_path, verify_benchmark
+from autoforecast._exact_json import loads_exact_json
+from autoforecast.benchmark import _evaluation_contract_from_record, artifact_path, verify_benchmark
 from autoforecast.campaign import CampaignStore
 from autoforecast.forecast_campaign import (
     _completed_output,
@@ -20,7 +22,7 @@ from autoforecast.forecast_campaign import (
     _verified_forecast,
 )
 from autoforecast.frequency import parse_frequency, period_points
-from provenance.lineage import directory_digest
+from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 ROW_SCHEMA = pa.schema(
     [
@@ -120,6 +122,18 @@ def _resolved_frequency(resolved: dict, contract_frequency: str | None) -> str |
 
 def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
     """Verify journal/output hashes and identities before exposing forecasts or run metadata."""
+    with tempfile.TemporaryDirectory(prefix="autoforecast-results-") as temporary:
+        return _read_results(campaign_root, pathlib.Path(temporary))
+
+
+def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) -> CampaignResults:
+    def read_verified_parquet(path: str | pathlib.Path, sha256: str, **kwargs) -> pa.Table:
+        snapshot = snapshot_parquet_directory(
+            pathlib.Path(path), snapshots / str(len(list(snapshots.iterdir()))),
+            expected_sha256=sha256, label="result artifact",
+        )
+        return pq.read_table(snapshot, **kwargs)
+
     store = CampaignStore.from_root(campaign_root)
     store.verify_completed_outputs()
     command = store.plan.stages[0].command
@@ -156,13 +170,19 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
         path, frozen = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
         if frozen["benchmark_id"] != benchmark["id"]:
             raise ValueError("campaign benchmark identity conflict")
-        from autoforecast.data_admission import load_dataset_contract
+        from autoforecast.data_admission import _load_dataset_contract_bytes
 
-        target = load_dataset_contract(path.parent / "dataset.yaml").panel(
+        dataset_path = path.parent / "dataset.yaml"
+        dataset_bytes = dataset_path.read_bytes()
+        if hashlib.sha256(dataset_bytes).hexdigest() != frozen["dataset_sha256"]:
+            raise ValueError("study dataset contract changed")
+        target = _load_dataset_contract_bytes(dataset_bytes, dataset_path).panel(
             artifact_path(path, frozen, "selection")
         )
         contract_frequency = parse_frequency(target.frequency).code
-        source_keys = pq.read_table(artifact_path(path, frozen, "source-keys"))
+        source_keys = read_verified_parquet(
+            artifact_path(path, frozen, "source-keys"), frozen["artifacts"]["source-keys"]
+        )
         metadata.update(
             {
                 "benchmark_id": benchmark["id"],
@@ -298,17 +318,30 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
                 )
                 comparison_sha = result["comparison_sha256"]
             if comparison_path is not None:
-                if hashlib.sha256(comparison_path.read_bytes()).hexdigest() != comparison_sha:
+                comparison_bytes = comparison_path.read_bytes()
+                if hashlib.sha256(comparison_bytes).hexdigest() != comparison_sha:
                     raise ValueError("study comparison changed")
-                comparison = load_exact_json(comparison_path)
-                for candidate in comparison["candidates"]:
+                comparison = loads_exact_json(comparison_bytes)
+                if not isinstance(comparison, dict):
+                    raise ValueError("study comparison must be an object")
+                expected_contract = _evaluation_contract_from_record(
+                    path, frozen, stage=stage_name, origin=result["origin"],
+                    horizon=result["horizon"], metric=resolved["selection"]["metric"],
+                )
+                if comparison.get("evaluation_contract") != expected_contract:
+                    raise ValueError("study comparison evaluation identity differs")
+                candidates = comparison.get("candidates")
+                if (not isinstance(candidates, list) or len(candidates) != 1
+                        or candidates[0].get("model_id") != result["model_id"]):
+                    raise ValueError("study per-series model identity differs")
+                for candidate in candidates:
                     evidence = candidate.get("score", {}).get("series_scores")
                     if evidence is None:
                         raise ValueError("study comparison lacks per-series scores and coverage")
                     if (directory_digest(evidence["path"], suffixes=(".parquet",))
                             != evidence["sha256"]):
                         raise ValueError("study per-series scores changed")
-                    table = pq.read_table(evidence["path"])
+                    table = read_verified_parquet(evidence["path"], evidence["sha256"])
                     for name, value in {
                         "study_id": metadata["study_id"], "model_id": result["model_id"],
                         "variant_id": result["variant_id"], "run_id": run_id,
@@ -327,7 +360,10 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
                 "declined_cell_identity": "unavailable; aggregate disposition only",
             }
         )
-        for row in pq.read_table(forecast.path, columns=["series_id", "date", "yhat"]).to_pylist():
+        forecast_rows = read_verified_parquet(
+            forecast.path, result["forecast_artifact_sha256"], columns=["series_id", "date", "yhat"]
+        )
+        for row in forecast_rows.to_pylist():
             rows.append(
                 {
                     "benchmark_id": benchmark["id"] if benchmark else None,

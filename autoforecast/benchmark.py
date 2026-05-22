@@ -15,7 +15,7 @@ from functools import partial
 
 from autoforecast._exact_json import loads_exact_json
 from autoforecast.column_names import validate_column_names
-from autoforecast.data_admission import load_dataset_contract
+from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.frequency import (
     Cadence,
     FrequencyError,
@@ -25,7 +25,7 @@ from autoforecast.frequency import (
     parse_frequency,
     parse_origin,
 )
-from provenance.lineage import directory_digest
+from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
 SCHEMA = "autoforecast.frozen-benchmark.v1"
 STUDY_SCHEMA = "autoforecast.frozen-benchmark.v2"
@@ -260,8 +260,9 @@ def resolve_study(output_root: pathlib.Path, study_id: str) -> tuple[pathlib.Pat
             or any(character not in "0123456789abcdef" for character in study_id)):
         raise BenchmarkError("study_id must be a lowercase SHA-256 identity")
     path, record = verify_benchmark(output_root / study_id / "benchmark.json")
-    if record["benchmark_id"] != study_id:
-        raise BenchmarkError("study_id differs from the registered content")
+    if (record["schema"] != STUDY_SCHEMA or record.get("study_id") != study_id
+            or record["benchmark_id"] != study_id):
+        raise BenchmarkError("study_id must resolve to the matching version-2 study")
     return path, record
 
 
@@ -386,6 +387,29 @@ def freeze_benchmark(
     study_id: str | None = None,
     scoring_references: pathlib.Path | None = None,
 ) -> pathlib.Path:
+    """Freeze one study from authenticated, operation-owned input snapshots."""
+    with ExitStack() as inputs:
+        try:
+            return _freeze_benchmark(
+                contract_path=contract_path, sources=sources, recipe=recipe,
+                output_root=output_root, spark=spark, study_id=study_id,
+                scoring_references=scoring_references, inputs=inputs,
+            )
+        except LineageError as error:
+            raise BenchmarkError(str(error)) from error
+
+
+def _freeze_benchmark(
+    *,
+    contract_path: pathlib.Path,
+    sources: dict[str, pathlib.Path],
+    recipe: dict,
+    output_root: pathlib.Path,
+    spark,
+    inputs: ExitStack,
+    study_id: str | None = None,
+    scoring_references: pathlib.Path | None = None,
+) -> pathlib.Path:
     """Validate source scope, normalize keys, and publish immutable role snapshots and grids.
 
     Population: all distinct source keys observed by the earliest validation origin.
@@ -425,8 +449,10 @@ def freeze_benchmark(
     cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
     horizon, test_horizon = recipe["validation_horizon"], recipe["final_test_horizon"]
     end = advance(cutoff, cadence, test_horizon)
+    if contract_path.is_symlink() or not contract_path.is_file():
+        raise BenchmarkError("dataset contract must be a regular file")
     contract_bytes = contract_path.read_bytes()
-    contract = load_dataset_contract(contract_path)
+    contract = _load_dataset_contract_bytes(contract_bytes, contract_path)
     panel = contract.panel(sources["selection"])
     if (
         parse_frequency(panel.frequency).code != cadence.code
@@ -458,11 +484,23 @@ def freeze_benchmark(
         all_sources["scoring_references"] = scoring_references
     before = {name: directory_digest(path, suffixes=(".parquet",))
               for name, path in all_sources.items()}
+    snapshot_root = pathlib.Path(inputs.enter_context(tempfile.TemporaryDirectory(
+        prefix="autoforecast-freeze-",
+    )))
+    read_paths = {}
+    physical_inputs = {}
+    for name, path in all_sources.items():
+        identity = (path.resolve(), before[name])
+        if identity not in physical_inputs:
+            physical_inputs[identity] = snapshot_parquet_directory(
+                path, snapshot_root / name, expected_sha256=before[name], label=name,
+            )
+        read_paths[name] = physical_inputs[identity]
     frames = {}
     key_types = None
     internal = "__af_series_id"
-    for name, path in sources.items():
-        frame = grid.read_time_parquet(spark, path, panel.time_col)
+    for name in sources:
+        frame = grid.read_time_parquet(spark, read_paths[name], panel.time_col)
         try:
             validate_column_names(frame.columns)
         except ValueError as error:
@@ -697,7 +735,7 @@ def freeze_benchmark(
         artifact_roles = [*sorted(sources), "source-keys"]
         if scoring_references is not None:
             references = _prepare_scoring_references(
-                scoring_references, key_map, keys, recipe, spark,
+                read_paths["scoring_references"], key_map, keys, recipe, spark,
             )
             references.write.parquet(str(scratch / "scoring_references"))
             artifact_roles.append("scoring_references")

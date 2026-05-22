@@ -30,13 +30,27 @@ def main() -> int:
     run_cli("init-example", project, cwd=project.parent)
     recipe_path = project / "recipe.json"
     recipe = json.loads(recipe_path.read_text())
-    recipe.update(actual_missing="mask", series_starts={
+    recipe.update(metric="wrmsse", actual_missing="mask", series_starts={
         "rule": "Synthetic starts declared before the first validation origin", "values": [
             {"keys": {"shop": "a|b", "sku": 1}, "start": "2024-01-01"},
             {"keys": {"shop": "a", "sku": 2}, "start": "2024-01-15"},
         ],
     })
     recipe_path.write_text(json.dumps(recipe))
+    request_path = project / "campaign.yaml"
+    request = yaml.safe_load(request_path.read_text())
+    request["forecast_campaign"]["selection"]["metric"] = "wrmsse"
+    request_path.write_text(yaml.safe_dump(request))
+    references = project / "scoring-references.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"keys": {"shop": shop, "sku": sku}, "stage": stage, "origin": origin,
+         "weight": weight, "scale": scale}
+        for stage, origin in [
+            *(("validation", value) for value in recipe["validation_origins"]),
+            ("test", recipe["final_train_cutoff"]),
+        ]
+        for shop, sku, weight, scale in (("a|b", 1, 14.0, 2.5), ("a", 2, 9.0, 4.0))
+    ]), references)
     source = project / "data/observations.parquet"
     table = pq.read_table(source)
     rows = []
@@ -50,12 +64,16 @@ def main() -> int:
             row["units"] = 0.0
         rows.append(row)
     pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), source)
-    frozen_path = run_cli("freeze", "--project-root", project, "--source", "data", cwd=project)
+    frozen_path = run_cli("freeze", "--project-root", project, "--source", "data",
+                          "--scoring-references", references, cwd=project)
     frozen = verify_benchmark(frozen_path)[1]
     study_id = frozen["study_id"]
     campaign = run_cli("run", "--project-root", project, "--study-id", study_id, cwd=project)
     results = read_results(campaign)
     assert results.metadata["study_id"] == study_id
+    assert results.metadata["final_score"]["metric"] == "wrmsse"
+    assert results.metadata["final_score"]["status"] == "unavailable"
+    assert results.metadata["final_score"]["score"] is None
     assert len(results.runs) == 5 and results.rows.num_rows == 70
     assert results.series_scores is not None and results.series_scores.num_rows == 10
     validation_coverage = {}
@@ -88,7 +106,8 @@ def main() -> int:
     pq.write_table(pa.Table.from_pylist(replacement, schema=table.schema), labels)
     revised_path = run_cli(
         "freeze", "--project-root", project, "--source", "data",
-        "--validation-score", labels, "--final-score", labels, cwd=project,
+        "--validation-score", labels, "--final-score", labels,
+        "--scoring-references", references, cwd=project,
     )
     revised = verify_benchmark(revised_path)[1]
     assert revised["study_id"] != study_id
@@ -99,6 +118,11 @@ def main() -> int:
     record = json.loads(rescored.read_text())
     assert record["original_study_id"] == study_id
     assert record["scoring_study_id"] == revised["study_id"]
+    for item in record["scores"]:
+        comparison = json.loads(pathlib.Path(item["comparison"]).read_text())
+        assert comparison["metric"] == "wrmsse"
+        candidate = comparison["candidates"][0]
+        assert candidate["status"] == "scored" and candidate["score"]["wrmsse"] is not None
     assert {entry["run_id"] for entry in record["scores"]} == {
         run["run_id"] for run in results.runs
     }
@@ -106,7 +130,8 @@ def main() -> int:
                for path, value in original_files.items())
     incompatible = {**recipe, "final_test_horizon": 6}
     recipe_path.write_text(json.dumps(incompatible))
-    mismatch = run_cli("freeze", "--project-root", project, "--source", "data", cwd=project)
+    mismatch = run_cli("freeze", "--project-root", project, "--source", "data",
+                       "--scoring-references", references, cwd=project)
     try:
         run_cli("rescore", "--project-root", project, "--campaign", campaign,
                 "--study-id", verify_benchmark(mismatch)[1]["study_id"],
@@ -166,7 +191,7 @@ def main() -> int:
     assert empty_results.series_scores is not None
     heldout = [row for row in empty_results.series_scores.to_pylist() if row["stage"] == "test"]
     assert len(heldout) == 2 and all(row["scored"] == 0 for row in heldout)
-    print("PASS: study coverage, export, resume, rescoring and complete-cohort preflight")
+    print("PASS: flat WRMSSE, coverage, export, resume, rescoring and complete-cohort preflight")
     return 0
 
 

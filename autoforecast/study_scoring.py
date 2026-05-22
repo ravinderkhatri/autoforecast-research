@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import hashlib
 import math
 import pathlib
+import tempfile
 from typing import cast
 
 from pyspark.sql import SparkSession
@@ -16,10 +19,11 @@ from autoforecast.benchmark import (
     artifact_path,
     verify_benchmark,
 )
-from autoforecast.data_admission import load_dataset_contract
-from autoforecast.panel import Forecast, Panel
+from autoforecast.data_admission import _load_dataset_contract_bytes
+from autoforecast.panel import Forecast, ForecastError, Panel
+from autoforecast.ranking import SelectionError, _exact_grid_restrictions
 from autoforecast.score_spark import MissingActual, ScoreError, score_forecast
-from provenance.lineage import directory_digest
+from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
 
 def verify_study_evaluation(contract: dict) -> tuple[pathlib.Path, dict]:
@@ -41,13 +45,71 @@ def score_study(
     output_dir: pathlib.Path,
 ) -> dict:
     """Score the full frozen grid and retain per-series coverage and unavailable scores."""
+    contract = copy.deepcopy(contract)
+    forecast = Forecast.from_record(forecast.as_record())
+    try:
+        forecast.validate()
+    except ForecastError as error:
+        raise ScoreError(str(error)) from error
     path, study = verify_study_evaluation(contract)
     actuals = contract["actuals"]
-    expected_panel = load_dataset_contract(path.parent / "dataset.yaml").panel(panel.path)
-    if dataclasses.asdict(panel) != dataclasses.asdict(expected_panel):
+    dataset_path = path.parent / "dataset.yaml"
+    dataset_bytes = dataset_path.read_bytes()
+    if hashlib.sha256(dataset_bytes).hexdigest() != study["dataset_sha256"]:
+        raise ScoreError("dataset contract changed before scoring")
+    dataset = _load_dataset_contract_bytes(dataset_bytes, dataset_path)
+    if dataclasses.asdict(panel) != dataclasses.asdict(dataset.panel(panel.path)):
         raise ScoreError("scoring panel roles differ from the frozen study")
-    if directory_digest(panel.path, suffixes=(".parquet",)) != actuals["sha256"]:
-        raise ScoreError("scoring actuals differ from the frozen study role")
+    if (forecast.n_series != study["cohort_series_count"] or forecast.n_declined
+            or forecast.n_emitted != contract["grid"]["n_cells"]):
+        raise ScoreError("forecast population or dispositions differ from the frozen cohort")
+    forecast_sha = directory_digest(forecast.path, suffixes=(".parquet",))
+    inputs = {
+        "actuals": (pathlib.Path(panel.path), actuals["sha256"]),
+        "forecast": (pathlib.Path(forecast.path), forecast_sha),
+        "grid": (pathlib.Path(contract["grid"]["path"]), contract["grid"]["sha256"]),
+        "coverage": (pathlib.Path(contract["coverage"]["path"]), contract["coverage"]["sha256"]),
+    }
+    if contract["metric_policy"]["metric"] == "wrmsse":
+        inputs["references"] = (artifact_path(path, study, "scoring_references"),
+                                study["artifacts"]["scoring_references"])
+    with tempfile.TemporaryDirectory(prefix="autoforecast-score-") as temporary:
+        root = pathlib.Path(temporary)
+        try:
+            snapshots = {
+                name: snapshot_parquet_directory(source, root / name,
+                                                  expected_sha256=sha, label=name)
+                for name, (source, sha) in inputs.items()
+            }
+        except LineageError as error:
+            raise ScoreError(str(error)) from error
+        private_panel = dataclasses.replace(panel, path=str(snapshots["actuals"]))
+        private_forecast = dataclasses.replace(forecast, path=str(snapshots["forecast"]))
+        score = _score_study_snapshot(
+            private_panel, private_forecast, spark, contract=contract,
+            snapshots=snapshots, output_dir=output_dir,
+        )
+    if (directory_digest(panel.path, suffixes=(".parquet",)) != actuals["sha256"]
+            or directory_digest(forecast.path, suffixes=(".parquet",)) != forecast_sha):
+        raise ScoreError("scoring inputs changed during evaluation")
+    verify_study_evaluation(contract)
+    return score
+
+
+def _score_study_snapshot(
+    panel: Panel, forecast: Forecast, spark: SparkSession, *, contract: dict,
+    snapshots: dict[str, pathlib.Path], output_dir: pathlib.Path,
+) -> dict:
+    """Consume only the verified copies owned by this scoring operation."""
+    try:
+        _, count = _exact_grid_restrictions(
+            {forecast.adapter: {forecast.origin: forecast}}, (forecast.origin,),
+            {forecast.origin: str(snapshots["grid"])}, spark,
+        )
+    except SelectionError as error:
+        raise ScoreError(str(error)) from error
+    if count != contract["grid"]["n_cells"]:
+        raise ScoreError("forecast grid differs from the frozen denominator")
     policy = contract["metric_policy"]
     missing = cast(
         MissingActual, "sparse_zero" if policy["actual_missing"] == "zero" else "no_data",
@@ -55,7 +117,7 @@ def score_study(
     raw_path = output_dir / "cell-sums"
     result = score_forecast(
         panel, forecast, spark, missing_actual=missing,
-        eligible_grid=contract["grid"]["path"], original_missing_column=MISSING_COLUMN,
+        eligible_grid=str(snapshots["grid"]), original_missing_column=MISSING_COLUMN,
         series_scores_path=str(raw_path),
     )
     sums = spark.read.parquet(str(raw_path))
@@ -64,7 +126,7 @@ def score_study(
         F.col("n_zero_filled").alias("zero_filled"),
         F.col("n_no_data").alias("excluded"), F.col("n_scored").alias("scored"),
     )
-    frozen = spark.read.parquet(contract["coverage"]["path"]).select(*coverage.columns)
+    frozen = spark.read.parquet(str(snapshots["coverage"])).select(*coverage.columns)
     if (coverage.exceptAll(frozen).limit(1).count()
             or frozen.exceptAll(coverage).limit(1).count()):
         raise ScoreError("scoring coverage differs from the frozen denominator")
@@ -89,7 +151,7 @@ def score_study(
         "metric_definition": policy,
     }
     if policy["metric"] == "wrmsse":
-        references = spark.read.parquet(str(artifact_path(path, study, "scoring_references")))
+        references = spark.read.parquet(str(snapshots["references"]))
         references = references.filter(F.col("boundary") == contract["boundary"])
         per_series = per_series.join(references.select("series_id", "weight", "scale"),
                                      "series_id", "left")
@@ -116,7 +178,4 @@ def score_study(
     score["series_scores"] = {
         "path": str(series_path), "sha256": directory_digest(series_path, suffixes=(".parquet",)),
     }
-    if directory_digest(panel.path, suffixes=(".parquet",)) != actuals["sha256"]:
-        raise ScoreError("scoring actuals changed during evaluation")
-    verify_study_evaluation(contract)
     return score

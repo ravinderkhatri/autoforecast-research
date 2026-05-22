@@ -670,3 +670,35 @@ selection_lock:
             seed=0,
             training_controls=controls,
         )
+
+
+@pytest.mark.parametrize("adapter", [
+    "sft", "hmfnet", "pact", "tft_q", "tft_hnb",
+])
+def test_flat_wrmsse_refuses_m5_checkpoint_adapters_before_runtime(tmp_path, monkeypatch, adapter):
+    candidates = discover_candidates(runner.ROOT / "configs/models")
+    candidate = next(item for item in candidates if item.adapter == adapter)
+    request_path = runner.ROOT / "configs/autoforecast/m5_tft_q_reference_smoke.yaml"
+    request = dataclasses.replace(runner.load_run_request(request_path),
+                                  models=(candidate.id,), evaluation=None)
+    monkeypatch.setattr(runner, "load_run_request", lambda *_: request)
+    monkeypatch.setattr(runner, "_runtime_data_path", lambda path: path)
+    monkeypatch.setattr(runner, "capture_source_identity", lambda *_: object())
+    monkeypatch.setattr(runner, "capture_runtime_identity", lambda *_, **kwargs: object())
+    def unexpected_runtime(*args, **kwargs):
+        pytest.fail("flat WRMSSE reached the training runtime")
+    monkeypatch.setattr(runner.resources, "acquire_local_runtime", unexpected_runtime)
+    from autoforecast import study_scoring
+    # Study authentication has its own real-artifact tests. Isolate the worker capability
+    # boundary so removing its guard reaches the runtime sentinel, not an incomplete fixture.
+    monkeypatch.setattr(study_scoring, "verify_study_evaluation", lambda _: (None, {}))
+    fixed = tmp_path / "evaluation.json"
+    fixed.write_text(json.dumps({"schema": "autoforecast.fixed-evaluation.v2",
+                                 "metric_policy": {"metric": "wrmsse"}}))
+    with pytest.raises(TrainWorkflowError, match="does not support a flat-WRMSSE study"):
+        runner.run_request(
+            request_path, data_path=tmp_path / "data", data_snapshot_id="test",
+            data_reference="local://test", output_root=tmp_path / "runs", epochs=2,
+            timeout_seconds=10, evaluation_contract_path=fixed,
+            evaluation_contract_sha256=hashlib.sha256(fixed.read_bytes()).hexdigest(),
+        )

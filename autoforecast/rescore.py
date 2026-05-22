@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import pathlib
 import shutil
+import tempfile
 
 from pyspark.sql import SparkSession
 
-from autoforecast.benchmark import evaluation_contract, verify_benchmark
-from autoforecast.data_admission import load_dataset_contract
+from autoforecast.benchmark import STUDY_SCHEMA, evaluation_contract, verify_benchmark
+from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.forecast_campaign import _verified_forecast
 from autoforecast.results import read_results
 from autoforecast.run_evaluation import compare_run_forecasts
-from provenance.lineage import directory_digest
+from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 
 def rescore_campaign(
@@ -26,8 +28,13 @@ def rescore_campaign(
     original = read_results(campaign_root)
     study_sha = hashlib.sha256(study_path.read_bytes()).hexdigest()
     study_path, study = verify_benchmark(study_path, study_sha)
-    if "study_id" not in study:
+    if study["schema"] != STUDY_SCHEMA:
         raise ValueError("rescoring requires an explicitly frozen version-2 study")
+    dataset_path = study_path.parent / "dataset.yaml"
+    dataset_bytes = dataset_path.read_bytes()
+    if hashlib.sha256(dataset_bytes).hexdigest() != study["dataset_sha256"]:
+        raise ValueError("dataset contract changed before rescoring")
+    dataset = _load_dataset_contract_bytes(dataset_bytes, dataset_path)
     output_dir = output_dir.resolve()
     if (output_dir.is_relative_to(campaign_root.resolve())
             or output_dir.is_relative_to(study_path.parent.resolve())):
@@ -51,14 +58,21 @@ def rescore_campaign(
             )
             if fixed["study"]["sha256"] != study_sha:
                 raise ValueError("scoring study changed between retained forecasts")
-            panel = load_dataset_contract(study_path.parent / "dataset.yaml").panel(
-                fixed["actuals"]["path"],
-            )
-            comparison = compare_run_forecasts(
-                panel, {run["model_id"]: forecast}, spark, missing_actual="no_data",
-                metric=study["recipe"]["metric"], output_dir=output_dir / f"score-{index:04d}",
-                fixed_contract=fixed,
-            )
+            panel = dataset.panel(fixed["actuals"]["path"])
+            with tempfile.TemporaryDirectory(prefix="autoforecast-rescore-") as temporary:
+                forecast_snapshot = snapshot_parquet_directory(
+                    pathlib.Path(forecast.path), pathlib.Path(temporary) / "forecast",
+                    expected_sha256=run["forecast_artifact_sha256"], label="retained forecast",
+                )
+                comparison = compare_run_forecasts(
+                    panel, {run["model_id"]: dataclasses.replace(
+                        forecast, path=str(forecast_snapshot),
+                    )}, spark, missing_actual="no_data", metric=study["recipe"]["metric"],
+                    output_dir=output_dir / f"score-{index:04d}", fixed_contract=fixed,
+                )
+            candidate = json.loads(comparison.read_bytes())["candidates"][0]
+            if candidate["status"] not in {"scored", "unavailable"}:
+                raise ValueError(f"retained forecast could not be scored: {candidate['detail']}")
             if (directory_digest(forecast.path, suffixes=(".parquet",))
                     != run["forecast_artifact_sha256"]):
                 raise ValueError("original forecast changed during rescoring")

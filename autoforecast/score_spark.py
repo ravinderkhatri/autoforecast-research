@@ -378,6 +378,7 @@ def _join_actuals(
             F.col(panel.time_col).alias("_raw_date"),
             F.col(panel.target_col).alias("_raw_actual")]
     if panel.has_exposure:
+        assert panel.exposure_col is not None
         cols.append(F.col(panel.exposure_col).alias("_state"))
     if original_missing_column is not None:
         if (original_missing_column not in raw.columns

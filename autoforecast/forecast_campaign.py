@@ -22,6 +22,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from dataclasses import asdict, dataclass, replace
@@ -51,7 +52,11 @@ from autoforecast.adapter_contracts import descriptor
 from autoforecast.adapters import validate_execution_controls
 from autoforecast.benchmarks.policy import is_m5_daily
 from autoforecast.campaign import CampaignError, CampaignStore
-from autoforecast.data_admission import load_dataset_contract
+from autoforecast.data_admission import (
+    DatasetContract,
+    _load_dataset_contract_bytes,
+    load_dataset_contract,
+)
 from autoforecast.frequency import (
     Cadence,
     FrequencyError,
@@ -1313,8 +1318,33 @@ def compile_forecast_campaign(
     benchmark_path: pathlib.Path | None = None,
 ) -> CompiledForecastCampaign:
     """Resolve and freeze a high-level request into idempotent durable stage commands."""
+    from autoforecast.benchmark import (
+        STUDY_SCHEMA,
+        _evaluation_contract_from_record,
+        artifact_path,
+        verify_benchmark,
+    )
+
     request = load_forecast_campaign_request(request_path)
     contract = _source_path(request.contract, "dataset contract")
+    contract_bytes = contract.read_bytes()
+    contract_sha256 = _sha_bytes(contract_bytes)
+    benchmark = None
+    benchmark_sha256 = None
+    if benchmark_path is not None:
+        benchmark_sha256 = _sha_file(benchmark_path)
+        benchmark_path, benchmark = verify_benchmark(benchmark_path, benchmark_sha256)
+        if benchmark["dataset_sha256"] != contract_sha256:
+            raise ForecastCampaignError("dataset contract differs from the frozen benchmark")
+    study = benchmark is not None and benchmark["schema"] == STUDY_SCHEMA
+    hierarchy_wrmsse = request.metric == "wrmsse" and not study
+    if study and any(
+        source.mode not in {"defaults", "manual"} for source in request.parameter_sources
+    ):
+        raise ForecastCampaignError(
+            "shared studies require defaults or manual fixed parameters: inner HPO windows "
+            "and reused HPO selections are not frozen in this study contract"
+        )
     template_path = (
         None if request.template is None else _source_path(request.template, "run template")
     )
@@ -1326,7 +1356,7 @@ def compile_forecast_campaign(
     if not catalog.is_relative_to(_root().resolve()) or not catalog.is_dir():
         raise ForecastCampaignError("model catalog must be a source directory below the repository")
     try:
-        contract_definition = load_dataset_contract(contract)
+        contract_definition = _load_dataset_contract_bytes(contract_bytes, contract)
         selection_panel = contract_definition.panel(selection_data_path)
         cadence = parse_frequency(selection_panel.frequency)
         request = replace(
@@ -1397,6 +1427,13 @@ def compile_forecast_campaign(
     unknown = sorted(set(request.model_ids) - set(candidates))
     if unknown:
         raise ForecastCampaignError(f"campaign model IDs are absent from catalog: {unknown}")
+    if study and request.metric == "wrmsse":
+        for model_id in request.model_ids:
+            if not descriptor(candidates[model_id].adapter).supports_flat_wrmsse:
+                raise ForecastCampaignError(
+                    f"campaign model {model_id!r} uses M5 checkpoint selection and does not "
+                    "support a flat-WRMSSE study"
+                )
     unsupported = sorted(
         model_id
         for model_id in request.model_ids
@@ -1486,7 +1523,7 @@ def compile_forecast_campaign(
                 "TFT-Q/TFT-HNB M5 requires the M5 daily contract, WRMSSE, 28-day horizons, "
                 "patience 10, zero relative min-delta, and pinned data-role digests"
             )
-    if request.metric == "wrmsse" and selection_panel.price_col is None:
+    if hierarchy_wrmsse and selection_panel.price_col is None:
         raise ForecastCampaignError(
             "WRMSSE selection requires a declared price column before training"
         )
@@ -1498,7 +1535,7 @@ def compile_forecast_campaign(
                 "TFT-Q/TFT-HNB capacity diagnostics require a validation window "
                 "and are unsupported"
             )
-        if request.metric == "wrmsse" and candidate.adapter in _ROLLING_BUDGET_ADAPTERS:
+        if hierarchy_wrmsse and candidate.adapter in _ROLLING_BUDGET_ADAPTERS:
             try:
                 recipe = loads_exact_json(candidate.implementation_config_bytes or b"")
             except ExactJSONError as error:
@@ -1577,7 +1614,7 @@ def compile_forecast_campaign(
         candidates,
         selection_data,
         frequency=cadence.code,
-        dataset_contract_sha256=_sha_file(contract),
+        dataset_contract_sha256=contract_sha256,
         features=template_features,
     )
     capability: list[dict[str, object]] = []
@@ -1658,7 +1695,7 @@ def compile_forecast_campaign(
             **source,
             "request_sha256": request_sha,
             "dataset_contract": contract.relative_to(_root()).as_posix(),
-            "dataset_contract_sha256": _sha_file(contract),
+            "dataset_contract_sha256": contract_sha256,
             "run_template": (
                 None if template_path is None else template_path.relative_to(_root()).as_posix()
             ),
@@ -1744,20 +1781,11 @@ def compile_forecast_campaign(
         },
     }
     if benchmark_path is not None:
-        from autoforecast.benchmark import (
-            _evaluation_contract_from_record,
-            artifact_path,
-            verify_benchmark,
-        )
-        benchmark_sha256 = _sha_file(benchmark_path)
-        benchmark_path, benchmark = verify_benchmark(benchmark_path, benchmark_sha256)
+        assert benchmark is not None and benchmark_sha256 is not None
+        if _sha_file(benchmark_path) != benchmark_sha256:
+            raise ForecastCampaignError("benchmark manifest changed during compilation")
         recipe = benchmark["recipe"]
-        if "study_id" in benchmark and any(p["tune_stage"] is not None for p in parameter_profiles):
-            raise ForecastCampaignError(
-                "shared studies require fixed parameters: inner HPO windows are not frozen "
-                "in this study contract; use the existing strict workflow for inner tuning"
-            )
-        if ("study_id" in benchmark and request.missing_actual != (
+        if (study and request.missing_actual != (
             "sparse_zero" if recipe["actual_missing"] == "zero" else "no_data"
         )):
             raise ForecastCampaignError("campaign missing-actual policy differs from frozen study")
@@ -1787,7 +1815,7 @@ def compile_forecast_campaign(
             contracts[value["boundary"]] = value
         resolved["benchmark"] = {"id": benchmark["benchmark_id"], "path": str(benchmark_path),
                                  "sha256": benchmark_sha256, "evaluations": contracts}
-        if "study_id" in benchmark:
+        if study:
             resolved["study_id"] = benchmark["study_id"]
             cast(dict, resolved["data"])["validation_score"] = {
                 "path": str(artifact_path(benchmark_path, benchmark, "validation_score")),
@@ -1799,6 +1827,8 @@ def compile_forecast_campaign(
             }
     elif installed_mode():
         raise ForecastCampaignError("installed campaigns require a frozen benchmark")
+    if contract.read_bytes() != contract_bytes:
+        raise ForecastCampaignError("dataset contract changed during campaign compilation")
     resolved_payload = _json(resolved).encode()
     resolved_sha = _sha_bytes(resolved_payload)
     score_input = {
@@ -2576,37 +2606,15 @@ def _snapshot_parquet_directory(
     expected_sha256: str,
     label: str,
 ) -> pathlib.Path:
-    """Copy authenticated Parquet bytes into a stage-owned immutable input boundary."""
-    if destination.exists():
-        raise ForecastCampaignError(f"{label} snapshot destination already exists")
-    if directory_digest(source, suffixes=(".parquet",)) != expected_sha256:
-        raise ForecastCampaignError(f"{label} changed before its scoring snapshot")
-    descendants = () if source.is_file() else tuple(source.rglob("*"))
-    if source.is_symlink() or any(item.is_symlink() for item in descendants):
-        raise ForecastCampaignError(f"{label} may not contain symlinks")
-    destination.mkdir()
-    parquet_files = (
-        ((pathlib.Path(source.name), source),)
-        if source.is_file()
-        else tuple(
-            (item.relative_to(source), item)
-            for item in descendants
-            if item.is_file() and item.suffix == ".parquet"
-        )
-    )
-    for relative, parquet in parquet_files:
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(parquet, target, follow_symlinks=False)
-    copied = directory_digest(destination, suffixes=(".parquet",))
-    if (
-        copied != expected_sha256
-        or directory_digest(source, suffixes=(".parquet",)) != expected_sha256
-    ):
-        shutil.rmtree(destination, ignore_errors=True)
-        raise ForecastCampaignError(f"{label} changed while its scoring snapshot was copied")
-    return destination
+    """Keep campaign errors at the shared authenticated Parquet snapshot boundary."""
+    from provenance.lineage import LineageError, snapshot_parquet_directory
 
+    try:
+        return snapshot_parquet_directory(
+            source, destination, expected_sha256=expected_sha256, label=label,
+        )
+    except LineageError as error:
+        raise ForecastCampaignError(str(error)) from error
 
 def _materialize_training_panel(
     source: pathlib.Path,
@@ -2617,11 +2625,45 @@ def _materialize_training_panel(
     horizon: int,
     training_start: str | None,
     expected_source_sha256: str,
+    expected_contract_sha256: str | None = None,
+) -> str:
+    """Build training rows only from captured contract bytes and a verified source copy."""
+    contract_path = _path_without_links(contract_path, "dataset contract")
+    contract_bytes = contract_path.read_bytes()
+    if (expected_contract_sha256 is not None
+            and _sha_bytes(contract_bytes) != expected_contract_sha256):
+        raise ForecastCampaignError("dataset contract changed before training materialization")
+    contract = _load_dataset_contract_bytes(contract_bytes, contract_path)
+    if directory_digest(source, suffixes=(".parquet",)) != expected_source_sha256:
+        raise ForecastCampaignError("training source changed before materialization")
+    with tempfile.TemporaryDirectory(prefix="autoforecast-training-") as temporary:
+        snapshot = _snapshot_parquet_directory(
+            source, pathlib.Path(temporary) / "source",
+            expected_sha256=expected_source_sha256, label="training source",
+        )
+        result = _write_training_panel(
+            snapshot, destination, contract=contract, origin=origin, horizon=horizon,
+            training_start=training_start, expected_source_sha256=expected_source_sha256,
+        )
+        if directory_digest(source, suffixes=(".parquet",)) != expected_source_sha256:
+            shutil.rmtree(destination)
+            raise ForecastCampaignError("training source changed during materialization")
+        return result
+
+
+def _write_training_panel(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    *,
+    contract: DatasetContract,
+    origin: str,
+    horizon: int,
+    training_start: str | None,
+    expected_source_sha256: str,
 ) -> str:
     """Stream a chronological panel and physically mask future labels when features need rows."""
     if directory_digest(source, suffixes=(".parquet",)) != expected_source_sha256:
         raise ForecastCampaignError("training source changed before materialization")
-    contract = load_dataset_contract(contract_path)
     panel = contract.panel(source).validate()
     cadence = parse_frequency(panel.frequency)
     cutoff = parse_origin(origin, cadence)
@@ -2971,6 +3013,9 @@ def run_tune_parameters(
         horizon=horizon,
         training_start=declared_training[0],
         expected_source_sha256=cast(str, data_record["sha256"]),
+        expected_contract_sha256=cast(
+            str, cast(dict[str, object], resolved["source"])["dataset_contract_sha256"],
+        ),
     )
     validation_path = attempt_dir / "hpo-validation-panel"
     validation_fingerprint = _materialize_panel_range(
@@ -3175,6 +3220,7 @@ def _test_score_value(comparison: dict, metric: str, model_id: str, fixed: dict 
             and candidates[0].get("model_id") == model_id
             and candidates[0].get("status") == "unavailable"
             and type(candidates[0].get("score")) is dict
+            and metric in candidates[0]["score"]
             and candidates[0]["score"].get(metric) is None
             and candidates[0]["score"].get("metric_definition") == fixed["metric_policy"]
             and comparison.get("ranking") is None):
@@ -4634,6 +4680,7 @@ def _run_generic_child(
                 str | None, cast(dict[str, object], resolved["temporal"])["training_start"]
             ),
             expected_source_sha256=cast(str, data_record["sha256"]),
+            expected_contract_sha256=cast(str, source_record["dataset_contract_sha256"]),
         )
     request_path = attempt_dir / "child-request.yaml"
     _write_child_request(request_path, resolved, child, evaluation=evaluate)

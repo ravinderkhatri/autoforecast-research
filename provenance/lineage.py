@@ -34,6 +34,7 @@ import dataclasses
 import hashlib
 import os
 import pathlib
+import shutil
 import stat
 from dataclasses import dataclass, field
 from typing import Literal
@@ -48,6 +49,7 @@ __all__ = [
     "directory_content_digest",
     "directory_digest",
     "parquet_files",
+    "snapshot_parquet_directory",
 ]
 
 EventType = Literal["INPUT", "OUTPUT"]
@@ -74,11 +76,11 @@ def _values_equal_exact(observed: object, expected: object) -> bool:
     """Compare nested records without bool/int/float or list/tuple aliases."""
     if type(observed) is not type(expected):
         return False
-    if isinstance(expected, dict):
+    if isinstance(expected, dict) and isinstance(observed, dict):
         return observed.keys() == expected.keys() and all(
             _values_equal_exact(observed[key], value) for key, value in expected.items()
         )
-    if isinstance(expected, list | tuple):
+    if isinstance(expected, list | tuple) and isinstance(observed, list | tuple):
         return len(observed) == len(expected) and all(
             _values_equal_exact(left, right) for left, right in zip(observed, expected, strict=True)
         )
@@ -180,8 +182,9 @@ def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()
     """Hash relative filenames and contents for a stable directory artifact identity.
 
     Modification times and ownership are ignored. A size change during the read is rejected, but
-    callers guarding a mutable input must digest again after consuming it to detect same-size
-    rewrites. A ``('.parquet',)`` filter also validates the complete directory inventory:
+    callers can digest again after consuming it to detect persistent same-size rewrites.
+    Use an authenticated private snapshot when consumption must use one fixed byte version.
+    A ``('.parquet',)`` filter also validates the complete directory inventory:
     reader-visible files must have that exact suffix, hidden markers are ignored, and
     links, special files, and streaming metadata are refused. Other filters select suffixes.
     """
@@ -449,3 +452,32 @@ class Graph:
             "executions": [dataclasses.asdict(e) for e in self.executions.values()],
             "events": [dataclasses.asdict(e) for e in self.events],
         }
+
+
+def snapshot_parquet_directory(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    *,
+    expected_sha256: str,
+    label: str,
+) -> pathlib.Path:
+    """Copy authenticated Parquet bytes into an operation-owned input boundary."""
+    if destination.exists():
+        raise LineageError(f"{label} snapshot destination already exists")
+    if directory_digest(source, suffixes=(".parquet",)) != expected_sha256:
+        raise LineageError(f"{label} changed before its snapshot")
+    parts = parquet_files(source)
+    destination.mkdir()
+    try:
+        for part in parts:
+            relative = pathlib.Path(part.name) if source.is_file() else part.relative_to(source)
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(part, target, follow_symlinks=False)
+        if (directory_digest(destination, suffixes=(".parquet",)) != expected_sha256
+                or directory_digest(source, suffixes=(".parquet",)) != expected_sha256):
+            raise LineageError(f"{label} changed while its snapshot was copied")
+        return destination
+    except BaseException:
+        shutil.rmtree(destination)
+        raise

@@ -358,7 +358,7 @@ def test_wrmsse_uniform_revision_weighting_is_rejected_before_training(
     request.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
     monkeypatch.setattr(subject, "_git_source_identity", lambda *_args: {})
     monkeypatch.setattr(
-        subject, "load_dataset_contract",
+        subject, "_load_dataset_contract_bytes",
         lambda *_args: SimpleNamespace(
             panel=lambda *_panel_args: SimpleNamespace(frequency="D", price_col="price")
         ),
@@ -1570,7 +1570,7 @@ def test_campaign_rejects_a_daily_only_adapter_before_unsupported_cadence_execut
     unsupported = SimpleNamespace(
         panel=lambda _path: SimpleNamespace(frequency=frequency, price_col=None)
     )
-    monkeypatch.setattr(subject, "load_dataset_contract", lambda _path: unsupported)
+    monkeypatch.setattr(subject, "_load_dataset_contract_bytes", lambda *_args: unsupported)
     with pytest.raises(
         subject.ForecastCampaignError, match=f"do not support {frequency} cadence"
     ):
@@ -1607,7 +1607,7 @@ def test_compile_propagates_supported_dataset_cadence(
     )
     path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
     contract = SimpleNamespace(panel=lambda _path: SimpleNamespace(frequency=frequency))
-    monkeypatch.setattr(subject, "load_dataset_contract", lambda _path: contract)
+    monkeypatch.setattr(subject, "_load_dataset_contract_bytes", lambda *_args: contract)
     monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {})
 
     compiled = _compile(path, tmp_path)
@@ -1686,7 +1686,7 @@ def test_compile_applies_dataset_frequency_to_validation_window(
     path = _request(tmp_path)
     monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {})
     weekly = SimpleNamespace(panel=lambda _path: SimpleNamespace(frequency="W"))
-    monkeypatch.setattr(subject, "load_dataset_contract", lambda _path: weekly)
+    monkeypatch.setattr(subject, "_load_dataset_contract_bytes", lambda *_args: weekly)
     with pytest.raises(subject.ForecastCampaignError, match="at dataset frequency"):
         _compile(path, tmp_path)
 

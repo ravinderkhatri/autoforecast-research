@@ -29,7 +29,7 @@ from autoforecast import resources
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast.adapters import isolated, validate_execution_controls
 from autoforecast.benchmarks.policy import is_m5_daily
-from autoforecast.data_admission import load_dataset_contract
+from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.data_observability import CheckReport, inspect_panel, run_incident_from_error
 from autoforecast.executable_source import materialize_executable_source_snapshot
 from autoforecast.experiments import ExperimentError, load_completed_attempt
@@ -1238,6 +1238,16 @@ def run_request(
     if unknown := sorted(set(selected_ids) - set(by_id)):
         raise TrainWorkflowError(f"requested models are absent from catalog: {unknown}")
     selected = tuple(by_id[model_id] for model_id in selected_ids)
+    if (fixed_contract is not None
+            and fixed_contract.get("schema") == "autoforecast.fixed-evaluation.v2"
+            and fixed_contract.get("metric_policy", {}).get("metric") == "wrmsse"):
+        from autoforecast.adapter_contracts import descriptor
+        for candidate in selected:
+            if not descriptor(candidate.adapter).supports_flat_wrmsse:
+                raise TrainWorkflowError(
+                    f"model {candidate.id!r} uses M5 checkpoint selection and does not "
+                    "support a flat-WRMSSE study"
+                )
     if patience is None:
         patience = (
             10 if any(candidate.adapter in {"tft_q", "tft_hnb"} for candidate in selected) else 5
@@ -1331,7 +1341,7 @@ def run_request(
         )
         spark.sparkContext.setLogLevel("ERROR")
     try:
-        dataset_contract = load_dataset_contract(contract_path)
+        dataset_contract = _load_dataset_contract_bytes(contract_bytes, contract_path)
         panel = dataset_contract.panel(data_path)
         with preflight_progress.step("Inspect and validate the governed data panel", spark=spark):
             preflight_progress.operation(
@@ -1686,7 +1696,7 @@ def run_request(
             score_panel=(
                 None
                 if evaluation_data_path is None
-                else load_dataset_contract(contract_path).panel(evaluation_data_path)
+                else dataset_contract.panel(evaluation_data_path)
             ),
             score_data_snapshot_id=evaluation_data_snapshot_id,
             score_data_reference=evaluation_data_reference,

@@ -244,9 +244,9 @@ caller responsibilities.
 
 The manifest's `study_id` binds the cohort, declared starts, prepared values, original missing
 flags, windows, policies, and metric definition. It is separate from model-run, HPO-study, and
-MLflow identifiers. Version-2 studies currently use fixed model parameters. Inner HPO has its
-own validation windows and remains on the existing strict workflow; it is refused for these
-studies because those extra windows are not part of this frozen contract. Existing HPO records
+MLflow identifiers. Version-2 studies currently use profile defaults or manual fixed model
+parameters. Inner HPO and reused HPO selections remain on the existing strict workflow;
+their extra validation windows are not part of this frozen contract. Existing HPO records
 are not changed. Reuse a verified study by ID:
 
 ```bash
@@ -279,6 +279,10 @@ Weights and scales are supplied by the caller and frozen with the study. The sco
 `sum(weight * sqrt(MSE / scale)) / sum(weight)`. Under masking, each series' MSE uses its
 observed cells. If any retained series has no scoreable actuals or an undefined scale, WRMSSE
 is unavailable. Weights are never redistributed.
+
+The `sft`, `hmfnet`, `pact`, `tft_q`, and `tft_hnb`
+adapters use M5-specific checkpoint selection and reject flat-WRMSSE studies before training.
+Use the baseline adapters for this metric, or a supported metric for those models.
 
 ## Inspect results
 

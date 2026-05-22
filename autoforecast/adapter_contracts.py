@@ -19,6 +19,7 @@ class AdapterDescriptor:
     requires_complete_window: bool = False
     supported_frequency_families: tuple[str, ...] = ("D",)
     supports_strided_daily: bool = False
+    supports_flat_wrmsse: bool = True
 
 
 DESCRIPTORS = {
@@ -40,10 +41,12 @@ DESCRIPTORS = {
     "shallow_global": AdapterDescriptor("shallow", "fit_predict", "shallow", "one", "typed"),
     "tft": AdapterDescriptor("tft", "fit_predict", "tft", "tft", "typed", ("autolog", "lightning")),
     "tft_q": AdapterDescriptor(
-        "tft_q", "fit_predict_quantile", "tft", "tft_q", "typed", ("autolog", "lightning")
+        "tft_q", "fit_predict_quantile", "tft", "tft_q", "typed", ("autolog", "lightning"),
+        supports_flat_wrmsse=False,
     ),
     "tft_hnb": AdapterDescriptor(
-        "tft_q", "fit_predict_hnb", "tft", "tft_q", "typed", ("autolog", "lightning")
+        "tft_q", "fit_predict_hnb", "tft", "tft_q", "typed", ("autolog", "lightning"),
+        supports_flat_wrmsse=False,
     ),
     "autogluon_zoo": AdapterDescriptor(
         "zoo", "fit_predict", "autogluon_zoo", "one", consumes_exposure=False
@@ -68,6 +71,7 @@ DESCRIPTORS = {
         ("reporter", "none"),
         target_estimands=("sales_given_availability", "unconstrained_demand"),
         handles_right_censoring=True,
+        supports_flat_wrmsse=False,
     ),
     "hmfnet": AdapterDescriptor(
         "mft",
@@ -78,6 +82,7 @@ DESCRIPTORS = {
         ("reporter", "none"),
         target_estimands=("sales_given_availability", "unconstrained_demand"),
         handles_right_censoring=True,
+        supports_flat_wrmsse=False,
     ),
     "pact": AdapterDescriptor(
         "mft",
@@ -86,6 +91,7 @@ DESCRIPTORS = {
         "mft",
         "typed",
         ("reporter", "none"),
+        supports_flat_wrmsse=False,
     ),
 }
 
@@ -105,6 +111,7 @@ def descriptor(name: str) -> AdapterDescriptor:
         != len(result.supported_frequency_families)
         or not set(result.supported_frequency_families) <= {"H", "D", "W", "M", "Y"}
         or type(result.supports_strided_daily) is not bool
+        or type(result.supports_flat_wrmsse) is not bool
         or result.operations != ("fit_predict",)
     ):
         raise ValueError(f"incomplete or unsupported adapter descriptor: {name}")

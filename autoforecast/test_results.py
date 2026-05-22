@@ -429,6 +429,9 @@ def test_initialization_parent_is_not_validation_evidence(
     }))
     (tmp_path / "source-keys").mkdir()
     pq.write_table(pa.table({"series_id": ["a"]}), tmp_path / "source-keys/part.parquet")
+    from provenance.lineage import directory_digest
+    frozen["dataset_sha256"] = hashlib.sha256((tmp_path / "dataset.yaml").read_bytes()).hexdigest()
+    frozen["artifacts"]["source-keys"] = directory_digest(tmp_path / "source-keys", suffixes=(".parquet",))
     monkeypatch.setattr(reader, "verify_benchmark", lambda *args: (benchmark_path, frozen))
     _reader_boundary(
         tmp_path, monkeypatch, [child],
@@ -537,12 +540,15 @@ def test_reader_retains_selection_actual_snapshot_for_revised_history(tmp_path, 
     pq.write_table(
         pa.Table.from_pylist([{"series_id": "a"}]), tmp_path / "source-keys/part.parquet"
     )
+    from provenance.lineage import directory_digest
+    frozen["artifacts"]["source-keys"] = directory_digest(tmp_path / "source-keys", suffixes=(".parquet",))
     monkeypatch.setattr(reader, "verify_benchmark", lambda *args: (benchmark_path, frozen))
     (tmp_path / "dataset.yaml").write_text(
         "schema_version: 1\ndataset:\n  id: meters\n  panel:\n"
         "    series_col: meter\n    time_col: date\n    target_col: kwh\n"
         "    target_estimand: observed_nonnegative\n"
     )
+    frozen["dataset_sha256"] = hashlib.sha256((tmp_path / "dataset.yaml").read_bytes()).hexdigest()
     result = read_results(tmp_path)
     assert result.metadata["target_estimand"] == "observed_nonnegative"
     assert result.metadata["actual_snapshots"] == {

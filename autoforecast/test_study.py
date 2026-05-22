@@ -413,21 +413,39 @@ def test_study_compilation_preserves_identity_roles_and_safe_training_slices(tmp
     assert benchmark.MISSING_COLUMN not in spark.read.parquet(str(destination)).columns
     assert max(pq.read_table(destination)["day"].to_pylist()).isoformat() == recipe["validation_origins"][0]
     assert hashlib.sha256(path.read_bytes()).hexdigest() == resolved["benchmark"]["sha256"]
-    profiles = campaign._parameter_profiles
-
-    def pending_inner_tune(*args, **kwargs):
-        values = profiles(*args, **kwargs)
-        values[0]["tune_stage"] = "t00"
-        return values
-
-    monkeypatch.setattr(campaign, "_parameter_profiles", pending_inner_tune)
-    with experiment_project(project), pytest.raises(campaign.ForecastCampaignError, match="inner HPO windows"):
-        campaign.compile_forecast_campaign(
-            request_path, benchmark_path=path, compiled_root=project / "inner-tune",
-            **{f"{role}_data_path": benchmark.artifact_path(path, record, role)
-               for role in ("selection", "final_training", "final_score")},
-        )
-    assert not (project / "inner-tune").exists()
+    # Fixed manual parameters work; HPO-derived sources cannot claim these outer windows.
+    profile = project / "models/shallow_global/model.yaml"
+    profile.parent.mkdir()
+    profile.write_bytes((campaign.ROOT / "configs/models/global/shallow_global/model.yaml").read_bytes())
+    request["forecast_campaign"]["models"]["candidates"] = [
+        {"model_id": "shallow_global", "parameters": {"mode": "defaults"}},
+    ]
+    for mode in ("manual", "tune", "reuse_tuned"):
+        parameters = {"mode": mode}
+        if mode == "manual":
+            parameters["values"] = {"model.num_leaves": 31}
+        else:
+            parameters["study_config"] = "not-opened.yaml"
+            if mode == "reuse_tuned":
+                parameters["selection"] = "not-opened-selection.json"
+        request["forecast_campaign"]["models"]["candidates"][0]["parameters"] = parameters
+        request_path.write_text(yaml.safe_dump(request))
+        with experiment_project(project):
+            arguments = dict(
+                benchmark_path=path, compiled_root=project / mode,
+                **{f"{role}_data_path": benchmark.artifact_path(path, record, role)
+                   for role in ("selection", "final_training", "final_score")},
+            )
+            if mode == "manual":
+                manual = campaign.compile_forecast_campaign(request_path, **arguments)
+                value = json.loads(manual.resolved_path.read_bytes())
+                assert value["study_id"] == record["study_id"]
+                assert value["parameter_profiles"][0]["mode"] == "manual"
+                assert value["parameter_profiles"][0]["resolution"]["effective_parameters"]["model.num_leaves"] == 31
+            else:
+                with pytest.raises(campaign.ForecastCampaignError, match="inner HPO windows"):
+                    campaign.compile_forecast_campaign(request_path, **arguments)
+                assert not (project / mode).exists()
 
 
 
