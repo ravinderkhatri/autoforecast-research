@@ -422,7 +422,13 @@ class Panel:
         self.validate_column_names()
         roles = self.role_columns
         schema = pq.read_schema(_any_fragment(p))
+        if len(schema.names) != len(set(schema.names)):
+            raise PanelError("Parquet column names must be unique; rename duplicate headers")
         present = set(schema.names) | _partition_columns(p)
+        try:
+            validate_column_names(present)
+        except ValueError as exc:
+            raise PanelError(str(exc)) from exc
         missing = [c for c in roles if c not in present]
         if missing:
             raise PanelError(

@@ -92,7 +92,7 @@ def test_run_rejects_malformed_dataset_mapping(tmp_path, field, value):
     assert not (project / ".autoforecast").exists()
 
 
-@pytest.mark.parametrize("column", ["meter.id", "meter id", "meter`id", "mètre", "__af_id"])
+@pytest.mark.parametrize("column", ["meter.id", "meter id", "meter`id", "mètre", "__af_id", "__AF_id"])
 def test_csv_refuses_unsupported_mapped_headers_before_output(tmp_path, column):
     source = tmp_path / "input.csv"
     source.write_text(f"{column},date,value\n001,2024-01-01,1\n")

@@ -41,7 +41,7 @@ def import_csv(
     ):
         raise ValueError("declare distinct, nonempty source key, date, and target columns")
     validate_column_names(columns)
-    if any(name.startswith("__af_") for name in columns):
+    if any(name.casefold().startswith("__af_") for name in columns):
         raise ValueError("source columns starting __af_ are reserved; rename the mapped headers")
     if output.suffix != ".parquet":
         raise ValueError("output must end in .parquet")

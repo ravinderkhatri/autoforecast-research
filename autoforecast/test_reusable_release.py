@@ -371,7 +371,7 @@ def test_freeze_rejects_blank_string_source_keys_from_typed_parquet(tmp_path, sp
         _freeze(project, recipe, sources, spark)
 
 
-@pytest.mark.parametrize("name", ["__af_series_id", "__af_unused"])
+@pytest.mark.parametrize("name", ["__af_series_id", "__af_unused", "__AF_series_id", "__Af_count"])
 def test_freeze_rejects_reserved_raw_columns_even_when_unmapped(tmp_path, spark, name):
     project, recipe, sources = _inputs(tmp_path)
     table = pq.read_table(project / "data")

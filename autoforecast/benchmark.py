@@ -267,7 +267,7 @@ def freeze_benchmark(
             validate_column_names(frame.columns)
         except ValueError as error:
             raise BenchmarkError(str(error)) from error
-        if any(column.startswith("__af_") for column in frame.columns):
+        if any(column.casefold().startswith("__af_") for column in frame.columns):
             raise BenchmarkError("source columns beginning __af_ are reserved for preparation")
         if any(k not in frame.columns for k in keys):
             raise BenchmarkError("source keys absent")

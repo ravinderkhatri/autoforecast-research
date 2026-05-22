@@ -182,6 +182,29 @@ def test_plan_identifiers_are_validated_at_construction():
         PlanSource("/plan", "valid.date", "known_at", price_col="price")
 
 
+@pytest.mark.parametrize("extra", ["ID", "unmapped.column"])
+def test_all_parquet_columns_follow_the_identifier_contract(tmp_path, extra):
+    path = tmp_path / "panel.parquet"
+    pq.write_table(pa.table({"id": ["one"], "date": [dt.date(2024, 1, 1)],
+                             "qty": [1.0], extra: ["unmapped"]}), path)
+    with pytest.raises(PanelError, match="rename headers"):
+        Panel(path, "id", "date", "qty").validate()
+
+
+def test_panel_roles_refuse_case_ambiguous_aliases_before_io():
+    with pytest.raises(PanelError, match="distinct ignoring case"):
+        Panel("unused", "id", "date", "qty", static=("ID",)).validate_column_names()
+
+
+def test_parquet_refuses_duplicate_physical_names(tmp_path):
+    path = tmp_path / "panel.parquet"
+    table = pa.table({"id": ["one"], "date": [dt.date(2024, 1, 1)], "qty": [1.0]})
+    table = table.append_column("id", pa.array(["other"]))
+    pq.write_table(table, path)
+    with pytest.raises(PanelError, match="rename duplicate headers"):
+        Panel(path, "id", "date", "qty").validate()
+
+
 def test_validate_refuses_one_column_in_two_roles() -> None:
     try:
         _structural_panel(exposure_col="qty").validate()

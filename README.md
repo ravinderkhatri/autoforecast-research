@@ -94,7 +94,8 @@ integral keys. The CSV convenience importer reads the selected observations into
 
 Mapped CSV headers and all Parquet column names must match `[A-Za-z_][A-Za-z0-9_]*`.
 For example, rename `meter.id` to `meter_id` and `daily usage` to `daily_usage` before import.
-Names beginning with `__af_` are reserved for prepared data. Series key values must be nonblank;
+Column names must be distinct ignoring case; names beginning with `__af_` in any case are
+reserved for prepared data. Series key values must be nonblank;
 string IDs such as `001` and integral IDs such as `0` are valid.
 
 Map this example in `dataset.yaml`:

@@ -93,3 +93,10 @@ def test_csv_cli_maps_non_retail_column_names(tmp_path):
     assert pq.read_table(output).to_pylist() == [
         {"meter": "0007", "date": dt.date(2024, 1, 1), "kwh": 12.5},
     ]
+
+
+def test_csv_refuses_case_ambiguous_mapped_names(tmp_path):
+    with pytest.raises(ValueError, match="distinct ignoring case"):
+        convert(tmp_path, "shop,SHOP,day,units\na,b,2024-01-01,1\n",
+                source_keys=["shop", "SHOP"])
+    assert not (tmp_path / "data/observations.parquet").exists()

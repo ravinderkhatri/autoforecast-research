@@ -8,9 +8,17 @@ from collections.abc import Iterable
 
 def validate_column_names(names: Iterable[object]) -> None:
     """Require ASCII identifiers; dots and backticks have expression meaning in Spark."""
+    seen: dict[str, str] = {}
     for name in names:
         if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
             raise ValueError(
                 f"unsupported column name {name!r}; rename headers to ASCII identifiers "
                 "matching [A-Za-z_][A-Za-z0-9_]*"
             )
+        folded = name.casefold()
+        if folded in seen and seen[folded] != name:
+            raise ValueError(
+                f"column names {seen[folded]!r} and {name!r} differ only by case; "
+                "rename headers so names are distinct ignoring case"
+            )
+        seen[folded] = name
