@@ -1,0 +1,42 @@
+# M5 public-holdout replay v2: the worker sees targets only through d_1913.
+# Supply its observed score panel through the three --evaluation-data-* CLI arguments.
+schema_version: 2
+run:
+  name: m5-public-holdout-deep-sft
+  dataset_contract: configs/datasets/m5_daily.yaml
+  model_catalog: configs/models
+  models: [mft]
+  origin: "2016-04-24"
+  horizon: 28
+  tracking:
+    mlflow: {enabled: true}
+  features:
+    calendar_events:
+      max_support: 30
+      events:
+        - [Christmas, "2013-12-25", null]
+        - [Christmas, "2014-12-25", null]
+        - [Christmas, "2015-12-25", null]
+        - [Thanksgiving, "2013-11-28", null]
+        - [Thanksgiving, "2014-11-27", null]
+        - [Thanksgiving, "2015-11-26", null]
+        - [SuperBowl, "2013-02-03", null]
+        - [SuperBowl, "2014-02-02", null]
+        - [SuperBowl, "2015-02-01", null]
+        - [SuperBowl, "2016-02-07", null]
+        - [Easter, "2013-03-31", null]
+        - [Easter, "2014-04-20", null]
+        - [Easter, "2015-04-05", null]
+        - [Easter, "2016-03-27", null]
+        - [LaborDay, "2013-09-02", null]
+        - [LaborDay, "2014-09-01", null]
+        - [LaborDay, "2015-09-07", null]
+        - [Memorial, "2013-05-27", null]
+        - [Memorial, "2014-05-26", null]
+        - [Memorial, "2015-05-25", null]
+        - [Memorial, "2016-05-30", null]
+  evaluation:
+    missing_actual: no_data
+    metric: wrmsse
+    input_mode: post_training_score_only
+    evidence_role: retrospective_public_holdout

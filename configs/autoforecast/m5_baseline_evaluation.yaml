@@ -1,0 +1,17 @@
+# Functional/example request only.  The CLI supplies the immutable local/GCS snapshot reference;
+# credentials and mutable database URLs never belong in this source-controlled request.
+schema_version: 2
+run:
+  name: m5-baseline-evaluation
+  dataset_contract: configs/datasets/m5_daily.yaml
+  model_catalog: configs/models
+  models: [seasonal_naive, croston]
+  origin: "2016-03-25"
+  horizon: 28
+  tracking:
+    mlflow: {enabled: false}
+  evaluation:
+    # M5 is dense: a missing actual is missing source data, not a zero sale.
+    missing_actual: no_data
+    # Point-forecast adapters emit conditional means, so RMSE is the exploratory selector.
+    metric: rmse

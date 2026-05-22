@@ -1,0 +1,82 @@
+# Non-claim-bearing end-to-end SFT smoke with reduced depth/head counts.
+# It uses two epochs and model values of 5 instead of 10 to make the test affordable.
+schema_version: 5
+forecast_campaign:
+  name: m5-sft-competition-benchmark-2epoch-smoke
+  purpose: single_model_benchmark
+  dataset:
+    contract: configs/datasets/m5_daily.yaml
+    selection:
+      source_uri: local://m5-public-selection-v1
+    final_training:
+      source_uri: local://m5-final-training-v1
+    final_score:
+      source_uri: kaggle://m5/organizer-private-replay-v1
+  models:
+    catalog: configs/models
+    candidates:
+      - model_id: sft
+        parameters:
+          mode: manual
+          values:
+            model.encoder_days: 371
+            model.d_model: 80
+            model.n_heads: 5
+            model.patch_size: 7
+            model.trunk_stages: 5
+            model.decoder_layers: 5
+            model.history_attention_layers: 5
+            model.commercial_attention_layers: 5
+            model.event_kernel_layers: 5
+            model.commercial_attention_heads: 5
+            model.demand_dropout: 0.1
+            model.covariate_dropout: 0.2
+            training.learning_rate: 0.0003
+            training.train_stride: 28
+            training.train_windows: 52
+            training.series_loss_weighting: uniform
+  temporal:
+    training_start: null
+    initialization_origin: "2016-02-28"
+    validation_origins: ["2016-04-24"]
+    validation_horizon: 28
+    final_train_cutoff: "2016-05-22"
+    final_test_horizon: 28
+  seeds: [0]
+  initialization_arms: [fresh]
+  selection:
+    metric: wrmsse
+    missing_actual: no_data
+    direction: minimize
+    tie_break: [mean_score, score_stddev, model_id, variant_id, initialization]
+  final_evidence_role: archived_private_replay_not_blind
+  budgets:
+    initialization:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 2
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+    validation:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 2
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+    final_fit:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 2
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+  compute:
+    device: cpu
+    batch_size: 32
+    gradient_microbatch_size: 32
+    memory_gib: 16
+    min_free_disk_gib: 0
+  tracking:
+    mlflow: true

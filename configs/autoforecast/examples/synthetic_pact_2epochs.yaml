@@ -1,0 +1,66 @@
+schema_version: 4
+forecast_campaign:
+  name: synthetic-pact-2epochs
+  dataset:
+    contract: configs/datasets/synthetic_daily.yaml
+    selection: {source_uri: local://synthetic-selection-v1}
+    final_training: {source_uri: local://synthetic-training-v1}
+    final_score: {source_uri: local://synthetic-score-v1}
+  models:
+    catalog: configs/models
+    candidates:
+      - model_id: pact
+        parameters:
+          mode: manual
+          values:
+            model.encoder_days: 28
+            model.d_model: 16
+            model.n_heads: 2
+            model.trunk_stages: 2
+            training.train_windows: 7
+            training.series_loss_weighting: uniform
+            training.train_stride: 1
+  temporal:
+    training_start: "2024-01-01"
+    initialization_origin: null
+    validation_origins: ["2024-04-19"]
+    validation_horizon: 7
+    final_train_cutoff: "2024-04-30"
+    final_test_horizon: 7
+  seeds: [7]
+  initialization_arms: [fresh]
+  selection:
+    metric: mae
+    missing_actual: no_data
+    direction: minimize
+    tie_break: [mean_score, score_stddev, model_id, variant_id, initialization]
+  final_evidence_role: synthetic_pipeline_validation
+  budgets:
+    initialization:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 600
+      max_attempts: 1
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+    validation:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 600
+      max_attempts: 1
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+    final_fit:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 600
+      max_attempts: 1
+      early_stopping_absolute_min_delta: 0.000001
+      early_stopping_relative_min_delta: 0.0
+  compute:
+    device: cpu
+    batch_size: 2
+    gradient_microbatch_size: 2
+    memory_gib: 2.5
+    min_free_disk_gib: 0.1
+  tracking: {mlflow: false}

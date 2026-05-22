@@ -1,0 +1,8 @@
+schema_version: 1
+model:
+  id: autogluon_zoo
+  adapter: autogluon_zoo
+  family: zoo
+  runtime: autogluon_zoo
+  status: candidate
+  tags: [autoforecast, development, optional]

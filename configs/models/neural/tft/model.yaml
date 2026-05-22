@@ -1,0 +1,29 @@
+schema_version: 2
+model:
+  id: tft
+  adapter: tft
+  family: neural
+  runtime: tft
+  status: candidate
+  tags: [autoforecast, development, neural]
+hyperparameters:
+  model.hidden_size:
+    default: 16
+    valid: {kind: int, low: 1, high: 1024, step: 1}
+    search: {kind: categorical, values: [8, 16, 32]}
+  model.attention_head_size:
+    default: 4
+    valid: {kind: int, low: 1, high: 64, step: 1}
+    search: {kind: categorical, values: [1, 2, 4]}
+  model.dropout:
+    default: 0.1
+    valid: {kind: float, low: 0.0, high: 0.95, log: false}
+    search: {kind: float, low: 0.0, high: 0.3, log: false}
+  training.learning_rate:
+    default: 0.001
+    valid: {kind: float, low: 0.000001, high: 1.0, log: false}
+    search: {kind: float, low: 0.0001, high: 0.01, log: true}
+constraints:
+  - kind: less_equal
+    dividend: model.attention_head_size
+    divisor: model.hidden_size

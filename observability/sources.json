@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "id": "data-preflight",
+      "evidence_class": "data preflight",
+      "report_glob": ".autoforecast/data-preflight/*/report.html",
+      "tensorboard": false
+    },
+    {
+      "id": "hpo-studies",
+      "evidence_class": "HPO validation or development smoke",
+      "report_glob": ".autoforecast/hpo/**/studies/*/report.html",
+      "tensorboard": true
+    },
+    {
+      "id": "model-execution-smoke",
+      "evidence_class": "model execution smoke",
+      "report_glob": ".autoforecast/smoke-runs/*/report.html",
+      "tensorboard": false
+    }
+  ]
+}
