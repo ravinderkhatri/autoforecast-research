@@ -307,34 +307,26 @@ def test_resolve_revision_rolling_config_returns_a_validate_revision_recipe_payl
     assert rolling["trunk_stages"] == 3 and v3["local_blocks"] == 3
 
 
-def test_legacy_pact_recipe_defaults_missing_series_loss_weighting_to_uniform() -> None:
-    candidate = next(
-        item
-        for item in discover_candidates(ROOT / "configs/models")
-        if item.id == "pact"
-    )
-    legacy = json.loads(candidate.implementation_config_bytes)
-    legacy.pop("series_loss_weighting")
-    validate_revision_recipe(legacy)
-    payload = (json.dumps(legacy, allow_nan=False) + "\n").encode()
+@pytest.mark.parametrize("model_id", ["sft", "hmfnet", "pact"])
+@pytest.mark.parametrize("field", ["v5", "series_loss_weighting"])
+def test_current_revision_recipe_requires_explicit_fields(model_id, field) -> None:
+    candidate = next(item for item in discover_candidates(ROOT / "configs/models")
+                     if item.id == model_id)
+    incomplete = json.loads(candidate.implementation_config_bytes)
+    incomplete.pop(field)
+    with pytest.raises(ValueError, match="fully serialize"):
+        validate_revision_recipe(incomplete)
+    payload = (json.dumps(incomplete, allow_nan=False) + "\n").encode()
     changed = dataclasses.replace(
         candidate,
         implementation_config_bytes=payload,
         implementation_config_sha256=hashlib.sha256(payload).hexdigest(),
     )
-
-    plan = resolve_execution_plan(
-        changed,
-        Panel("functional.parquet", "id", "date", "qty"),
-        _facts(),
-        horizon=7,
-        epochs=2,
-    )
-
-    rolling = plan.as_record()["adapter_kwargs"]["rolling_config"]
-    assert rolling["variant"] == "v5"
-    assert rolling["v5"] == legacy["v5"]
-    assert rolling["series_loss_weighting"] == "uniform"
+    with pytest.raises(ExecutionPlanError, match="fully serialize"):
+        resolve_execution_plan(
+            changed, Panel("functional.parquet", "id", "date", "qty"), _facts(),
+            horizon=7, epochs=2,
+        )
 
 
 def test_global_left_padding_is_limited_to_mask_aware_sft_and_hmfnet() -> None:

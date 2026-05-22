@@ -204,14 +204,6 @@ custom-torch = [
     { name = "tensorboard" },
     { name = "torch" },
 ]
-daily = [
-    { name = "numpy" },
-    { name = "pandas" },
-    { name = "psutil" },
-    { name = "pyarrow" },
-    { name = "pyspark" },
-    { name = "pyyaml" },
-]
 data = [
     { name = "kaggle" },
     { name = "numpy" },
@@ -274,28 +266,22 @@ requires-dist = [
     { name = "lightning", marker = "extra == 'tft'", specifier = ">=2.5,<3" },
     { name = "matplotlib", marker = "extra == 'plots'", specifier = "==3.11.1" },
     { name = "mlflow-skinny", marker = "extra == 'mlflow-tracking'", specifier = "==3.13.0" },
-    { name = "numpy", marker = "extra == 'daily'", specifier = "==2.5.3" },
     { name = "numpy", marker = "extra == 'data'" },
     { name = "numpy", marker = "extra == 'timeseries'", specifier = "==2.5.3" },
     { name = "optuna", marker = "extra == 'hpo-optuna'", specifier = "==5.0.0" },
-    { name = "pandas", marker = "extra == 'daily'", specifier = "==2.3.3" },
     { name = "pandas", marker = "extra == 'data'" },
     { name = "pandas", marker = "extra == 'shallow'" },
     { name = "pandas", marker = "extra == 'timeseries'", specifier = "==2.3.3" },
     { name = "psutil", marker = "extra == 'campaign'", specifier = "==7.2.2" },
-    { name = "psutil", marker = "extra == 'daily'", specifier = "==7.2.2" },
     { name = "psutil", marker = "extra == 'mlflow-tracking'", specifier = "==7.2.2" },
     { name = "psutil", marker = "extra == 'timeseries'", specifier = "==7.2.2" },
-    { name = "pyarrow", marker = "extra == 'daily'", specifier = "==24.0.0" },
     { name = "pyarrow", marker = "extra == 'data'" },
     { name = "pyarrow", marker = "extra == 'spark'", specifier = ">=24,<26" },
     { name = "pyarrow", marker = "extra == 'timeseries'", specifier = "==24.0.0" },
-    { name = "pyspark", marker = "extra == 'daily'", specifier = "==4.2.0" },
     { name = "pyspark", marker = "extra == 'spark'", specifier = ">=4,<5" },
     { name = "pyspark", marker = "extra == 'timeseries'", specifier = "==4.2.0" },
     { name = "pytorch-forecasting", marker = "extra == 'tft'", specifier = ">=1.3,<2" },
     { name = "pyyaml", marker = "extra == 'catalog'", specifier = "==6.0.3" },
-    { name = "pyyaml", marker = "extra == 'daily'", specifier = "==6.0.3" },
     { name = "pyyaml", marker = "extra == 'hpo-optuna'", specifier = "==6.0.3" },
     { name = "pyyaml", marker = "extra == 'hpo-ray'", specifier = "==6.0.3" },
     { name = "pyyaml", marker = "extra == 'timeseries'", specifier = "==6.0.3" },
@@ -305,7 +291,7 @@ requires-dist = [
     { name = "timesfm", marker = "extra == 'timesfm'", git = "https://github.com/google-research/timesfm.git?rev=2f1625c208cf99bd4c9f6650d54796d8f88486f8" },
     { name = "torch", marker = "extra == 'custom-torch'", specifier = ">=2.5,<3" },
 ]
-provides-extras = ["timeseries", "daily", "plots", "data", "spark", "catalog", "hpo-optuna", "hpo-ray", "mlflow-tracking", "campaign", "classical", "custom-torch", "shallow", "tft", "autogluon-zoo", "timesfm"]
+provides-extras = ["timeseries", "plots", "data", "spark", "catalog", "hpo-optuna", "hpo-ray", "mlflow-tracking", "campaign", "classical", "custom-torch", "shallow", "tft", "autogluon-zoo", "timesfm"]
 
 [package.metadata.requires-dev]
 ci = [

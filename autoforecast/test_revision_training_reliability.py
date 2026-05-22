@@ -159,7 +159,10 @@ def test_feature_state_callbacks_must_be_paired(revision_data):
 
 
 @pytest.mark.parametrize("precision", ["32-true", "16-mixed"])
-def test_shared_trainer_exposes_model_agnostic_training_and_validation_regions(precision):
+@pytest.mark.parametrize("study_metric", [None, "wrmsse"])
+def test_shared_trainer_exposes_model_agnostic_training_and_validation_regions(
+    precision, study_metric,
+):
     class SpyProfiler:
         def __init__(self):
             self.begun = []
@@ -202,6 +205,21 @@ def test_shared_trainer_exposes_model_agnostic_training_and_validation_regions(p
         np.ones((2, 2), dtype=np.float32),
         np.ones((2, 2), dtype=bool),
     )
+    study = None
+    if study_metric is not None:
+        from autoforecast.study_validation import StudyValidation
+
+        study = StudyValidation(
+            json.dumps({
+                "study_id": "b" * 64,
+                "boundary": f"validation/{data.cutoff.isoformat()}/2/D",
+                "metric_policy": {"metric": "wrmsse", "actual_missing": "mask"},
+            }), "a" * 64, data.series_ids,
+            np.array([[1.0, 0.0], [2.0, 4.0]]),
+            np.array([[True, False], [True, True]]),
+            np.array([1.0, 3.0]), np.array([1.0, 4.0]),
+        )
+        holdout = ValidationWindow.from_study(data.cutoff.isoformat(), study)
     config = small_config(
         "v2",
         encoder_days=7,
@@ -270,7 +288,15 @@ def test_shared_trainer_exposes_model_agnostic_training_and_validation_regions(p
     profiler = SpyProfiler()
     trainer.performance_profiler = profiler
     records = []
-    _, summary = trainer.fit(records.append)
+    model, summary = trainer.fit(records.append)
+    if study is not None:
+        with torch.no_grad():
+            expected = study.score(model(torch.ones(2)).double().numpy())
+        assert summary["selection_metric"] == "wrmsse"
+        assert summary["training_contract"]["study_evaluation"] == study.as_record()
+        assert summary["validation"][0]["mean_wrmsse"] == pytest.approx(expected["wrmsse"])
+        validation = next(record["validation"] for record in records if "validation" in record)
+        assert validation[data.cutoff.isoformat()]["observed_cells"] == 3
     if precision == "16-mixed":
         assert summary["precision"] == "16-mixed"
         assert summary["selected_updates"] == summary["steps_per_epoch"]

@@ -69,7 +69,7 @@ def test_resolve_study_rejects_obsolete_schema_before_artifact_reads(tmp_path, m
 
 
 @pytest.mark.parametrize("metric,policy", [("wrmsse", "zero"), ("rmse", "zero"), ("rmse", "mask")])
-def test_study_compiles_for_shared_scorer_and_refuses_native_checkpoint_selection(
+def test_study_compiles_for_shared_scorer_and_enforces_declared_adapter_support(
     tmp_path, spark, monkeypatch, metric, policy,
 ):
     """A recipe-v2 single-level WRMSSE study is not an M5 hierarchy campaign."""
@@ -136,8 +136,15 @@ def test_study_compiles_for_shared_scorer_and_refuses_native_checkpoint_selectio
     assert resolved["selection"]["metric"] == metric
 
     original_discover = campaign.discover_candidates
+    original_descriptor = campaign.descriptor
     with experiment_project(project):
         for adapter in ("sft", "hmfnet", "pact", "tft_q", "tft_hnb", ):
+            assert original_descriptor(adapter).supports_shared_studies
+            monkeypatch.setattr(
+                campaign, "descriptor", lambda name: dataclasses.replace(
+                    original_descriptor(name), supports_shared_studies=False,
+                ),
+            )
             monkeypatch.setattr(
                 campaign, "discover_candidates",
                 lambda root, adapter=adapter: [

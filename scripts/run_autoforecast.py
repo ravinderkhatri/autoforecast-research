@@ -486,6 +486,8 @@ def _worker_kwargs(
     validation_data_path: pathlib.Path | None,
     fixed_update_budget: int | None,
     validation_metric: str | None,
+    evaluation_contract_path: pathlib.Path | None = None,
+    evaluation_contract_sha256: str | None = None,
 ) -> dict[str, object]:
     """Add common output paths to adapter-owned typed execution inputs."""
     out = context.attempt_dir / "evaluation" / "forecast"
@@ -493,6 +495,18 @@ def _worker_kwargs(
     if type(serialized) is not dict:  # pragma: no cover - ExecutionPlan owns this invariant
         raise TrainWorkflowError("execution plan adapter inputs are not a mapping")
     kwargs: dict[str, object] = {**serialized, "out_dir": str(out)}
+    if evaluation_contract_path is not None and context.input.run.adapter in {
+        "sft", "hmfnet", "pact", "tft_q", "tft_hnb",
+    }:
+        if training_mode != "fixed_validation" or evaluation_contract_sha256 is None:
+            raise TrainWorkflowError("native study selection requires a fixed validation contract")
+        kwargs.update(
+            evaluation_contract_path=str(evaluation_contract_path),
+            evaluation_contract_sha256=evaluation_contract_sha256,
+            validation_data_path=(
+                None if validation_data_path is None else str(validation_data_path)
+            ),
+        )
     if context.input.run.adapter in {
         "mft",
         "sft",
@@ -1243,8 +1257,13 @@ def run_request(
         for candidate in selected:
             if not descriptor(candidate.adapter).supports_shared_studies:
                 raise TrainWorkflowError(
-                    f"model {candidate.id!r} does not support shared studies; "
-                    "native checkpoint selection is supported only in standalone campaigns"
+                    f"model {candidate.id!r} does not support shared studies"
+                )
+            if candidate.adapter in {
+                "sft", "hmfnet", "pact", "tft_q", "tft_hnb",
+            } and (training_mode != "fixed_validation" or evaluation_data_path is None):
+                raise TrainWorkflowError(
+                    "native study selection requires fixed_validation and separate evaluation data"
                 )
     if patience is None:
         patience = (
@@ -1636,6 +1655,8 @@ def run_request(
                                 and training_mode != "fixed_refit"
                                 else None
                             ),
+                            evaluation_contract_path=evaluation_contract_path,
+                            evaluation_contract_sha256=evaluation_contract_sha256,
                         ),
                     ),
                 )

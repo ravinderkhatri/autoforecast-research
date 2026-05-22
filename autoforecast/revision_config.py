@@ -177,24 +177,12 @@ def _validate_v5(value: object) -> None:
 def validate_revision_recipe(recipe: object) -> None:
     """Validate the complete JSON-facing RollingConfig contract before worker launch."""
     actual = set(recipe) if type(recipe) is dict else set()
-    legacy_fields = ROLLING_CONFIG_FIELDS - {"v5", "series_loss_weighting"}
-    legacy_pact_fields = ROLLING_CONFIG_FIELDS - {"series_loss_weighting"}
-    legacy_serialization = type(recipe) is dict and (
-        actual == legacy_fields and recipe.get("variant") != "v5"
-        or actual == legacy_pact_fields and recipe.get("variant") == "v5"
-    )
-    if type(recipe) is not dict or actual != ROLLING_CONFIG_FIELDS and not legacy_serialization:
+    if type(recipe) is not dict or actual != ROLLING_CONFIG_FIELDS:
         raise ValueError(
             "revision recipe must fully serialize RollingConfig; "
             f"missing={sorted(ROLLING_CONFIG_FIELDS - actual)}, "
             f"extra={sorted(actual - ROLLING_CONFIG_FIELDS)}"
         )
-    if legacy_serialization:
-        recipe = {
-            **recipe,
-            "v5": recipe.get("v5"),
-            "series_loss_weighting": "uniform",
-        }
     if any(type(recipe[name]) is not int or recipe[name] < 1 for name in _POSITIVE_INTS):
         raise ValueError("revision counts and budgets must be positive integers")
     if any(type(recipe[name]) is not int or recipe[name] < 0 for name in ("seed", "factor_rank")):

@@ -257,3 +257,26 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print("PASS " + name)
+
+
+def test_implementation_config_uses_the_active_experiment_project(tmp_path, monkeypatch):
+    from autoforecast.project import experiment_project
+
+    checkout = tmp_path / "checkout"
+    project = tmp_path / "project"
+    checkout.mkdir()
+    project.mkdir()
+    first = b'{"owner":"checkout"}\n'
+    second = b'{"owner":"project"}\n'
+    (checkout / "recipe.json").write_bytes(first)
+    (project / "recipe.json").write_bytes(second)
+    checkout_catalog = _implementation_profile(checkout, "recipe.json", first)
+    project_catalog = _implementation_profile(project, "recipe.json", second)
+    monkeypatch.setattr(catalog, "_PROJECT_ROOT", checkout)
+    with experiment_project(project):
+        candidate = catalog.discover_candidates(project_catalog)[0]
+        assert candidate.implementation_config_bytes == second
+        assert candidate.implementation_config_path == project / "recipe.json"
+        with pytest.raises(catalog.CatalogError, match="has changed"):
+            catalog.discover_candidates(checkout_catalog)
+    assert catalog.discover_candidates(checkout_catalog)[0].implementation_config_bytes == first

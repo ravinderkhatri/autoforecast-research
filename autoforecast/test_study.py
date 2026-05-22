@@ -165,6 +165,56 @@ def test_study_registration_reuses_bytes_and_rejects_changed_rules(tmp_path, spa
     assert new_path != path
 
 
+@pytest.mark.parametrize("policy,scored", [("zero", 4), ("mask", 2)])
+def test_study_freezes_inner_tuning_population_and_missingness(tmp_path, spark, policy, scored):
+    # Population: the same A/B cohort as outer validation; four inner target cells.
+    # A on day 4 is null and B on day 5 is absent; the late series remains excluded.
+    path = freeze(
+        tmp_path, spark, actual_missing=policy,
+        mutate=lambda recipe: recipe.update(tuning_windows=[{"origin": "2024-01-03", "horizon": 2}]),
+    )
+    _, record = benchmark.verify_benchmark(path)
+    fixed = benchmark.evaluation_contract(
+        path, stage="tuning", origin="2024-01-03", horizon=2, metric="rmse",
+    )
+    assert fixed["actuals"]["role"] == "selection"
+    assert fixed["actuals"]["sha256"] == record["artifacts"]["selection"]
+    assert fixed["grid"]["n_cells"] == 4
+    assert fixed["coverage"]["counts"] == {
+        "expected": 4, "originally_missing": 2, "scored": scored,
+        "zero_filled": 2 if policy == "zero" else 0,
+        "excluded": 2 if policy == "mask" else 0,
+    }
+    with pytest.raises(benchmark.BenchmarkError, match="boundary absent"):
+        benchmark.evaluation_contract(
+            path, stage="tuning", origin="2024-01-02", horizon=2, metric="rmse",
+        )
+    changed = copy.deepcopy(record)
+    changed["recipe"]["tuning_windows"][0]["horizon"] = 1
+    with pytest.raises(benchmark.BenchmarkError, match="grid inventory"):
+        benchmark._validate_manifest(changed)
+
+
+@pytest.mark.parametrize("windows", [
+    None, [], {}, [True], [{"origin": "2024-01-03", "horizon": True}],
+    [{"origin": "2024-01-03", "horizon": 0}],
+    [{"origin": "2024-01-03", "horizon": 3}],
+    [{"origin": "2023-12-31", "horizon": 2}],
+    [{"origin": "2024-01-02", "horizon": 2}],  # B has not reached its declared start.
+    [{"origin": "2024-01-03", "horizon": 1}, {"origin": "2024-01-03", "horizon": 2}],
+    [{"origin": "2024-01-04", "horizon": 1}, {"origin": "2024-01-03", "horizon": 2}],
+    [{"origin": "2024-01-03", "horizon": 2, "metric": "mae"}],
+])
+def test_study_rejects_invalid_inner_windows_before_runtime(tmp_path, windows):
+    contract, sources, recipe = inputs(tmp_path)
+    recipe["tuning_windows"] = windows
+    with pytest.raises(benchmark.BenchmarkError):
+        benchmark.freeze_benchmark(
+            contract_path=contract, sources=sources, recipe=recipe,
+            output_root=tmp_path / "frozen", spark=object(),
+        )
+
+
 def test_obsolete_recipe_is_rejected_before_runtime(tmp_path):
     contract, sources, recipe = inputs(tmp_path)
     recipe["schema_version"] = 1

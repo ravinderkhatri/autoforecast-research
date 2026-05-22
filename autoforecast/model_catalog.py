@@ -22,6 +22,7 @@ from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast.adapter_contracts import descriptor
 from autoforecast.adapters import known_adapter_names
 from autoforecast.model_runtime import runtime_ids
+from autoforecast.project import project_root
 
 __all__ = [
     "Candidate",
@@ -230,10 +231,11 @@ def _candidate(path: pathlib.Path) -> Candidate:
         pure = pathlib.PurePosixPath(relative)
         if pure.is_absolute() or ".." in pure.parts or not pure.parts:
             raise CatalogError(f"{path}: implementation identity is invalid")
-        implementation_path = _PROJECT_ROOT.joinpath(*pure.parts)
+        owner = project_root(_PROJECT_ROOT)
+        implementation_path = owner.joinpath(*pure.parts)
         try:
             implementation_bytes = _read_regular_bytes(
-                implementation_path, root=_PROJECT_ROOT
+                implementation_path, root=owner
             )
         except CatalogError as error:
             raise CatalogError(f"{path}: implementation config is missing or aliased") from error

@@ -49,6 +49,7 @@ from autoforecast.model_execution import (
 )
 from autoforecast.model_names import REVISION_VARIANTS
 from autoforecast.precision_policy import effective_precision
+from autoforecast.project import installed_library_identity, installed_mode
 from autoforecast.tuning import (
     PARAMETER_EXECUTION_COMPATIBILITY,
     TuningError,
@@ -642,7 +643,7 @@ def _selected_source_commit(
     expected_parameters: dict[str, object],
     expected_protocol: dict[str, object] | None,
     attempt_completion: dict[str, object],
-) -> tuple[str, dict[str, object]]:
+) -> tuple[str | None, dict[str, object]]:
     """Verify the selected attempt came from one complete governed runner bundle."""
     evaluation_files = {
         item.relative_to(attempt).as_posix()
@@ -669,6 +670,11 @@ def _selected_source_commit(
         "source_data_fingerprint",
         "test_metrics",
     }
+    study_evaluation = governed.get("study_evaluation")
+    if "study_evaluation" in governed:
+        governed_keys.add("study_evaluation")
+        if type(study_evaluation) is not dict:
+            raise ParameterSourceError("selected HPO study evaluation is invalid")
     run_id = governed.get("run_id")
     bundle_relative = governed.get("source_bundle")
     metric = governed.get("metric")
@@ -757,6 +763,12 @@ def _selected_source_commit(
     provenance = _exact_record(
         bundle / "provenance" / "manifest.json", "selected source provenance manifest"
     )
+    source = _exact_record(bundle / "provenance" / "source.json", "selected source identity")
+    library_source = source.get("schema") == "autoforecast.installed-library.v1"
+    if library_source and (
+        not installed_mode() or not _same_exact(source, installed_library_identity().as_record())
+    ):
+        raise ParameterSourceError("selected installed library differs from the active library")
     configuration = provenance.get("configuration")
     model_configuration = (
         configuration.get("model_profile") if type(configuration) is dict else None
@@ -784,10 +796,21 @@ def _selected_source_commit(
             "lockfile",
             "lockfile_sha256",
             "image_digest",
-        }
-        or runtime.get("schema") != "mlops.runtime-identity.v1"
-        or not _is_relative_source_path(runtime_lockfile)
-        or not _is_sha256(runtime_lockfile_sha)
+        } | ({"installed_packages"} if library_source else set())
+        or runtime.get("schema") != (
+            "mlops.runtime-identity.v2" if library_source else "mlops.runtime-identity.v1"
+        )
+        or (library_source and (
+            type(runtime.get("installed_packages")) is not list
+            or not runtime["installed_packages"]
+            or any(type(row) is not list or len(row) != 2
+                   or any(type(value) is not str or not value for value in row)
+                   for row in cast(list, runtime["installed_packages"]))
+        ))
+        or (not library_source and (
+            not _is_relative_source_path(runtime_lockfile) or not _is_sha256(runtime_lockfile_sha)
+        ))
+        or (library_source and (runtime_lockfile is not None or runtime_lockfile_sha is not None))
         or provenance.get("schema") != "mlops.run-provenance.v1"
         or provenance.get("data") != data
         or provenance.get("runtime") != runtime
@@ -840,7 +863,7 @@ def _selected_source_commit(
     retained_lock = _without_links(
         bundle / "provenance" / "runtime" / "uv.lock", "selected runtime lockfile copy"
     )
-    if (
+    if not library_source and (
         not retained_lock.is_file()
         or hashlib.sha256(retained_lock.read_bytes()).hexdigest() != runtime_lockfile_sha
     ):
@@ -881,6 +904,11 @@ def _selected_source_commit(
         raise ParameterSourceError("selected source run request is invalid") from error
     if type(request_run) is not dict:
         raise ParameterSourceError("selected source run request is invalid")
+    from autoforecast.data_admission import _load_dataset_contract_bytes
+
+    retained_contract = _load_dataset_contract_bytes(dataset_bytes, retained_dataset)
+    if (retained_contract.required_series_count is None) != (study_evaluation is None):
+        raise ParameterSourceError("selected HPO study evaluation does not match its dataset")
 
     forecast = _exact_record(bundle / "evaluation" / "forecast.json", "selected source forecast")
     model_artifacts = _exact_record(
@@ -1022,7 +1050,35 @@ def _selected_source_commit(
         forecast_digest = directory_digest(forecast_artifact, suffixes=(".parquet",))
     except (LineageError, OSError, TypeError, ValueError) as error:
         raise ParameterSourceError("selected source forecast artifact is invalid") from error
-    if metric == "wrmsse":
+    fixed = comparison.get("evaluation_contract")
+    if study_evaluation is not None:
+        from autoforecast.hpo_bridge import _require_exact_validation_population
+
+        if type(fixed) is not dict:
+            raise ParameterSourceError("selected HPO study evaluation is missing")
+        try:
+            _require_exact_validation_population(
+                comparison, forecast, model_id=candidate.id, metric=cast(str, metric),
+                validation_series=cast(int, study.data["validation_series"]),
+                horizon=cast(int, resolved["horizon"]), fixed_contract=fixed,
+            )
+        except (HPOError, ValueError) as error:
+            raise ParameterSourceError(f"selected HPO study score is invalid: {error}") from error
+        expected_study = {
+            "study_id": fixed["study_id"], "boundary": fixed["boundary"],
+            "evaluation_contract_sha256": hashlib.sha256(_canonical(fixed)).hexdigest(),
+            "metric_policy": fixed["metric_policy"],
+        }
+        score_shape_valid = (
+            _same_exact(study_evaluation, expected_study)
+            and fixed["boundary"] == (
+                f"tuning/{resolved['origin']}/{resolved['horizon']}/{cadence.code}"
+            )
+            and fixed["actuals"]["sha256"] == governed["source_data_fingerprint"]
+            and fixed["actuals"]["sha256"] == governed["validation_data_fingerprint"]
+            and _same_exact(metric_value, validation_value)
+        )
+    elif metric == "wrmsse":
         per_level = score.get("per_level") if type(score) is dict else None
         scored_by_level = score.get("n_series_scored") if type(score) is dict else None
         dropped_by_level = score.get("n_series_dropped") if type(score) is dict else None
@@ -1079,7 +1135,7 @@ def _selected_source_commit(
             "candidates",
             "ranking",
             "comparison_error",
-        }
+        } | ({"evaluation_contract"} if study_evaluation is not None else set())
         or comparison.get("schema") != "autoforecast.run-candidate-comparison.v1"
         or not score_shape_valid
         or comparison.get("comparison_error") is not None
@@ -1120,8 +1176,7 @@ def _selected_source_commit(
     ):
         raise ParameterSourceError("selected source score differs from completed HPO evidence")
 
-    source = _exact_record(bundle / "provenance" / "source.json", "selected source identity")
-    if set(source) != {
+    if not library_source and set(source) != {
         "schema",
         "repository_root",
         "commit",
@@ -1132,81 +1187,83 @@ def _selected_source_commit(
         raise ParameterSourceError("selected source identity is incomplete")
     if provenance.get("source") != source:
         raise ParameterSourceError("selected source provenance manifest disagrees with source")
-    commit, tree = source.get("commit"), source.get("tree")
-    relevant_paths = source.get("relevant_paths")
-    repository_root = source.get("repository_root")
-    origin_url = source.get("origin_url")
-    if type(relevant_paths) is not list or any(
-        type(item) is not str or not item for item in relevant_paths
-    ):
-        raise ParameterSourceError("selected source identity is incompatible")
-    if origin_url is not None and (
-        type(origin_url) is not str or sanitize_repository_origin(origin_url) != origin_url
-    ):
-        raise ParameterSourceError("selected source identity is incompatible")
-    if (
-        source.get("schema") != "mlops.source-identity.v1"
-        or not _is_commit(commit)
-        or not _is_commit(tree)
-        or type(repository_root) is not str
-        or not pathlib.Path(repository_root).is_absolute()
-        or not {
-            "autoforecast",
-            "forecast",
-            "mlops",
-            "provenance",
-            "scripts",
-            "spec",
-            "configs",
-            "pyproject.toml",
-            "uv.lock",
-        }.issubset(set(relevant_paths))
-    ):
-        raise ParameterSourceError("selected source identity is incompatible")
-    assert isinstance(commit, str) and isinstance(tree, str)
-    commit_check = subprocess.run(
-        ["git", "-C", str(project_root), "cat-file", "-e", f"{commit}^{{commit}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    tree_check = subprocess.run(
-        ["git", "-C", str(project_root), "rev-parse", f"{commit}^{{tree}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if commit_check.returncode or tree_check.returncode or tree_check.stdout.strip() != tree:
-        raise ParameterSourceError("selected source Git commit/tree is not retained locally")
-    source_configs = [
-        (candidate.source_path, candidate.source_sha256),
-        (study.source_path, study.source_sha256),
-        (project_root / cast(str, runtime_lockfile), cast(str, runtime_lockfile_sha)),
-    ]
-    if candidate.implementation_config_path is not None:
-        assert candidate.implementation_config_sha256 is not None
-        source_configs.append(
-            (
-                candidate.implementation_config_path,
-                candidate.implementation_config_sha256,
-            )
-        )
-    for source_path, expected_sha in source_configs:
-        try:
-            relative = source_path.resolve().relative_to(project_root).as_posix()
-        except ValueError as error:
-            raise ParameterSourceError(
-                "selected source configuration is outside the project"
-            ) from error
-        blob = subprocess.run(
-            ["git", "-C", str(project_root), "show", f"{commit}:{relative}"],
+    commit = None
+    if not library_source:
+        commit, tree = source.get("commit"), source.get("tree")
+        relevant_paths = source.get("relevant_paths")
+        repository_root = source.get("repository_root")
+        origin_url = source.get("origin_url")
+        if type(relevant_paths) is not list or any(
+            type(item) is not str or not item for item in relevant_paths
+        ):
+            raise ParameterSourceError("selected source identity is incompatible")
+        if origin_url is not None and (
+            type(origin_url) is not str or sanitize_repository_origin(origin_url) != origin_url
+        ):
+            raise ParameterSourceError("selected source identity is incompatible")
+        if (
+            source.get("schema") != "mlops.source-identity.v1"
+            or not _is_commit(commit)
+            or not _is_commit(tree)
+            or type(repository_root) is not str
+            or not pathlib.Path(repository_root).is_absolute()
+            or not {
+                "autoforecast",
+                "forecast",
+                "mlops",
+                "provenance",
+                "scripts",
+                "spec",
+                "configs",
+                "pyproject.toml",
+                "uv.lock",
+            }.issubset(set(relevant_paths))
+        ):
+            raise ParameterSourceError("selected source identity is incompatible")
+        assert isinstance(commit, str) and isinstance(tree, str)
+        commit_check = subprocess.run(
+            ["git", "-C", str(project_root), "cat-file", "-e", f"{commit}^{{commit}}"],
             capture_output=True,
+            text=True,
             check=False,
         )
-        if blob.returncode or hashlib.sha256(blob.stdout).hexdigest() != expected_sha:
-            raise ParameterSourceError(
-                "selected source commit does not contain the declared model/study configuration"
+        tree_check = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", f"{commit}^{{tree}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commit_check.returncode or tree_check.returncode or tree_check.stdout.strip() != tree:
+            raise ParameterSourceError("selected source Git commit/tree is not retained locally")
+        source_configs = [
+            (candidate.source_path, candidate.source_sha256),
+            (study.source_path, study.source_sha256),
+            (project_root / cast(str, runtime_lockfile), cast(str, runtime_lockfile_sha)),
+        ]
+        if candidate.implementation_config_path is not None:
+            assert candidate.implementation_config_sha256 is not None
+            source_configs.append(
+                (
+                    candidate.implementation_config_path,
+                    candidate.implementation_config_sha256,
+                )
             )
+        for source_path, expected_sha in source_configs:
+            try:
+                relative = source_path.resolve().relative_to(project_root).as_posix()
+            except ValueError as error:
+                raise ParameterSourceError(
+                    "selected source configuration is outside the project"
+                ) from error
+            blob = subprocess.run(
+                ["git", "-C", str(project_root), "show", f"{commit}:{relative}"],
+                capture_output=True,
+                check=False,
+            )
+            if blob.returncode or hashlib.sha256(blob.stdout).hexdigest() != expected_sha:
+                raise ParameterSourceError(
+                    "selected source commit does not contain the declared model/study configuration"
+                )
     observed_protocol = {
         "metric": metric,
         "missing_actual": comparison.get("missing_actual"),
@@ -1226,6 +1283,8 @@ def _selected_source_commit(
             "early_stopping_relative_min_delta"
         ),
         "precision": training_controls.get("effective_precision"),
+        **({"study_evaluation": study_evaluation} if study_evaluation is not None else {}),
+        **({"library": source} if library_source else {}),
     }
     if (
         not _training_controls_match_candidate(training_controls, candidate)
@@ -1449,8 +1508,17 @@ def validate_parameter_resolution(
                 or _ID.fullmatch(cast(str, source["selected_trial_id"])) is None
                 or type(source.get("selected_attempt_id")) is not str
                 or _ID.fullmatch(cast(str, source["selected_attempt_id"])) is None
-                or not _is_commit(source.get("selected_source_commit"))
                 or type(source.get("protocol")) is not dict
+                or (
+                    not _is_commit(source.get("selected_source_commit"))
+                    and not (
+                        source.get("selected_source_commit") is None
+                        and type(source.get("protocol")) is dict
+                        and type(source["protocol"].get("library")) is dict
+                        and source["protocol"]["library"].get("schema")
+                        == "autoforecast.installed-library.v1"
+                    )
+                )
             )
         ):
             raise ParameterSourceError("HPO parameter source provenance is incomplete")

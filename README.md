@@ -33,9 +33,8 @@ export FORECAST_SPARK_CORES=2
 export FORECAST_SPARK_MEMORY=1g
 ```
 
-The `timeseries` extra includes the local data/runtime dependencies. The older `daily` extra
-installs the same dependencies for compatibility. The two built-in baselines need
-neither a GPU nor a model download. Additional model libraries are optional.
+The `timeseries` extra includes the local data/runtime dependencies. The two built-in baselines
+need neither a GPU nor a model download. Additional model libraries are optional.
 
 ## Run the example
 
@@ -244,10 +243,8 @@ caller responsibilities.
 
 The manifest's `study_id` binds the cohort, declared starts, prepared values, original missing
 flags, windows, policies, and metric definition. It is separate from model-run, HPO-study, and
-MLflow identifiers. Studies use profile defaults or manual fixed model parameters.
-Standalone campaigns support inner HPO and reused HPO selections. Their extra validation
-windows are not part of a shared study, so shared studies reject these parameter modes
-before training. Reuse a verified study by ID:
+MLflow identifiers. Studies support profile defaults, manual parameters, inner HPO, and verified
+HPO reuse. Reuse a verified study by ID:
 
 ```bash
 autoforecast run --project-root my-experiment --study-id STUDY_ID
@@ -265,12 +262,12 @@ model; an unavailable held-out test score is reported without changing the selec
 
 Study `wrmsse` uses a single-level weighted mean of per-series RMSSE. It does not use M5's
 hierarchy. Supply `--scoring-references references.parquet` with one row for every retained
-series and every validation/test boundary:
+series and every tuning, validation, and test boundary:
 
 | Column | Value |
 |---|---|
 | `keys` | Struct containing the recipe's source-key names and exact types |
-| `stage` | `validation` or `test` |
+| `stage` | `tuning`, `validation`, or `test` |
 | `origin` | Canonical origin string at the declared frequency |
 | `weight` | Finite non-negative weight; positive total at each boundary |
 | `scale` | Mean squared naive-change scale; zero or null means undefined |
@@ -281,10 +278,83 @@ observed cells. If any retained series has no scoreable actuals or an undefined 
 is unavailable. Weights are never redistributed.
 
 The `sft`, `hmfnet`, `pact`, `tft_q`, and `tft_hnb`
-adapters currently run through standalone campaigns in a source checkout. Their native
-checkpoint selection does not implement shared-study scoring, so shared studies reject them
-before training. Other adapters use the shared scorer for validation and testing, subject to
-their declared cadence, target and history requirements.
+adapters select checkpoints with the study metric, including its original missing-value mask
+and any supplied weights and scales. Training loss remains model-specific. Final refit uses
+the selected update budget without test labels. These native adapters retain their daily-data,
+target, feature, and history requirements; use a compatible adapter for other frequencies.
+
+### Tune within a study
+
+Declare inner tuning windows in `recipe.json` **before** freezing the study. For example,
+when the first outer validation origin is April 21:
+
+```json
+"tuning_windows": [{"origin": "2024-03-31", "horizon": 7}]
+```
+
+Every tuning target must precede the first outer validation target. The complete frozen cohort
+must have usable history by the tuning origin. The tuning window uses the selection snapshot;
+outer validation and test labels never select HPO parameters. Missingness and metric rules
+are the same at every boundary.
+
+Install the model's runtime extra and `hpo-optuna` or `hpo-ray`. Copy its profile from
+`configs/models/` into your project's `models/` catalog. If the profile declares an
+`implementation.config`, copy that configuration to the same relative path in your project.
+Its SHA-256 must still match the profile. Choose a history length and training budget that fit
+your data and hardware.
+
+Set the candidate in `campaign.yaml` to:
+
+```yaml
+models:
+  candidates:
+    - model_id: sft
+      parameters:
+        mode: tune
+        study_config: hpo.yaml
+```
+
+Create `hpo.yaml` with explicit data ranges and a trial budget. This template uses two series
+whose selection snapshot covers January 1 through April 21; replace its IDs, hashes, and
+ranges with those from your own study:
+
+```yaml
+schema_version: 1
+study:
+  id: sft-inner-search
+  model_config: models/sft/model.yaml
+  backend: optuna
+  direction: minimize
+  objective: validation/objective
+  max_trials: 10
+  top_k: 1
+  seed: 7
+  comparability_fingerprint: STUDY_ID
+  evaluator: builtin
+  data:
+    id: selection-snapshot
+    fingerprint: SELECTION_ARTIFACT_SHA256
+    observed_date_range: ['2024-01-01', '2024-04-21']
+    training_date_range: ['2024-01-01', '2024-03-31']
+    validation_date_range: ['2024-01-01', '2024-03-31']
+    validation_target_date_range: ['2024-04-01', '2024-04-07']
+    test_date_range: ['2024-04-08', '2024-04-14']
+    test_target_date_range: ['2024-04-08', '2024-04-14']
+    training_series: 2
+    validation_series: 2
+    test: reserved_not_evaluated
+```
+
+`fingerprint` is the frozen manifest's `artifacts.selection`. Both series counts must equal
+the frozen cohort. The training range ends at the inner origin; validation targets match the
+declared tuning window. The reserved inner test range is not evaluated by HPO. The model
+profile defines the search space. Run the same `autoforecast run --study-id ...` command after
+configuring the campaign.
+
+To reuse its retained `selection.json`, change the candidate mode to `reuse_tuned`, keep
+`study_config`, and add `selection: /path/to/selection.json`. Reuse verifies the study boundary,
+data, model, training protocol, and executable provenance. Changing those inputs requires a
+new tuning run. Defaults and manual parameters do not require tuning windows.
 
 Campaign requests use `schema_version: 6`; standalone run requests use `schema_version: 3`.
 The checked-in examples declare `precision: 32-true` to preserve their FP32 settings. New

@@ -248,7 +248,7 @@ run:
         shared["schema_version"] = 2
         shared["dataset"]["required_series_count"] = 2
         contract.write_text(yaml.safe_dump(shared))
-        with pytest.raises(HPOError, match="shared-study inner HPO windows are not frozen"):
+        with pytest.raises(HPOError, match="authenticated frozen tuning window"):
             bridge._request(study)
     else:
         with pytest.raises(HPOError, match="does not support 7D cadence"):

@@ -22,7 +22,7 @@ LIBRARY_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 def project_root(default: pathlib.Path) -> pathlib.Path:
-    """Return the caller's project or the legacy checkout boundary."""
+    """Return the caller's experiment project or the source checkout boundary."""
     return _PROJECT.get() or default
 
 
@@ -35,7 +35,7 @@ def project_arguments() -> list[str]:
 
 
 def project_entrypoint(function):
-    """Give legacy thin CLIs an explicit project option without changing their coordinator."""
+    """Give thin CLIs an explicit experiment-project option."""
 
     @functools.wraps(function)
     def wrapped():

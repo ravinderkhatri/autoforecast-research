@@ -25,12 +25,14 @@ def _recipe(variant: str) -> dict[str, object]:
 @pytest.mark.parametrize("variant", ["v2", "v3", "v5"])
 @pytest.mark.parametrize("isolated", [False, True])
 @pytest.mark.parametrize("precision", ["32-true", "16-mixed"])
+@pytest.mark.parametrize("shared_study", [False, True])
 def test_revision_adapter_publishes_generic_outputs_and_overlays_controls(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     variant: str,
     isolated: bool,
     precision: str,
+    shared_study: bool,
 ) -> None:
     captured = {"spark_released": False}
 
@@ -48,10 +50,13 @@ def test_revision_adapter_publishes_generic_outputs_and_overlays_controls(
         precision,
         performance_profile,
         performance_profile_dir,
+        evaluation_contract_path,
+        evaluation_contract_sha256,
     ):
         assert not captured["spark_released"]
         captured["config"] = config
         captured["precision"] = precision
+        captured["study_evaluation"] = (evaluation_contract_path, evaluation_contract_sha256)
         captured["levels"] = levels
         captured["training_contract"] = (
             training_mode,
@@ -126,6 +131,12 @@ def test_revision_adapter_publishes_generic_outputs_and_overlays_controls(
         early_stopping_relative_min_delta=0.02,
         validation_metric="wrmsse",
         precision=precision,
+        **({
+            "training_mode": "fixed_validation",
+            "validation_data_path": str(tmp_path / "validation"),
+            "evaluation_contract_path": str(tmp_path / "evaluation.json"),
+            "evaluation_contract_sha256": "a" * 64,
+        } if shared_study else {}),
     )
     config = captured["config"]
     assert config.variant == variant
@@ -140,8 +151,15 @@ def test_revision_adapter_publishes_generic_outputs_and_overlays_controls(
     assert captured["precision"] == precision
     from autoforecast.benchmarks.m5 import M5_LEVELS
 
-    assert captured["levels"] == M5_LEVELS
-    assert captured["training_contract"] == ("rolling_backtest", None, None)
+    assert captured["levels"] == (() if shared_study else M5_LEVELS)
+    if shared_study:
+        mode, validation, budget = captured["training_contract"]
+        assert mode == "fixed_validation" and budget is None
+        assert validation.path == str(tmp_path / "validation")
+        assert captured["study_evaluation"] == (str(tmp_path / "evaluation.json"), "a" * 64)
+    else:
+        assert captured["training_contract"] == ("rolling_backtest", None, None)
+        assert captured["study_evaluation"] == (None, None)
     assert captured["performance_profile"] == (None, None)
     assert result.path == str(out)
     assert (out / "part-00000.parquet").read_bytes() == captured["forecast_bytes"]

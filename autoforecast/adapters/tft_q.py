@@ -20,7 +20,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pandas as pd
 import pyarrow as pa
@@ -95,6 +95,9 @@ def fit_predict(
     checkpoint_out: str | pathlib.Path | None = None,
     training_mode: str = "fixed_validation",
     fixed_update_budget: int | None = None,
+    validation_data_path: str | pathlib.Path | None = None,
+    evaluation_contract_path: str | pathlib.Path | None = None,
+    evaluation_contract_sha256: str | None = None,
 ) -> Forecast:
     """Select on the preceding 28 days or refit for the sealed update count.
 
@@ -142,6 +145,24 @@ def fit_predict(
             raise ValueError("fixed_refit requires a positive selected update count")
     elif fixed_update_budget is not None:
         raise ValueError("selection cannot receive a fixed update budget")
+    if (evaluation_contract_path is None) != (evaluation_contract_sha256 is None):
+        raise ValueError("study evaluation requires both path and digest")
+    study = None
+    if evaluation_contract_path is not None:
+        from autoforecast.study_validation import StudyValidation
+
+        if training_mode != "fixed_validation" or validation_data_path is None:
+            raise ValueError("study selection requires a separate fixed validation panel")
+        frame, static_categoricals = _tft_frame(
+            panel, origin_day=origin_day, horizon=horizon,
+            max_encoder_length=max_encoder_length, min_encoder_length=min_encoder_length,
+            lag_long_days=lag_long_days,
+        )
+        study = StudyValidation.read(
+            evaluation_contract_path, evaluation_contract_sha256,
+            panel=replace(panel, path=str(validation_data_path)), origin=origin, horizon=horizon,
+            series_ids=tuple(sorted(frame["series_id"].astype(str).unique())),
+        )
     run_identity = {
         "panel": asdict(panel),
         "origin": origin,
@@ -167,6 +188,7 @@ def fit_predict(
         "training_mode": training_mode,
         "fixed_update_budget": fixed_update_budget,
         "max_epochs": max_epochs,
+        **({"study_evaluation": study.as_record()} if study is not None else {}),
     }
     checkpoint = _checkpoint_path(out_dir, checkpoint_out)
     output_dir = pathlib.Path(out_dir)
@@ -205,21 +227,23 @@ def fit_predict(
         loss = QuantileLoss(quantiles=list(QUANTILES))
 
     pl.seed_everything(seed, workers=True)
-    frame, static_categoricals = _tft_frame(
-        panel,
-        origin_day=origin_day,
-        horizon=horizon,
-        max_encoder_length=max_encoder_length,
-        min_encoder_length=min_encoder_length,
-        lag_long_days=lag_long_days,
-    )
+    if study is None:
+        frame, static_categoricals = _tft_frame(
+            panel,
+            origin_day=origin_day,
+            horizon=horizon,
+            max_encoder_length=max_encoder_length,
+            min_encoder_length=min_encoder_length,
+            lag_long_days=lag_long_days,
+        )
     cutoff = int(frame.loc[frame["is_history"], "time_idx"].max())
-    train_cutoff = cutoff - horizon if training_mode == "fixed_validation" else cutoff
+    internal_validation = training_mode == "fixed_validation" and study is None
+    train_cutoff = cutoff - horizon if internal_validation else cutoff
     if loss_kind == "v3_hurdle_nb":
         _assign_hmfnet_mean_scales(
             frame,
             decoder_ends=(train_cutoff, cutoff)
-            if training_mode == "fixed_validation" else (cutoff,),
+            if internal_validation else (cutoff,),
             horizon=horizon,
         )
     history = frame.loc[frame["is_history"]].copy()
@@ -258,14 +282,13 @@ def fit_predict(
             "[autoforecast:non-retryable] selected TFT-Q/TFT-HNB refit update budget cannot "
             "cover every training window"
         )
-    if training_mode == "fixed_validation":
+    if internal_validation:
         validation_dataset = TimeSeriesDataSet.from_dataset(
             dataset, history, predict=True, stop_randomization=True
         )
         _require_one_window(validation_dataset, n_series, "validation")
     else:
         validation_dataset = None
-        assert fixed_update_budget is not None
     successful_updates = {"count": 0, "retries": 0}
     model_class = (
         mixed_precision_tft_class(TemporalFusionTransformer, successful_updates, device)
@@ -288,21 +311,52 @@ def fit_predict(
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     epoch_log = _EpochLog(successful_updates if precision == "16-mixed" else None)
     callbacks = [epoch_log, _FiniteGradientClip(precision=precision)]
+    prediction_dataset = TimeSeriesDataSet.from_dataset(
+        dataset, frame.drop(columns=["is_history"]), predict=True, stop_randomization=True
+    )
+    _require_one_window(prediction_dataset, n_series, "prediction")
+    if study is not None:
+        import numpy as np
+
+        from autoforecast.study_validation import study_score_callback
+
+        prediction_loader = prediction_dataset.to_dataloader(
+            train=False, batch_size=batch_size, num_workers=0,
+        )
+
+        def predict_window(module):
+            predictions = {}
+            for batch in prediction_loader:
+                inputs = module.transfer_batch_to_device(batch[0], module.device, 0)
+                output = module.to_prediction(module(inputs)).detach().cpu().numpy()
+                ids = prediction_dataset.x_to_index(inputs)["series_id"].astype(str)
+                for series, values in zip(ids, output, strict=True):
+                    if series in predictions:
+                        raise ValueError("study TFT prediction duplicated a series")
+                    predictions[series] = np.maximum(values, 0.0)
+            if set(predictions) != set(study.series_ids):
+                raise ValueError("study TFT prediction changed the frozen population")
+            return np.stack([predictions[series] for series in study.series_ids])
+
+        callbacks.insert(0, study_score_callback(study, predict_window))
     selected_checkpoint = None
-    if validation_dataset is not None:
+    if training_mode == "fixed_validation":
+        monitor = "study_score" if study is not None else "val_loss"
         selected_checkpoint = ModelCheckpoint(
             dirpath=checkpoint.parent / "selection-checkpoints",
-            filename="best-{epoch:05d}-{val_loss:.6f}",
-            monitor="val_loss",
+            filename="best-{epoch:05d}",
+            monitor=monitor,
             mode="min",
             save_top_k=1,
             auto_insert_metric_name=False,
+            save_on_train_epoch_end=study is not None,
         )
         callbacks.extend(
             [
                 selected_checkpoint,
                 _early_stopping_callback(
-                    patience=early_stopping_patience, min_delta=early_stopping_min_delta
+                    patience=early_stopping_patience, min_delta=early_stopping_min_delta,
+                    monitor=monitor, check_on_train_epoch_end=study is not None,
                 ),
             ]
         )
@@ -368,10 +422,6 @@ def fit_predict(
         selected_epoch = math.ceil(selected_updates / steps_per_epoch)
         if selected_updates != fixed_update_budget:
             raise RuntimeError("TFT-Q/TFT-HNB refit stopped before the selected update count")
-    prediction_dataset = TimeSeriesDataSet.from_dataset(
-        dataset, frame.drop(columns=["is_history"]), predict=True, stop_randomization=True
-    )
-    _require_one_window(prediction_dataset, n_series, "prediction")
     raw = model.predict(
         prediction_dataset.to_dataloader(train=False, batch_size=batch_size, num_workers=0),
         mode="quantiles" if loss_kind == "quantile" else "prediction",
@@ -427,11 +477,13 @@ def fit_predict(
                 "requested_device": requested_device,
                 "resolved_device": device,
                 "amp_overflow_retries": successful_updates["retries"],
-                "validation": epoch_log.records if validation_dataset is not None else [],
+                "validation": epoch_log.records if training_mode == "fixed_validation" else [],
                 "epoch_log": epoch_log.records,
+                **({"selection_metric": study.metric} if study is not None else {}),
                 "training_contract": {
                     "mode": training_mode,
                     "fixed_update_budget": fixed_update_budget,
+                    **({"study_evaluation": study.as_record()} if study is not None else {}),
                 },
             },
             "profile": {
@@ -684,6 +736,7 @@ def _adopt_completed_forecast(
         or training["selected_updates"] < 1
         or contract.get("mode") != training_mode
         or contract.get("fixed_update_budget") != fixed_update_budget
+        or contract.get("study_evaluation") != run_identity.get("study_evaluation")
         or (training_mode == "fixed_refit" and (
             training.get("refit_optimizer_steps") != fixed_update_budget
             or training.get("selected_updates") != fixed_update_budget
@@ -813,16 +866,19 @@ def _validate_options(**options: object) -> None:
         raise ValueError("early_stopping_min_delta must be in [0, 1)")
 
 
-def _early_stopping_callback(*, patience: int, min_delta: float):
+def _early_stopping_callback(
+    *, patience: int, min_delta: float, monitor: str = "val_loss",
+    check_on_train_epoch_end: bool = False,
+):
     """Build the explicit TFT-Q/TFT-HNB stopping rule after options have been validated."""
     from lightning.pytorch.callbacks import EarlyStopping
 
     return EarlyStopping(
-        monitor="val_loss",
+        monitor=monitor,
         mode="min",
         min_delta=min_delta,
         patience=patience,
-        check_on_train_epoch_end=False,
+        check_on_train_epoch_end=check_on_train_epoch_end,
     )
 
 
@@ -892,6 +948,10 @@ def _EpochLog(successful_updates: dict[str, int] | None = None, *, label: str = 
                     "train_loss": train_loss,
                     "val_loss": None if val_loss is None else float(val_loss),
                     "val_loss_dtype": None if val_loss is None else str(val_loss.dtype),
+                    **({
+                        "study_score": float(metrics["study_score"]),
+                        "study_score_dtype": str(metrics["study_score"].dtype),
+                    } if "study_score" in metrics else {}),
                     "elapsed_seconds": time.monotonic() - self.started,
                 }
             )

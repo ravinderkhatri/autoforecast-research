@@ -58,6 +58,16 @@ jobs:
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
         run: python scripts/run_tests.py
+      - name: Installed native model and HPO acceptance
+        working-directory: ${{ runner.temp }}
+        env:
+          FORECAST_SPARK_CORES: '2'
+          FORECAST_SPARK_MEMORY: '1g'
+          SPARK_LOCAL_IP: '127.0.0.1'
+        run: |
+          env -u PYTHONPATH python -m scripts.verify_native_study_release "$RUNNER_TEMP/native-study-project" \
+            --model-profile "$GITHUB_WORKSPACE/configs/models/custom/sft/model.yaml" \
+            --implementation-config "$GITHUB_WORKSPACE/configs/experiments/multibranch_revisions/sft_campaign_default.json"
   installed-wheel:
     runs-on: ubuntu-latest
     strategy:
