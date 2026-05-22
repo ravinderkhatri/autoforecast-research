@@ -281,8 +281,10 @@ observed cells. If any retained series has no scoreable actuals or an undefined 
 is unavailable. Weights are never redistributed.
 
 The `sft`, `hmfnet`, `pact`, `tft_q`, and `tft_hnb`
-adapters use M5-specific checkpoint selection and reject flat-WRMSSE studies before training.
-Use the baseline adapters for this metric, or a supported metric for those models.
+adapters require their existing strict benchmark workflow. Their native checkpoint selection
+does not implement the shared study's actuals and scoring contract, so version-2 studies
+reject them before training. The other adapters use the shared scorer for study validation
+and testing, subject to their existing cadence, target and history requirements.
 
 ## Inspect results
 

@@ -338,3 +338,50 @@ def test_result_reader_parses_the_comparison_bytes_it_authenticates(
     results = read_results(tmp_path)
     assert reads == 1
     assert results.series_scores["model_id"].to_pylist() == ["model", "model"]
+
+
+@pytest.mark.parametrize("fault", [
+    None, "output", "stage_result", "unlisted", "directory", "attempt", "status",
+])
+def test_completed_json_is_bound_to_the_journal_bytes(tmp_path, monkeypatch, fault):
+    """A completion check cannot authorize different scalar bytes in a later read."""
+    import hashlib
+    from types import SimpleNamespace
+
+    from autoforecast import forecast_campaign as campaign
+
+    attempt = tmp_path / "stages/validation/attempt-0001"
+    attempt.mkdir(parents=True)
+    output = attempt / "child-result.json"
+    output.write_text(json.dumps({"score": 1.0}))
+    output_sha = hashlib.sha256(output.read_bytes()).hexdigest()
+    artifact = {"path": output.name, "kind": "file", "sha256": output_sha}
+    if fault == "unlisted":
+        artifact["path"] = "other.json"
+    if fault == "directory":
+        artifact["kind"] = "directory"
+    result = attempt / "stage-result.json"
+    result.write_text(json.dumps({"artifacts": [artifact]}))
+    state = {"id": "validation", "status": "completed", "attempts": 1,
+             "last_result_sha256": hashlib.sha256(result.read_bytes()).hexdigest()}
+    if fault == "attempt":
+        state["attempts"] = 2
+    if fault == "status":
+        state["status"] = "running"
+    store = SimpleNamespace(state=lambda: {"stages": [state]})
+    monkeypatch.setattr(campaign.CampaignStore, "from_root", lambda _: store)
+    real_read = type(output).read_bytes
+
+    def transient_read(path):
+        raw = real_read(path)
+        if (fault == "output" and path == output) or (fault == "stage_result" and path == result):
+            return raw + b"\n"
+        return raw
+
+    monkeypatch.setattr(type(output), "read_bytes", transient_read)
+    if fault is None:
+        value, observed = campaign._load_completed_json(output)
+        assert value == {"score": 1.0} and observed == output_sha
+    else:
+        with pytest.raises(campaign.ForecastCampaignError):
+            campaign._load_completed_json(output)

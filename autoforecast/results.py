@@ -12,12 +12,12 @@ from typing import cast
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from autoforecast._exact_json import load_exact_json as _load_exact_json
 from autoforecast._exact_json import loads_exact_json
 from autoforecast.benchmark import _evaluation_contract_from_record, artifact_path, verify_benchmark
 from autoforecast.campaign import CampaignStore
 from autoforecast.forecast_campaign import (
     _completed_output,
+    _load_completed_json,
     _load_json_with_identity,
     _verified_forecast,
 )
@@ -38,13 +38,6 @@ ROW_SCHEMA = pa.schema(
         ("status", pa.string()),
     ]
 )
-
-
-def load_exact_json(path: pathlib.Path) -> dict:
-    value = _load_exact_json(path)
-    if type(value) is not dict:
-        raise ValueError("result evidence must be a JSON object")
-    return value
 
 
 @dataclass(frozen=True)
@@ -161,7 +154,7 @@ def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) ->
     stages = cast(list[dict], store.state()["stages"])
     completed = {item["id"] for item in stages if item["status"] == "completed"}
     if "final_score" in completed:
-        metadata["final_score"] = load_exact_json(
+        metadata["final_score"], _ = _load_completed_json(
             _completed_output(store.root, "final_score", "final-score.json")
         )
     source_keys = None
@@ -226,7 +219,7 @@ def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) ->
     lock_sha256 = None
     if "aggregate_selection" in completed:
         lock_path = _completed_output(store.root, "aggregate_selection", "selection-lock.json")
-        lock, lock_sha256 = _load_json_with_identity(lock_path, "selection lock")
+        lock, lock_sha256 = _load_completed_json(lock_path)
         lock = cast(dict, lock)
         if lock["resolved_sha256"] != expected:
             raise ValueError("selection lock differs from campaign configuration")
@@ -265,7 +258,8 @@ def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) ->
             runs.append(base)
             continue
         result_path = _completed_output(store.root, stage["id"], "child-result.json")
-        result = load_exact_json(result_path)
+        result, _ = _load_completed_json(result_path)
+        result = cast(dict, result)
         if child and any(
             result[key] != child[key]
             for key in ("model_id", "variant_id", "seed", "origin", "horizon", "initialization")

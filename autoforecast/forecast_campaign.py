@@ -45,7 +45,7 @@ from mlops.provenance import (
 )
 
 from autoforecast import resources
-from autoforecast._exact_json import ExactJSONError, load_exact_json, loads_exact_json
+from autoforecast._exact_json import ExactJSONError, loads_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast._numeric import is_finite_real
 from autoforecast.adapter_contracts import descriptor
@@ -1427,12 +1427,12 @@ def compile_forecast_campaign(
     unknown = sorted(set(request.model_ids) - set(candidates))
     if unknown:
         raise ForecastCampaignError(f"campaign model IDs are absent from catalog: {unknown}")
-    if study and request.metric == "wrmsse":
+    if study:
         for model_id in request.model_ids:
-            if not descriptor(candidates[model_id].adapter).supports_flat_wrmsse:
+            if not descriptor(candidates[model_id].adapter).supports_shared_studies:
                 raise ForecastCampaignError(
-                    f"campaign model {model_id!r} uses M5 checkpoint selection and does not "
-                    "support a flat-WRMSSE study"
+                    f"campaign model {model_id!r} does not support shared studies; "
+                    "native checkpoint selection requires a legacy strict benchmark"
                 )
     unsupported = sorted(
         model_id
@@ -2599,6 +2599,33 @@ def _verify_data(record: dict[str, object], label: str) -> pathlib.Path:
     return path
 
 
+def _load_completed_json(path: pathlib.Path) -> tuple[dict[str, object], str]:
+    """Parse the exact output bytes pinned by the completed stage's journal entry."""
+    attempt_dir = path.parent
+    stage_id = attempt_dir.parent.name
+    if attempt_dir.parent.parent.name != "stages":
+        raise ForecastCampaignError("completed output is outside a campaign stage attempt")
+    store = CampaignStore.from_root(attempt_dir.parent.parent.parent)
+    item = next(
+        (item for item in cast(list[dict], store.state()["stages"])
+         if item["id"] == stage_id), None,
+    )
+    if (item is None or item["status"] != "completed"
+            or attempt_dir.name != f"attempt-{item['attempts']:04d}"):
+        raise ForecastCampaignError("output does not belong to the current completed attempt")
+    result = _load_hashed_json(
+        attempt_dir / "stage-result.json", item["last_result_sha256"],
+        "completed stage result",
+    )
+    artifacts = cast(list[dict], result["artifacts"])
+    matches = [entry for entry in artifacts
+               if entry.get("path") == path.name and entry.get("kind") == "file"]
+    if len(matches) != 1:
+        raise ForecastCampaignError("completed output is not a journal-pinned file")
+    expected = matches[0]["sha256"]
+    return _load_hashed_json(path, expected, "completed output"), expected
+
+
 def _snapshot_parquet_directory(
     source: pathlib.Path,
     destination: pathlib.Path,
@@ -2868,7 +2895,7 @@ def _child_parameter_resolution(
             campaign_root, cast(str, profile["tune_stage"]), "parameter-resolution.json"
         )
         try:
-            value = load_exact_json(path)
+            value, _ = _load_completed_json(path)
         except ExactJSONError as error:
             raise ForecastCampaignError(
                 f"tuned parameter resolution is invalid: {error}"
@@ -4387,9 +4414,13 @@ def _validated_child_result(
     path: pathlib.Path,
     *,
     require_score: bool,
+    completed: bool = True,
 ) -> dict[str, object]:
     try:
-        value = load_exact_json(path)
+        value, _ = (
+            _load_completed_json(path) if completed
+            else _load_json_with_identity(path, "new child result")
+        )
     except ExactJSONError as error:
         raise ForecastCampaignError(f"invalid child result: {error}") from error
     precision_aware = cast(int, resolved.get("request_schema_version", 3)) >= 6
@@ -4588,7 +4619,9 @@ def _validated_child_result(
             cast(str, child["origin"]), cast(int, child["horizon"]),
         )
         if fixed is not None:
-            comparison = cast(dict, load_exact_json(comparison_path))
+            comparison = _load_hashed_json(
+                comparison_path, cast(str, comparison_sha), "child comparison",
+            )
             if (comparison.get("evaluation_contract") != fixed
                     or comparison.get("comparison_kind") != "fixed_benchmark"):
                 raise ForecastCampaignError("child did not score its frozen benchmark grid/metric")
@@ -4841,7 +4874,7 @@ def _run_generic_child(
         raise ForecastCampaignError("governed child did not publish exactly one run group")
     run = _run_group_path(attempt_dir, runs[0], "governed child run path")
     summary_path = run / "run-summary.json"
-    summary = json.loads(summary_path.read_text())
+    summary, run_summary_sha = _load_json_with_identity(summary_path, "new run summary")
     outcomes = summary.get("models")
     if (
         type(outcomes) is not list
@@ -4898,7 +4931,7 @@ def _run_generic_child(
         "training_data_sha256": training_digest,
         "parent": parent_identity,
         "run_path": str(run),
-        "run_summary_sha256": _sha_file(summary_path),
+        "run_summary_sha256": run_summary_sha,
         "forecast_record_path": str(forecast_paths[0]),
         "forecast_record_sha256": forecast_record_sha,
         "forecast_artifact_sha256": directory_digest(forecast.path, suffixes=(".parquet",)),
@@ -4933,10 +4966,12 @@ def _run_generic_child(
         result["checkpoint"] = {"path": str(checkpoints[0]), "sha256": _sha_file(checkpoints[0])}
     if evaluate:
         comparison_path = run / "evaluation/candidate-comparison.json"
-        comparison = cast(dict[str, object], json.loads(comparison_path.read_text()))
+        comparison, comparison_sha = _load_json_with_identity(
+            comparison_path, "new child comparison",
+        )
         metric = cast(str, cast(dict[str, object], resolved["selection"])["metric"])
         result["score"] = _score_value(comparison, metric, cast(str, child["model_id"]))
-        result["comparison_sha256"] = _sha_file(comparison_path)
+        result["comparison_sha256"] = comparison_sha
     result_path = attempt_dir / "child-result.json"
     result_path.write_text(_json(result), encoding="utf-8")
     return _validated_child_result(
@@ -4944,6 +4979,7 @@ def _run_generic_child(
         child,
         result_path,
         require_score=evaluate,
+        completed=False,
     )
 
 
@@ -5319,8 +5355,8 @@ def _validated_selection_evidence(
         ],
     }
     try:
-        summary = load_exact_json(summary_path)
-        lock = load_exact_json(lock_path)
+        summary, summary_sha = _load_completed_json(summary_path)
+        lock, _ = _load_completed_json(lock_path)
     except ExactJSONError as error:
         raise ForecastCampaignError(f"selection evidence is invalid JSON: {error}") from error
     if not _same_exact(summary, expected_summary):
@@ -5339,7 +5375,7 @@ def _validated_selection_evidence(
         "tie_break": list(_TIE_BREAK),
         "validation_origins": cast(dict[str, object], resolved["temporal"])["validation_origins"],
         "validation_horizon": cast(dict[str, object], resolved["temporal"])["validation_horizon"],
-        "validation_summary_sha256": _sha_file(summary_path),
+        "validation_summary_sha256": summary_sha,
         "chosen": {
             "candidate_id": chosen["candidate_id"],
             "model_id": chosen["model_id"],
@@ -5437,7 +5473,7 @@ def run_final_fit(
             result, selected_update_budget, batch_size=cast(int, compute["batch_size"]),
             resolved=resolved,
         )
-    result["selection_lock_sha256"] = _sha_file(lock_path)
+    result["selection_lock_sha256"] = _load_completed_json(lock_path)[1]
     (attempt_dir / "child-result.json").write_text(_json(result), encoding="utf-8")
 
 
@@ -5488,7 +5524,7 @@ def _validated_locked_final_result(
         resolved, _resolved_final_child(resolved, lock), result_path,
         require_score=False,
     )
-    if result.get("selection_lock_sha256") != _sha_file(lock_path):
+    if result.get("selection_lock_sha256") != _load_completed_json(lock_path)[1]:
         raise ForecastCampaignError("final fit was not authorized by the current selection lock")
     selected = cast(dict[str, object], lock["chosen"]).get("selected_update_budget")
     if selected is not None:
@@ -5633,7 +5669,9 @@ def score_final(
     finally:
         with contextlib.suppress(Exception):
             spark.stop()
-    comparison = cast(dict[str, object], json.loads(comparison_path.read_text()))
+    comparison, comparison_sha = _load_json_with_identity(
+        comparison_path, "new final comparison",
+    )
     score = _test_score_value(
         comparison, cast(str, score_input["metric"]), cast(str, final_result["model_id"]), fixed,
     )
@@ -5648,8 +5686,8 @@ def score_final(
         "schema": FINAL_SCORE_SCHEMA,
         "status": "scored" if score is not None else "unavailable",
         "resolved_sha256": resolved_sha,
-        "selection_lock_sha256": _sha_file(lock_path),
-        "final_fit_result_sha256": _sha_file(final_result_path),
+        "selection_lock_sha256": _load_completed_json(lock_path)[1],
+        "final_fit_result_sha256": _load_completed_json(final_result_path)[1],
         "score_input_sha256": score_input_sha,
         "score_data": {
             "snapshot_id": score_data["snapshot_id"],
@@ -5668,7 +5706,7 @@ def score_final(
         "horizon": score_input["horizon"],
         "metric": score_input["metric"],
         "score": score,
-        "comparison_sha256": _sha_file(comparison_path),
+        "comparison_sha256": comparison_sha,
     }
     (attempt_dir / "final-score.json").write_text(_json(record), encoding="utf-8")
 
@@ -5689,7 +5727,7 @@ def replay_report(
     final_score_path = _completed_output(campaign_root, "final_score", "final-score.json")
     final_fit = _validated_locked_final_result(resolved, lock, lock_path, final_fit_path)
     try:
-        final_score_value = load_exact_json(final_score_path)
+        final_score_value, _ = _load_completed_json(final_score_path)
     except ExactJSONError as error:
         raise ForecastCampaignError(f"final score record is invalid JSON: {error}") from error
     final_score_fields = {
@@ -5741,8 +5779,8 @@ def replay_report(
         final_score["schema"] != FINAL_SCORE_SCHEMA
         or final_score["status"] != ("unavailable" if unavailable else "scored")
         or final_score["resolved_sha256"] != resolved_sha
-        or final_score["selection_lock_sha256"] != _sha_file(lock_path)
-        or final_score["final_fit_result_sha256"] != _sha_file(final_fit_path)
+        or final_score["selection_lock_sha256"] != _load_completed_json(lock_path)[1]
+        or final_score["final_fit_result_sha256"] != _load_completed_json(final_fit_path)[1]
         or not _same_exact(final_score["score_data"], reported_score_data)
         or final_score["forecast_input_artifact_sha256"] != final_fit["forecast_artifact_sha256"]
         or final_score["score_input_artifact_sha256"] != score_data["sha256"]
@@ -5764,7 +5802,9 @@ def replay_report(
         != final_score["score_input_artifact_sha256"]
     ):
         raise ForecastCampaignError("final score record differs from its sealed evidence")
-    comparison = cast(dict[str, object], load_exact_json(comparison_path))
+    comparison = _load_hashed_json(
+        comparison_path, cast(str, final_score["comparison_sha256"]), "final comparison",
+    )
     if _test_score_value(
         comparison, cast(str, final_score["metric"]), cast(str, final_score["model_id"]),
         _fixed_evaluation(resolved, "test", cast(str, final_score["origin"]),
@@ -5774,15 +5814,17 @@ def replay_report(
     forecast_path = pathlib.Path(cast(str, final_fit["forecast_record_path"]))
     checks = {
         "selection_lock": lock.get("resolved_sha256") == resolved_sha,
-        "validation_summary": lock.get("validation_summary_sha256") == _sha_file(summary_path),
-        "final_fit_authorization": final_fit.get("selection_lock_sha256") == _sha_file(lock_path),
+        "validation_summary": lock.get("validation_summary_sha256")
+        == _load_completed_json(summary_path)[1],
+        "final_fit_authorization": final_fit.get("selection_lock_sha256")
+        == _load_completed_json(lock_path)[1],
         "parameter_identity": final_fit.get("parameter_resolution_sha256")
         == cast(dict[str, object], lock["chosen"]).get("parameter_resolution_sha256"),
         "final_score_authorization": final_score.get("selection_lock_sha256")
-        == _sha_file(lock_path),
+        == _load_completed_json(lock_path)[1],
         "final_forecast": final_fit.get("forecast_record_sha256") == _sha_file(forecast_path),
         "final_score_result": final_score.get("final_fit_result_sha256")
-        == _sha_file(final_fit_path),
+        == _load_completed_json(final_fit_path)[1],
     }
     if not all(checks.values()):
         raise ForecastCampaignError(f"campaign replay verification failed: {checks}")
@@ -5807,7 +5849,7 @@ def replay_report(
         "parameter_profiles": resolved["parameter_profiles"],
         "capabilities": resolved["initialization_capabilities"],
         "validation": summary,
-        "selection_lock_sha256": _sha_file(lock_path),
+        "selection_lock_sha256": _load_completed_json(lock_path)[1],
         "chosen": lock["chosen"],
         "final_fit": final_fit,
         "final_score": final_score,

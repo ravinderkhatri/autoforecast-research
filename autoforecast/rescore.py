@@ -8,12 +8,13 @@ import json
 import pathlib
 import shutil
 import tempfile
+from typing import cast
 
 from pyspark.sql import SparkSession
 
 from autoforecast.benchmark import STUDY_SCHEMA, evaluation_contract, verify_benchmark
 from autoforecast.data_admission import _load_dataset_contract_bytes
-from autoforecast.forecast_campaign import _verified_forecast
+from autoforecast.forecast_campaign import _load_json_with_identity, _verified_forecast
 from autoforecast.results import read_results
 from autoforecast.run_evaluation import compare_run_forecasts
 from provenance.lineage import directory_digest, snapshot_parquet_directory
@@ -70,7 +71,10 @@ def rescore_campaign(
                     )}, spark, missing_actual="no_data", metric=study["recipe"]["metric"],
                     output_dir=output_dir / f"score-{index:04d}", fixed_contract=fixed,
                 )
-            candidate = json.loads(comparison.read_bytes())["candidates"][0]
+            comparison_record, comparison_sha = _load_json_with_identity(
+                comparison, "new post-hoc comparison",
+            )
+            candidate = cast(list[dict], comparison_record["candidates"])[0]
             if candidate["status"] not in {"scored", "unavailable"}:
                 raise ValueError(f"retained forecast could not be scored: {candidate['detail']}")
             if (directory_digest(forecast.path, suffixes=(".parquet",))
@@ -82,7 +86,7 @@ def rescore_campaign(
                 "forecast_record_sha256": run["forecast_record_sha256"],
                 "forecast_artifact_sha256": run["forecast_artifact_sha256"],
                 "comparison": str(comparison),
-                "comparison_sha256": hashlib.sha256(comparison.read_bytes()).hexdigest(),
+                "comparison_sha256": comparison_sha,
             })
         refreshed = read_results(campaign_root)
         if refreshed.metadata != original.metadata or refreshed.runs != original.runs:

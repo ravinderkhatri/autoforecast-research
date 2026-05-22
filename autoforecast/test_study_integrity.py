@@ -69,8 +69,9 @@ def test_resolve_study_rejects_a_legacy_v1_benchmark(tmp_path):
     assert benchmark.verify_benchmark(target / "benchmark.json")[1] == legacy
 
 
-def test_flat_wrmsse_study_compiles_without_m5_price_or_hierarchy(
-    tmp_path, spark, monkeypatch
+@pytest.mark.parametrize("metric,policy", [("wrmsse", "zero"), ("rmse", "zero"), ("rmse", "mask")])
+def test_study_compiles_for_shared_scorer_and_refuses_native_checkpoint_selection(
+    tmp_path, spark, monkeypatch, metric, policy,
 ):
     """A recipe-v2 single-level WRMSSE study is not an M5 hierarchy campaign."""
     from autoforecast import forecast_campaign as campaign
@@ -80,7 +81,7 @@ def test_flat_wrmsse_study_compiles_without_m5_price_or_hierarchy(
     project = tmp_path / "project"
     create_example(project)
     recipe = json.loads((project / "recipe.json").read_text())
-    recipe["metric"] = "wrmsse"
+    recipe.update(metric=metric, actual_missing=policy)
     references = project / "scoring-references.parquet"
     rows = [
         {
@@ -107,7 +108,7 @@ def test_flat_wrmsse_study_compiles_without_m5_price_or_hierarchy(
         recipe=recipe,
         output_root=project / "frozen",
         spark=spark,
-        scoring_references=references,
+        scoring_references=references if metric == "wrmsse" else None,
     )
     _, record = benchmark.verify_benchmark(study_path)
     request_path = project / "campaign.yaml"
@@ -115,7 +116,9 @@ def test_flat_wrmsse_study_compiles_without_m5_price_or_hierarchy(
     request["forecast_campaign"]["dataset"]["contract"] = str(
         (study_path.parent / "dataset.yaml").relative_to(project)
     )
-    request["forecast_campaign"]["selection"]["metric"] = "wrmsse"
+    request["forecast_campaign"]["selection"].update(
+        metric=metric, missing_actual="sparse_zero" if policy == "zero" else "no_data",
+    )
     request_path.write_text(yaml.safe_dump(request))
     monkeypatch.setattr(campaign, "_git_source_identity", lambda *_args: {})
 
@@ -131,7 +134,7 @@ def test_flat_wrmsse_study_compiles_without_m5_price_or_hierarchy(
         )
     resolved = json.loads(compiled.resolved_path.read_text())
     assert resolved["study_id"] == record["study_id"]
-    assert resolved["selection"]["metric"] == "wrmsse"
+    assert resolved["selection"]["metric"] == metric
 
     original_discover = campaign.discover_candidates
     with experiment_project(project):
@@ -143,7 +146,7 @@ def test_flat_wrmsse_study_compiles_without_m5_price_or_hierarchy(
                     for candidate in original_discover(root)
                 ],
             )
-            with pytest.raises(campaign.ForecastCampaignError, match="flat-WRMSSE study"):
+            with pytest.raises(campaign.ForecastCampaignError, match="does not support shared studies"):
                 campaign.compile_forecast_campaign(
                     request_path, benchmark_path=study_path,
                     compiled_root=project / ("refused-" + adapter),
@@ -432,7 +435,8 @@ def test_fixed_study_rejects_extra_declined_series_in_forecast_manifest(tmp_path
     )
 
 
-def test_rescore_uses_pinned_forecast_bytes(tmp_path, spark, monkeypatch):
+@pytest.mark.parametrize("changed_input", ["forecast", "comparison"])
+def test_rescore_uses_pinned_forecast_bytes(tmp_path, spark, monkeypatch, changed_input):
     """A transient forecast rewrite must not be labeled with the original forecast digest."""
     from autoforecast import rescore
     from autoforecast.run_evaluation import compare_run_forecasts as real_compare
@@ -473,13 +477,30 @@ def test_rescore_uses_pinned_forecast_bytes(tmp_path, spark, monkeypatch):
     changed = pa.Table.from_pylist(rows, schema=original_table.schema)
 
     changed_during_call = False
+    comparison_reads = []
+    real_read = pathlib.Path.read_bytes
 
     def transient_rewrite(*args, **kwargs):
         nonlocal changed_during_call
         changed_during_call = True
-        pq.write_table(changed, forecast_part)
+        if changed_input == "forecast":
+            pq.write_table(changed, forecast_part)
         try:
-            return real_compare(*args, **kwargs)
+            result = real_compare(*args, **kwargs)
+            if changed_input == "comparison":
+                captured = real_read(result)
+                different = json.loads(captured)
+                different["candidates"][0]["score"]["rmse"] = 987654.0
+
+                def transient_comparison_read(path):
+                    if path == result:
+                        comparison_reads.append(path)
+                        return (captured if len(comparison_reads) == 1
+                                else json.dumps(different).encode())
+                    return real_read(path)
+
+                monkeypatch.setattr(pathlib.Path, "read_bytes", transient_comparison_read)
+            return result
         finally:
             forecast_part.write_bytes(original_bytes)
 
@@ -488,13 +509,19 @@ def test_rescore_uses_pinned_forecast_bytes(tmp_path, spark, monkeypatch):
         tmp_path / "campaign", study_path, tmp_path / "rescore", spark
     )
     record = json.loads(result.read_text())
-    comparison = json.loads(pathlib.Path(record["scores"][0]["comparison"]).read_text())
+    comparison_path = pathlib.Path(record["scores"][0]["comparison"])
+    comparison = json.loads(real_read(comparison_path))
     candidate = comparison["candidates"][0]
     assert changed_during_call
     assert candidate["status"] == "scored"
     assert candidate["score"]["rmse"] == pytest.approx(3.5), (
         "rescore accepted a score from transient forecast bytes while recording the original hash"
     )
+    assert record["scores"][0]["comparison_sha256"] == hashlib.sha256(
+        real_read(comparison_path)
+    ).hexdigest()
+    if changed_input == "comparison":
+        assert len(comparison_reads) == 1
 
 
 
@@ -566,3 +593,80 @@ def test_study_scores_private_copies_of_all_inputs(tmp_path, spark, monkeypatch,
     expected = (14 * math.sqrt(14.5 / 2.5) + 9 * math.sqrt(10 / 4)) / 23
     assert candidate["score"]["wrmsse"] == pytest.approx(expected)
     assert part.read_bytes() == original
+
+
+def test_known_future_features_do_not_extend_validation_actuals_into_test(tmp_path, spark):
+    import datetime as dt
+
+    contract = tmp_path / "dataset.yaml"
+    contract.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "dataset": {
+                    "id": "known-future-study",
+                    "panel": {
+                        "series_col": "id",
+                        "time_col": "date",
+                        "target_col": "y",
+                        "exposure_col": "state",
+                        "known_future": ["promotion"],
+                        "frequency": "D",
+                        "season_length": 2,
+                        "target_estimand": "observed_nonnegative",
+                    },
+                },
+            }
+        )
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    rows = [
+        {
+            "id": "A",
+            "date": dt.date(2024, 1, day),
+            "y": float(day),
+            "state": "exact",
+            "promotion": float(day % 2),
+            "promotion_known_at": dt.datetime(2024, 1, 1),
+        }
+        for day in range(1, 10)
+    ]
+    pq.write_table(pa.Table.from_pylist(rows), source / "part.parquet")
+    recipe = {
+        "schema_version": 2,
+        "source_keys": ["id"],
+        "training_start": "2024-01-01",
+        "validation_origins": ["2024-01-05"],
+        "validation_horizon": 2,
+        "final_train_cutoff": "2024-01-07",
+        "final_test_horizon": 2,
+        "history_policy": "fixed",
+        "new_series_policy": "exclude_after_first_origin",
+        "target_unit": "units",
+        "feature_availability": {"promotion": "promotion_known_at"},
+        "metric": "rmse",
+        "actual_missing": "zero",
+    }
+    sources = dict.fromkeys(
+        ("selection", "final_training", "validation_score", "final_score"), source
+    )
+    manifest = benchmark.freeze_benchmark(
+        contract_path=contract,
+        sources=sources,
+        recipe=recipe,
+        output_root=tmp_path / "frozen",
+        spark=spark,
+    )
+    _, record = benchmark.verify_benchmark(manifest)
+    validation = pq.read_table(
+        benchmark.artifact_path(manifest, record, "validation_score")
+    ).to_pylist()
+    leaked = [
+        (row["date"].isoformat(), row["y"])
+        for row in validation
+        if row["date"] > dt.date(2024, 1, 7)
+    ]
+
+    assert leaked == []
+    assert max(row["date"] for row in validation) == dt.date(2024, 1, 7)

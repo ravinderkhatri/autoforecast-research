@@ -589,7 +589,7 @@ def _freeze_benchmark(
             if name == "final_score"
             else (start, origins[-1] if name == "selection" else cutoff)
         )
-        upper = end if panel.known_future and name != "final_score" else high
+        upper = end if panel.known_future and name in {"selection", "final_training"} else high
         window = retained.filter(
             F.col(panel.time_col).between(
                 grid.time_literal(low, cadence), grid.time_literal(upper, cadence)

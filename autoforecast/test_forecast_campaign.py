@@ -2317,6 +2317,9 @@ def test_research_selection_locks_lower_median_of_verified_update_frontiers(
 def test_final_result_rechecks_locked_refit_at_scoring_and_replay_boundary(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This fixture isolates refit semantics; journal authentication is exercised separately.
+    monkeypatch.setattr(subject, "_load_completed_json",
+                        lambda path: subject._load_json_with_identity(path, "fixture output"))
     lock_path = tmp_path / "selection-lock.json"
     lock_path.write_text("{}\n")
     lock = {"chosen": {"selected_update_budget": 17}}
@@ -4030,7 +4033,7 @@ def test_child_result_rejects_failed_or_numerically_invalid_evidence(
     path.write_text(subject._json(record), encoding="utf-8")  # noqa: SLF001
     with pytest.raises(subject.ForecastCampaignError, match="identity/status"):
         subject._validated_child_result(  # noqa: SLF001
-            {}, child, path, require_score=True
+            {}, child, path, require_score=True, completed=False
         )
 
 
@@ -4080,7 +4083,7 @@ def test_child_result_rejects_each_candidate_identity_field_independently(
     path = tmp_path / "child-result.json"
     path.write_text(subject._json(record), encoding="utf-8")  # noqa: SLF001
     with pytest.raises(subject.ForecastCampaignError, match="identity/status"):
-        subject._validated_child_result({}, child, path, require_score=True)  # noqa: SLF001
+        subject._validated_child_result({}, child, path, require_score=True, completed=False)  # noqa: SLF001
 
 
 def test_selection_lock_status_and_values_are_recomputed_before_final_fit(
@@ -4165,6 +4168,8 @@ def test_selection_lock_status_and_values_are_recomputed_before_final_fit(
         return child_path
 
     monkeypatch.setattr(subject, "_completed_output", completed)
+    monkeypatch.setattr(subject, "_load_completed_json",
+                        lambda path: subject._load_json_with_identity(path, "fixture output"))
     monkeypatch.setattr(
         subject,
         "_validated_child_result",
@@ -4237,6 +4242,8 @@ def test_aggregation_requires_every_child_and_applies_the_predeclared_tie_break(
             raise subject.ForecastCampaignError("missing required child") from error
 
     monkeypatch.setattr(subject, "_completed_output", completed)
+    monkeypatch.setattr(subject, "_load_completed_json",
+                        lambda path: subject._load_json_with_identity(path, "fixture output"))
     monkeypatch.setattr(
         subject,
         "_validated_child_result",
@@ -4284,6 +4291,9 @@ def test_final_fit_uses_the_locked_winner_and_final_training_identity_only(
             "final_fit_budget": resolved["budgets"]["final_fit"],
         },
     }
+    # This fixture isolates refit semantics; journal authentication is exercised separately.
+    monkeypatch.setattr(subject, "_load_completed_json",
+                        lambda path: subject._load_json_with_identity(path, "fixture output"))
     lock_path = tmp_path / "selection-lock.json"
     lock_path.write_text(subject._json(lock), encoding="utf-8")  # noqa: SLF001
     monkeypatch.setattr(

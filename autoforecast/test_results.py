@@ -61,6 +61,10 @@ def _reader_boundary(
     )
     monkeypatch.setattr(reader.CampaignStore, "from_root", lambda _: store)
     monkeypatch.setattr(reader, "_completed_output", lambda root, stage, name: root / stage / name)
+    # These tests isolate reader semantics; completed-stage authentication has separate
+    # journal-boundary and installed selection/reader regression coverage.
+    monkeypatch.setattr(reader, "_load_completed_json",
+                        lambda path: reader._load_json_with_identity(path, "fixture output"))
     return digest
 
 

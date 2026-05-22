@@ -1239,14 +1239,13 @@ def run_request(
         raise TrainWorkflowError(f"requested models are absent from catalog: {unknown}")
     selected = tuple(by_id[model_id] for model_id in selected_ids)
     if (fixed_contract is not None
-            and fixed_contract.get("schema") == "autoforecast.fixed-evaluation.v2"
-            and fixed_contract.get("metric_policy", {}).get("metric") == "wrmsse"):
+            and fixed_contract.get("schema") == "autoforecast.fixed-evaluation.v2"):
         from autoforecast.adapter_contracts import descriptor
         for candidate in selected:
-            if not descriptor(candidate.adapter).supports_flat_wrmsse:
+            if not descriptor(candidate.adapter).supports_shared_studies:
                 raise TrainWorkflowError(
-                    f"model {candidate.id!r} uses M5 checkpoint selection and does not "
-                    "support a flat-WRMSSE study"
+                    f"model {candidate.id!r} does not support shared studies; "
+                    "native checkpoint selection requires a legacy strict benchmark"
                 )
     if patience is None:
         patience = (

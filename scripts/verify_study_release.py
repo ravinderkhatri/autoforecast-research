@@ -7,6 +7,8 @@ import hashlib
 import json
 import pathlib
 import subprocess
+import tempfile
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -15,6 +17,84 @@ from autoforecast.benchmark import verify_benchmark
 from autoforecast.results import export_results, read_results
 
 from scripts.verify_timeseries_release import run_cli
+
+
+def verify_scalar_identity(campaign: pathlib.Path, project: pathlib.Path) -> None:
+    """Transient scalar reads must not change the chosen model or exported scores."""
+    from autoforecast.campaign import CampaignStore
+    from autoforecast.forecast_campaign import (
+        ForecastCampaignError,
+        aggregate_selection,
+        replay_report,
+    )
+    from autoforecast.project import experiment_project
+
+    command = CampaignStore.from_root(campaign).plan.stages[0].command
+    resolved = pathlib.Path(command[command.index("--resolved") + 1])
+    resolved_sha = command[command.index("--resolved-sha256") + 1]
+    read_bytes, read_text = pathlib.Path.read_bytes, pathlib.Path.read_text
+    for operation, filename in (
+        ("reader", "child-result.json"), ("reader", "final-score.json"),
+        ("reader", "selection-lock.json"), ("reader", "candidate-comparison.json"),
+        ("selection", "child-result.json"), ("selection", "candidate-comparison.json"),
+        ("selection", "paired-scores"), ("replay", "child-result.json"),
+        ("replay", "final-score.json"), ("replay", "final-comparison"),
+        ("replay", "selection-lock.json"), ("replay", "validation-summary.json"),
+    ):
+        injected = []
+
+        def changed(path, raw, *, expected_filename=filename, observed=injected):
+            matches = path.name == expected_filename
+            if expected_filename == "paired-scores":
+                matches = path.name in {"child-result.json", "candidate-comparison.json"}
+            elif expected_filename == "final-comparison":
+                matches = path.name == "candidate-comparison.json" and "final_score" in path.parts
+            if not matches or not path.is_relative_to(campaign):
+                return raw
+            value = json.loads(raw)
+            if expected_filename == "paired-scores":
+                target = value["candidates"][0] if "candidates" in value else value
+                score = 100.0 if target["model_id"] == "seasonal_naive" else 0.0
+                if "candidates" in value:
+                    target["score"][value["metric"]] = score
+                else:
+                    target["score"] = score
+            elif path.name == "candidate-comparison.json":
+                value["candidates"][0]["score"][value["metric"]] = 987654.0
+            elif expected_filename == "selection-lock.json":
+                value["chosen"]["model_id"] = "unexpected-model"
+            else:
+                value["score"] = 987654.0
+            observed.append(path)
+            return json.dumps(value).encode()
+
+        def bytes_read(path):
+            return changed(path, read_bytes(path))
+
+        def text_read(path, *args, **kwargs):
+            return changed(path, read_text(path, *args, **kwargs).encode()).decode()
+
+        with patch.object(pathlib.Path, "read_bytes", bytes_read), \
+                patch.object(pathlib.Path, "read_text", text_read):
+            try:
+                if operation == "reader":
+                    read_results(campaign)
+                else:
+                    with (
+                        tempfile.TemporaryDirectory(prefix="study-scalar-probe-") as temporary,
+                        experiment_project(project),
+                    ):
+                        consume = aggregate_selection if operation == "selection" else replay_report
+                        consume(resolved, resolved_sha, campaign_root=campaign,
+                                attempt_dir=pathlib.Path(temporary))
+            except ForecastCampaignError as error:
+                assert "identity differs" in str(error), error
+            except ValueError as error:
+                assert "study comparison changed" in str(error), error
+            else:
+                raise AssertionError(f"{operation} accepted transient {filename}")
+        assert injected, f"probe did not reach {operation}/{filename}"
+    print("PASS: journal-bound scalar reads reject transient changes in selection and results")
 
 
 def main() -> int:
@@ -76,6 +156,7 @@ def main() -> int:
     assert results.metadata["final_score"]["score"] is None
     assert len(results.runs) == 5 and results.rows.num_rows == 70
     assert results.series_scores is not None and results.series_scores.num_rows == 10
+    verify_scalar_identity(campaign, project)
     validation_coverage = {}
     for row in results.series_scores.to_pylist():
         if row["stage"] != "validation":
