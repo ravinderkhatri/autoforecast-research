@@ -2326,7 +2326,7 @@ def test_final_result_rechecks_locked_refit_at_scoring_and_replay_boundary(
     result = {"selection_lock_sha256": subject._sha_file(lock_path)}  # noqa: SLF001
     monkeypatch.setattr(subject, "_resolved_final_child", lambda *_args: {})
     monkeypatch.setattr(
-        subject, "_validated_child_result", lambda *_args, **_kwargs: result
+        subject, "_validated_child_result", lambda *_args, **_kwargs: (result, "a" * 64)
     )
     calls = []
     monkeypatch.setattr(
@@ -4173,7 +4173,7 @@ def test_selection_lock_status_and_values_are_recomputed_before_final_fit(
     monkeypatch.setattr(
         subject,
         "_validated_child_result",
-        lambda *_args, **_kwargs: {"score": 1.0},
+        lambda *_args, **_kwargs: ({"score": 1.0}, "a" * 64),
     )
     monkeypatch.setattr(
         subject,
@@ -4247,7 +4247,7 @@ def test_aggregation_requires_every_child_and_applies_the_predeclared_tie_break(
     monkeypatch.setattr(
         subject,
         "_validated_child_result",
-        lambda _resolved, _child, path, *, require_score: json.loads(path.read_text()),
+        lambda _resolved, _child, path, *, require_score: subject._load_completed_json(path),
     )
     monkeypatch.setattr(subject, "_verify_resolved_source", lambda _resolved: None)
     attempt = tmp_path / "aggregate"

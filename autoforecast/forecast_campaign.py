@@ -4415,9 +4415,9 @@ def _validated_child_result(
     *,
     require_score: bool,
     completed: bool = True,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], str]:
     try:
-        value, _ = (
+        value, result_sha = (
             _load_completed_json(path) if completed
             else _load_json_with_identity(path, "new child result")
         )
@@ -4653,7 +4653,7 @@ def _validated_child_result(
         parent_result_path = _completed_output(
             campaign_root, cast(str, parent_stage), "child-result.json"
         )
-        parent_result = _validated_child_result(
+        parent_result, _ = _validated_child_result(
             resolved,
             parent_child,
             parent_result_path,
@@ -4670,7 +4670,7 @@ def _validated_child_result(
             raise ForecastCampaignError("final fit selection-lock identity is invalid")
     elif selection_lock_sha is not None:
         raise ForecastCampaignError(f"non-final child has selection authorization: {child['id']}")
-    return result
+    return result, result_sha
 
 
 def _run_generic_child(
@@ -4840,7 +4840,7 @@ def _run_generic_child(
             for item in cast(list[dict[str, object]], resolved["children"])
             if item["id"] == parent_stage
         )
-        parent_result = _validated_child_result(
+        parent_result, _ = _validated_child_result(
             resolved,
             parent_child,
             parent_result_path,
@@ -4974,13 +4974,14 @@ def _run_generic_child(
         result["comparison_sha256"] = comparison_sha
     result_path = attempt_dir / "child-result.json"
     result_path.write_text(_json(result), encoding="utf-8")
-    return _validated_child_result(
+    validated, _ = _validated_child_result(
         resolved,
         child,
         result_path,
         require_score=evaluate,
         completed=False,
     )
+    return validated
 
 
 def run_child(
@@ -5014,9 +5015,10 @@ def run_child(
 
 def _selection_statistics(
     resolved: dict[str, object],
-    results: list[dict[str, object]],
-    campaign_root: pathlib.Path,
+    validated: list[tuple[dict[str, object], str]],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    results = [result for result, _ in validated]
+    child_hashes = {cast(str, result["child_id"]): sha for result, sha in validated}
     grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
     for result in results:
         grouped.setdefault(
@@ -5068,12 +5070,7 @@ def _selection_statistics(
                     cast(dict[str, object], item["replay"])["status"] for item in items
                 ],
                 "child_result_sha256": [
-                    _sha_file(
-                        _completed_output(
-                            campaign_root, cast(str, item["child_id"]), "child-result.json"
-                        )
-                    )
-                    for item in items
+                    child_hashes[cast(str, item["child_id"])] for item in items
                 ],
             }
         )
@@ -5249,10 +5246,10 @@ def aggregate_selection(
         for item in cast(list[dict[str, object]], resolved["children"])
         if item["kind"] == "validation"
     ]
-    results: list[dict[str, object]] = []
+    validated: list[tuple[dict[str, object], str]] = []
     for child in validations:
         path = _completed_output(campaign_root, cast(str, child["id"]), "child-result.json")
-        results.append(
+        validated.append(
             _validated_child_result(
                 resolved,
                 child,
@@ -5260,7 +5257,8 @@ def aggregate_selection(
                 require_score=True,
             )
         )
-    candidates, paired, ranked = _selection_statistics(resolved, results, campaign_root)
+    results = [result for result, _ in validated]
+    candidates, paired, ranked = _selection_statistics(resolved, validated)
     chosen = ranked[0]
     selected_update_budget = _locked_selected_update_budget(resolved, chosen, results)
     summary = {
@@ -5281,7 +5279,8 @@ def aggregate_selection(
         ],
     }
     summary_path = attempt_dir / "validation-summary.json"
-    summary_path.write_text(_json(summary), encoding="utf-8")
+    summary_bytes = _json(summary).encode("utf-8")
+    summary_path.write_bytes(summary_bytes)
     lock = {
         "schema": SELECTION_LOCK_SCHEMA,
         "status": "locked",
@@ -5294,7 +5293,7 @@ def aggregate_selection(
         "tie_break": list(_TIE_BREAK),
         "validation_origins": cast(dict[str, object], resolved["temporal"])["validation_origins"],
         "validation_horizon": cast(dict[str, object], resolved["temporal"])["validation_horizon"],
-        "validation_summary_sha256": _sha_file(summary_path),
+        "validation_summary_sha256": _sha_bytes(summary_bytes),
         "chosen": {
             "candidate_id": chosen["candidate_id"],
             "model_id": chosen["model_id"],
@@ -5327,7 +5326,7 @@ def _validated_selection_evidence(
         for item in cast(list[dict[str, object]], resolved["children"])
         if item["kind"] == "validation"
     ]
-    results = [
+    validated = [
         _validated_child_result(
             resolved,
             child,
@@ -5336,7 +5335,8 @@ def _validated_selection_evidence(
         )
         for child in validations
     ]
-    candidates, paired, ranked = _selection_statistics(resolved, results, campaign_root)
+    results = [result for result, _ in validated]
+    candidates, paired, ranked = _selection_statistics(resolved, validated)
     expected_summary = {
         "schema": VALIDATION_SUMMARY_SCHEMA,
         "resolved_sha256": resolved_sha,
@@ -5520,7 +5520,7 @@ def _validated_locked_final_result(
     lock_path: pathlib.Path, result_path: pathlib.Path,
 ) -> dict[str, object]:
     """Recheck the sealed refit frontier at every final-result consumption boundary."""
-    result = _validated_child_result(
+    result, _ = _validated_child_result(
         resolved, _resolved_final_child(resolved, lock), result_path,
         require_score=False,
     )

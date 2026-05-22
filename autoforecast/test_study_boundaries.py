@@ -385,3 +385,61 @@ def test_completed_json_is_bound_to_the_journal_bytes(tmp_path, monkeypatch, fau
     else:
         with pytest.raises(campaign.ForecastCampaignError):
             campaign._load_completed_json(output)
+
+
+@pytest.mark.parametrize("filename", ["child-result.json", "validation-summary.json"])
+def test_selection_records_captured_identities(tmp_path, monkeypatch, filename):
+    """Selection carries journal identities and written bytes through to its lock."""
+    import hashlib
+
+    from autoforecast import forecast_campaign as subject
+    from autoforecast.campaign import CampaignSupervisor
+    from autoforecast.test_campaign import _stage, _store
+
+    child = {
+        "kind": "validation", "id": "validation", "child_id": "validation",
+        "candidate_id": "baseline", "model_id": "last_value", "variant_id": "default",
+        "adapter": "last_value", "initialization": "fresh", "seed": 0, "origin": "2024-01-05",
+        "parameter_mode": "defaults", "parameter_resolution": {},
+        "parameter_resolution_sha256": "a" * 64, "score": 1.0,
+        "runtime_seconds": 2.0, "peak_rss_bytes": 100,
+        "replay": {"status": "verified_artifact_bytes"},
+    }
+    raw = json.dumps(child)
+    code = ("from pathlib import Path; "
+            f"Path(r'{{attempt_dir}}/child-result.json').write_text({raw!r})")
+    store = _store(tmp_path, [_stage("validation", code, outputs=["child-result.json"])])
+    assert CampaignSupervisor(store, poll_seconds=0.01).run()["status"] == "completed"
+    output = subject._completed_output(store.root, "validation", "child-result.json")
+    _, expected_sha = subject._load_completed_json(output)
+    resolved = {
+        "children": [child], "seeds": [0], "selection": {"metric": "rmse"},
+        "temporal": {"validation_origins": ["2024-01-05"], "validation_horizon": 2},
+        "initialization_capabilities": {}, "source": {}, "data": {"selection": {}},
+        "budgets": {"final_fit": 1},
+    }
+    monkeypatch.setattr(subject, "_load_resolved", lambda *_: resolved)
+    # Isolate model/checkpoint validation; exercise the real completed-stage journal boundary.
+    monkeypatch.setattr(subject, "_validated_child_result",
+                        lambda _resolved, _child, path, **_: subject._load_completed_json(path))
+    real_hash = subject._sha_file
+    rereads = []
+
+    def changed_hash(path):
+        if path.name == filename:
+            rereads.append(path)
+            return "0" * 64
+        return real_hash(path)
+
+    monkeypatch.setattr(subject, "_sha_file", changed_hash)
+    attempt = tmp_path / "selection"
+    attempt.mkdir()
+    subject.aggregate_selection(tmp_path / "resolved.json", "b" * 64,
+                                campaign_root=store.root, attempt_dir=attempt)
+    summary_bytes = (attempt / "validation-summary.json").read_bytes()
+    summary = json.loads(summary_bytes)
+    lock = json.loads((attempt / "selection-lock.json").read_bytes())
+    assert summary["candidates"][0]["child_result_sha256"] == [expected_sha]
+    assert lock["validation_summary_sha256"] == hashlib.sha256(summary_bytes).hexdigest()
+    assert lock["chosen"]["mean_score"] == 1.0
+    assert not rereads

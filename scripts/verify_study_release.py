@@ -8,6 +8,7 @@ import json
 import pathlib
 import subprocess
 import tempfile
+from typing import cast
 from unittest.mock import patch
 
 import pyarrow as pa
@@ -95,6 +96,47 @@ def verify_scalar_identity(campaign: pathlib.Path, project: pathlib.Path) -> Non
                 raise AssertionError(f"{operation} accepted transient {filename}")
         assert injected, f"probe did not reach {operation}/{filename}"
     print("PASS: journal-bound scalar reads reject transient changes in selection and results")
+
+    from autoforecast import forecast_campaign as campaign_ops
+
+    with experiment_project(project):
+        record = campaign_ops._load_resolved(resolved, resolved_sha)
+    child_paths = [
+        campaign_ops._completed_output(campaign, cast(str, child["id"]), "child-result.json")
+        for child in cast(list[dict[str, object]], record["children"])
+        if child["kind"] == "validation"
+    ]
+    expected_hashes = sorted(campaign_ops._load_completed_json(path)[1] for path in child_paths)
+    original_lock, _ = campaign_ops._load_completed_json(
+        campaign_ops._completed_output(campaign, "aggregate_selection", "selection-lock.json")
+    )
+    real_hash = campaign_ops._sha_file
+    for filename in ("child-result.json", "validation-summary.json"):
+        rereads = []
+
+        def changed_hash(path, *, target=filename, observed=rereads):
+            if path.name == target:
+                observed.append(path)
+                return "0" * 64
+            return real_hash(path)
+
+        with (
+            tempfile.TemporaryDirectory(prefix="study-producer-probe-") as temporary,
+            experiment_project(project),
+            patch.object(campaign_ops, "_sha_file", changed_hash),
+        ):
+            attempt = pathlib.Path(temporary)
+            aggregate_selection(resolved, resolved_sha, campaign_root=campaign,
+                                attempt_dir=attempt)
+            summary_bytes = (attempt / "validation-summary.json").read_bytes()
+            summary = json.loads(summary_bytes)
+            lock = json.loads((attempt / "selection-lock.json").read_bytes())
+            assert sorted(sha for candidate in summary["candidates"]
+                          for sha in candidate["child_result_sha256"]) == expected_hashes
+            assert lock["validation_summary_sha256"] == hashlib.sha256(summary_bytes).hexdigest()
+            assert lock == original_lock
+            assert not rereads, f"selection reopened scalar identity: {filename}"
+    print("PASS: selection hashes use authenticated child and serialized summary bytes")
 
 
 def main() -> int:
