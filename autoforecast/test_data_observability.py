@@ -316,7 +316,7 @@ def test_inspection_rejects_lossy_and_off_anchor_time_keys(
     spark = _spark()
     source = tmp_path / f"off-grid-{frequency}"
     spark.createDataFrame(
-        [("a", bad_key, 1.0)], "id string, date timestamp, qty double"
+        [("a", bad_key, 1.0)], "id string, date timestamp_ntz, qty double"
     ).write.parquet(str(source))
 
     report = inspect_panel(
@@ -366,8 +366,13 @@ def test_hourly_inspection_rejects_timezone_sensitive_spark_timestamp_storage(
     )
 
     assert isinstance(report, CheckReport) and not report.accepted
-    check = next(item for item in report.checks if item.id == "time_grain")
-    assert check.status == "failed" and check.numerator == 1
+    check = next(item for item in report.checks if item.id == "data_definition")
+    assert check.status == "failed" and check.numerator is None
+    assert "ARROW:schema" in check.technical_detail
+    assert "timezone-naive" in check.technical_detail
+    assert report.facts.n_rows == report.facts.n_series == report.facts.n_dates == 0
+    assert report.facts.data_range == ("", "")
+    assert report.facts.profile is None and report.facts.spark_schema == {}
 
 
 def test_preflight_cli_writes_an_accepted_snapshot_report() -> None:

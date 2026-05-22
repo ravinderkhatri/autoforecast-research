@@ -20,6 +20,8 @@ import tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pyspark.sql import SparkSession
 
@@ -303,13 +305,38 @@ def test_scorer_rejects_hourly_date_type_and_nonmidnight_daily_key() -> None:
     timestamp_out = pathlib.Path(tempfile.mkdtemp()) / "timestamp-forecast"
     spark().createDataFrame(
         [("known", dt.datetime(2020, 1, 2, 1), 2.0)],
-        "series_id string, date timestamp, yhat double",
+        "series_id string, date timestamp_ntz, yhat double",
     ).write.mode("overwrite").parquet(str(timestamp_out))
     timestamp_fc = Forecast(
         "synthetic", str(timestamp_out), "2020-01-01", 1, 1, {"emitted": 1}, frequency="D",
     )
     with pytest.raises(ScoreError, match="lossy non-midnight"):
         score_forecast(daily_panel, timestamp_fc, spark(), missing_actual="no_data")
+
+
+def test_scorer_reports_invalid_parquet_time_storage_as_score_error() -> None:
+    panel = _synthetic_panel([
+        ("known", "2020-01-01 01:00:00", 3.0),
+    ], frequency="H")
+    output = pathlib.Path(tempfile.mkdtemp()) / "aware-int96-forecast"
+    output.mkdir()
+    pq.write_table(
+        pa.table({
+            "series_id": ["known"],
+            "date": pa.array(
+                [dt.datetime(2020, 1, 1, 1)], type=pa.timestamp("us", tz="Asia/Kathmandu")
+            ),
+            "yhat": [2.0],
+        }),
+        output / "part.parquet",
+        use_deprecated_int96_timestamps=True,
+    )
+    forecast = Forecast(
+        "synthetic", output, "2020-01-01T00:00:00", 1, 1, {"emitted": 1}, frequency="H"
+    )
+
+    with pytest.raises(ScoreError, match="invalid time storage.*timezone-bearing"):
+        score_forecast(panel, forecast, spark(), missing_actual="no_data")
 
 
 def test_scorer_rejects_calendar_key_off_the_declared_grid() -> None:

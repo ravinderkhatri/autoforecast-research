@@ -3771,6 +3771,68 @@ dataset:
     assert points == [dt.datetime(2024, 3, 1, 21), dt.datetime(2024, 3, 1, 22)]
 
 
+def test_snapshot_boundaries_reject_timezone_bearing_int96(
+    tmp_path: pathlib.Path,
+) -> None:
+    contract = tmp_path / "hourly.yaml"
+    contract.write_text(
+        """schema_version: 1
+dataset:
+  id: aware-int96
+  panel:
+    series_col: series_id
+    time_col: date
+    target_col: target
+    frequency: H
+    season_length: 2
+""",
+        encoding="utf-8",
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    pq.write_table(
+        pa.table({
+            "series_id": ["a", "a", "a"],
+            "date": pa.array(
+                [dt.datetime(2024, 1, 1, hour) for hour in range(3)],
+                type=pa.timestamp("us", tz="Asia/Kathmandu"),
+            ),
+            "target": [1.0, 2.0, 3.0],
+        }),
+        source / "part.parquet",
+        use_deprecated_int96_timestamps=True,
+    )
+    expected = subject.directory_digest(source, suffixes=(".parquet",))
+
+    with pytest.raises(ValueError, match="timezone-bearing"):
+        subject._panel_range_facts(source, contract_path=contract)  # noqa: SLF001
+
+    training = tmp_path / "training"
+    with pytest.raises(ValueError, match="timezone-bearing"):
+        subject._materialize_training_panel(  # noqa: SLF001
+            source,
+            training,
+            contract_path=contract,
+            origin="2024-01-01T01:00:00",
+            horizon=1,
+            training_start=None,
+            expected_source_sha256=expected,
+        )
+    assert not training.exists()
+
+    evaluation = tmp_path / "evaluation"
+    with pytest.raises(ValueError, match="timezone-bearing"):
+        subject._materialize_panel_range(  # noqa: SLF001
+            source,
+            evaluation,
+            contract_path=contract,
+            start="2024-01-01T00:00:00",
+            end="2024-01-01T01:00:00",
+            expected_source_sha256=expected,
+        )
+    assert not evaluation.exists()
+
+
 def test_training_materializer_keeps_known_future_features_but_masks_labels(
     tmp_path: pathlib.Path,
 ) -> None:

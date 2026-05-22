@@ -34,6 +34,7 @@ from autoforecast.frequency import (
     parse_origin,
     period_points,
 )
+from autoforecast.parquet_time import ParquetTimeError, validate_parquet_time_storage
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 # noqa: E402 -- sys.path must be extended before the spec can be imported.
@@ -486,6 +487,10 @@ class Panel:
         if patypes.is_timestamp(time_type) and getattr(time_type, "tz", None) is not None:
             raise PanelError(
                 f"time_col={self.time_col!r} must be timezone-naive, got {time_type}")
+        try:
+            validate_parquet_time_storage(p, self.time_col)
+        except ParquetTimeError as exc:
+            raise PanelError(f"time_col={self.time_col!r} has invalid storage: {exc}") from exc
         _require_type(fields, self.target_col, "target_col", patypes.is_integer,
                       patypes.is_floating, patypes.is_decimal)
         for column in self.static_reals:
@@ -544,12 +549,12 @@ def _any_fragment(p: pathlib.Path) -> pathlib.Path:
     Reading one fragment's schema is O(1); opening the whole dataset walks every partition, which
     on a client estate with 100k files is the difference between milliseconds and minutes.
 
-    LIMIT, stated because it was hit: this does NOT detect a directory whose fragments disagree
-    with each other. `m5.build_parquet` appended rather than replacing, leaving two generations
-    with different date types in one directory -- `validate` passed on the first fragment and
-    Spark failed on the second. The fix belongs with the PRODUCER, which now clears its output;
-    checking every footer here would push a per-file cost onto every panel to catch a defect only
-    a broken writer can create.
+    LIMIT, stated because it was hit: this does NOT detect general schema disagreement between
+    fragments. `m5.build_parquet` appended rather than replacing, leaving two generations with
+    different date types in one directory -- `validate` passed on the first fragment and Spark
+    failed on the second. The fix belongs with the PRODUCER, which now clears its output. Time
+    storage is the narrow exception: timezone and INT96 proof are checked across every visible
+    footer because reconstruction can otherwise erase the evidence before any row is inspected.
 
     Raises:
         PanelError: `p` is a directory containing no `.parquet` file.
@@ -739,6 +744,12 @@ class Forecast:
         if patypes.is_timestamp(date_type) and getattr(date_type, "tz", None) is not None:
             raise ForecastError(
                 f"{self.adapter!r}: forecast date must be timezone-naive, got {date_type}")
+        try:
+            validate_parquet_time_storage(artifact, "date", allow_hive_partition=True)
+        except ParquetTimeError as exc:
+            raise ForecastError(
+                f"{self.adapter!r}: forecast date has invalid storage: {exc}"
+            ) from exc
         allowed_dates = set(period_points(self.origin, cadence, self.horizon))
 
         n_rows = 0

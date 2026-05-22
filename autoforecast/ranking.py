@@ -491,12 +491,13 @@ def common_cells(
                 f"{forecast.horizon!r}"
             )
         try:
+            forecast.validate()
             cadence = parse_frequency(forecast.frequency)
             origin = parse_origin(forecast.origin, cadence)
             advance(origin, cadence, forecast.horizon)
         except (TypeError, ValueError, OverflowError) as exc:
             raise SelectionError(
-                f"{forecast.adapter}: origin/frequency does not define a supported canonical "
+                f"{forecast.adapter}: forecast does not define a valid canonical artifact and "
                 f"span: {exc}"
             ) from exc
     spans = {(f.origin, f.horizon, f.frequency) for f in forecasts}
@@ -505,10 +506,18 @@ def common_cells(
             f"forecasts span different (origin, horizon, frequency): {sorted(spans)}. "
             "Intersecting cells "
             "across different windows compares forecasts of different things")
-    frames = [
-        grid.read_time_parquet(spark, f.path, "date").select("series_id", "date")
-        for f in forecasts
-    ]
+    frames = []
+    for forecast in forecasts:
+        try:
+            frames.append(
+                grid.read_grid_keys(
+                    forecast.path, spark, frequency=forecast.frequency
+                )
+            )
+        except grid.GridError as exc:
+            raise SelectionError(
+                f"{forecast.adapter}: forecast keys are invalid: {exc}"
+            ) from exc
     keep = reduce(lambda a, b: a.intersect(b), frames).distinct()
     out = str(pathlib.Path(out_dir))
     keep.write.mode("overwrite").parquet(out)

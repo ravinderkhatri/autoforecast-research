@@ -19,6 +19,7 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
+from autoforecast import plots
 from autoforecast.adapters.naive import seasonal_naive
 from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 from autoforecast.plots import diagnostic_plot, series_across_zero_rate_deciles
@@ -125,6 +126,34 @@ def test_series_selection_preserves_mapped_columns_that_match_temporary_names(tm
     )
 
     assert picked == [("series", 0.5)]
+
+
+@pytest.mark.parametrize(
+    "frequency,origin,point,expected",
+    [
+        ("D", "2024-01-01", dt.datetime(2024, 1, 2), dt.date(2024, 1, 2)),
+        (
+            "H",
+            "2024-01-01T00:00:00",
+            dt.datetime(2024, 1, 1, 1),
+            dt.datetime(2024, 1, 1, 1),
+        ),
+    ],
+)
+def test_forecast_collection_uses_declared_canonical_time_keys(
+    tmp_path, frequency, origin, point, expected
+) -> None:
+    path = tmp_path / "forecast"
+    spark().createDataFrame(
+        [("a", point, 1.0)], "series_id string, date timestamp_ntz, yhat double"
+    ).write.parquet(str(path))
+    forecast = Forecast(
+        "candidate", path, origin, 1, 1, {"emitted": 1}, frequency=frequency
+    ).validate()
+
+    assert plots._collect_forecast(forecast, spark(), ["a"]) == {  # noqa: SLF001
+        "a": [(expected, 1.0)]
+    }
 
 
 def test_diagnostic_plot_writes_a_png_for_a_real_forecast() -> None:

@@ -291,6 +291,42 @@ def test_summarise_reports_density_of_a_ragged_grid() -> None:
     assert stats["density"] == 0.5
 
 
+@pytest.mark.parametrize(
+    "rows,schema,frequency,error",
+    [
+        ([("a", None)], "series_id string, date date", "D", "invalid time key"),
+        ([("a", "not-a-date")], "series_id string, date string", "D", "invalid time key"),
+        (
+            [("a", dt.date(2024, 1, 2)), ("a", dt.date(2024, 1, 2))],
+            "series_id string, date date",
+            "D",
+            "duplicate",
+        ),
+        (
+            [("a", dt.date(2024, 2, 15))],
+            "series_id string, date date",
+            "M",
+            "invalid time key",
+        ),
+    ],
+)
+def test_raw_time_consumers_refuse_uncanonical_keys_before_output(
+    tmp_path, rows, schema, frequency, error
+) -> None:
+    invalid = tmp_path / "invalid"
+    spark().createDataFrame(rows, schema).write.parquet(str(invalid))
+    good = tmp_path / "good"
+    good_date = dt.date(2024, 2, 29) if frequency == "M" else dt.date(2024, 1, 2)
+    spark().createDataFrame(
+        [("a", good_date)], "series_id string, date date"
+    ).write.parquet(str(good))
+
+    with pytest.raises(grid.GridError, match=error):
+        grid.summarise(invalid, spark(), frequency=frequency)
+    with pytest.raises(grid.GridError, match=error):
+        grid.agrees_with(good, invalid, spark(), frequency=frequency)
+
+
 def test_content_hash_is_logical_not_a_parquet_layout_hash() -> None:
     first = grid.build(source(), ORIGIN, HORIZON, spark(), tempfile.mkdtemp(),
                        series_col="id", time_col="day", eligible_col="eligible")

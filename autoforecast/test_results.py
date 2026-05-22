@@ -262,6 +262,72 @@ def test_completed_forecast_must_match_authenticated_campaign_frequency(tmp_path
         read_results(tmp_path)
 
 
+def test_results_refuse_timezone_bearing_int96_before_export(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    from autoforecast.panel import ForecastError
+    from provenance.lineage import directory_digest
+
+    child = {
+        "id": "validation",
+        "kind": "validation",
+        "model_id": "example",
+        "variant_id": "default",
+        "seed": 0,
+        "initialization": "fresh",
+        "origin": "2024-01-01T00:00:00",
+        "horizon": 1,
+    }
+    _reader_boundary(
+        tmp_path,
+        monkeypatch,
+        [child],
+        [{"id": "validation", "status": "completed", "attempts": 1}],
+        temporal={"frequency": "H"},
+    )
+    output = tmp_path / "validation"
+    forecast_dir = output / "forecast"
+    forecast_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({
+            "series_id": ["a"],
+            "date": pa.array(
+                [dt.datetime(2024, 1, 1, 1)],
+                type=pa.timestamp("us", tz="Asia/Kathmandu"),
+            ),
+            "yhat": [1.0],
+        }),
+        forecast_dir / "part.parquet",
+        use_deprecated_int96_timestamps=True,
+    )
+    forecast_record = {
+        "adapter": "seasonal_naive",
+        "path": str(forecast_dir),
+        "origin": child["origin"],
+        "horizon": 1,
+        "n_series": 1,
+        "disposition": {"emitted": 1},
+        "target_estimand": "sales_given_availability",
+        "frequency": "H",
+        "n_emitted": 1,
+        "n_declined": 0,
+    }
+    record = output / "forecast.json"
+    record.write_text(json.dumps(forecast_record))
+    (output / "child-result.json").write_text(json.dumps({
+        **child,
+        "adapter": "seasonal_naive",
+        "run_path": str(output / "run"),
+        "forecast_record_path": str(record),
+        "forecast_record_sha256": hashlib.sha256(record.read_bytes()).hexdigest(),
+        "forecast_artifact_sha256": directory_digest(forecast_dir, suffixes=(".parquet",)),
+        "score": None,
+    }))
+
+    with pytest.raises(ForecastError, match="timezone-bearing"):
+        read_results(tmp_path)
+
+
 @pytest.mark.parametrize(
     "frequency, origin, dates",
     [

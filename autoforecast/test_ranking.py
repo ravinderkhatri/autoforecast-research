@@ -6,6 +6,7 @@ notice failing is not a guard.
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import pathlib
 import shutil
@@ -745,6 +746,55 @@ def test_common_cells_refuses_equal_horizons_with_different_frequencies() -> Non
     ]
     with pytest.raises(ranking.SelectionError, match="frequency"):
         ranking.common_cells(forecasts, object(), "/not-written")
+
+
+@pytest.mark.parametrize(
+    "day,error",
+    [
+        (dt.date(2024, 2, 15), "aligned|outside"),
+        (dt.date(2024, 3, 31), "outside"),
+    ],
+)
+def test_common_cells_refuses_uncanonical_or_out_of_window_keys(
+    tmp_path, day, error
+) -> None:
+    artifact = tmp_path / "forecast"
+    spark().createDataFrame(
+        [("a", day, 1.0)], "series_id string, date date, yhat double"
+    ).write.parquet(str(artifact))
+    forecast = Forecast(
+        "candidate", artifact, "2024-01-31", 1, 1, {"emitted": 1}, frequency="M"
+    )
+    output = tmp_path / "common"
+
+    with pytest.raises(ranking.SelectionError, match=error):
+        ranking.common_cells([forecast], spark(), output)
+
+    assert not output.exists()
+
+
+def test_common_cells_writes_canonical_daily_keys_from_midnight_timestamps(tmp_path) -> None:
+    timestamp_artifact = tmp_path / "timestamp"
+    spark().createDataFrame(
+        [("a", dt.datetime(2024, 1, 2), 1.0)],
+        "series_id string, date timestamp_ntz, yhat double",
+    ).write.parquet(str(timestamp_artifact))
+    date_artifact = tmp_path / "date"
+    spark().createDataFrame(
+        [("a", dt.date(2024, 1, 2), 2.0)],
+        "series_id string, date date, yhat double",
+    ).write.parquet(str(date_artifact))
+    forecasts = [
+        Forecast("timestamp", timestamp_artifact, "2024-01-01", 1, 1, {"emitted": 1}),
+        Forecast("date", date_artifact, "2024-01-01", 1, 1, {"emitted": 1}),
+    ]
+
+    output, count = ranking.common_cells(forecasts, spark(), tmp_path / "common")
+    frame = spark().read.parquet(output)
+
+    assert count == 1
+    assert frame.schema["date"].dataType.typeName() == "date"
+    assert frame.first()["date"] == dt.date(2024, 1, 2)
 
 
 @pytest.mark.parametrize("origin,horizon", [("20200101", 2), ("2020-01-01", True)])

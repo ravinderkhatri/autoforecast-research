@@ -224,9 +224,28 @@ def _collect_forecast(
     forecast: Forecast, spark: SparkSession, ids: list[str]
 ) -> dict[str, list[tuple[TimePoint, float]]]:
     """Pull (date, yhat) for the chosen series only."""
-    rows = (read_time_parquet(spark, forecast.path, "date")
-            .filter(F.col("series_id").isin(*ids))
-            .select("series_id", "date", "yhat").orderBy("series_id", "date").collect())
+    cadence = parse_frequency(forecast.frequency)
+    source = read_time_parquet(spark, forecast.path, "date")
+    if cadence.key_kind == "timestamp" and (
+        source.schema["date"].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ValueError(
+            "hourly forecast date must have timestamp_ntz physical type"
+        )
+    date, valid_date = canonical_key("date", cadence)
+    canonical = source.select(
+        "series_id", date.alias("date"), valid_date.alias("_valid_date"), "yhat"
+    )
+    if canonical.filter(~F.col("_valid_date")).limit(1).count():
+        raise ValueError(
+            f"forecast contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    rows = (
+        canonical.filter(F.col("series_id").isin(*ids))
+        .select("series_id", "date", "yhat")
+        .orderBy("series_id", "date")
+        .collect()
+    )
     out: dict[str, list[tuple[TimePoint, float]]] = {}
     for r in rows:
         out.setdefault(r["series_id"], []).append((r["date"], float(r["yhat"])))
