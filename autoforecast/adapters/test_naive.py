@@ -358,11 +358,11 @@ def test_baseline_rejects_lossy_or_off_grid_panel_keys(
 ) -> None:
     source = tmp_path / f"bad-{frequency}"
     spark().createDataFrame(
-        [("a", bad_key, 1.0)], "id string, date timestamp, qty double"
+        [("a", bad_key, 1.0)], "id string, date timestamp_ntz, qty double"
     ).write.parquet(str(source))
     described = Panel(source, "id", "date", "qty", season_length=1, frequency=frequency)
 
-    with pytest.raises(ValueError, match="malformed|lossy|off-anchor"):
+    with pytest.raises(ValueError, match=r"^panel contains a malformed, lossy, or off-anchor"):
         seasonal_naive(
             described, origin, 1, spark=spark(), out_dir=tmp_path / f"out-{frequency}"
         )
