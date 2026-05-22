@@ -4,12 +4,21 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
+
 from autoforecast.model_api import CheckReport, CheckResult, DataFacts
 from autoforecast.notifications import (
     campaign_notification_from_environment,
     notifier_from_environment,
 )
 from autoforecast.train_workflow import ModelOutcome, RunSummary
+
+
+@pytest.fixture(autouse=True)
+def isolated_notification_environment(monkeypatch):
+    """Each test opts into its own sinks without using the developer's notification settings."""
+    monkeypatch.delenv("AUTOFORECAST_SLACK_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("AUTOFORECAST_EMAIL_TO", raising=False)
 
 
 def _summary(tmp_path):

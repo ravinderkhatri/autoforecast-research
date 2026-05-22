@@ -1,7 +1,7 @@
-# Archived M5 private-evaluation replay.  This is the only request that may be compared to the
-# published M5 Accuracy leaderboard: origin d_1941 (2016-05-22), targets d_1942..d_1969, and the
-# 12-level dollar-weighted WRMSSE convention.  It is not a blind competition submission because
-# the completed competition's labels are now public; freeze the profile before running it.
+# Non-executable legacy fixture, retained for historical request compatibility.
+# The current runner refuses this archived-final scoring format. For a governed replay, use
+# m5_private_evaluation_deep_v2.yaml after completing its public-holdout selection lock.
+# Do not rewrite this frozen request or treat its archived labels as a blind evaluation.
 schema_version: 2
 run:
   name: m5-private-evaluation-replay

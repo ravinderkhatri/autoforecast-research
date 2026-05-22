@@ -1,5 +1,7 @@
-# Frozen request for the four-layer custom architecture.  Epoch budget and early-stopping
-# controls are CLI inputs recorded in each run bundle's metadata/training-controls.json.
+# Non-executable legacy fixture for the four-layer custom architecture.
+# The current runner refuses this archived-final scoring format. For a governed replay, use
+# m5_private_evaluation_deep_v2.yaml after completing its public-holdout selection lock.
+# Retain these frozen fields for compatibility tests; do not update this request in place.
 schema_version: 2
 run:
   name: m5-private-evaluation-deep-v1

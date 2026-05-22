@@ -4,13 +4,13 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 import argparse
-import os
 import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from autoforecast import resources
 from autoforecast.data_admission import load_dataset_contract
 from autoforecast.data_observability import (
     CheckReport,
@@ -29,12 +29,9 @@ def main() -> int:
     parser.add_argument("--as-of", required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
-    os.environ["PYSPARK_PYTHON"] = sys.executable
-    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-    spark = (
-        SparkSession.builder.appName("autoforecast_data_preflight")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate()
+    spark = resources.acquire_local_runtime(
+        SparkSession, SparkContext, profile=resources.spark_profile(python_udfs=False),
+        app_name="autoforecast_data_preflight",
     )
     try:
         panel = load_dataset_contract(args.dataset_contract).panel(args.data_path)
@@ -50,7 +47,6 @@ def main() -> int:
         return 2
     finally:
         spark.stop()
-        SparkContext._active_spark_context = None
 
 
 if __name__ == "__main__":
