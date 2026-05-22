@@ -11,6 +11,8 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from autoforecast.frequency import Cadence, FrequencyError, parse_frequency
+
 if TYPE_CHECKING:
     from autoforecast.profiling import Profile
 
@@ -162,6 +164,17 @@ class ResolvedRun:
     horizon: int
     settings: tuple[tuple[str, object], ...] = ()
     frequency: str = "D"
+
+    def __post_init__(self) -> None:
+        """Give equivalent valid frequency spellings one immutable run identity."""
+        try:
+            cadence = parse_frequency(self.frequency)
+        except FrequencyError:
+            if isinstance(self.frequency, Cadence):
+                raise
+            # Factory validation retains responsibility for rejecting malformed strings.
+            return
+        object.__setattr__(self, "frequency", cadence.code)
 
     def setting(self, name: str, default: object) -> object:
         return dict(self.settings).get(name, default)

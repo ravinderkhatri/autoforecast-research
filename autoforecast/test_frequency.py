@@ -10,6 +10,7 @@ import sys
 import pytest
 
 from autoforecast.frequency import (
+    Cadence,
     FrequencyError,
     advance,
     canonical_origin,
@@ -60,6 +61,39 @@ def test_parse_frequency_exposes_family_anchor_and_physical_key(
 def test_parse_frequency_rejects_unknown_or_noncanonical_declarations(value) -> None:
     with pytest.raises(FrequencyError, match="supported|non-blank"):
         parse_frequency(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        ("ME", "M", 1, "date", "end"),
+        ("H", "D", 1, "date", None),
+        ("D", "D", 2, "date", None),
+        ("D", "D", True, "date", None),
+        ("D", "D", 1.0, "date", None),
+        ("H", "H", 1, "date", None),
+        ("M", "M", 1, "date", "start"),
+        ("2D", "D", 1, "date", None),
+    ],
+)
+def test_cadence_constructor_rejects_every_inconsistent_field(fields) -> None:
+    with pytest.raises(FrequencyError, match="inconsistent"):
+        Cadence(*fields)  # type: ignore[arg-type]
+
+
+def test_parse_frequency_revalidates_an_existing_cadence_object() -> None:
+    forged = object.__new__(Cadence)
+    for name, value in zip(
+        ("code", "unit", "multiplier", "key_kind", "anchor"),
+        ("H", "D", 1, "date", None),
+        strict=True,
+    ):
+        object.__setattr__(forged, name, value)
+
+    with pytest.raises(FrequencyError, match="inconsistent"):
+        parse_frequency(forged)
+    with pytest.raises(FrequencyError, match="inconsistent"):
+        frequency_is_supported(forged, ("D",))
 
 
 def test_nonunit_daily_stride_requires_an_explicit_capability() -> None:

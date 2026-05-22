@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import pathlib
 import subprocess
@@ -168,6 +169,68 @@ def test_every_cadence_reports_a_missing_internal_period(
     assert check.status == "warning" and check.numerator == 1
 
 
+@pytest.mark.parametrize(
+    "frequency,origin,aligned,shifted",
+    [
+        (
+            "W",
+            "2024-01-10",
+            (dt.date(2023, 12, 27), dt.date(2024, 1, 3), dt.date(2024, 1, 10)),
+            (dt.date(2023, 12, 21), dt.date(2023, 12, 28), dt.date(2024, 1, 4)),
+        ),
+        (
+            "3D",
+            "2024-01-10",
+            (dt.date(2024, 1, 4), dt.date(2024, 1, 7), dt.date(2024, 1, 10)),
+            (dt.date(2024, 1, 3), dt.date(2024, 1, 6), dt.date(2024, 1, 9)),
+        ),
+    ],
+)
+def test_generic_preflight_rejects_consistent_wrong_origin_phase_for_weekly_and_strided_daily(
+    tmp_path, frequency: str, origin: str,
+    aligned: tuple[dt.date, ...], shifted: tuple[dt.date, ...],
+) -> None:
+    spark = _spark()
+    populations = {
+        "aligned": [("aligned", point, 1.0) for point in aligned],
+        "mixed": (
+            [("aligned", point, 1.0) for point in aligned]
+            + [("shifted", point, 1.0) for point in shifted]
+        ),
+        "all-shifted": [("shifted", point, 1.0) for point in shifted],
+    }
+
+    for population, rows in populations.items():
+        source = tmp_path / f"{frequency}-{population}"
+        spark.createDataFrame(rows, "id string, date date, qty double").write.parquet(
+            str(source)
+        )
+        panel = Panel(
+            source, "id", "date", "qty", frequency=frequency, season_length=3,
+        )
+        report = inspect_panel(panel, spark, as_of=origin)
+        assert isinstance(report, CheckReport)
+        time_grain = next(item for item in report.checks if item.id == "time_grain")
+
+        if population == "aligned":
+            assert report.accepted
+            assert time_grain.status == "passed" and time_grain.numerator == 0
+            continue
+
+        assert not report.accepted
+        assert time_grain.status == "failed"
+        assert time_grain.numerator == len(shifted)
+        admission = validate_model_compatibility(
+            "seasonal_naive",
+            panel,
+            report.facts.profile,
+            horizon=1,
+            data_checks=report,
+        )
+        assert admission.status == "ineligible"
+        assert admission.reasons == ("Data checks failed. Model checks were not run.",)
+
+
 def test_hourly_inspection_excludes_later_hours_on_the_same_day(tmp_path) -> None:
     spark = _spark()
     source = tmp_path / "hourly"
@@ -303,6 +366,57 @@ def test_preflight_cli_writes_an_accepted_snapshot_report() -> None:
         assert result.returncode == 0, result.stderr
         assert "Data check report:" in result.stdout
         assert (root / "report" / "report.html").exists()
+
+
+def test_preflight_cli_rejects_a_complete_weekly_lattice_on_the_wrong_as_of_phase() -> None:
+    if not os.environ.get("JAVA_HOME"):
+        pytest.skip("Spark functional test needs JAVA_HOME")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "panel.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "item": ["shifted"] * 3,
+                    "day": [
+                        dt.date(2023, 12, 21),
+                        dt.date(2023, 12, 28),
+                        dt.date(2024, 1, 4),
+                    ],
+                    "units": [1.0, 2.0, 3.0],
+                }
+            ),
+            source,
+        )
+        contract = root / "contract.yaml"
+        contract.write_text(
+            "schema_version: 1\ndataset:\n  id: cli-weekly\n  panel:\n"
+            "    series_col: item\n    time_col: day\n    target_col: units\n"
+            "    frequency: W\n    season_length: 3\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/run_data_preflight.py",
+                str(contract),
+                str(source),
+                "--as-of",
+                "2024-01-10",
+                "--output",
+                str(root / "report"),
+            ],
+            cwd=pathlib.Path(__file__).resolve().parents[1],
+            env=os.environ.copy(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        record = json.loads((root / "report" / "data_validation_report.json").read_text())
+        assert not record["accepted"]
+        time_grain = next(check for check in record["checks"] if check["id"] == "time_grain")
+        assert time_grain["status"] == "failed" and time_grain["numerator"] == 3
 
 
 def test_preflight_cli_keeps_a_read_failure_out_of_the_data_check_report() -> None:

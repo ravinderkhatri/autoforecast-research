@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import errno
 import hashlib
 import heapq
@@ -70,26 +71,52 @@ def _recipe_point(value: object, cadence: Cadence) -> TimePoint:
         raise BenchmarkError(message) from error
 
 
-def _inclusive_period_points(
+def _inclusive_period_count(
     start: TimePoint, end: TimePoint, cadence: Cadence, *, label: str
-) -> tuple[TimePoint, ...]:
-    """Return a bounded inclusive cadence grid and reject endpoints on another phase."""
+) -> int:
+    """Count an aligned inclusive grid without enumerating its historical observations."""
     if start > end:
         raise BenchmarkError(f"{label} start must not follow its end")
-    points: list[TimePoint] = []
-    index = 0
+    if cadence.unit == "H":
+        assert isinstance(start, dt.datetime) and isinstance(end, dt.datetime)
+        periods = (end - start) // dt.timedelta(hours=1)
+    elif cadence.unit in {"D", "W"}:
+        stride = cadence.multiplier if cadence.unit == "D" else 7
+        periods = (end.toordinal() - start.toordinal()) // stride
+    elif cadence.unit == "M":
+        periods = (end.year - start.year) * 12 + end.month - start.month
+    else:
+        periods = end.year - start.year
     try:
-        while True:
-            point = advance(start, cadence, index)
-            if point > end:
-                break
-            points.append(point)
-            if point == end:
-                return tuple(points)
-            index += 1
+        if advance(start, cadence, periods) == end:
+            return periods + 1
     except (FrequencyError, OverflowError) as error:
         raise BenchmarkError(f"{label} is outside the representable cadence grid") from error
     raise BenchmarkError(f"{label} endpoints are not aligned to frequency {cadence.code}")
+
+
+def _period_frame(spark, start: TimePoint, end: TimePoint, cadence: Cadence, column: str):
+    """Generate historical keys in Spark, keeping driver memory independent of the span."""
+    from pyspark.sql import functions as F
+
+    from autoforecast.grid import time_literal
+
+    count = _inclusive_period_count(start, end, cadence, label="observation window")
+    index = F.col("id")
+    first = time_literal(start, cadence)
+    if cadence.unit == "H":
+        point = F.timestamp_add("HOUR", index, first)
+    elif cadence.unit in {"D", "W"}:
+        stride = cadence.multiplier if cadence.unit == "D" else 7
+        point = F.date_add(first, (index * stride).cast("int"))
+    else:
+        months = index * (12 if cadence.unit == "Y" else 1)
+        point = F.add_months(first, months.cast("int"))
+        if cadence.anchor == "end":
+            point = F.last_day(point)
+    # Python's representable dates bound even an hourly span below 88 million periods, within
+    # Spark range's signed-long index and the integer day/month arithmetic above.
+    return spark.range(count).select(point.alias(column))
 
 
 _PYTHON_WHITESPACE = "".join(chr(value) for value in range(0x110000) if chr(value).isspace())
@@ -253,7 +280,7 @@ def validate_recipe(recipe: dict) -> None:
         *(('validation window', origin) for origin in origins),
         ("final training window", cutoff),
     ]:
-        _inclusive_period_points(start, point, cadence, label=label)
+        _inclusive_period_count(start, point, cadence, label=label)
 
 
 def freeze_benchmark(
@@ -392,15 +419,7 @@ def freeze_benchmark(
                 grid.time_literal(low, cadence), grid.time_literal(upper, cadence)
             )
         )
-        accepted_points = _inclusive_period_points(low, upper, cadence, label=f"{name} role")
-        periods = spark.createDataFrame(
-            [(canonical_origin(point, cadence),) for point in accepted_points],
-            "__af_time_text string",
-        ).select(
-            F.col("__af_time_text")
-            .cast("timestamp_ntz" if cadence.key_kind == "timestamp" else "date")
-            .alias(panel.time_col)
-        )
+        periods = _period_frame(spark, low, upper, cadence, panel.time_col)
         if window.join(periods, panel.time_col, "left_anti").limit(1).count():
             raise BenchmarkError(
                 f"{name}: source contains time keys off the declared {cadence.code} grid"
@@ -656,12 +675,12 @@ def _validate_manifest(record: object) -> dict:
     cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
     selection_end = _recipe_point(recipe["validation_origins"][-1], cadence)
     role_periods = {
-        "selection": len(_inclusive_period_points(
+        "selection": _inclusive_period_count(
             start, selection_end, cadence, label="selection role"
-        )),
-        "final_training": len(_inclusive_period_points(
+        ),
+        "final_training": _inclusive_period_count(
             start, cutoff, cadence, label="final training role"
-        )),
+        ),
         "final_score": recipe["final_test_horizon"],
     }
     for role, values in mapping(record["counts"], source_roles, "counts").items():

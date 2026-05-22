@@ -190,18 +190,23 @@ def test_run_passes_through_a_correctly_labelled_forecast() -> None:
 
 
 @pytest.mark.parametrize(
-    "frequency,origin",
+    "frequency,canonical,origin",
     [
-        ("H", "2024-03-01T22:00:00"),
-        ("D", "2024-03-01"),
-        ("W", "2024-02-28"),
-        ("M", "2024-02-29"),
-        ("MS", "2024-03-01"),
-        ("Y", "2023-12-31"),
-        ("YS", "2024-01-01"),
+        ("H", "H", "2024-03-01T22:00:00"),
+        ("D", "D", "2024-03-01"),
+        ("1D", "D", "2024-03-01"),
+        ("W", "W", "2024-02-28"),
+        ("M", "M", "2024-02-29"),
+        ("ME", "M", "2024-02-29"),
+        ("MS", "MS", "2024-03-01"),
+        ("Y", "Y", "2023-12-31"),
+        ("YE", "Y", "2023-12-31"),
+        ("YS", "YS", "2024-01-01"),
     ],
 )
-def test_run_allows_explicitly_supported_frequency_families(frequency, origin) -> None:
+def test_run_allows_explicitly_supported_frequency_families(
+    frequency, canonical, origin,
+) -> None:
     fresh()
     registry.register(
         "a",
@@ -212,7 +217,7 @@ def test_run_allows_explicitly_supported_frequency_families(frequency, origin) -
     out = registry.run(
         "a", Panel("/tmp/unused", "id", "date", "qty", frequency=frequency), origin, 2
     )
-    assert out.frequency == frequency and out.origin == origin
+    assert out.frequency == canonical and out.origin == origin
     fresh()
 
 

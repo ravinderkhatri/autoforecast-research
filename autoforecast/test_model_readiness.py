@@ -16,6 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from autoforecast.adapters import known_adapter_names
 from autoforecast.data_observability import CheckReport, inspect_panel
 from autoforecast.frequency import canonical_origin, period_points
+from autoforecast.model_api import ResolvedRun
 from autoforecast.model_readiness import (
     approve_run,
     create_resolved_run,
@@ -101,6 +102,40 @@ def test_create_resolved_run_refuses_noncanonical_origin_identity() -> None:
             origin="20240101",
             horizon=4,
         )
+
+
+@pytest.mark.parametrize(
+    "declaration,canonical,origin",
+    [
+        ("1D", "D", "2024-01-01"),
+        ("ME", "M", "2024-01-31"),
+        ("YE", "Y", "2023-12-31"),
+    ],
+)
+def test_resolved_run_aliases_share_one_config_identity(
+    declaration: str, canonical: str, origin: str,
+) -> None:
+    adapter = "seasonal_naive"
+    alias = create_resolved_run(
+        model_id=adapter, adapter=adapter, origin=origin, horizon=1,
+        frequency=declaration,
+    )
+    expected = create_resolved_run(
+        model_id=adapter, adapter=adapter, origin=origin, horizon=1,
+        frequency=canonical,
+    )
+
+    assert alias.frequency == canonical
+    assert alias.config_hash == expected.config_hash
+
+
+def test_resolved_run_keeps_distinct_anchor_and_stride_identities() -> None:
+    def run(frequency: str) -> ResolvedRun:
+        return ResolvedRun("model", "seasonal_naive", "2024-01-01", 1, frequency=frequency)
+
+    assert run("M").config_hash != run("MS").config_hash
+    assert run("Y").config_hash != run("YS").config_hash
+    assert run("D").config_hash != run("7D").config_hash
 
 
 @pytest.mark.parametrize(

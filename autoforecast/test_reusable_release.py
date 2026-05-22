@@ -68,6 +68,51 @@ def frozen(tmp_path_factory, spark):
     return path, project, recipe, sources
 
 
+@pytest.mark.parametrize("frequency,start,end,expected", [
+    ("H", "2024-02-29T23:00:00", "2024-03-01T01:00:00",
+     ["2024-02-29T23:00:00", "2024-03-01T00:00:00", "2024-03-01T01:00:00"]),
+    ("D", "2024-02-28", "2024-03-01", ["2024-02-28", "2024-02-29", "2024-03-01"]),
+    ("W", "2024-02-23", "2024-03-08", ["2024-02-23", "2024-03-01", "2024-03-08"]),
+    ("3D", "2024-02-26", "2024-03-03", ["2024-02-26", "2024-02-29", "2024-03-03"]),
+    ("M", "2024-02-29", "2024-04-30", ["2024-02-29", "2024-03-31", "2024-04-30"]),
+    ("MS", "2023-12-01", "2024-02-01", ["2023-12-01", "2024-01-01", "2024-02-01"]),
+    ("Y", "2099-12-31", "2101-12-31", ["2099-12-31", "2100-12-31", "2101-12-31"]),
+    ("YS", "2099-01-01", "2101-01-01", ["2099-01-01", "2100-01-01", "2101-01-01"]),
+])
+def test_historical_grid_is_distributed_and_preserves_exact_keys(
+    spark, monkeypatch, frequency, start, end, expected,
+):
+    monkeypatch.setattr(
+        spark, "createDataFrame", lambda *a, **k: pytest.fail("historical keys reached the driver")
+    )
+    original_zone = spark.conf.get("spark.sql.session.timeZone")
+    spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")
+    try:
+        cadence = benchmark.parse_frequency(frequency)
+        frame = benchmark._period_frame(
+            spark, benchmark.parse_origin(start, cadence), benchmark.parse_origin(end, cadence),
+            cadence, "time",
+        )
+        assert frame.schema["time"].dataType.typeName() == (
+            "timestamp_ntz" if frequency == "H" else "date"
+        )
+        assert [row["time"].isoformat() for row in frame.orderBy("time").collect()] == expected
+    finally:
+        spark.conf.set("spark.sql.session.timeZone", original_zone)
+
+
+def test_large_hourly_history_can_be_planned_without_driver_enumeration(spark, monkeypatch):
+    monkeypatch.setattr(
+        spark, "createDataFrame", lambda *a, **k: pytest.fail("historical keys reached the driver")
+    )
+    cadence = benchmark.parse_frequency("H")
+    start, end = dt.datetime(1, 1, 1), dt.datetime(9998, 1, 1)
+    frame = benchmark._period_frame(spark, start, end, cadence, "time")
+    assert [row["time"] for row in frame.limit(2).collect()] == [
+        start, start + dt.timedelta(hours=1),
+    ]
+
+
 def test_freeze_composite_series_and_idempotent_identity(frozen, spark):
     path, project, recipe, sources = frozen
     record = benchmark.verify_benchmark(path)[1]

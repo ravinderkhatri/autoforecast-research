@@ -213,26 +213,35 @@ def canonical_key(column: str, cadence: Cadence) -> tuple[Column, Column]:
     escaped = column.replace("`", "``")
     timestamp = F.expr(f"try_cast(`{escaped}` as timestamp_ntz)")
     raw = F.col(column)
-    timezone_text = raw.cast("string").rlike(
-        r"(?i)(?:Z|[+-][0-9]{2}:?[0-9]{2}|[T ][^ ]*[+-][0-9]{2})$"
-    )
+    source_type = F.expr(f"typeof(`{escaped}`)")
+    text = raw.cast("string")
     if cadence.key_kind == "timestamp":
         key = timestamp
+        representation = (source_type == F.lit("timestamp_ntz")) | (
+            (source_type == F.lit("string"))
+            & text.rlike(
+                r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:00:00\z"
+            )
+        )
         valid = (
             raw.isNotNull()
             & timestamp.isNotNull()
             & (F.date_trunc("hour", timestamp) == timestamp)
-            & ~timezone_text
+            & representation
         )
         return key, valid
 
     key = F.expr(f"try_cast(`{escaped}` as date)")
+    representation = source_type.isin("date", "timestamp_ntz") | (
+        (source_type == F.lit("string"))
+        & text.rlike(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z")
+    )
     valid = (
         raw.isNotNull()
         & timestamp.isNotNull()
         & key.isNotNull()
         & (F.date_trunc("day", timestamp) == timestamp)
-        & ~timezone_text
+        & representation
     )
     if cadence.unit == "M":
         expected_day = F.lit(1) if cadence.anchor == "start" else F.dayofmonth(F.last_day(key))

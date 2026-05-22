@@ -390,9 +390,18 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         ).count()
     elif cadence.unit in {"D", "W"}:
         stride = cadence.multiplier if cadence.unit == "D" else 7
-        phase_errors = ordered.filter(
-            F.col("_previous").isNotNull()
-            & (F.pmod(F.datediff("_time_key", "_previous"), F.lit(stride)) != 0)
+        # W and nD have no intrinsic calendar anchor. The declared inspection boundary is the
+        # run's phase authority; pairwise deltas alone accept a complete lattice shifted away
+        # from that origin. Count every valid historical row that cannot belong to the run grid.
+        phase_errors = frame.filter(
+            F.col("_valid_time_key")
+            & (
+                F.pmod(
+                    F.datediff("_time_key", time_literal(cutoff_point, cadence)),
+                    F.lit(stride),
+                )
+                != 0
+            )
         ).count()
     elif cadence.unit == "M":
         phase_errors = 0

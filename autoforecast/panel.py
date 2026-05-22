@@ -25,6 +25,7 @@ import pyarrow.types as patypes
 
 from autoforecast.column_names import validate_column_names
 from autoforecast.frequency import (
+    Cadence,
     FrequencyError,
     TimePoint,
     advance,
@@ -214,18 +215,25 @@ class Panel:
     past_only: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Normalise `path` so a `pathlib.Path` caller and a `str` caller hash identically."""
+        """Normalise path and every valid cadence spelling to their semantic identities."""
         if not isinstance(self.path, str | pathlib.Path):
             raise PanelError(f"panel path must be a string or Path, got {type(self.path).__name__}")
         if not str(self.path).strip():
             raise PanelError("panel path cannot be blank")
         object.__setattr__(self, "path", str(self.path))
-        if isinstance(self.season_length, _DefaultSeasonLength):
-            try:
-                default = _SEASON_DEFAULTS[parse_frequency(self.frequency).unit]
-            except FrequencyError as exc:
+        default_season = isinstance(self.season_length, _DefaultSeasonLength)
+        try:
+            cadence = parse_frequency(self.frequency)
+        except FrequencyError as exc:
+            if isinstance(self.frequency, Cadence):
                 raise PanelError(str(exc)) from exc
-            object.__setattr__(self, "season_length", default)
+            # An explicit season length historically defers a malformed string to ``validate``.
+            if default_season:
+                raise PanelError(str(exc)) from exc
+        else:
+            object.__setattr__(self, "frequency", cadence.code)
+            if default_season:
+                object.__setattr__(self, "season_length", _SEASON_DEFAULTS[cadence.unit])
 
     @classmethod
     def from_record(cls, record: dict[str, object]) -> Panel:
@@ -610,7 +618,7 @@ class Forecast:
     frequency: str = "D"
 
     def __post_init__(self) -> None:
-        """Normalise `path`, matching `Panel`."""
+        """Normalise path and valid cadence aliases, matching `Panel`."""
         if not isinstance(self.path, str | pathlib.Path):
             raise ForecastError(
                 f"{self.adapter!r}: forecast path must be a string or Path, got "
@@ -618,6 +626,17 @@ class Forecast:
         if not str(self.path).strip():
             raise ForecastError(f"{self.adapter!r}: forecast path cannot be blank")
         object.__setattr__(self, "path", str(self.path))
+        try:
+            cadence = parse_frequency(self.frequency)
+        except FrequencyError as exc:
+            if isinstance(self.frequency, Cadence):
+                raise ForecastError(
+                    f"{self.adapter!r}: invalid frequency contract: {exc}"
+                ) from exc
+            # Preserve the existing contract: malformed strings fail when ``validate`` is called.
+            pass
+        else:
+            object.__setattr__(self, "frequency", cadence.code)
 
     @property
     def n_emitted(self) -> int:

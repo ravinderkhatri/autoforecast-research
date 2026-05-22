@@ -421,6 +421,25 @@ def test_malformed_forecast_date_cannot_hide_a_large_error_as_no_data() -> None:
     raise AssertionError("a malformed key dropped yhat=999 from the score as no-data")
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2020-01-02 00:00:00 America/New_York",
+        "2020-01-02 00:00:00+00:00:30",
+    ],
+)
+def test_timezone_bearing_forecast_text_cannot_reach_scoring(value: str) -> None:
+    panel = _synthetic_panel([("known", "2020-01-02", 5.0)])
+    out = pathlib.Path(tempfile.mkdtemp()) / "timezone-forecast"
+    spark().createDataFrame(
+        [("known", value, 5.0)], "series_id string, date string, yhat double",
+    ).write.mode("overwrite").parquet(str(out))
+    forecast = Forecast("synthetic", str(out), "2020-01-01", 1, 1, {"emitted": 1})
+
+    with pytest.raises(ScoreError, match="valid calendar date"):
+        score_forecast(panel, forecast, spark(), missing_actual="no_data")
+
+
 def test_malformed_panel_date_cannot_hide_a_large_error_as_no_data() -> None:
     panel_out = pathlib.Path(tempfile.mkdtemp()) / "string-date-panel"
     spark().createDataFrame([

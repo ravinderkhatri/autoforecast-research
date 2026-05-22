@@ -25,6 +25,19 @@ from autoforecast.frequency import parse_frequency
 
 ORIGIN = "2024-01-03"
 HORIZON = 3
+TIMEZONE_TEXTS = (
+    "2024-01-01T00:00:00Z",
+    "2024-01-01T00:00:00z",
+    "2024-01-01 00:00:00+00:00",
+    "2024-01-01 00:00:00+0000",
+    "2024-01-01 00:00:00+00",
+    "2024-01-01 00:00:00-05",
+    "2024-01-01 00:00:00 UTC",
+    "2024-01-01 00:00:00 GMT",
+    "2024-01-01 00:00:00 Europe/London",
+    "2024-01-01 00:00:00 America/New_York",
+    "2024-01-01 00:00:00+00:00:30",
+)
 
 _SPARK: SparkSession | None = None
 
@@ -152,6 +165,55 @@ def test_hourly_literals_and_membership_ignore_the_non_utc_session_zone() -> Non
     ).collect()] == [dt.datetime(2024, 3, 1, 23)]
 
 
+def test_canonical_key_uses_positive_lossless_text_grammars() -> None:
+    values = (
+        "2024-01-01",
+        "2024-01-01T00:00:00",
+        "2024-01-01 00:00:00",
+        *TIMEZONE_TEXTS,
+    )
+    frame = spark().createDataFrame([(value,) for value in values], "raw string")
+    hour_key, hour_valid = grid.canonical_key("raw", parse_frequency("H"))
+    day_key, day_valid = grid.canonical_key("raw", parse_frequency("D"))
+    rows = {
+        row["raw"]: row
+        for row in frame.select(
+            "raw",
+            hour_key.cast("string").alias("hour_key"),
+            hour_valid.alias("hour_valid"),
+            day_key.cast("string").alias("day_key"),
+            day_valid.alias("day_valid"),
+        ).collect()
+    }
+
+    assert rows["2024-01-01"]["day_valid"]
+    assert not rows["2024-01-01"]["hour_valid"]
+    for value in ("2024-01-01T00:00:00", "2024-01-01 00:00:00"):
+        assert rows[value]["hour_valid"]
+        assert not rows[value]["day_valid"]
+    for value in TIMEZONE_TEXTS:
+        assert not rows[value]["hour_valid"]
+        assert not rows[value]["day_valid"]
+
+
+def test_canonical_key_preserves_typed_dates_and_naive_timestamps() -> None:
+    date_frame = spark().createDataFrame([(dt.date(2024, 1, 1),)], "raw date")
+    date_key, date_valid = grid.canonical_key("raw", parse_frequency("D"))
+    assert date_frame.select(date_key.alias("key"), date_valid.alias("valid")).first() == (
+        dt.date(2024, 1, 1), True,
+    )
+
+    timestamp_frame = spark().createDataFrame(
+        [(dt.datetime(2024, 1, 1),)], "raw timestamp_ntz",
+    )
+    day_key, day_valid = grid.canonical_key("raw", parse_frequency("D"))
+    hour_key, hour_valid = grid.canonical_key("raw", parse_frequency("H"))
+    assert timestamp_frame.select(
+        day_key.alias("day"), day_valid.alias("day_valid"),
+        hour_key.alias("hour"), hour_valid.alias("hour_valid"),
+    ).first() == (dt.date(2024, 1, 1), True, dt.datetime(2024, 1, 1), True)
+
+
 def test_period_membership_handles_a_large_hourly_history_as_one_native_predicate() -> None:
     cadence = parse_frequency("H")
     start = dt.datetime(2024, 1, 1)
@@ -231,6 +293,22 @@ def test_content_hash_refuses_duplicate_or_invalid_keys() -> None:
         assert "duplicate" in str(exc)
     else:
         raise AssertionError("hashed a grid with duplicate keys")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2024-01-04 00:00:00 America/New_York",
+        "2024-01-04 00:00:00+00:00:30",
+    ],
+)
+def test_content_hash_refuses_timezone_bearing_text_keys(value: str) -> None:
+    path = pathlib.Path(tempfile.mkdtemp()) / "timezone-key"
+    spark().createDataFrame(
+        [("a", value)], "series_id string, date string",
+    ).write.parquet(str(path))
+    with pytest.raises(grid.GridError, match="invalid time key"):
+        grid.content_hash(path, spark(), frequency="D")
 
 
 def test_content_hash_preserves_hourly_keys_instead_of_collapsing_to_date() -> None:

@@ -37,21 +37,71 @@ class Cadence:
     key_kind: Literal["timestamp", "date"]
     anchor: Literal["start", "end"] | None = None
 
+    def __post_init__(self) -> None:
+        _validate_cadence(self)
+
 
 FrequencyLike = str | Cadence
 
+_CadenceFields = tuple[
+    str,
+    Literal["H", "D", "W", "M", "Y"],
+    int,
+    Literal["timestamp", "date"],
+    Literal["start", "end"] | None,
+]
 
-_PUBLIC: dict[str, Cadence] = {
-    "H": Cadence("H", "H", 1, "timestamp"),
-    "D": Cadence("D", "D", 1, "date"),
-    "W": Cadence("W", "W", 1, "date"),
-    "M": Cadence("M", "M", 1, "date", "end"),
-    "ME": Cadence("M", "M", 1, "date", "end"),
-    "MS": Cadence("MS", "M", 1, "date", "start"),
-    "Y": Cadence("Y", "Y", 1, "date", "end"),
-    "YE": Cadence("Y", "Y", 1, "date", "end"),
-    "YS": Cadence("YS", "Y", 1, "date", "start"),
+_FIXED_FIELDS: dict[str, _CadenceFields] = {
+    "H": ("H", "H", 1, "timestamp", None),
+    "D": ("D", "D", 1, "date", None),
+    "W": ("W", "W", 1, "date", None),
+    "M": ("M", "M", 1, "date", "end"),
+    "ME": ("M", "M", 1, "date", "end"),
+    "MS": ("MS", "M", 1, "date", "start"),
+    "Y": ("Y", "Y", 1, "date", "end"),
+    "YE": ("Y", "Y", 1, "date", "end"),
+    "YS": ("YS", "Y", 1, "date", "start"),
 }
+
+
+def _canonical_fields(code: object) -> _CadenceFields:
+    if not isinstance(code, str) or not code:
+        raise FrequencyError(f"frequency must be a non-blank string, got {code!r}")
+    known = _FIXED_FIELDS.get(code)
+    if known is not None:
+        return known
+    match = re.fullmatch(r"([1-9][0-9]*)D", code)
+    if match is not None:
+        multiplier = int(match.group(1))
+        return ("D" if multiplier == 1 else code, "D", multiplier, "date", None)
+    raise FrequencyError(
+        "supported frequencies are H, D, W, M/ME, MS, Y/YE, YS, or a positive integral nD"
+    )
+
+
+def _validate_cadence(cadence: Cadence) -> None:
+    expected = _canonical_fields(cadence.code)
+    actual = (
+        cadence.code,
+        cadence.unit,
+        cadence.multiplier,
+        cadence.key_kind,
+        cadence.anchor,
+    )
+    if (
+        type(cadence.code) is not str
+        or type(cadence.unit) is not str
+        or type(cadence.multiplier) is not int
+        or type(cadence.key_kind) is not str
+        or (cadence.anchor is not None and type(cadence.anchor) is not str)
+        or actual != expected
+    ):
+        raise FrequencyError(
+            f"Cadence fields {actual!r} are inconsistent; canonical fields are {expected!r}"
+        )
+
+
+_PUBLIC = {declaration: Cadence(*fields) for declaration, fields in _FIXED_FIELDS.items()}
 
 
 def parse_frequency(code: FrequencyLike) -> Cadence:
@@ -61,19 +111,10 @@ def parse_frequency(code: FrequencyLike) -> Cadence:
     They are members of the daily family but retain their multiplier and canonical code.
     """
     if isinstance(code, Cadence):
+        _validate_cadence(code)
         return code
-    if not isinstance(code, str) or not code:
-        raise FrequencyError(f"frequency must be a non-blank string, got {code!r}")
-    known = _PUBLIC.get(code)
-    if known is not None:
-        return known
-    match = re.fullmatch(r"([1-9][0-9]*)D", code)
-    if match is not None:
-        multiplier = int(match.group(1))
-        return Cadence("D" if multiplier == 1 else code, "D", multiplier, "date")
-    raise FrequencyError(
-        "supported frequencies are H, D, W, M/ME, MS, Y/YE, YS, or a positive integral nD"
-    )
+    known = _PUBLIC.get(code) if isinstance(code, str) else None
+    return known if known is not None else Cadence(*_canonical_fields(code))
 
 
 def frequency_is_supported(

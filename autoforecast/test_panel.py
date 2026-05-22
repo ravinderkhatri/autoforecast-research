@@ -20,6 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from autoforecast.frequency import Cadence
 from autoforecast.panel import (
     ELIGIBLE_STATES,
     Forecast,
@@ -247,6 +248,70 @@ def test_panel_default_season_length_follows_the_cadence_family() -> None:
     assert Panel(
         "/not-read", "id", "date", "qty", frequency="W", season_length=7,
     ).season_length == 7
+
+
+@pytest.mark.parametrize(
+    "declaration,canonical,origin",
+    [
+        ("1D", "D", "2024-01-01"),
+        ("ME", "M", "2024-01-31"),
+        ("YE", "Y", "2023-12-31"),
+        ("7D", "7D", "2024-01-01"),
+        ("MS", "MS", "2024-01-01"),
+        ("YS", "YS", "2024-01-01"),
+    ],
+)
+def test_panel_and_forecast_records_use_canonical_frequency_identity(
+    declaration: str, canonical: str, origin: str,
+) -> None:
+    panel = Panel("/not-read", "id", "date", "qty", frequency=declaration)
+    forecast = Forecast(
+        "model", "/not-read", origin, 1, 1, {"emitted": 1}, frequency=declaration,
+    )
+
+    assert panel.frequency == forecast.frequency == canonical
+    assert dataclasses.asdict(panel)["frequency"] == canonical
+    assert forecast.as_record()["frequency"] == canonical
+
+    panel_record = dataclasses.asdict(panel)
+    panel_record["frequency"] = declaration
+    forecast_record = forecast.as_record()
+    forecast_record["frequency"] = declaration
+    assert Panel.from_record(panel_record).frequency == canonical
+    assert Forecast.from_record(forecast_record).frequency == canonical
+
+
+def test_invalid_frequency_strings_keep_their_existing_validation_boundary() -> None:
+    panel = _structural_panel(frequency="hourly", season_length=7)
+    forecast = Forecast(
+        "model", "/not-read", "2024-01-01", 1, 1, {"emitted": 1}, frequency="Q",
+    )
+    assert panel.frequency == "hourly" and forecast.frequency == "Q"
+    with pytest.raises(PanelError, match="supported"):
+        panel.validate()
+    with pytest.raises(ForecastError, match="frequency"):
+        forecast.validate()
+
+
+def test_contract_construction_refuses_an_inconsistent_cadence_object() -> None:
+    forged = object.__new__(Cadence)
+    for name, value in zip(
+        ("code", "unit", "multiplier", "key_kind", "anchor"),
+        ("H", "D", 1, "date", None),
+        strict=True,
+    ):
+        object.__setattr__(forged, name, value)
+
+    with pytest.raises(PanelError, match="inconsistent"):
+        Panel(
+            "/not-read", "id", "date", "qty", season_length=7,
+            frequency=forged,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ForecastError, match="inconsistent"):
+        Forecast(
+            "model", "/not-read", "2024-01-01", 1, 1, {"emitted": 1},
+            frequency=forged,  # type: ignore[arg-type]
+        )
 
 
 def test_hourly_panel_requires_a_timezone_naive_timestamp_column(tmp_path) -> None:
