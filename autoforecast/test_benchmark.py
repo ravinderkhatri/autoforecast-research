@@ -185,7 +185,7 @@ def _frozen_example(tmp_path):
         "counts": {name: {"required_observations": len(tables[name]),
                           "written_rows": len(tables[name]), "originally_missing": 0, "zero_filled": 0}
                    for name in ("selection", "final_training", "validation_score", "final_score")},
-        "policies": {"history_missing": "zero", "actual_missing": "zero",
+        "policies": {"history_missing": "preserve", "actual_missing": "error",
                      "missing_definition": "absent_row_or_null_target", "confirmed_zero": "observed",
                      "missing_indicator": benchmark.MISSING_COLUMN},
         "metric_definition": benchmark._metric_definition(recipe),

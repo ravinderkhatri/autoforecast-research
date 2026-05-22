@@ -27,7 +27,7 @@ def spark():
     session.stop()
 
 
-def inputs(root, *, actual_missing="zero"):
+def inputs(root, *, actual_missing="mask"):
     """Two retained series; one late arrival; four cells in each scoring window."""
     root.mkdir(parents=True, exist_ok=True)
     contract = root / "dataset.yaml"
@@ -71,7 +71,7 @@ def inputs(root, *, actual_missing="zero"):
     return contract, sources, recipe
 
 
-def freeze(root, spark, *, actual_missing="zero", mutate=None, study_id=None):
+def freeze(root, spark, *, actual_missing="mask", mutate=None, study_id=None):
     contract, sources, recipe = inputs(root, actual_missing=actual_missing)
     if mutate:
         mutate(recipe)
@@ -81,7 +81,7 @@ def freeze(root, spark, *, actual_missing="zero", mutate=None, study_id=None):
     )
 
 
-@pytest.mark.parametrize("policy,scored", [("zero", 4), ("mask", 2)])
+@pytest.mark.parametrize("policy,scored", [("mask", 2)])
 def test_study_freezes_unequal_starts_original_missingness_and_complete_grids(
     tmp_path, spark, policy, scored,
 ):
@@ -93,13 +93,13 @@ def test_study_freezes_unequal_starts_original_missingness_and_complete_grids(
     assert record["excluded_new_series"] == 1
     assert record["cohort_series_count"] == 2
     assert load_dataset_contract(path.parent / "dataset.yaml").required_series_count == 2
-    assert record["recipe"]["history_missing"] == "zero"
+    assert record["recipe"]["history_missing"] == "preserve"
     assert record["counts"]["selection"]["required_observations"] == 8
     assert record["counts"]["selection"]["originally_missing"] == 2
     selection = pq.read_table(benchmark.artifact_path(path, record, "selection")).to_pylist()
     assert len(selection) == 8
     assert min(row["date"] for row in selection if row["id"] == "B") == dt.date(2024, 1, 3)
-    assert all(row["y"] == 0 for row in selection if row[benchmark.MISSING_COLUMN])
+    assert all(row["y"] is None for row in selection if row[benchmark.MISSING_COLUMN])
     assert benchmark.artifact_path(path, record, "validation_score") == (
         benchmark.artifact_path(path, record, "final_training")
     )
@@ -107,8 +107,8 @@ def test_study_freezes_unequal_starts_original_missingness_and_complete_grids(
         assert grid["n_cells"] == 4
         assert record["coverage_identities"][boundary]["counts"] == {
             "expected": 4, "originally_missing": 2, "scored": scored,
-            "zero_filled": 2 if policy == "zero" else 0,
-            "excluded": 2 if policy == "mask" else 0,
+            "zero_filled": 0,
+            "excluded": 2,
         }
     actuals = pq.read_table(benchmark.artifact_path(path, record, "final_score")).to_pylist()
     zero = next(row for row in actuals if row["id"] == "A" and row["date"].day == 8)
@@ -122,7 +122,7 @@ def test_study_uniform_default_does_not_infer_start_from_first_record(tmp_path, 
     rows = pq.read_table(benchmark.artifact_path(path, record, "selection")).to_pylist()
     leading = [row for row in rows if row["id"] == "B" and row["date"].day < 3]
     assert len(leading) == 2
-    assert all(row["y"] == 0 and row[benchmark.MISSING_COLUMN] for row in leading)
+    assert all(row["y"] is None and row[benchmark.MISSING_COLUMN] for row in leading)
     assert record["recipe"]["series_starts"]["rule"] == "study_lower_bound"
 
 
@@ -151,7 +151,7 @@ def test_study_registration_reuses_bytes_and_rejects_changed_rules(tmp_path, spa
     ) == path
     assert path.read_bytes() == original
     changed = copy.deepcopy(recipe)
-    changed["actual_missing"] = "mask"
+    changed["series_starts"]["rule"] = "revised declaration"
     with pytest.raises(benchmark.BenchmarkError, match="different settings or data"):
         benchmark.freeze_benchmark(
             contract_path=contract, sources=sources, recipe=changed,
@@ -165,7 +165,7 @@ def test_study_registration_reuses_bytes_and_rejects_changed_rules(tmp_path, spa
     assert new_path != path
 
 
-@pytest.mark.parametrize("policy,scored", [("zero", 4), ("mask", 2)])
+@pytest.mark.parametrize("policy,scored", [("mask", 2)])
 def test_study_freezes_inner_tuning_population_and_missingness(tmp_path, spark, policy, scored):
     # Population: the same A/B cohort as outer validation; four inner target cells.
     # A on day 4 is null and B on day 5 is absent; the late series remains excluded.
@@ -182,8 +182,8 @@ def test_study_freezes_inner_tuning_population_and_missingness(tmp_path, spark, 
     assert fixed["grid"]["n_cells"] == 4
     assert fixed["coverage"]["counts"] == {
         "expected": 4, "originally_missing": 2, "scored": scored,
-        "zero_filled": 2 if policy == "zero" else 0,
-        "excluded": 2 if policy == "mask" else 0,
+        "zero_filled": 0,
+        "excluded": 2,
     }
     with pytest.raises(benchmark.BenchmarkError, match="boundary absent"):
         benchmark.evaluation_contract(
@@ -255,23 +255,20 @@ def score_fixture(path, spark, output, *, stage="validation", remove=False):
     return json.loads(comparison.read_text())
 
 
-@pytest.mark.parametrize("policy", ["zero", "mask"])
+@pytest.mark.parametrize("policy", ["mask"])
 def test_study_scoring_uses_original_missingness_and_reports_every_series(tmp_path, spark, policy):
     import math
 
     path = freeze(tmp_path, spark, actual_missing=policy)
     # Validation actuals: A=(missing,7), B=(6,missing); predictions all 2.
     # Test actuals: A=(recorded 0,9), B=(missing,missing).
-    for stage, errors in (("validation", [4, 25, 16, 4]), ("test", [4, 49, 4, 4])):
+    for stage, expected_errors in (("validation", [25, 16]), ("test", [4, 49])):
         result = score_fixture(path, spark, tmp_path / stage, stage=stage)
         score = result["candidates"][0]["score"]
-        assert result["missing_actual"] == ("sparse_zero" if policy == "zero" else "no_data")
-        expected_errors = errors if policy == "zero" else (
-            [25, 16] if stage == "validation" else [4, 49]
-        )
+        assert result["missing_actual"] == "no_data"
         assert score["rmse"] == pytest.approx(math.sqrt(sum(expected_errors) / len(expected_errors)))
         assert result["ranking"]["n_common_cells"] == 4
-        assert score["coverage"]["scored"] == (4 if policy == "zero" else 2)
+        assert score["coverage"]["scored"] == 2
         series = pq.read_table(score["series_scores"]["path"]).to_pylist()
         assert len(series) == 2
         if stage == "test" and policy == "mask":
@@ -299,7 +296,7 @@ def test_validation_actuals_are_independent_of_refit_values(tmp_path, spark):
     _, record = benchmark.verify_benchmark(path)
     assert record["role_paths"]["validation_score"] != record["role_paths"]["final_training"]
     score = score_fixture(path, spark, tmp_path / "scores")["candidates"][0]["score"]
-    assert score["rmse"] == pytest.approx(((98**2 + 25 + 16 + 4) / 4) ** 0.5)
+    assert score["rmse"] == pytest.approx(((98**2 + 25 + 16) / 3) ** 0.5)
     assert score["coverage"]["originally_missing"] == 1
 
 
@@ -314,7 +311,7 @@ def scoring_references(root, *, scale_b=4.0):
     return path
 
 
-@pytest.mark.parametrize("policy,scale_b", [("zero", 4.0), ("mask", 4.0), ("mask", 0.0)])
+@pytest.mark.parametrize("policy,scale_b", [("mask", 4.0), ("mask", 0.0)])
 def test_flat_wrmsse_fixed_weights_and_undefined_cases(tmp_path, spark, policy, scale_b):
     import math
 
@@ -328,18 +325,16 @@ def test_flat_wrmsse_fixed_weights_and_undefined_cases(tmp_path, spark, policy, 
     validation = score_fixture(path, spark, tmp_path / "validation")
     score = validation["candidates"][0]["score"]
     if scale_b:
-        mse_a, mse_b = (14.5, 10) if policy == "zero" else (25, 16)
+        mse_a, mse_b = (25, 16)
         expected = (14 * math.sqrt(mse_a / 2.5) + 9 * math.sqrt(mse_b / 4)) / 23
         assert score["wrmsse"] == pytest.approx(expected)
         assert validation["candidates"][0]["status"] == "scored"
     else:
         assert score["wrmsse"] is None
         assert validation["ranking"] is None
-    test = score_fixture(path, spark, tmp_path / "test", stage="test")
-    if policy == "mask":
-        assert test["candidates"][0]["score"]["wrmsse"] is None
-        assert test["candidates"][0]["status"] == "unavailable"
-        assert test["ranking"] is None
+    from autoforecast.score_spark import ScoreError
+    with pytest.raises(ScoreError, match="every retained series"):
+        score_fixture(path, spark, tmp_path / "test", stage="test")
     _, frozen = benchmark.verify_benchmark(path)
     table_path = benchmark.artifact_path(path, frozen, "scoring_references")
     part = next(table_path.glob("*.parquet"))
@@ -372,18 +367,19 @@ def test_all_missing_heldout_score_is_unavailable(tmp_path, spark):
     assert _test_score_value(result, "rmse", "test", result["evaluation_contract"]) is None
 
 
-def test_complete_flat_wrmsse_matches_hand_calculation(tmp_path, spark):
+@pytest.mark.parametrize("policy", ["error", "mask"])
+def test_complete_flat_wrmsse_matches_hand_calculation(tmp_path, spark, policy):
     import math
 
     from autoforecast.panel import Forecast
     from autoforecast.run_evaluation import compare_run_forecasts
 
-    contract, sources, recipe = inputs(tmp_path)
+    contract, sources, recipe = inputs(tmp_path, actual_missing=policy)
     source = sources["selection"]
     table = pq.read_table(source)
-    rows = [row for row in table.to_pylist() if row["date"].day not in (6, 7)]
+    rows = [row for row in table.to_pylist() if row["date"].day not in (6, 7, 8, 9)]
     rows.extend({"id": key, "date": dt.date(2024, 1, day), "y": value}
-                for key, value in (("A", 5.0), ("B", 6.0)) for day in (6, 7))
+                for key, value in (("A", 5.0), ("B", 6.0)) for day in (6, 7, 8, 9))
     pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), source)
     recipe["metric"] = "wrmsse"
     path = benchmark.freeze_benchmark(
@@ -409,6 +405,8 @@ def test_complete_flat_wrmsse_matches_hand_calculation(tmp_path, spark):
     score = json.loads(output.read_text())["candidates"][0]["score"]
     rendered = output.with_suffix(".html").read_text()
     assert "Scored cells" in rendered and "Series by level" not in rendered
+    label = "masked WRMSSE" if policy == "mask" else "WRMSSE"
+    assert f"<th>{label}</th>" in rendered
     assert score["wrmsse"] == pytest.approx((14 * math.sqrt(1 / 2.5) + 9 * math.sqrt(2 / 4)) / 23)
 
 
@@ -424,6 +422,12 @@ def test_study_compilation_preserves_identity_roles_and_safe_training_slices(tmp
 
     project = tmp_path / "project"
     create_example(project)
+    part = next((project / "data").glob("*.parquet"))
+    source_table = pq.read_table(part)
+    source_rows = source_table.to_pylist()
+    source_rows[0]["units"] = None
+    source_rows[1]["units"] = 0.0
+    pq.write_table(pa.Table.from_pylist(source_rows, schema=source_table.schema), part)
     recipe = json.loads((project / "recipe.json").read_text())
     path = benchmark.freeze_benchmark(
         contract_path=project / "dataset.yaml",
@@ -461,6 +465,11 @@ def test_study_compilation_preserves_identity_roles_and_safe_training_slices(tmp
     )
     assert benchmark.MISSING_COLUMN not in pq.read_table(destination).column_names
     assert benchmark.MISSING_COLUMN not in spark.read.parquet(str(destination)).columns
+    exported = pq.read_table(destination).to_pylist()
+    for original in source_rows[:2]:
+        actual = next(row for row in exported
+                      if all(row[key] == original[key] for key in ("shop", "sku", "day")))
+        assert actual["units"] == original["units"]
     assert max(pq.read_table(destination)["day"].to_pylist()).isoformat() == recipe["validation_origins"][0]
     assert hashlib.sha256(path.read_bytes()).hexdigest() == resolved["benchmark"]["sha256"]
     # Fixed manual parameters work; HPO cannot add an inner window after study freeze.

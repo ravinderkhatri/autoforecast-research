@@ -40,11 +40,11 @@ class ValidationWindow:
         cls, origin: str, study: StudyValidation, *, route_lower_bound_to_exact: bool = False,
     ) -> ValidationWindow:
         """Retain the frozen scoring mask while enforcing the native count-model domain."""
-        values = study.target
+        values = study.target[study.observed]
         if (not np.isfinite(values).all() or np.any(values < 0)
                 or np.any(values > 2**24) or np.any(values != np.floor(values))):
             raise ValueError("fixed validation targets must be finite integer counts in [0, 2**24]")
-        target = values.astype(np.float32)
+        target = study.target.astype(np.float32)
         physical = (np.where(study.observed, 0, 2).astype(np.int8)
                     if route_lower_bound_to_exact else None)
         for array in (target, physical):

@@ -17,7 +17,7 @@ from autoforecast.test_benchmark import _frozen_example
 
 def window(*, metric="rmse", observed=None, weight=None, scale=None):
     return StudyValidation(
-        json.dumps({"metric_policy": {"metric": metric}}), "a" * 64, ("a", "b"),
+        json.dumps({"metric_policy": {"metric": metric, "actual_missing": "mask"}}), "a" * 64, ("a", "b"),
         np.array([[1.0, 0.0], [2.0, 4.0]]),
         np.array([[True, False], [True, True]]) if observed is None else observed,
         weight, scale,
@@ -52,11 +52,15 @@ def test_checkpoint_flat_wrmsse_uses_all_declared_weights_and_scales():
     ([1.0, 4.0], [[False, False], [True, True]]),
 ])
 def test_checkpoint_wrmsse_does_not_redistribute_an_unavailable_series(scale, observed):
-    score = window(
+    study = window(
         metric="wrmsse", weight=np.array([0.0, 3.0]), scale=np.array(scale),
         observed=np.array(observed),
-    ).score(np.zeros((2, 2)))
-    assert score["wrmsse"] is None
+    )
+    if not np.asarray(observed).any(axis=1).all():
+        with pytest.raises(ValueError, match="every retained series"):
+            study.score(np.zeros((2, 2)))
+    else:
+        assert study.score(np.zeros((2, 2)))["wrmsse"] is None
 
 
 def test_checkpoint_empty_coverage_and_zero_volume_remain_unavailable():
@@ -137,3 +141,25 @@ def test_checkpoint_reader_never_admits_test_labels_for_selection(tmp_path):
     file, sha, args, _ = frozen_window(tmp_path, stage="test")
     with pytest.raises(ValueError, match="window or population"):
         StudyValidation.read(file, sha, **args)
+
+
+@pytest.mark.parametrize("physical", [False, True])
+def test_native_window_preserves_missing_targets_and_frozen_identity(physical):
+    from autoforecast.rolling_data import ValidationWindow
+    from autoforecast.rolling_training import RollingTrainingContract
+
+    study = dataclasses.replace(window(), target=np.array([[1.0, np.nan], [2.0, 4.0]]))
+    native = ValidationWindow.from_study("2024-01-01", study,
+                                         route_lower_bound_to_exact=physical)
+    assert np.isnan(native.target[0, 1])
+    np.testing.assert_array_equal(native.target, study.target)
+    assert not native.target.flags.writeable
+    RollingTrainingContract(mode="fixed_validation", fixed_validation=native)
+    wrong = dataclasses.replace(native, target=np.nan_to_num(native.target))
+    with pytest.raises(ValueError, match="differs from its frozen study"):
+        RollingTrainingContract(mode="fixed_validation", fixed_validation=wrong)
+    for invalid in (-1.0, 0.5, float("inf"), float("nan"), 2**24 + 1):
+        changed = study.target.copy()
+        changed[0, 0] = invalid
+        with pytest.raises(ValueError, match="finite integer counts"):
+            ValidationWindow.from_study("2024-01-01", dataclasses.replace(study, target=changed))

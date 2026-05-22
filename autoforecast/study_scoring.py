@@ -8,7 +8,6 @@ import hashlib
 import math
 import pathlib
 import tempfile
-from typing import cast
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -22,7 +21,7 @@ from autoforecast.benchmark import (
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.panel import Forecast, ForecastError, Panel
 from autoforecast.ranking import SelectionError, _exact_grid_restrictions
-from autoforecast.score_spark import MissingActual, ScoreError, score_forecast
+from autoforecast.score_spark import MissingActualError, ScoreError, score_forecast
 from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
 
@@ -111,12 +110,10 @@ def _score_study_snapshot(
     if count != contract["grid"]["n_cells"]:
         raise ScoreError("forecast grid differs from the frozen denominator")
     policy = contract["metric_policy"]
-    missing = cast(
-        MissingActual, "sparse_zero" if policy["actual_missing"] == "zero" else "no_data",
-    )
+
     raw_path = output_dir / "cell-sums"
     result = score_forecast(
-        panel, forecast, spark, missing_actual=missing,
+        panel, forecast, spark, missing_actual="no_data",
         eligible_grid=str(snapshots["grid"]), original_missing_column=MISSING_COLUMN,
         series_scores_path=str(raw_path),
     )
@@ -130,6 +127,11 @@ def _score_study_snapshot(
     if (coverage.exceptAll(frozen).limit(1).count()
             or frozen.exceptAll(coverage).limit(1).count()):
         raise ScoreError("scoring coverage differs from the frozen denominator")
+    if policy["actual_missing"] == "error" and result.n_dropped_no_data:
+        raise MissingActualError(
+            f"{contract['boundary']}: scoring requires complete actuals; "
+            f"expected={count}, missing={result.n_dropped_no_data}"
+        )
     n = F.col("n_scored")
     per_series = sums.select(
         "series_id", "expected", "originally_missing",
@@ -151,6 +153,10 @@ def _score_study_snapshot(
         "metric_definition": policy,
     }
     if policy["metric"] == "wrmsse":
+        if per_series.filter(F.col("scored") == 0).limit(1).count():
+            raise MissingActualError(
+                "WRMSSE requires observations for every retained series"
+            )
         references = spark.read.parquet(str(snapshots["references"]))
         references = references.filter(F.col("boundary") == contract["boundary"])
         per_series = per_series.join(references.select("series_id", "weight", "scale"),

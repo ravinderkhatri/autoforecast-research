@@ -68,7 +68,7 @@ def test_resolve_study_rejects_obsolete_schema_before_artifact_reads(tmp_path, m
         benchmark.resolve_study(registry, identity)
 
 
-@pytest.mark.parametrize("metric,policy", [("wrmsse", "zero"), ("rmse", "zero"), ("rmse", "mask")])
+@pytest.mark.parametrize("metric,policy", [("wrmsse", "error"), ("rmse", "error"), ("rmse", "mask")])
 def test_study_compiles_for_shared_scorer_and_enforces_declared_adapter_support(
     tmp_path, spark, monkeypatch, metric, policy,
 ):
@@ -116,7 +116,7 @@ def test_study_compiles_for_shared_scorer_and_enforces_declared_adapter_support(
         (study_path.parent / "dataset.yaml").relative_to(project)
     )
     request["forecast_campaign"]["selection"].update(
-        metric=metric, missing_actual="sparse_zero" if policy == "zero" else "no_data",
+        metric=metric, missing_actual="no_data",
     )
     request_path.write_text(yaml.safe_dump(request))
     monkeypatch.setattr(campaign, "_git_source_identity", lambda *_args: {})
@@ -401,7 +401,7 @@ def test_score_study_uses_pinned_actual_bytes(tmp_path, spark, monkeypatch):
     candidate = json.loads(comparison.read_text())["candidates"][0]
     assert changed_during_call
     assert candidate["status"] == "scored"
-    assert candidate["score"]["rmse"] == pytest.approx(3.5), (
+    assert candidate["score"]["rmse"] == pytest.approx((41 / 2) ** 0.5), (
         "score was computed from transient bytes even though final provenance re-authenticated "
         "the original digest"
     )
@@ -520,7 +520,7 @@ def test_rescore_uses_pinned_forecast_bytes(tmp_path, spark, monkeypatch, change
     candidate = comparison["candidates"][0]
     assert changed_during_call
     assert candidate["status"] == "scored"
-    assert candidate["score"]["rmse"] == pytest.approx(3.5), (
+    assert candidate["score"]["rmse"] == pytest.approx((41 / 2) ** 0.5), (
         "rescore accepted a score from transient forecast bytes while recording the original hash"
     )
     assert record["scores"][0]["comparison_sha256"] == hashlib.sha256(
@@ -594,9 +594,9 @@ def test_study_scores_private_copies_of_all_inputs(tmp_path, spark, monkeypatch,
     )
     candidate = json.loads(comparison.read_bytes())["candidates"][0]
     assert calls == 1 and candidate["status"] == "scored"
-    assert candidate["score"]["rmse"] == pytest.approx(3.5)
-    # A's errors are 4 and 25; B's are 16 and 4. Supplied scales are 2.5 and 4.
-    expected = (14 * math.sqrt(14.5 / 2.5) + 9 * math.sqrt(10 / 4)) / 23
+    assert candidate["score"]["rmse"] == pytest.approx((41 / 2) ** 0.5)
+    # Observed squared errors: A=25, B=16. Supplied scales are 2.5 and 4.
+    expected = (14 * math.sqrt(25 / 2.5) + 9 * math.sqrt(16 / 4)) / 23
     assert candidate["score"]["wrmsse"] == pytest.approx(expected)
     assert part.read_bytes() == original
 
@@ -652,7 +652,7 @@ def test_known_future_features_do_not_extend_validation_actuals_into_test(tmp_pa
         "target_unit": "units",
         "feature_availability": {"promotion": "promotion_known_at"},
         "metric": "rmse",
-        "actual_missing": "zero",
+        "actual_missing": "mask",
     }
     sources = dict.fromkeys(
         ("selection", "final_training", "validation_score", "final_score"), source

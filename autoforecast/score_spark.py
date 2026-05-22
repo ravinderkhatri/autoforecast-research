@@ -43,6 +43,10 @@ def _read_time_storage(
         raise ScoreError(f"{context} has invalid time storage: {exc}") from exc
 
 
+class MissingActualError(ScoreError):
+    """A study cannot produce its requested metric from incomplete actuals."""
+
+
 def score_forecast(
     panel: Panel,
     forecast: Forecast,
@@ -247,6 +251,8 @@ def score_forecast(
     if (original_missing_column is not None
             and (eligible_grid is None or series_scores_path is None)):
         raise ScoreError("original missingness requires a fixed grid and per-series score output")
+    if original_missing_column is not None and missing_actual == "sparse_zero":
+        raise ScoreError("study scoring never fills missing actuals")
     joined = _join_actuals(fc, panel, panel_cadence, spark, original_missing_column)
     actual = F.col("_actual")
     bad_actual = (joined.filter(
@@ -400,9 +406,9 @@ def _join_actuals(
                             & (F.col("_date") == F.col("_f_date")), "left_semi")
     if original_missing_column is not None:
         flag, actual = F.col("_original_missing"), F.col("_actual")
-        if (relevant.filter(flag.isNull() | (flag & (actual.isNull() | (actual != 0))))
+        if (relevant.filter(flag.isNull() | (flag != actual.isNull()))
                 .limit(1).count()):
-            raise ScoreError("original-missing indicator requires a zero-filled target")
+            raise ScoreError("original-missing indicator must agree with a null target")
     if relevant.groupBy("_sid", "_date").count().filter(F.col("count") != 1).limit(1).count():
         raise ScoreError(
             "panel contains duplicate actual (series, date) keys in the forecast window; the join "
@@ -471,7 +477,9 @@ def _aggregations(
     zero_filled = eligible & absent & F.lit(missing_actual == "sparse_zero")
     no_data = eligible & absent & F.lit(missing_actual == "no_data")
     scored = eligible & (~absent | F.lit(missing_actual == "sparse_zero"))
-    actual = F.coalesce(F.col("_actual"), F.lit(0.0))
+    actual = F.col("_actual")
+    if missing_actual == "sparse_zero":
+        actual = F.coalesce(actual, F.lit(0.0))
     err = F.col("yhat").cast("double") - actual
     return [
         F.count(F.when(scored, F.lit(1))).alias("n_scored"),
@@ -488,4 +496,4 @@ def _aggregations(
     ]
 
 
-__all__ = ["ScoreError", "score_forecast"]
+__all__ = ["MissingActualError", "ScoreError", "score_forecast"]

@@ -95,7 +95,7 @@ def main() -> int:
         "freeze", "--project-root", project, "--source", source, cwd=project,
     )
     frozen = verify_benchmark(benchmark)[1]
-    assert frozen["schema"] == "autoforecast.frozen-benchmark.v2"
+    assert frozen["schema"] == "autoforecast.frozen-benchmark.v3"
     assert frozen["study_id"] == frozen["benchmark_id"]
     assert frozen["source_series_count"] == frozen["cohort_series_count"] == 2
     assert frozen["excluded_new_series"] == 0

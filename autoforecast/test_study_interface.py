@@ -39,8 +39,7 @@ def spark():
     session.stop()
 
 
-@pytest.fixture(scope="module", params=[("daily", "zero"), ("daily", "mask"),
-                                      ("hourly", "zero"), ("hourly", "mask")])
+@pytest.fixture(scope="module", params=[("daily", "mask"), ("hourly", "mask")])
 def frozen(request, tmp_path_factory, spark):
     # Population: A/B retained, one late series excluded, four cells per comparison.
     # The hourly client uses different source keys, column names and calendar dates.
@@ -129,7 +128,9 @@ def test_study_interface_stage_slices_ranges_keys_and_borrowed_runtime(frozen, s
         testing = study.testing_data.collect()
         zeros = [row for row in testing if row[panel.target_col] == 0]
         assert any(not row[benchmark.MISSING_COLUMN] for row in zeros)
-        assert any(row[benchmark.MISSING_COLUMN] for row in zeros)
+        assert all(not row[benchmark.MISSING_COLUMN] for row in zeros)
+        assert any(row[panel.target_col] is None and row[benchmark.MISSING_COLUMN]
+                   for row in testing)
         assert sum(row[benchmark.MISSING_COLUMN] for row in testing) == 2
         assert study.policies["actual_missing"] == recipe["actual_missing"]
         assert study.scoring_references is None
@@ -172,7 +173,7 @@ def test_study_interface_scores_match_direct_scorer_and_retain_run_identities(fr
             assert {k: v for k, v in result["score"].items() if k != "series_scores"} == expected
             assert result["score"]["coverage"] == {
                 "expected": 4, "originally_missing": 2,
-                "zero_filled": 2 if recipe["actual_missing"] == "zero" else 0,
+                "zero_filled": 0,
                 "excluded": 2 if recipe["actual_missing"] == "mask" else 0,
                 "scored": 2 if recipe["actual_missing"] == "mask" else 4,
             }
@@ -274,10 +275,16 @@ def test_study_interface_rejects_multiple_validation_origins(tmp_path, spark):
         load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark)
 
 
-@pytest.mark.parametrize("policy,scale", [("zero", None), ("mask", 4.0)])
-def test_study_interface_keeps_undefined_wrmsse_and_frozen_weights(tmp_path, spark, policy, scale):
+@pytest.mark.parametrize("scale", [None, 0.0])
+def test_study_interface_keeps_undefined_wrmsse_and_frozen_weights(tmp_path, spark, scale):
     from autoforecast.test_study import scoring_references
-    contract, sources, recipe = inputs(tmp_path, actual_missing=policy)
+    contract, sources, recipe = inputs(tmp_path, actual_missing="mask")
+    # Keep one observed B test actual so this exercises undefined scale, not empty coverage.
+    source = sources["final_score"]
+    table = pq.read_table(source)
+    rows = table.to_pylist()
+    rows.append({"id": "B", "date": dt.date(2024, 1, 9), "y": 9.0})
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), source)
     recipe["metric"] = "wrmsse"
     manifest = benchmark.freeze_benchmark(
         contract_path=contract, sources=sources, recipe=recipe, output_root=tmp_path / "registry",
@@ -287,12 +294,32 @@ def test_study_interface_keeps_undefined_wrmsse_and_frozen_weights(tmp_path, spa
         assert study.scoring_references.count() == 4
         result = study.run_validation(
             validation_forecasts=example_forecast(study, spark, tmp_path / "validation", "validation"),
-            testing_forecasts=example_forecast(study, spark, tmp_path / "testing", "test"), model_id="weights",
+            testing_forecasts=example_forecast(study, spark, tmp_path / "testing", "test"),
+            model_id="weights",
         )
         assert result["test"]["score"]["wrmsse"] is None
         assert result["test"]["status"] == "unavailable"
         per_series = pq.read_table(result["test"]["score"]["series_scores"]["path"]).to_pylist()
         assert sorted(row["normalized_weight"] for row in per_series) == pytest.approx([9/23, 14/23])
+
+
+def test_study_interface_refuses_an_empty_wrmsse_series(tmp_path, spark):
+    from autoforecast.score_spark import MissingActualError
+    from autoforecast.test_study import scoring_references
+
+    contract, sources, recipe = inputs(tmp_path, actual_missing="mask")
+    recipe["metric"] = "wrmsse"
+    manifest = benchmark.freeze_benchmark(
+        contract_path=contract, sources=sources, recipe=recipe, output_root=tmp_path / "registry",
+        spark=spark, scoring_references=scoring_references(tmp_path),
+    )
+    with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
+        with pytest.raises(MissingActualError, match="every retained series"):
+            study.run_validation(
+                validation_forecasts=example_forecast(study, spark, tmp_path / "validation", "validation"),
+                testing_forecasts=example_forecast(study, spark, tmp_path / "testing", "test"),
+                model_id="empty-series",
+            )
 
 
 def test_study_interface_requires_supplied_or_active_session(frozen, monkeypatch):
@@ -535,7 +562,7 @@ def test_study_interface_captures_both_forecasts_before_either_score(frozen, spa
         assert observed
         assert directory_digest(testing.path, suffixes=(".parquet",)) != expected
         assert result["test"]["forecast_artifact_sha256"] == expected
-        expected_rmse = (61 / 4 if recipe["actual_missing"] == "zero" else 53 / 2) ** 0.5
+        expected_rmse = (53 / 2) ** 0.5
         assert result["test"]["score"]["rmse"] == pytest.approx(expected_rmse)
 
 

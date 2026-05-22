@@ -43,6 +43,12 @@ def freeze_native_study(root, spark, *, horizon=7, price=False, metric="rmse"):
     } for index, series in enumerate(("a", "b")) for offset in range(112 + 2 * horizon)]
     source = root / "observations.parquet"
     pq.write_table(pa.Table.from_pylist(rows), source)
+    # Caller-owned complete history; missing evaluation labels remain null in their own source.
+    history = root / "history.parquet"
+    history_rows = [{**row, "sales": ((row["date"] - start).days
+                                     + (0 if row["series"] == "a" else 1)) % 5 + 1}
+                    for row in rows]
+    pq.write_table(pa.Table.from_pylist(history_rows), history)
     contract = root / "dataset.yaml"
     contract.write_text(yaml.safe_dump({
         "schema_version": 1, "dataset": {"id": "synthetic-native-study", "panel": {
@@ -64,8 +70,8 @@ def freeze_native_study(root, spark, *, horizon=7, price=False, metric="rmse"):
     }
     path = benchmark.freeze_benchmark(
         contract_path=contract,
-        sources=dict.fromkeys(("selection", "validation_score", "final_training", "final_score"),
-                              source),
+        sources={"selection": history, "final_training": history,
+                 "validation_score": source, "final_score": source},
         recipe=recipe, output_root=root / "studies", spark=spark,
     )
     _, record = benchmark.verify_benchmark(path)

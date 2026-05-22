@@ -128,7 +128,7 @@ def test_freeze_composite_series_and_idempotent_identity(frozen, spark):
     assert len({g["logical_sha256"] for g in record["grids"].values()}) == 3
 
 
-def test_freeze_fills_internal_and_trailing_gaps_with_original_missing_flags(tmp_path, spark):
+def test_freeze_preserves_internal_and_trailing_gaps_with_original_missing_flags(tmp_path, spark):
     project, recipe, sources = _inputs(tmp_path)
     recipe.update(
         training_start="2024-01-01",
@@ -145,10 +145,12 @@ def test_freeze_fills_internal_and_trailing_gaps_with_original_missing_flags(tmp
     path = _freeze(project, recipe, sources, spark)
     record = benchmark.verify_benchmark(path)[1]
     prepared = pq.read_table(benchmark.artifact_path(path, record, "selection")).to_pylist()
-    assert len(prepared) == 8 and all(row["units"] == 0 for row in prepared)
+    assert len(prepared) == 8
+    assert all(row["units"] is None if row[benchmark.MISSING_COLUMN] else row["units"] == 0
+               for row in prepared)
     assert {row["day"].day for row in prepared if row[benchmark.MISSING_COLUMN]} == {4, 5, 7, 8}
     assert record["counts"]["selection"] == {
-        "required_observations": 8, "written_rows": 8, "originally_missing": 4, "zero_filled": 4,
+        "required_observations": 8, "written_rows": 8, "originally_missing": 4, "zero_filled": 0,
     }
 
 
@@ -540,5 +542,5 @@ def test_last_time_column_preserves_missing_observation_flags_without_alias_coll
     missing = [row for row in rows if row[benchmark.MISSING_COLUMN]]
     assert len(missing) == 1
     assert missing[0]["sku"] == 1 and missing[0]["last"] == dt.date(2024, 1, 7)
-    assert missing[0]["units"] == 0
+    assert missing[0]["units"] is None
     assert record["counts"]["selection"]["originally_missing"] == 1

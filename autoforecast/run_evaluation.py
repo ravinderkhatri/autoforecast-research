@@ -20,7 +20,7 @@ from autoforecast.frequency import parse_frequency
 from autoforecast.panel import Forecast, Panel
 from autoforecast.ranking import SelectionError, _exact_grid_restrictions, common_cells
 from autoforecast.score import Score
-from autoforecast.score_spark import MissingActual, ScoreError, score_forecast
+from autoforecast.score_spark import MissingActual, MissingActualError, ScoreError, score_forecast
 from autoforecast.wrmsse import Wrmsse, WrmsseError
 from autoforecast.wrmsse import score as score_wrmsse
 from provenance.lineage import directory_digest
@@ -106,8 +106,9 @@ def _write_html(path: pathlib.Path, record: Mapping[str, object]) -> None:
             if isinstance(ranking, dict)
             else "No rank was published; every candidate must have a valid common-cell score."
         )
+    label = fixed["metric_policy"]["label"] if isinstance(fixed, dict) and flat else "WRMSSE"
     columns = (
-        ("<th>WRMSSE</th><th>Scored cells</th>" if flat
+        (f"<th>{html.escape(str(label))}</th><th>Scored cells</th>" if flat
          else "<th>WRMSSE</th><th>Series by level</th>")
         if is_wrmsse
         else "<th>RMSE</th><th>MAE</th><th>WAPE</th><th>Scored cells</th>"
@@ -159,7 +160,7 @@ def compare_run_forecasts(
         from autoforecast.study_scoring import verify_study_evaluation
         verify_study_evaluation(dict(fixed_contract))
         policy = cast(dict, fixed_contract["metric_policy"])
-        missing_actual = "sparse_zero" if policy["actual_missing"] == "zero" else "no_data"
+        missing_actual = "no_data"
         if policy["metric"] != metric:
             raise EvaluationError("metric differs from the frozen study")
     if fixed_contract is not None:
@@ -222,6 +223,8 @@ def compare_run_forecasts(
                     eligible_grid=grid_path,
                 )
         except (ScoreError, WrmsseError) as error:
+            if isinstance(error, MissingActualError):
+                raise
             candidates.append({"model_id": model_id, "status": "not_scored", "detail": str(error)})
         else:
             scored.append((model_id, score))
