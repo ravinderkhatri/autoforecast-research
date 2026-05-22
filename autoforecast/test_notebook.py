@@ -592,3 +592,42 @@ finally:
     context.stop()
 """, str(tmp_path / "project"), str(fail)], capture_output=True, text=True)
     assert process.returncode == 0, process.stdout + process.stderr
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_example_main_stops_its_owned_session(tmp_path, fail):
+    # A separate process starts with no caller runtime and checks the real owned-session boundary.
+    process = subprocess.run([sys.executable, "-c", """
+import sys
+from pyspark import SparkContext
+from pyspark.sql import SparkSession
+from scripts import notebook_study_example as example
+
+assert SparkContext._active_spark_context is None
+assert SparkSession.getActiveSession() is None
+assert SparkSession._instantiatedSession is None
+fail = sys.argv.pop() == 'True'
+seen = []
+def run(project, session):
+    assert session.sparkContext is SparkContext._active_spark_context
+    seen.append(session)
+    if fail:
+        raise RuntimeError('example failure')
+    return {}
+example.run_example = run
+try:
+    try:
+        result = example.main()
+    except RuntimeError as error:
+        assert fail and str(error) == 'example failure'
+    else:
+        assert not fail and result == 0
+    assert len(seen) == 1
+    assert seen[0].sparkContext._jsc is None
+    assert SparkContext._active_spark_context is None
+finally:
+    context = SparkContext._active_spark_context
+    if context is not None:
+        context.stop()
+""", str(tmp_path / "project"), str(fail)], capture_output=True, text=True)
+    assert process.returncode == 0, process.stdout + process.stderr
