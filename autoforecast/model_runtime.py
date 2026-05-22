@@ -8,6 +8,7 @@ are loaded exclusively in the isolated model worker.
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 from dataclasses import dataclass
 
@@ -79,10 +80,23 @@ def runtime(runtime_id: str) -> ModelRuntime:
         ) from None
 
 
+def _module_available(module: str) -> bool:
+    """Discover dotted packages without executing their parent initializers."""
+    parts = module.split(".")
+    spec = importlib.util.find_spec(parts[0])
+    for index in range(1, len(parts)):
+        if spec is None or spec.submodule_search_locations is None:
+            return False
+        spec = importlib.machinery.PathFinder.find_spec(
+            ".".join(parts[:index + 1]), spec.submodule_search_locations
+        )
+    return spec is not None
+
+
 def check_runtime(runtime_id: str) -> RuntimeCheck:
     """Check declared modules without importing model code or a native runtime."""
     definition = runtime(runtime_id)
     missing = tuple(
-        module for module in definition.required_modules if importlib.util.find_spec(module) is None
+        module for module in definition.required_modules if not _module_available(module)
     )
     return RuntimeCheck(definition, missing)
