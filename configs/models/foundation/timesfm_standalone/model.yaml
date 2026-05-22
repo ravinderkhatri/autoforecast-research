@@ -1,8 +1,0 @@
-schema_version: 1
-model:
-  id: timesfm_standalone
-  adapter: timesfm_standalone
-  family: foundation
-  runtime: timesfm
-  status: candidate
-  tags: [autoforecast, development, foundation]

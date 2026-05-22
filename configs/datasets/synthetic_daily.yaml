@@ -1,9 +1,0 @@
-schema_version: 1
-dataset:
-  id: synthetic_daily
-  panel:
-    series_col: series_id
-    time_col: date
-    target_col: target
-    frequency: D
-    season_length: 7
