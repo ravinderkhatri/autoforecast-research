@@ -422,7 +422,8 @@ def test_read_forecast_grid_checks_all_int96_provenance_before_filtering(
         )
 
 
-def test_read_forecast_grid_keeps_wide_year_int96_and_hive_dates(tmp_path):
+@pytest.mark.parametrize("filter_actuals", [False, True])
+def test_read_forecast_grid_keeps_wide_year_int96_and_hive_dates(tmp_path, filter_actuals):
     import datetime as dt
 
     import pyarrow as pa
@@ -435,7 +436,7 @@ def test_read_forecast_grid_keeps_wide_year_int96_and_hive_dates(tmp_path):
     }), legacy, use_deprecated_int96_timestamps=True)
     np.testing.assert_array_equal(read_forecast_grid(
         str(legacy), ("a",), "2500-01-01T00:00:00", 1, series_col="id",
-        time_col="date", value_col="value", frequency="H",
+        time_col="date", value_col="value", frequency="H", filter_actuals=filter_actuals,
     ), [[3.0]])
     partitioned = tmp_path / "partitioned"
     pq.write_to_dataset(pa.table({
@@ -443,8 +444,51 @@ def test_read_forecast_grid_keeps_wide_year_int96_and_hive_dates(tmp_path):
     }), root_path=str(partitioned), partition_cols=["date"])
     np.testing.assert_array_equal(read_forecast_grid(
         str(partitioned), ("a",), "2024-01-01", 1, series_col="id",
-        time_col="date", value_col="value",
+        time_col="date", value_col="value", filter_actuals=filter_actuals,
     ), [[4.0]])
+
+
+@pytest.mark.parametrize("frequency,origin", [
+    ("H", "2024-01-01T00:00:00"), ("D", "2024-01-01"), ("W", "2024-01-01"),
+    ("M", "2024-01-31"), ("MS", "2024-01-01"),
+    ("Y", "2023-12-31"), ("YS", "2024-01-01"),
+])
+def test_filtered_hive_grid_uses_temporal_bounds_and_preserves_raw_keys(
+    tmp_path, frequency, origin,
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from autoforecast.frequency import period_points
+
+    points = [origin, *(point.isoformat() for point in period_points(origin, frequency, 3))]
+    pq.write_to_dataset(pa.table({
+        "id": ["a"] * 4, "date": points, "value": [99.0, 1.0, 2.0, 99.0],
+    }), root_path=str(tmp_path), partition_cols=["date"])
+    np.testing.assert_array_equal(read_forecast_grid(
+        str(tmp_path), ("a",), origin, 2, series_col="id", time_col="date",
+        value_col="value", frequency=frequency, filter_actuals=True,
+    ), [[1.0, 2.0]])
+
+
+@pytest.mark.parametrize("frequency,origin,bad_key", [
+    ("H", "2024-01-01T00:00:00", "2024-01-01T01:00:00.000000001"),
+    ("H", "2024-01-01T00:00:00", "2024-01-01 01:00:00"),
+    ("M", "2024-01-31", "2024-02-15"),
+])
+def test_filtered_hive_grid_does_not_normalize_invalid_original_keys(
+    tmp_path, frequency, origin, bad_key,
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_to_dataset(pa.table({"id": ["a"], "date": [bad_key], "value": [1.0]}),
+                        root_path=str(tmp_path), partition_cols=["date"])
+    with pytest.raises(ValueError, match="malformed|misaligned|Failed to parse"):
+        read_forecast_grid(
+            str(tmp_path), ("a",), origin, 1, series_col="id", time_col="date",
+            value_col="value", frequency=frequency, filter_actuals=True,
+        )
 
 
 def test_hierarchy_arithmetic_does_not_require_optional_arrow():

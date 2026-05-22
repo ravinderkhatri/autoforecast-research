@@ -64,6 +64,11 @@ def read_forecast_grid(
     source = ds.dataset(path, format=parquet, partitioning="hive")
     date_field = ds.field(time_col)  # pyright: ignore[reportPrivateImportUsage]
     field_type = source.schema.field(time_col).type
+    if filter_actuals and (pa.types.is_string(field_type) or pa.types.is_large_string(field_type)):
+        # Hive partition keys are strings. Cast only the predicate; keep original keys in
+        # the result so strict canonical validation can still reject malformed labels.
+        field_type = pa.timestamp("us") if cadence.key_kind == "timestamp" else pa.date32()
+        date_field = date_field.cast(field_type)
     if pa.types.is_timestamp(field_type):
         start_bound = start if isinstance(start, dt.datetime) else dt.datetime.combine(
             start, dt.time()

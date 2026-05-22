@@ -23,6 +23,8 @@ class ParquetTimeStorage:
     """Footer evidence needed by runtimes that distinguish INT96 from native timestamps."""
 
     all_int96: bool
+    has_int96: bool
+    all_physical_timestamps: bool
 
 
 def validate_parquet_time_storage(
@@ -41,6 +43,7 @@ def validate_parquet_time_storage(
         raise ParquetTimeError(f"Parquet artifact {path} contains no visible fragments")
 
     int96: list[tuple[pathlib.Path, str]] = []
+    all_physical_timestamps = True
     for fragment in fragments:
         try:
             with pq.ParquetFile(fragment) as part:
@@ -48,6 +51,7 @@ def validate_parquet_time_storage(
                 if not physical and allow_hive_partition and _hive_partition_has(
                     root, fragment, time_col
                 ):
+                    all_physical_timestamps = False
                     continue
                 if len(physical) != 1:
                     raise ParquetTimeError(
@@ -64,6 +68,7 @@ def validate_parquet_time_storage(
                             f"time column {time_col!r} is absent from {fragment}"
                         )
                     field_type = part.schema_arrow.field(index).type
+                all_physical_timestamps &= pa.types.is_timestamp(field_type)
                 if pa.types.is_timestamp(field_type) and field_type.tz is not None:
                     raise ParquetTimeError(
                         f"time column {time_col!r} in {fragment} is timezone-bearing "
@@ -77,7 +82,11 @@ def validate_parquet_time_storage(
             ) from error
 
     _require_microsecond_int96(int96, time_col)
-    return ParquetTimeStorage(all_int96=len(int96) == len(fragments))
+    return ParquetTimeStorage(
+        all_int96=len(int96) == len(fragments),
+        has_int96=bool(int96),
+        all_physical_timestamps=all_physical_timestamps,
+    )
 
 
 def _hive_partition_has(root: pathlib.Path, fragment: pathlib.Path, column: str) -> bool:

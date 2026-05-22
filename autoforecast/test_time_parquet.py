@@ -154,6 +154,62 @@ def test_naive_int96_preserves_exact_wall_clock_keys(spark, tmp_path, zone, freq
         spark.conf.set("spark.sql.session.timeZone", previous)
 
 
+@pytest.mark.parametrize("zone", ["UTC", "Asia/Kolkata"])
+@pytest.mark.parametrize("frequency", ["D", "H"])
+@pytest.mark.parametrize("legacy_first", [True, False])
+@pytest.mark.parametrize("native_unit", ["ms", "us"])
+def test_mixed_naive_timestamp_fragments_keep_exact_keys(
+    spark, tmp_path, zone, frequency, legacy_first, native_unit,
+):
+    points = [dt.datetime(2024, 1, 1), dt.datetime(2024, 1, 2)] if frequency == "D" else [
+        dt.datetime(2024, 1, 1, 23), dt.datetime(2024, 1, 2),
+    ]
+    for index, point in enumerate(points):
+        legacy = (index == 0) == legacy_first
+        _write(tmp_path / f"{index}.parquet", [point], int96=legacy,
+               unit="us" if legacy else native_unit)
+    previous = spark.conf.get("spark.sql.session.timeZone")
+    try:
+        spark.conf.set("spark.sql.session.timeZone", zone)
+        frame = grid.read_time_parquet(spark, tmp_path, "when").orderBy("when")
+        assert frame.schema["when"].dataType.typeName() == "timestamp_ntz"
+        key, valid = grid.canonical_key("when", parse_frequency(frequency))
+        rows = frame.select(key.alias("key"), valid.alias("valid")).collect()
+        expected = points if frequency == "H" else [point.date() for point in points]
+        assert [row.key for row in rows] == expected
+        assert all(row.valid for row in rows)
+    finally:
+        spark.conf.set("spark.sql.session.timeZone", previous)
+
+
+@pytest.mark.parametrize("bad_first", [True, False])
+@pytest.mark.parametrize("fault", ["aware_native", "aware_legacy", "unproven", "lossy"])
+def test_mixed_timestamp_fragments_still_require_lossless_naive_storage(
+    spark, tmp_path, bad_first, fault,
+):
+    _write(tmp_path / ("1.parquet" if bad_first else "0.parquet"),
+           [dt.datetime(2024, 1, 1)], int96=fault == "aware_native")
+    _write(
+        tmp_path / ("0.parquet" if bad_first else "1.parquet"),
+        [1_704_067_200_000_000_001] if fault == "lossy" else [dt.datetime(2024, 1, 2)],
+        unit="ns" if fault == "lossy" else "us",
+        timezone="Asia/Kathmandu" if fault.startswith("aware") else None,
+        store_schema=fault != "unproven", int96=fault != "aware_native",
+    )
+    with pytest.raises(grid.GridError, match="timezone-bearing|ARROW:schema|sub-microsecond"):
+        grid.read_time_parquet(spark, tmp_path, "when")
+
+
+@pytest.mark.parametrize("legacy_first", [True, False])
+def test_mixed_int96_and_date_fields_require_a_uniform_schema(spark, tmp_path, legacy_first):
+    _write(tmp_path / ("0.parquet" if legacy_first else "1.parquet"),
+           [dt.datetime(2024, 1, 1)])
+    pq.write_table(pa.table({"when": [dt.date(2024, 1, 2)]}),
+                   tmp_path / ("1.parquet" if legacy_first else "0.parquet"))
+    with pytest.raises(grid.GridError, match="uniform time schema"):
+        grid.read_time_parquet(spark, tmp_path, "when")
+
+
 @pytest.mark.parametrize("timezone", ["UTC", "America/New_York"])
 @pytest.mark.parametrize("int96", [True, False])
 def test_timezone_bearing_parquet_is_never_reinterpreted_as_naive(
@@ -310,8 +366,9 @@ def test_int96_read_does_not_relax_cadence_alignment(spark, tmp_path, frequency,
 
 
 @pytest.mark.parametrize("frequency", ["D", "H"])
+@pytest.mark.parametrize("mixed", [False, True])
 def test_int96_panel_and_forecast_work_through_inspection_baseline_and_scoring(
-    spark, tmp_path, frequency,
+    spark, tmp_path, frequency, mixed,
 ):
     # Full synthetic population: one series, six observed periods, no exclusions. The last
     # two periods are held out. Their actuals differ from the repeated last season by 2 each.
@@ -320,10 +377,14 @@ def test_int96_panel_and_forecast_work_through_inspection_baseline_and_scoring(
     points = [start + step * index for index in range(6)]
     source = tmp_path / "panel"
     source.mkdir()
-    pq.write_table(pa.table({
+    table = pa.table({
         "product": ["a"] * 6, "when": pa.array(points, type=pa.timestamp("us")),
         "value": [1., 2., 3., 4., 5., 6.],
-    }), source / "data.parquet", use_deprecated_int96_timestamps=True)
+    })
+    pq.write_table(table.slice(0, 3) if mixed else table,
+                   source / "a.parquet", use_deprecated_int96_timestamps=True)
+    if mixed:
+        pq.write_table(table.slice(3), source / "b.parquet")
     panel = Panel(str(source), "product", "when", "value", frequency=frequency,
                   season_length=2).validate()
     origin = points[3].isoformat() if frequency == "H" else points[3].date().isoformat()
@@ -338,10 +399,14 @@ def test_int96_panel_and_forecast_work_through_inspection_baseline_and_scoring(
     # An externally supplied forecast/grid can use the same legacy representation.
     legacy = tmp_path / "legacy"
     legacy.mkdir()
-    pq.write_table(pa.table({
+    table = pa.table({
         "series_id": ["a", "a"], "date": pa.array(points[4:], type=pa.timestamp("us")),
         "yhat": [3., 4.],
-    }), legacy / "data.parquet", use_deprecated_int96_timestamps=True)
+    })
+    pq.write_table(table.slice(0, 1) if mixed else table,
+                   legacy / "a.parquet", use_deprecated_int96_timestamps=True)
+    if mixed:
+        pq.write_table(table.slice(1), legacy / "b.parquet")
     external = Forecast("external", str(legacy), origin, 2, 1, {"emitted": 2},
                         frequency=frequency).validate()
     result = score_forecast(panel, external, spark, missing_actual="no_data",

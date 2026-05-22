@@ -74,8 +74,12 @@ def read_time_parquet(
         storage = validate_parquet_time_storage(path, time_col, allow_hive_partition=True)
     except ParquetTimeError as error:
         raise GridError(str(error)) from error
+    if storage.has_int96 and not storage.all_physical_timestamps:
+        raise GridError(
+            "mixed INT96 and non-timestamp time fields require a uniform time schema"
+        )
     frame = spark.read.parquet(str(path))
-    if not storage.all_int96:
+    if not storage.has_int96:
         if (
             time_col in frame.columns
             and frame.schema[time_col].dataType.typeName() == "timestamp"
