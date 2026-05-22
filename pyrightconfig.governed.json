@@ -3,6 +3,8 @@
   "include": [
     "autoforecast/adapter_contracts.py",
     "autoforecast/benchmark.py",
+    "autoforecast/study.py",
+    "scripts/study_example.py",
     "autoforecast/cli.py",
     "autoforecast/project.py",
     "autoforecast/results.py",
