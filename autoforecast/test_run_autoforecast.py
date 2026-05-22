@@ -34,7 +34,7 @@ def test_direct_runner_refuses_an_existing_host_training_lease(
         )
 
 
-def test_cli_defers_precision_default_to_versioned_request_policy(
+def test_cli_defers_precision_default_to_request_policy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
@@ -74,25 +74,54 @@ def test_tft_direct_runner_rejects_explicit_non_governing_patience(
 
 
 @pytest.mark.parametrize(
-    ("schema", "has_parent", "explicit", "expected"),
+    ("declared", "has_parent", "explicit", "expected"),
     [
-        (1, False, None, "32-true"),
-        (2, False, None, "32-true"),
-        (3, False, None, "16-mixed"),
-        (3, True, None, "32-true"),
-        (2, False, "16-mixed", "16-mixed"),
-        (3, False, "32-true", "32-true"),
+        ("32-true", False, None, "32-true"),
+        ("16-mixed", False, None, "16-mixed"),
+        ("16-mixed", True, None, "32-true"),
+        ("32-true", False, "16-mixed", "16-mixed"),
+        ("16-mixed", False, "32-true", "32-true"),
     ],
 )
-def test_versioned_precision_policy_preserves_legacy_and_continuation_runs(
-    schema: int, has_parent: bool, explicit: str | None, expected: str
+def test_declared_precision_and_continuation_policy(
+    declared: str, has_parent: bool, explicit: str | None, expected: str
 ) -> None:
-    assert runner._resolved_precision(schema, explicit, has_parent=has_parent) == expected
+    assert runner._resolved_precision(declared, explicit, has_parent=has_parent) == expected
 
 
 def test_mixed_precision_refuses_checkpoint_continuation_even_when_explicit() -> None:
     with pytest.raises(TrainWorkflowError, match="unsupported for checkpoint continuations"):
-        runner._resolved_precision(3, "16-mixed", has_parent=True)
+        runner._resolved_precision("16-mixed", "16-mixed", has_parent=True)
+
+
+@pytest.mark.parametrize("declared", ["32-true", "16-mixed"])
+def test_runner_uses_precision_from_the_request_file(
+    declared: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = tmp_path / "request.yaml"
+    request.write_text(
+        "schema_version: 3\nrun:\n  name: precision-handoff\n"
+        "  dataset_contract: configs/datasets/synthetic_daily.yaml\n"
+        "  model_catalog: configs/models\n  models: [seasonal_naive]\n"
+        "  origin: '2024-01-31'\n  horizon: 7\n  tracking:\n    mlflow: {enabled: false}\n"
+        f"  precision: {declared}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner, "_runtime_data_path", lambda path: path)
+    monkeypatch.setattr(runner, "_inside_repository", lambda path, _label: path)
+
+    def inspect_precision(value: str, explicit: str | None, *, has_parent: bool) -> str:
+        assert value == declared
+        assert explicit is None and not has_parent
+        raise RuntimeError("precision reached the runtime policy")
+
+    monkeypatch.setattr(runner, "_resolved_precision", inspect_precision)
+    with pytest.raises(RuntimeError, match="precision reached the runtime policy"):
+        runner.run_request(
+            request, data_path=tmp_path / "data", data_snapshot_id="test",
+            data_reference="local://test", output_root=tmp_path / "runs",
+            epochs=2, timeout_seconds=10,
+        )
 
 
 def _request() -> RunRequest:
@@ -330,8 +359,9 @@ def test_governed_runner_refuses_identical_training_and_score_content_at_separat
 ) -> None:
     request_path = tmp_path / "request.yaml"
     request_path.write_text(
-        """schema_version: 2
+        """schema_version: 3
 run:
+  precision: 32-true
   name: separate-score
   dataset_contract: configs/datasets/synthetic_daily.yaml
   model_catalog: configs/models

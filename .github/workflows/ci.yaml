@@ -128,11 +128,3 @@ jobs:
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
         run: env -u PYTHONPATH "$RUNNER_TEMP/timeseries-env/bin/python" -m scripts.verify_study_release "$RUNNER_TEMP/study-project"
-      - name: Legacy strict benchmark acceptance
-        if: matrix.frequency == 'D' && matrix.input == 'parquet' && matrix.python == '3.12'
-        working-directory: ${{ runner.temp }}
-        env:
-          FORECAST_SPARK_CORES: '2'
-          FORECAST_SPARK_MEMORY: '1g'
-          SPARK_LOCAL_IP: '127.0.0.1'
-        run: env -u PYTHONPATH "$RUNNER_TEMP/timeseries-env/bin/python" -m scripts.verify_timeseries_release "$RUNNER_TEMP/legacy-project" --legacy

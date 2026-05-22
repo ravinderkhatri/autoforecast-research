@@ -18,7 +18,7 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from autoforecast import headroom, ranking, registry
+from autoforecast import grid, headroom, registry
 from autoforecast.adapters import register_defaults
 from autoforecast.panel import Panel
 from autoforecast.score import Score
@@ -276,7 +276,7 @@ def test_estimate_applies_zero_policy_to_oracle_omissions_on_the_full_grid() -> 
     spark().createDataFrame(
         [(sid, day) for sid, day, _qty, _state in rows],
         "series_id string, date date").write.parquet(str(grid_path))
-    grid_hash = ranking.eligible_grid_content_hash(grid_path, spark())
+    grid_hash = grid.content_hash(grid_path, spark())
 
     result = headroom.estimate(
         source, "candidate", fake(10.0, n=len(rows)), (origin,), horizon, spark(), root / "runs",

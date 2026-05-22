@@ -43,7 +43,7 @@ def test_training_controls_precision_schema_preserves_mft_and_rejects_tampering(
         "early_stopping_absolute_min_delta": 1e-6,
         "early_stopping_relative_min_delta": 0.0,
     }
-    assert _training_controls_are_valid(legacy)
+    assert not _training_controls_are_valid(legacy)
     mixed = {
         **legacy,
         "schema": "autoforecast.training-controls.v2",
@@ -244,7 +244,7 @@ study:
     run_request_path = project / "configs/autoforecast/hpo.yaml"
     run_request_path.parent.mkdir(parents=True)
     run_request_path.write_text(
-        "schema_version: 2\nrun:\n  name: hpo-example\n  models: [example_tft]\n",
+        "schema_version: 3\nrun:\n  precision: 32-true\n  name: hpo-example\n  models: [example_tft]\n",
         encoding="utf-8",
     )
     candidate = discover_candidates(project / "configs/models")[0]
@@ -340,7 +340,9 @@ study:
         },
     )
     training_controls: dict[str, object] = {
-            "schema": "autoforecast.training-controls.v1",
+            "schema": "autoforecast.training-controls.v2",
+            "requested_precision": "32-true",
+            "effective_precision": "32-true",
             "maximum_epochs": True if malformed_evidence == "boolean_control" else 2,
             "patience": 5,
             "device": "cpu",

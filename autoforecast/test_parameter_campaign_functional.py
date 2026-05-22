@@ -131,8 +131,9 @@ study:
         "early_stopping_relative_min_delta": 0.0,
     }
     request = {
-        "schema_version": 4,
+        "schema_version": 6,
         "forecast_campaign": {
+            "purpose": "forecast_campaign",
             "name": "parameter-source-functional",
             "dataset": {
                 "contract": "configs/datasets/synthetic_daily.yaml",
@@ -203,6 +204,7 @@ study:
                 "final_fit": dict(budget),
             },
             "compute": {
+                "precision": "32-true",
                 "device": "cpu",
                 "batch_size": 32,
                 "gradient_microbatch_size": 16,

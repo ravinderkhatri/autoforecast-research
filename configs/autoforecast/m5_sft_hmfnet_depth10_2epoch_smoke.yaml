@@ -1,6 +1,7 @@
 # Full-data, two-epoch resource smoke for the depth-10 M5 SFT/HMFNet experiment.
-schema_version: 4
+schema_version: 6
 forecast_campaign:
+  purpose: forecast_campaign
   name: m5-sft-hmfnet-depth10-2epoch-smoke
   dataset:
     contract: configs/datasets/m5_daily.yaml
@@ -84,6 +85,7 @@ forecast_campaign:
       early_stopping_absolute_min_delta: 0.000001
       early_stopping_relative_min_delta: 0.0
   compute:
+    precision: 32-true
     device: cpu
     batch_size: 512
     gradient_microbatch_size: 512

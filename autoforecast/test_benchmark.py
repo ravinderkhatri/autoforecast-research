@@ -20,7 +20,7 @@ from autoforecast import benchmark
 from autoforecast.cli import create_example
 
 
-def _legacy_hash(path):
+def _reference_hash(path):
     dataset = ds.dataset(path, format="parquet", exclude_invalid_files=True)
     columns = sorted(dataset.schema.names)
     schema = [(name, str(dataset.schema.field(name).type)) for name in columns]
@@ -36,7 +36,7 @@ def _legacy_hash(path):
 
 
 @pytest.mark.parametrize("size", [0, 1, 3, 4, 29])
-def test_external_sort_preserves_v1_hash_and_bounds_each_sort_and_merge(tmp_path, monkeypatch, size):
+def test_external_sort_matches_reference_and_bounds_each_sort_and_merge(tmp_path, monkeypatch, size):
     path = tmp_path / "data.parquet"
     table = pa.table({
         "key": pa.array([f"key-{index % 5}" for index in range(size)], type=pa.string()),
@@ -71,7 +71,7 @@ def test_external_sort_preserves_v1_hash_and_bounds_each_sort_and_merge(tmp_path
             assert kwargs["fragment_readahead"] == 1 and kwargs["use_threads"] is False
             return self.value.scanner(**kwargs)
 
-    expected = _legacy_hash(path)
+    expected = _reference_hash(path)
     monkeypatch.setattr(benchmark, "_write_hash_run", checked_write)
     monkeypatch.setattr(benchmark, "_merge_hash_runs", checked_merge)
     monkeypatch.setattr(ds, "dataset", lambda *args, **kwargs: CheckedDataset(dataset(*args, **kwargs)))
@@ -117,32 +117,38 @@ def test_external_sort_cleans_scratch_after_merge_failure(tmp_path, monkeypatch)
 def _frozen_example(tmp_path):
     """Two synthetic series, 42 dates each; no exclusions; 14 cells per evaluation boundary."""
     project = tmp_path / "project"
-    create_example(project, recipe_version=1)
+    create_example(project)
     root = project / "frozen"
     root.mkdir()
-    recipe = json.loads((project / "recipe.json").read_text())
+    recipe = benchmark._normalise_recipe(json.loads((project / "recipe.json").read_text()))
     contract = yaml.safe_load((project / "dataset.yaml").read_text())
+    contract["schema_version"] = 2
+    contract["dataset"]["required_series_count"] = 2
     contract["dataset"]["panel"]["series_col"] = "__af_series_id"
     (root / "dataset.yaml").write_text(yaml.safe_dump(contract))
     rows = pq.read_table(project / "data").to_pylist()
     for row in rows:
+        row[benchmark.MISSING_COLUMN] = False
         row["__af_series_id"] = json.dumps(
             {key: row[key] for key in recipe["source_keys"]}, separators=(",", ":"),
         )
     keys = {row["__af_series_id"]: {key: row[key] for key in ["__af_series_id", "shop", "sku"]}
             for row in rows}
+    for key in keys.values():
+        key[benchmark.START_COLUMN] = dt.date.fromisoformat(recipe["training_start"])
     cutoff = dt.date.fromisoformat(recipe["final_train_cutoff"])
     validation_end = dt.date.fromisoformat(recipe["validation_origins"][-1])
     tables = {
         "selection": [row for row in rows if row["day"] <= validation_end],
         "final_training": [row for row in rows if row["day"] <= cutoff],
+        "validation_score": [row for row in rows if row["day"] <= cutoff],
         "final_score": [row for row in rows if row["day"] > cutoff],
         "source-keys": list(keys.values()),
     }
     for name, values in tables.items():
         (root / name).mkdir()
         pq.write_table(pa.Table.from_pylist(values), root / name / "part.parquet")
-    grids, identities = {}, {}
+    grids, identities, coverage, coverage_identities = {}, {}, {}, {}
     for stage, origin in [("validation", day) for day in recipe["validation_origins"]] + [
         ("test", recipe["final_train_cutoff"]),
     ]:
@@ -156,22 +162,41 @@ def _frozen_example(tmp_path):
         grids[key] = {"path": f"grids/{key}", "sha256": benchmark.directory_digest(destination),
                       "logical_sha256": logical, "n_cells": 14}
         identities[key] = {"content_sha256": logical, "logical_sha256": logical, "n_cells": 14}
+        coverage_path = root / "coverage" / key
+        coverage_path.mkdir(parents=True)
+        counts = {"expected": 7, "originally_missing": 0, "zero_filled": 0,
+                  "excluded": 0, "scored": 7}
+        pq.write_table(pa.Table.from_pylist([
+            {"series_id": series, **counts} for series in keys
+        ]), coverage_path / "part.parquet")
+        coverage[key] = {"path": f"coverage/{key}",
+                         "sha256": benchmark.directory_digest(coverage_path)}
+        coverage_identities[key] = {
+            "content_sha256": benchmark._parquet_hash(coverage_path),
+            "counts": {name: 2 * count for name, count in counts.items()},
+        }
     record = {
-        "schema": benchmark.SCHEMA, "recipe": recipe, "key_types": {"shop": "string", "sku": "bigint"},
+        "schema": benchmark.STUDY_SCHEMA, "recipe": recipe, "key_types": {"shop": "string", "sku": "bigint"},
         "contract_sha256": hashlib.sha256((project / "dataset.yaml").read_bytes()).hexdigest(),
         "logical_snapshots": {name: benchmark._parquet_hash(root / name) for name in tables},
         "source_series_count": 2, "excluded_new_series": 0, "cohort_series_count": 2,
         "dataset_sha256": hashlib.sha256((root / "dataset.yaml").read_bytes()).hexdigest(),
         "grid_identities": identities, "grids": grids,
-        "counts": {name: {"required_observations": len(tables[name]), "written_rows": len(tables[name])}
-                   for name in ("selection", "final_training", "final_score")},
-        "policies": {"absent_rows": "error", "null_targets": "error", "confirmed_zero": "observed",
-                     "late_feeds": "error", "retirement": "error"},
+        "counts": {name: {"required_observations": len(tables[name]),
+                          "written_rows": len(tables[name]), "originally_missing": 0, "zero_filled": 0}
+                   for name in ("selection", "final_training", "validation_score", "final_score")},
+        "policies": {"history_missing": "zero", "actual_missing": "zero",
+                     "missing_definition": "absent_row_or_null_target", "confirmed_zero": "observed",
+                     "missing_indicator": benchmark.MISSING_COLUMN},
+        "metric_definition": benchmark._metric_definition(recipe),
+        "role_paths": {name: name for name in tables},
+        "coverage": coverage, "coverage_identities": coverage_identities,
         "sources": {name: {"path": str(project / "data"), "sha256": "0" * 64}
-                    for name in ("selection", "final_training", "final_score")},
+                    for name in ("selection", "final_training", "validation_score", "final_score")},
         "artifacts": {name: benchmark.directory_digest(root / name) for name in tables},
     }
     record["benchmark_id"] = benchmark.digest(benchmark._identity(record))
+    record["study_id"] = record["benchmark_id"]
     path = root / "benchmark.json"
     path.write_text(json.dumps(record))
     return path, record, project
@@ -220,7 +245,7 @@ def test_manifest_structure_is_validated_before_identity_or_artifact_reads(tmp_p
     assert benchmark.verify_benchmark(path)[1] == record
     monkeypatch.setattr(benchmark, "_identity", lambda *_: pytest.fail("identity saw malformed record"))
     monkeypatch.setattr(benchmark, "directory_digest", lambda *_a, **_k: pytest.fail("read artifacts"))
-    malformed = list(_malformed_records(record)) + [[], None, {"schema": benchmark.SCHEMA}]
+    malformed = list(_malformed_records(record)) + [[], None, {"schema": benchmark.STUDY_SCHEMA}]
     assert len(malformed) > 40
     for value in malformed:
         path.write_text(json.dumps(value))
@@ -230,9 +255,9 @@ def test_manifest_structure_is_validated_before_identity_or_artifact_reads(tmp_p
 
 def test_run_rejects_malformed_benchmark_without_traceback(tmp_path):
     path = tmp_path / "benchmark.json"
-    path.write_text(json.dumps({"schema": benchmark.SCHEMA}))
+    path.write_text(json.dumps({"schema": benchmark.STUDY_SCHEMA}))
     project = tmp_path / "project"
-    create_example(project, recipe_version=1)
+    create_example(project)
     result = subprocess.run(
         [sys.executable, "-m", "autoforecast.cli", "run", "--project-root", str(project),
          "--request", str(project / "campaign.yaml"), "--benchmark", str(path),
@@ -312,6 +337,7 @@ def test_publication_refuses_a_different_or_corrupted_winner(tmp_path, monkeypat
     if defect == "different_identity":
         record["recipe"]["target_unit"] = "other units"
         record["benchmark_id"] = benchmark.digest(benchmark._identity(record))
+        record["study_id"] = record["benchmark_id"]
         (destination / "benchmark.json").write_text(json.dumps(record))
         expected_error, match = benchmark.BenchmarkError, "different benchmark identity"
     elif defect == "changed_artifact":
@@ -332,7 +358,7 @@ def test_publication_refuses_a_different_or_corrupted_winner(tmp_path, monkeypat
 @pytest.mark.parametrize("role", ["source_key", "feature", "known_at"])
 def test_recipe_rejects_names_with_expression_meaning_before_runtime(tmp_path, name, role):
     project = tmp_path / "project"
-    create_example(project, recipe_version=1)
+    create_example(project)
     recipe = json.loads((project / "recipe.json").read_text())
     if role == "source_key":
         recipe["source_keys"] = [name]
@@ -355,7 +381,8 @@ def test_recipe_rejects_names_with_expression_meaning_before_runtime(tmp_path, n
 )
 def test_recipe_windows_count_cadence_periods(frequency, start, origin, cutoff):
     recipe = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "metric": "rmse",
         "source_keys": ["series"],
         "training_start": start,
         "validation_origins": [origin],
@@ -383,7 +410,8 @@ def test_recipe_windows_count_cadence_periods(frequency, start, origin, cutoff):
 )
 def test_recipe_refuses_off_grid_hour_week_month_or_year(frequency, start, origin, cutoff):
     recipe = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "metric": "rmse",
         "source_keys": ["series"],
         "training_start": start,
         "validation_origins": [origin],
@@ -402,7 +430,8 @@ def test_recipe_refuses_off_grid_hour_week_month_or_year(frequency, start, origi
 
 def test_large_hourly_recipe_validation_does_not_enumerate_history(monkeypatch):
     recipe = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "metric": "rmse",
         "source_keys": ["series"],
         "training_start": "0001-01-01T00:00:00",
         "validation_origins": ["9998-01-01T00:00:00"],

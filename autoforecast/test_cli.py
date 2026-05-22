@@ -181,16 +181,14 @@ def test_run_rejects_invalid_study_id_before_runtime(tmp_path, identity):
                        "lowercase SHA-256")
 
 
-def test_run_study_id_rejects_legacy_benchmark_before_compilation(tmp_path):
-    import shutil
-
-    from autoforecast.test_benchmark import _frozen_example
-
-    legacy, record, _ = _frozen_example(tmp_path / "legacy")
+def test_run_study_id_rejects_obsolete_schema_before_compilation(tmp_path):
     project = tmp_path / "project"
     create_example(project)
-    registry = project / ".autoforecast/benchmarks" / record["benchmark_id"]
-    registry.parent.mkdir(parents=True)
-    shutil.copytree(legacy.parent, registry)
-    assert_input_error(cli("run", "--project-root", project, "--study-id", record["benchmark_id"]),
-                       "version-2 study")
+    identity = "a" * 64
+    registry = project / ".autoforecast/benchmarks" / identity
+    registry.mkdir(parents=True)
+    (registry / "benchmark.json").write_text(json.dumps({
+        "schema": "autoforecast.frozen-benchmark.v1",
+    }))
+    assert_input_error(cli("run", "--project-root", project, "--study-id", identity),
+                       "unsupported benchmark schema")

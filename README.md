@@ -189,7 +189,7 @@ training, validation, and test windows.
   expected, originally missing, zero-filled, excluded, and scored counts for every series.
 - Every model must meet its minimum history and window requirements for the whole frozen
   cohort before fitting. A model cannot silently drop short series.
-- Existing version-1 recipes and manifests retain their strict gap and null-target errors.
+- Only the current version-2 preparation recipe and study manifest are supported.
 - New series default to an error. The explicit `exclude_after_first_origin` recipe policy
   excludes series absent from the initial cohort and records the count.
 - `history_policy: fixed` requires overlapping history to agree across snapshots.
@@ -244,10 +244,10 @@ caller responsibilities.
 
 The manifest's `study_id` binds the cohort, declared starts, prepared values, original missing
 flags, windows, policies, and metric definition. It is separate from model-run, HPO-study, and
-MLflow identifiers. Version-2 studies currently use profile defaults or manual fixed model
-parameters. Inner HPO and reused HPO selections remain on the existing strict workflow;
-their extra validation windows are not part of this frozen contract. Existing HPO records
-are not changed. Reuse a verified study by ID:
+MLflow identifiers. Studies use profile defaults or manual fixed model parameters.
+Standalone campaigns support inner HPO and reused HPO selections. Their extra validation
+windows are not part of a shared study, so shared studies reject these parameter modes
+before training. Reuse a verified study by ID:
 
 ```bash
 autoforecast run --project-root my-experiment --study-id STUDY_ID
@@ -281,10 +281,16 @@ observed cells. If any retained series has no scoreable actuals or an undefined 
 is unavailable. Weights are never redistributed.
 
 The `sft`, `hmfnet`, `pact`, `tft_q`, and `tft_hnb`
-adapters require their existing strict benchmark workflow. Their native checkpoint selection
-does not implement the shared study's actuals and scoring contract, so version-2 studies
-reject them before training. The other adapters use the shared scorer for study validation
-and testing, subject to their existing cadence, target and history requirements.
+adapters currently run through standalone campaigns in a source checkout. Their native
+checkpoint selection does not implement shared-study scoring, so shared studies reject them
+before training. Other adapters use the shared scorer for validation and testing, subject to
+their declared cadence, target and history requirements.
+
+Campaign requests use `schema_version: 6`; standalone run requests use `schema_version: 3`.
+The checked-in examples declare `precision: 32-true` to preserve their FP32 settings. New
+requests without an explicit precision use `16-mixed`; checkpoint continuation remains FP32.
+Use a current example as a starting point. Older request and resolved-artifact formats are
+rejected rather than translated.
 
 ## Inspect results
 
@@ -372,9 +378,7 @@ These checks cover preparation, isolated workers, validation selection, refit, f
 export, plotting, resume, and tamper rejection. They assert exact forecast keys and reconcile
 84 source observations, two retained series, no exclusions, and 14 cells per evaluation.
 CI repeats CSV and Parquet workflows for every listed cadence on Python 3.12, with additional
-daily checks on Python 3.13. `scripts.verify_daily_release` remains a compatibility entry point.
-Source tests live
-beside their modules; optional-model tests require their corresponding extras. Dataset-backed
+daily checks on Python 3.13. Source tests live beside their modules; optional-model tests require their corresponding extras. Dataset-backed
 tests report skips when the external dataset is absent.
 
 With the test extras and `pytest` installed, run `python scripts/run_tests.py`. Each module runs

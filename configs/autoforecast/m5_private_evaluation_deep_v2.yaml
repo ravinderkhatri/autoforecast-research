@@ -1,7 +1,8 @@
 # M5 archived-final replay v2: the worker sees targets only through d_1941.
 # Supply its observed score panel through the three --evaluation-data-* CLI arguments.
-schema_version: 2
+schema_version: 3
 run:
+  precision: 32-true
   name: m5-private-evaluation-deep-sft
   dataset_contract: configs/datasets/m5_daily.yaml
   model_catalog: configs/models

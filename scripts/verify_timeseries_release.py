@@ -36,7 +36,6 @@ def main() -> int:
     parser.add_argument("project", type=pathlib.Path)
     parser.add_argument("--csv", action="store_true", help="exercise the CSV input route")
     parser.add_argument("--frequency", default="D", help="H, D, W, M/ME, MS, Y/YE, or YS")
-    parser.add_argument("--legacy", action="store_true", help="verify the strict version-1 recipe")
     args = parser.parse_args()
     frequency = parse_frequency(args.frequency)
     project = args.project.resolve()
@@ -45,13 +44,9 @@ def main() -> int:
         "no exclusions, and 14 forecast cells per seven-period evaluation. "
         f"Frequency: {frequency.code}.", flush=True,
     )
-    if args.legacy:
-        from autoforecast.cli import create_example
-        create_example(project, frequency=frequency.code, recipe_version=1)
-    else:
-        assert run_cli(
-            "init-example", project, "--frequency", frequency.code, cwd=project.parent
-        ) == project
+    assert run_cli(
+        "init-example", project, "--frequency", frequency.code, cwd=project.parent
+    ) == project
     source = project / "data"
     if args.csv:
         import pyarrow.csv as csv
@@ -100,8 +95,8 @@ def main() -> int:
         "freeze", "--project-root", project, "--source", source, cwd=project,
     )
     frozen = verify_benchmark(benchmark)[1]
-    if args.legacy:
-        assert frozen["schema"] == "autoforecast.frozen-benchmark.v1" and "study_id" not in frozen
+    assert frozen["schema"] == "autoforecast.frozen-benchmark.v2"
+    assert frozen["study_id"] == frozen["benchmark_id"]
     assert frozen["source_series_count"] == frozen["cohort_series_count"] == 2
     assert frozen["excluded_new_series"] == 0
     estimand = "observed_nonnegative" if args.csv else "sales_given_availability"

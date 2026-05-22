@@ -11,15 +11,13 @@ from autoforecast.frequency import advance, parse_frequency
 
 
 def create_example(
-    project: pathlib.Path, *, frequency: str = "D", recipe_version: int = 2,
+    project: pathlib.Path, *, frequency: str = "D",
 ) -> None:
     """Write a deterministic, non-client example without any repository resources."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     import yaml
 
-    if recipe_version not in (1, 2):
-        raise ValueError("example recipe_version must be 1 or 2")
     cadence = parse_frequency(frequency)
     starts = {
         "H": dt.datetime(2024, 1, 1),
@@ -72,7 +70,8 @@ def create_example(
         },
     )
     recipe = {
-        "schema_version": recipe_version,
+        "schema_version": 2,
+        "metric": "rmse",
         "source_keys": ["shop", "sku"],
         "training_start": points[0].isoformat(),
         "validation_origins": [points[20].isoformat(), points[27].isoformat()],
@@ -84,8 +83,6 @@ def create_example(
         "target_unit": "units",
         "feature_availability": {},
     }
-    if recipe_version == 2:
-        recipe["metric"] = "rmse"
     if cadence.code != "D":
         recipe["frequency"] = cadence.code
     (project / "recipe.json").write_text(json.dumps(recipe, indent=2) + "\n")
@@ -115,7 +112,7 @@ def create_example(
     write(
         "campaign.yaml",
         {
-            "schema_version": 5,
+            "schema_version": 6,
             "forecast_campaign": {
                 "name": example_id,
                 "purpose": "forecast_campaign",
@@ -148,7 +145,7 @@ def create_example(
                 "initialization_arms": ["fresh"],
                 "selection": {
                     "metric": "rmse",
-                    "missing_actual": "sparse_zero" if recipe_version == 2 else "no_data",
+                    "missing_actual": "sparse_zero",
                     "direction": "minimize",
                     "tie_break": [
                         "mean_score",
@@ -163,6 +160,7 @@ def create_example(
                     role: dict(budget) for role in ("initialization", "validation", "final_fit")
                 },
                 "compute": {
+                    "precision": "32-true",
                     "device": "cpu",
                     "batch_size": 2,
                     "gradient_microbatch_size": None,
@@ -361,9 +359,7 @@ def main() -> int:
                 recipe = load_exact_json(project / args.recipe)
                 if type(recipe) is not dict:
                     raise ValueError("preparation recipe must be an object")
-                roles = ["selection", "final_training", "final_score"]
-                if recipe.get("schema_version") == 2:
-                    roles.append("validation_score")
+                roles = ["selection", "final_training", "validation_score", "final_score"]
                 sources = {
                     role: getattr(args, role) or args.source
                     for role in roles

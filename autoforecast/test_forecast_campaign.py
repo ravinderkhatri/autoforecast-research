@@ -23,7 +23,6 @@ import yaml
 import autoforecast.forecast_campaign as subject
 from autoforecast.model_catalog import discover_candidates
 from autoforecast.model_names import REVISION_MODELS
-from autoforecast.tuning import loads_tuning_spec
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 M5_DEPTH10_PARAMETERS = (
@@ -59,35 +58,77 @@ M5_DEPTH10_PARAMETERS = (
 )
 
 
-def test_campaign_precision_policy_is_versioned_and_legacy_safe(tmp_path: pathlib.Path) -> None:
-    original = (
-        ROOT / "configs/autoforecast/examples/synthetic_sft_single_model_2epochs.yaml"
-    ).read_text(encoding="utf-8")
-    legacy = tmp_path / "legacy.yaml"
-    legacy.write_text(original, encoding="utf-8")
-    assert subject.load_forecast_campaign_request(legacy).compute.precision == "32-true"
-    fresh = tmp_path / "fresh.yaml"
-    fresh.write_text(original.replace("schema_version: 5", "schema_version: 6", 1),
-                     encoding="utf-8")
-    assert subject.load_forecast_campaign_request(fresh).compute.precision == "16-mixed"
-    explicit = tmp_path / "explicit.yaml"
-    explicit.write_text(
-        original.replace("schema_version: 5", "schema_version: 6", 1).replace(
-            "  compute:\n", "  compute:\n    precision: 32-true\n", 1
-        ),
-        encoding="utf-8",
-    )
-    assert subject.load_forecast_campaign_request(explicit).compute.precision == "32-true"
-    for index, bad in enumerate(("[]", "{}", "true", "16", "null")):
-        malformed = tmp_path / f"bad-{index}.yaml"
-        malformed.write_text(
-            original.replace("schema_version: 5", "schema_version: 6", 1).replace(
-                "  compute:\n", f"  compute:\n    precision: {bad}\n", 1
-            ),
-            encoding="utf-8",
-        )
+def test_campaign_precision_is_explicit_or_uses_current_default(tmp_path: pathlib.Path) -> None:
+    source = ROOT / "configs/autoforecast/examples/synthetic_sft_single_model_2epochs.yaml"
+    value = yaml.safe_load(source.read_text())
+    assert subject.load_forecast_campaign_request(source).compute.precision == "32-true"
+    value["forecast_campaign"]["compute"].pop("precision")
+    path = tmp_path / "request.yaml"
+    path.write_text(yaml.safe_dump(value))
+    assert subject.load_forecast_campaign_request(path).compute.precision == "16-mixed"
+    for precision in ("32-true", "16-mixed"):
+        value["forecast_campaign"]["compute"]["precision"] = precision
+        path.write_text(yaml.safe_dump(value))
+        assert subject.load_forecast_campaign_request(path).compute.precision == precision
+    for bad in ([], {}, True, 16, None):
+        value["forecast_campaign"]["compute"]["precision"] = bad
+        path.write_text(yaml.safe_dump(value))
         with pytest.raises(subject.ForecastCampaignError, match="compute.precision"):
-            subject.load_forecast_campaign_request(malformed)
+            subject.load_forecast_campaign_request(path)
+
+
+@pytest.mark.parametrize("precision", ["32-true", "16-mixed"])
+@pytest.mark.parametrize("writer", ["child", "hpo"])
+def test_generated_run_request_preserves_campaign_precision(
+    tmp_path: pathlib.Path, precision: str, writer: str
+) -> None:
+    resolved: dict[str, object] = {
+        "compute": {"precision": precision},
+        "source": {
+            "dataset_contract": "configs/datasets/synthetic_daily.yaml",
+            "model_catalog": "configs/models",
+        },
+        "selection": {"missing_actual": "no_data", "metric": "rmse"},
+        "tracking": {"mlflow": False},
+        "template_features": {"calendar_events": [], "event_max_support": 30},
+    }
+    path = tmp_path / f"{writer}-request.yaml"
+    if writer == "child":
+        subject._write_child_request(  # noqa: SLF001
+            path,
+            resolved,
+            {
+                "id": "v0fs0o0",
+                "model_id": "seasonal_naive",
+                "origin": "2024-01-31",
+                "horizon": 7,
+            },
+            evaluation=True,
+        )
+    else:
+        subject._write_hpo_request(  # noqa: SLF001
+            path,
+            resolved,
+            model_id="seasonal_naive",
+            origin=dt.date(2024, 1, 31),
+            horizon=7,
+        )
+    request = subject.load_run_request(path)
+    assert request.schema_version == 3
+    assert request.precision == precision
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, True])
+def test_campaign_rejects_obsolete_versions(tmp_path, version):
+    path = tmp_path / "request.yaml"
+    value = yaml.safe_load(
+        (ROOT / "configs/autoforecast/examples/synthetic_sft_single_model_2epochs.yaml").read_text()
+    )
+    value["schema_version"] = version
+    path.write_text(yaml.safe_dump(value))
+    with pytest.raises(subject.ForecastCampaignError, match="schema_version must be integer 6"):
+        subject.load_forecast_campaign_request(path)
+
 
 
 @pytest.mark.parametrize("mode", ["defaults", "manual"])
@@ -163,6 +204,7 @@ def test_mixed_campaign_rejects_mft_weights_only_arm_before_building_children(
     )
     source["schema_version"] = 6
     body = source["forecast_campaign"]
+    body["compute"]["precision"] = "16-mixed"
     body["purpose"] = "forecast_campaign"
     body["models"]["candidates"] = [
         {"model_id": "mft", "parameters": {"mode": "defaults"}}
@@ -255,28 +297,29 @@ def _request(
     for offset, path in enumerate((selection, final_training, final_score)):
         _panel(path, target_offset=float(offset * 100))
     value = {
-        "schema_version": 1,
+        "schema_version": 6,
         "forecast_campaign": {
+            "purpose": "forecast_campaign",
             "name": "synthetic-campaign",
             "dataset": {
                 "contract": "configs/datasets/synthetic_daily.yaml",
                 "run_template": "configs/autoforecast/examples/synthetic_seasonal_naive.yaml",
                 "selection": {
-                    "snapshot_id": "selection-v1",
-                    "reference": "local://selection-v1",
+                    "source_uri": "local://selection-v1",
                 },
                 "final_training": {
-                    "snapshot_id": "training-v1",
-                    "reference": "local://training-v1",
+                    "source_uri": "local://training-v1",
                 },
                 "final_score": {
-                    "snapshot_id": "score-v1",
-                    "reference": "local://score-v1",
+                    "source_uri": "local://score-v1",
                 },
             },
             "models": {
                 "catalog": "configs/models",
-                "ids": models or ["seasonal_naive", "croston"],
+                "candidates": [
+                    {"model_id": model, "parameters": {"mode": "defaults"}}
+                    for model in (models or ["seasonal_naive", "croston"])
+                ],
             },
             "temporal": {
                 "training_start": "2024-01-01",
@@ -296,6 +339,7 @@ def _request(
                     "mean_score",
                     "score_stddev",
                     "model_id",
+                    "variant_id",
                     "initialization",
                 ],
             },
@@ -312,6 +356,7 @@ def _request(
                 for name in ("initialization", "validation", "final_fit")
             },
             "compute": {
+                "precision": "32-true",
                 "device": "cpu",
                 "batch_size": 32,
                 "gradient_microbatch_size": 16,
@@ -406,38 +451,13 @@ def test_compiled_artifact_publication_cannot_be_redirected_by_parent_swap(
     assert not (outside / "request-source.yaml").exists()
 
 
-def _request_v2(
-    tmp_path: pathlib.Path,
-    candidates: list[dict[str, object]],
-) -> pathlib.Path:
-    path = _request(tmp_path, models=[cast(str, item["id"]) for item in candidates])
-    value = yaml.safe_load(path.read_text())
-    value["schema_version"] = 2
-    value["forecast_campaign"]["models"] = {
-        "catalog": "configs/models",
-        "candidates": candidates,
-    }
-    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
-    return path
 
 
-def _request_v3(
-    tmp_path: pathlib.Path,
-    candidates: list[dict[str, object]],
-) -> pathlib.Path:
-    path = _request(tmp_path, models=[cast(str, item["model_id"]) for item in candidates])
-    value = yaml.safe_load(path.read_text())
-    value["schema_version"] = 3
-    value["forecast_campaign"]["models"] = {
-        "catalog": "configs/models",
-        "candidates": candidates,
-    }
-    value["forecast_campaign"]["selection"]["tie_break"] = list(subject._TIE_BREAK)  # noqa: SLF001
-    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
-    return path
 
 
-def _request_v4(
+
+
+def _request_candidates(
     tmp_path: pathlib.Path,
     candidates: list[dict[str, object]],
     *,
@@ -445,14 +465,11 @@ def _request_v4(
 ) -> pathlib.Path:
     path = _request(tmp_path, models=[cast(str, item["model_id"]) for item in candidates])
     value = yaml.safe_load(path.read_text())
-    value["schema_version"] = 4
     dataset = value["forecast_campaign"]["dataset"]
     if run_template is None:
         dataset.pop("run_template")
     else:
         dataset["run_template"] = run_template
-    for role in ("selection", "final_training", "final_score"):
-        dataset[role] = {"source_uri": dataset[role]["reference"]}
     value["forecast_campaign"]["models"] = {
         "catalog": "configs/models",
         "candidates": candidates,
@@ -465,10 +482,10 @@ def _request_v4(
     return path
 
 
-def test_schema_four_derives_variant_and_data_identities(
+def test_current_request_derives_variant_and_data_identities(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = _request_v4(
+    path = _request_candidates(
         tmp_path,
         [
             {
@@ -489,11 +506,8 @@ def test_schema_four_derives_variant_and_data_identities(
         ],
     )
     request = subject.load_forecast_campaign_request(path)
-    assert request.schema_version == 4
-    assert request.variant_ids == (None, None)
-    assert request.candidate_ids == (None, None)
+    assert request.schema_version == 6
     assert request.template is None
-    assert request.selection_data.snapshot_id is None
     assert request.selection_data.reference == "local://selection-v1"
 
     monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {"git_commit": "a" * 40})
@@ -530,7 +544,7 @@ def test_schema_four_derives_variant_and_data_identities(
     assert repeated_profiles[0]["variant_id"] == profiles[0]["variant_id"]
 
     changed_root = tmp_path / "changed"
-    changed_path = _request_v4(
+    changed_path = _request_candidates(
         changed_root,
         [
             {
@@ -561,7 +575,7 @@ def test_compiled_directory_identity_covers_every_runtime_dataset(
     role: str,
     replacement_offset: float,
 ) -> None:
-    path = _request_v4(
+    path = _request_candidates(
         tmp_path,
         [{"model_id": "seasonal_naive", "parameters": {"mode": "defaults"}}],
     )
@@ -635,14 +649,14 @@ def test_reused_tuned_variant_identity_ignores_machine_paths_but_not_evidence() 
     )
 
 
-def test_schema_four_rejects_duplicate_resolved_candidate_specs(
+def test_current_request_rejects_duplicate_resolved_candidate_specs(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     candidate = {
         "model_id": "sft",
         "parameters": {"mode": "defaults"},
     }
-    path = _request_v4(
+    path = _request_candidates(
         tmp_path,
         [
             candidate,
@@ -657,10 +671,10 @@ def test_schema_four_rejects_duplicate_resolved_candidate_specs(
         _compile(path, tmp_path)
 
 
-def test_schema_four_rejects_authored_variant_snapshot_and_boolean_modes(
+def test_current_request_rejects_authored_variant_snapshot_and_boolean_modes(
     tmp_path: pathlib.Path,
 ) -> None:
-    path = _request_v4(
+    path = _request_candidates(
         tmp_path,
         [{"model_id": "sft", "parameters": {"mode": "defaults"}}],
     )
@@ -687,18 +701,16 @@ def test_schema_four_rejects_authored_variant_snapshot_and_boolean_modes(
         subject.load_forecast_campaign_request(path)
 
 
-def test_schema_three_separates_models_from_parameter_variants(
+def test_current_request_separates_models_from_derived_parameter_variants(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = _request_v3(
+    path = _request_candidates(
         tmp_path,
         [
             {
                 "model_id": "sft",
-                "variant_id": "short_context",
                 "parameters": {
-                    "source": "manual",
-                    "base": "profile_defaults",
+                    "mode": "manual",
                     "values": {
                         "model.encoder_days": 28,
                         "training.train_windows": 3,
@@ -708,13 +720,11 @@ def test_schema_three_separates_models_from_parameter_variants(
             },
             {
                 "model_id": "sft",
-                "variant_id": "annual_context",
-                "parameters": {"source": "defaults"},
+                "parameters": {"mode": "defaults"},
             },
             {
                 "model_id": "hmfnet",
-                "variant_id": "annual_context",
-                "parameters": {"source": "defaults"},
+                "parameters": {"mode": "defaults"},
             },
         ],
     )
@@ -727,46 +737,29 @@ def test_schema_three_separates_models_from_parameter_variants(
         "sft",
         "hmfnet",
     )
-    assert request.candidate_ids == (
-        "@3:sft:short_context",
-        "@3:sft:annual_context",
-        "@6:hmfnet:annual_context",
-    )
     monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {"git_commit": "a" * 40})
     compiled = _compile(path, tmp_path)
     resolved = json.loads(compiled.resolved_path.read_text())
-    assert [item["candidate_id"] for item in resolved["parameter_profiles"]] == list(
-        request.candidate_ids
-    )
-    assert {
-        (item["candidate_id"], item["model_id"], item["variant_id"])
-        for item in resolved["children"]
-        if item["kind"] == "validation"
-    } == {
-        ("@3:sft:short_context", "sft", "short_context"),
-        (
-            "@3:sft:annual_context",
-            "sft",
-            "annual_context",
-        ),
-        (
-            "@6:hmfnet:annual_context",
-            "hmfnet",
-            "annual_context",
-        ),
+    profiles = resolved["parameter_profiles"]
+    assert len({item["candidate_id"] for item in profiles}) == 3
+    assert profiles[0]["variant_id"].startswith("manual-")
+    assert profiles[1]["variant_id"].startswith("defaults-")
+    assert profiles[0]["variant_id"] != profiles[1]["variant_id"]
+    assert {(item["candidate_id"], item["model_id"], item["variant_id"])
+            for item in resolved["children"] if item["kind"] == "validation"} == {
+        (item["candidate_id"], item["model_id"], item["variant_id"]) for item in profiles
     }
 
 
-def test_resolved_v3_replays_while_resolved_v4_requires_variant_identity(
+def test_obsolete_resolved_schema_is_rejected_and_current_requires_variant_identity(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = _request_v3(
+    path = _request_candidates(
         tmp_path,
         [
             {
                 "model_id": "seasonal_naive",
-                "variant_id": "default",
-                "parameters": {"source": "defaults"},
+                "parameters": {"mode": "defaults"},
             }
         ],
     )
@@ -775,19 +768,19 @@ def test_resolved_v3_replays_while_resolved_v4_requires_variant_identity(
     resolved = json.loads(compiled.resolved_path.read_text())
     monkeypatch.setattr(subject, "_verify_resolved_source", lambda _resolved: None)
 
+    with pytest.raises(subject.ForecastCampaignError, match="resolved artifact schema is invalid"):
+        subject._verify_resolved_parameter_profiles(
+            {**resolved, "schema": "autoforecast.forecast-campaign-resolved.v3"}
+        )
+
     historical = json.loads(subject._json(resolved))  # noqa: SLF001
-    historical["schema"] = subject.LEGACY_RESOLVED_SCHEMA
+    historical["schema"] = "autoforecast.forecast-campaign-resolved.v3"
     historical.pop("request_schema_version")
     historical["parameter_profiles"][0].pop("variant_spec_sha256")
     historical_path = tmp_path / "resolved-v3.json"
     historical_path.write_text(subject._json(historical), encoding="utf-8")  # noqa: SLF001
-    assert (
-        subject._load_resolved(  # noqa: SLF001
-            historical_path,
-            subject._sha_file(historical_path),  # noqa: SLF001
-        )["schema"]
-        == subject.LEGACY_RESOLVED_SCHEMA
-    )
+    with pytest.raises(subject.ForecastCampaignError, match="schema"):
+        subject._load_resolved(historical_path, subject._sha_file(historical_path))
 
     for index, removed in enumerate(
         [("variant_spec_sha256",), ("request_schema_version", "variant_spec_sha256")]
@@ -805,153 +798,19 @@ def test_resolved_v3_replays_while_resolved_v4_requires_variant_identity(
             )
 
     downgraded = json.loads(subject._json(resolved))  # noqa: SLF001
-    downgraded["schema"] = subject.LEGACY_RESOLVED_SCHEMA
+    downgraded["schema"] = "autoforecast.forecast-campaign-resolved.v3"
     downgraded["parameter_profiles"][0].pop("variant_spec_sha256")
     downgraded_path = tmp_path / "downgraded-resolved-v4.json"
     downgraded_path.write_text(subject._json(downgraded), encoding="utf-8")  # noqa: SLF001
-    with pytest.raises(subject.ForecastCampaignError, match="legacy resolved artifact"):
+    with pytest.raises(subject.ForecastCampaignError, match="schema"):
         subject._load_resolved(  # noqa: SLF001
             downgraded_path,
             subject._sha_file(downgraded_path),  # noqa: SLF001
         )
 
 
-def test_checked_in_m5_sft_hmfnet_campaign_is_archival_not_executable(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = ROOT / "configs/autoforecast/m5_sft_hmfnet_50k.yaml"
-    request = subject.load_forecast_campaign_request(source)
-    assert request.model_ids == (
-        "sft",
-        "hmfnet",
-    )
-    assert request.schema_version == 4
-    assert request.variant_ids == (None, None)
-    assert request.candidate_ids == (None, None)
-    assert [source.mode for source in request.parameter_sources] == ["manual", "manual"]
-    assert [source.values for source in request.parameter_sources] == list(M5_DEPTH10_PARAMETERS)
-    candidates = {item.id: item for item in discover_candidates(ROOT / "configs/models")}
-    for model_id, parameter_source in zip(
-        request.model_ids, request.parameter_sources, strict=True
-    ):
-        candidate = candidates[model_id]
-        spec = loads_tuning_spec(candidate.source_bytes, source_path=candidate.source_path)
-        assert set(parameter_source.values) == {parameter.name for parameter in spec.parameters}
-    assert request.compute.device == "cpu"
-    assert request.compute.batch_size == request.compute.gradient_microbatch_size == 256
-    assert request.template is None
-    assert request.initialization_origin == dt.date(2016, 2, 28)
-    assert request.validation_origins == (dt.date(2016, 3, 27), dt.date(2016, 4, 24))
-    assert request.final_train_cutoff == dt.date(2016, 5, 22)
-    assert request.validation_horizon == request.final_test_horizon == 28
-    assert request.seeds == (0, 1, 2)
-    assert request.initialization_arms == ("fresh",)
-    assert request.metric == "wrmsse" and request.missing_actual == "no_data"
-    assert request.evidence_role == "archived_private_replay_not_blind"
-    assert request.mlflow_enabled is True
-    for budget in (
-        request.initialization_budget,
-        request.validation_budget,
-        request.final_fit_budget,
-    ):
-        assert budget.maximum_epochs == 50_000 and budget.patience == 10
-        assert budget.timeout_seconds == 86_400 and budget.max_attempts == 2
-        assert budget.absolute_min_delta == 1e-6 and budget.relative_min_delta == 0
-
-    with pytest.raises(subject.ForecastCampaignError, match="separate requests and output roots"):
-        subject.compile_forecast_campaign(
-            source,
-            selection_data_path=tmp_path / "selection",
-            final_training_data_path=tmp_path / "training",
-            final_score_data_path=tmp_path / "score",
-        )
-    short_source = tmp_path / "archival-two-epoch-structure.yaml"
-    short_request = yaml.safe_load(source.read_text(encoding="utf-8"))
-    for budget in short_request["forecast_campaign"]["budgets"].values():
-        budget["maximum_epochs"] = 2
-    short_source.write_text(yaml.safe_dump(short_request), encoding="utf-8")
-
-    data_paths = [tmp_path / name for name in ("selection", "training", "score")]
-    for offset, path in enumerate(data_paths):
-        _panel(path, target_offset=float(offset * 100))
-    monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {"git_commit": "a" * 40})
-    compiled = subject.compile_forecast_campaign(
-        short_source,
-        selection_data_path=data_paths[0],
-        final_training_data_path=data_paths[1],
-        final_score_data_path=data_paths[2],
-        compiled_root=tmp_path / "compiled",
-    )
-    resolved = json.loads(compiled.resolved_path.read_text())
-    assert [item["model_id"] for item in resolved["models"]] == list(request.model_ids)
-    assert [item["variant_id"].split("-", maxsplit=1)[0] for item in resolved["models"]] == [
-        "manual",
-        "manual",
-    ]
-    assert all(
-        item["resolution"]["effective_parameters"]["model.encoder_days"] == 1911
-        for item in resolved["parameter_profiles"]
-    )
-    assert [
-        (
-            item["resolution"]["effective_parameters"]["model.d_model"],
-            item["resolution"]["effective_parameters"]["model.n_heads"],
-            item["resolution"]["effective_parameters"]["model.trunk_stages"],
-        )
-        for item in resolved["parameter_profiles"]
-    ] == [(80, 10, 10), (80, 10, 10)]
-    assert (
-        resolved["parameter_profiles"][0]["resolution"]["effective_parameters"][
-            "model.event_kernel_layers"
-        ]
-        == 10
-    )
-    assert (
-        "model.event_kernel_layers"
-        not in resolved["parameter_profiles"][1]["resolution"]["effective_parameters"]
-    )
-    validation_models = [
-        item["model_id"] for item in resolved["children"] if item["kind"] == "validation"
-    ]
-    assert validation_models == ["sft"] * 6 + ["hmfnet"] * 6
-
-
-def test_checked_in_m5_sft_hmfnet_b32_campaign_preserves_early_stopping_capacity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    request = subject.load_forecast_campaign_request(
-        ROOT / "configs/autoforecast/m5_sft_hmfnet_50k_b32.yaml"
-    )
-
-    assert request.model_ids == ("sft", "hmfnet")
-    assert request.compute.batch_size == request.compute.gradient_microbatch_size == 32
-    for budget in (
-        request.initialization_budget,
-        request.validation_budget,
-        request.final_fit_budget,
-    ):
-        assert budget.maximum_epochs == 50_000 and budget.patience == 10
-        assert budget.timeout_seconds == 259_200 and budget.max_attempts == 2
-    with pytest.raises(subject.ForecastCampaignError, match="separate requests and output roots"):
-        subject.compile_forecast_campaign(
-            ROOT / "configs/autoforecast/m5_sft_hmfnet_50k_b32.yaml",
-            selection_data_path="/not-read",
-            final_training_data_path="/not-read",
-            final_score_data_path="/not-read",
-        )
-    with pytest.raises(subject.ForecastCampaignError, match="separate requests and output roots"):
-        monkeypatch.setattr(
-            subject, "_resolved_catalog_candidates",
-            lambda _resolved: {
-                model_id: SimpleNamespace(adapter=model_id) for model_id in request.model_ids
-            },
-        )
-        subject._run_generic_child(  # noqa: SLF001
-            {"models": [{"model_id": model_id} for model_id in request.model_ids],
-             "budgets": {"validation": {"maximum_epochs": 50_000}}},
-            {}, campaign_root=pathlib.Path("/not-read"),
-            attempt_dir=pathlib.Path("/not-read"), evaluate=False,
-        )
+# Archived combined-campaign fixtures were removed. The isolation rule remains tested
+# by test_long_sft_hmfnet_isolation_uses_adapter_not_catalog_alias below.
 
 
 @pytest.mark.parametrize("aliases", [
@@ -963,7 +822,11 @@ def test_long_sft_hmfnet_isolation_uses_adapter_not_catalog_alias(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
     aliases: tuple[str, str],
 ) -> None:
-    source = ROOT / "configs/autoforecast/m5_sft_hmfnet_50k.yaml"
+    value = yaml.safe_load((ROOT / "configs/autoforecast/m5_sft_hmfnet_depth10_2epoch_smoke.yaml").read_text())
+    for budget in value["forecast_campaign"]["budgets"].values():
+        budget["maximum_epochs"] = 50_000
+    source = tmp_path / "combined.yaml"
+    source.write_text(yaml.safe_dump(value))
     request = subject.load_forecast_campaign_request(source)
     catalog = {candidate.id: candidate for candidate in discover_candidates(ROOT / "configs/models")}
     monkeypatch.setattr(
@@ -1041,7 +904,7 @@ def test_checked_in_capacity_soaks_allow_the_complete_three_epoch_worker(
     source = ROOT / "configs/autoforecast" / filename
     request = subject.load_forecast_campaign_request(source)
 
-    assert request.schema_version == 5
+    assert request.schema_version == 6
     assert request.purpose == "capacity_diagnostic"
     assert request.model_ids == (model_id,)
     assert request.seeds == (0,)
@@ -1111,24 +974,15 @@ def test_checked_in_capacity_soaks_allow_the_complete_three_epoch_worker(
 def test_checked_in_m5_depth10_smoke_is_full_data_and_compiles(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    full = subject.load_forecast_campaign_request(ROOT / "configs/autoforecast/m5_sft_hmfnet_50k.yaml")
     source = ROOT / "configs/autoforecast/m5_sft_hmfnet_depth10_2epoch_smoke.yaml"
     smoke = subject.load_forecast_campaign_request(source)
 
-    assert smoke.model_ids == full.model_ids
+    assert smoke.model_ids == ("sft", "hmfnet")
     assert [item.values for item in smoke.parameter_sources] == list(M5_DEPTH10_PARAMETERS)
-    assert [item.values for item in full.parameter_sources] == list(M5_DEPTH10_PARAMETERS)
-    assert (
-        smoke.contract,
-        smoke.selection_data,
-        smoke.final_training_data,
-        smoke.final_score_data,
-    ) == (
-        full.contract,
-        full.selection_data,
-        full.final_training_data,
-        full.final_score_data,
-    )
+    assert smoke.contract == pathlib.Path("configs/datasets/m5_daily.yaml")
+    assert smoke.selection_data.reference == "local://m5-public-selection-v1"
+    assert smoke.final_training_data.reference == "local://m5-final-training-v1"
+    assert smoke.final_score_data.reference == "kaggle://m5/organizer-private-replay-v1"
     assert smoke.seeds == (0,)
     assert smoke.validation_origins == (dt.date(2016, 4, 24),)
     assert smoke.compute.device == "cpu"
@@ -1156,28 +1010,12 @@ def test_checked_in_m5_depth10_smoke_is_full_data_and_compiles(
     assert compiled.plan_path.is_file() and compiled.resolved_path.is_file()
 
 
-def test_schema_three_rejects_only_duplicate_model_variant_pairs(tmp_path: pathlib.Path) -> None:
-    path = _request_v3(
-        tmp_path,
-        [
-            {
-                "model_id": "sft",
-                "variant_id": "same",
-                "parameters": {"source": "defaults"},
-            },
-            {
-                "model_id": "sft",
-                "variant_id": "same",
-                "parameters": {"source": "defaults"},
-            },
-        ],
-    )
-    with pytest.raises(subject.ForecastCampaignError, match="model_id, variant_id"):
-        subject.load_forecast_campaign_request(path)
+# Obsolete request syntax is covered by test_campaign_rejects_obsolete_versions.
+# Current parameter modes and duplicate derived candidates are tested below.
 
 
 def test_candidate_identity_encoding_is_injective_for_valid_identifiers() -> None:
-    assert subject._candidate_id("foo--bar", "default") == "foo--bar"  # noqa: SLF001
+    assert subject._candidate_id("foo--bar", "default") == "@8:foo--bar:default"  # noqa: SLF001
     assert subject._candidate_id("foo", "bar") == "@3:foo:bar"  # noqa: SLF001
     assert subject._candidate_id("foo--bar", "default") != subject._candidate_id(  # noqa: SLF001
         "foo", "bar"
@@ -1192,9 +1030,10 @@ def test_revision_controls_fail_during_campaign_compilation(
     model_id: str,
     invalid: str,
 ) -> None:
-    path = _request_v3(
+    path = _request_candidates(
         tmp_path,
-        [{"model_id": model_id, "variant_id": "candidate", "parameters": {"source": "defaults"}}],
+        [{"model_id": model_id, "parameters": {"mode": "defaults"}}],
+        run_template="configs/autoforecast/examples/synthetic_seasonal_naive.yaml",
     )
     value = yaml.safe_load(path.read_text())
     compute = value["forecast_campaign"]["compute"]
@@ -1224,14 +1063,13 @@ def test_revision_controls_fail_during_campaign_compilation(
 def test_tuned_revision_recipe_is_validated_before_hpo_or_worker_launch(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = _request_v3(
+    path = _request_candidates(
         tmp_path,
         [
             {
                 "model_id": "sft",
-                "variant_id": "tuned",
                 "parameters": {
-                    "source": "tune",
+                    "mode": "tune",
                     "study_config": "configs/hpo/does-not-need-to-exist.yaml",
                 },
             }
@@ -1266,13 +1104,12 @@ def test_resolved_candidate_second_read_must_match_compiled_profile_identity(
     monkeypatch: pytest.MonkeyPatch,
     changed_field: str,
 ) -> None:
-    path = _request_v3(
+    path = _request_candidates(
         tmp_path,
         [
             {
                 "model_id": "sft",
-                "variant_id": "candidate",
-                "parameters": {"source": "defaults"},
+                "parameters": {"mode": "defaults"},
             }
         ],
     )
@@ -1294,29 +1131,8 @@ def test_resolved_candidate_second_read_must_match_compiled_profile_identity(
         subject._verify_resolved_parameter_profiles(resolved)  # noqa: SLF001
 
 
-@pytest.mark.parametrize(
-    "parameters",
-    [
-        {"source": "defaults"},
-        {
-            "source": "manual",
-            "base": "profile_defaults",
-            "values": {"model.d_model": 40},
-        },
-        {"source": "tune", "study_config": "configs/hpo/example.yaml"},
-        {
-            "source": "reuse_selection",
-            "study_config": "configs/hpo/example.yaml",
-            "selection": ".autoforecast/hpo/studies/example/selection.json",
-        },
-    ],
-)
-def test_schema_two_exposes_one_unambiguous_parameter_source(
-    tmp_path: pathlib.Path, parameters: dict[str, object]
-) -> None:
-    path = _request_v2(tmp_path, [{"id": "mft", "parameters": parameters}])
-    request = subject.load_forecast_campaign_request(path)
-    assert request.parameter_sources[0].mode == parameters["source"]
+# Obsolete request syntax is covered by test_campaign_rejects_obsolete_versions.
+# Current parameter modes and duplicate derived candidates are tested below.
 
 
 @pytest.mark.parametrize(
@@ -1335,12 +1151,12 @@ def test_schema_two_exposes_one_unambiguous_parameter_source(
         ),
     ],
 )
-def test_schema_four_exposes_one_tagged_parameter_mode(
+def test_current_request_exposes_one_tagged_parameter_mode(
     tmp_path: pathlib.Path,
     parameters: dict[str, object],
     expected_mode: str,
 ) -> None:
-    path = _request_v4(
+    path = _request_candidates(
         tmp_path,
         [{"model_id": "mft", "parameters": parameters}],
     )
@@ -1362,10 +1178,10 @@ def test_schema_four_exposes_one_tagged_parameter_mode(
         {"mode": "reuse_tuned", "selection": "selection.json"},
     ],
 )
-def test_schema_four_parameter_modes_reject_inactive_fields(
+def test_current_request_parameter_modes_reject_inactive_fields(
     tmp_path: pathlib.Path, parameters: dict[str, object]
 ) -> None:
-    path = _request_v4(
+    path = _request_candidates(
         tmp_path,
         [{"model_id": "mft", "parameters": parameters}],
     )
@@ -1373,43 +1189,24 @@ def test_schema_four_parameter_modes_reject_inactive_fields(
         subject.load_forecast_campaign_request(path)
 
 
-def test_parameter_source_rejects_inactive_or_contradictory_fields(
-    tmp_path: pathlib.Path,
-) -> None:
-    cases = [
-        {"source": "defaults", "values": {}},
-        {"source": "manual", "base": "profile_defaults"},
-        {
-            "source": "tune",
-            "study_config": "configs/hpo/example.yaml",
-            "selection": "selection.json",
-        },
-        {"source": "reuse_selection", "selection": "selection.json"},
-    ]
-    for index, parameters in enumerate(cases):
-        path = _request_v2(
-            tmp_path / str(index),
-            [{"id": "mft", "parameters": parameters}],
-        )
-        with pytest.raises(subject.ForecastCampaignError):
-            subject.load_forecast_campaign_request(path)
+# Obsolete request syntax is covered by test_campaign_rejects_obsolete_versions.
+# Current parameter modes and duplicate derived candidates are tested below.
 
 
 def test_compile_freezes_complete_manual_values_and_keeps_models_sequential(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = _request_v2(
+    path = _request_candidates(
         tmp_path,
         [
             {
-                "id": "mft",
+                "model_id": "mft",
                 "parameters": {
-                    "source": "manual",
-                    "base": "profile_defaults",
+                    "mode": "manual",
                     "values": {"model.d_model": 40},
                 },
             },
-            {"id": "seasonal_naive", "parameters": {"source": "defaults"}},
+            {"model_id": "seasonal_naive", "parameters": {"mode": "defaults"}},
         ],
     )
     monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {"git_commit": "a" * 40})
@@ -1429,13 +1226,13 @@ def test_compile_freezes_complete_manual_values_and_keeps_models_sequential(
 def test_tune_mode_compiles_as_a_required_durable_stage(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = _request_v2(
+    path = _request_candidates(
         tmp_path,
         [
             {
-                "id": "shallow_global",
+                "model_id": "shallow_global",
                 "parameters": {
-                    "source": "tune",
+                    "mode": "tune",
                     "study_config": "configs/hpo/study.yaml",
                 },
             }
@@ -1621,6 +1418,20 @@ def test_compile_propagates_supported_dataset_cadence(
     }
 
 
+@pytest.mark.parametrize("temporal", [{"step_days": 1}, {"frequency": "D", "step_days": 1}])
+def test_resolved_campaign_rejects_obsolete_day_stride(
+    temporal: dict[str, object], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _request(tmp_path, models=["seasonal_naive"], arms=["fresh"])
+    monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {})
+    compiled = _compile(path, tmp_path)
+    resolved = json.loads(compiled.resolved_path.read_text())
+    resolved["temporal"].pop("frequency")
+    resolved["temporal"].update(temporal)
+    with pytest.raises(subject.ForecastCampaignError, match="frequency without step_days"):
+        subject._resolved_cadence(resolved)
+
+
 def test_request_refuses_ambiguous_yaml_zero_memory_and_symlink_source(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1780,7 +1591,7 @@ def _make_single_model_benchmark(
     path: pathlib.Path, *, models: list[str] | None = None
 ) -> dict[str, object]:
     value = yaml.safe_load(path.read_text())
-    value["schema_version"] = 5
+    value["schema_version"] = 6
     campaign = value["forecast_campaign"]
     campaign["purpose"] = "single_model_benchmark"
     for role in ("selection", "final_training", "final_score"):
@@ -2586,7 +2397,8 @@ def test_rolling_selection_journal_rejects_coherently_rewritten_epoch_cadence(
         last_update=3, trainable_series=2,
     )
     objective_masks = {"2024-01-01": np.ones((2, 28), dtype=bool)}
-    governed = {"temporal": {"step_days": 1}}
+    governed = {"source": {"dataset_contract": "configs/datasets/m5_daily.yaml"},
+                "temporal": {"frequency": "D"}}
     assert subject._governed_rolling_selection_origins(  # noqa: SLF001
         governed, result
     ) == ("2024-01-01",)
@@ -3024,7 +2836,7 @@ def test_pinned_data_role_rejects_different_parquet_bytes(tmp_path: pathlib.Path
     _panel(intended)
     _panel(changed, target_offset=1.0)
     expected = subject.directory_digest(intended, suffixes=(".parquet",))
-    input_role = subject.DataInput(None, "local://m5-public-selection-v1", expected)
+    input_role = subject.DataInput("local://m5-public-selection-v1", expected)
     assert subject._data_identity(input_role, intended, "selection data")["sha256"] == expected  # noqa: SLF001
     with pytest.raises(subject.ForecastCampaignError, match="pinned SHA-256"):
         subject._data_identity(input_role, changed, "selection data")  # noqa: SLF001
@@ -3035,7 +2847,6 @@ def test_data_role_refuses_malformed_pinned_sha256() -> None:
         subject._data_input(  # noqa: SLF001
             {"source_uri": "local://m5-public-selection-v1", "sha256": "invalid"},
             "dataset.selection",
-            schema_version=5,
         )
 
 
@@ -4037,6 +3848,51 @@ def test_child_result_rejects_failed_or_numerically_invalid_evidence(
         )
 
 
+def test_child_result_rejects_obsolete_v3_literal(tmp_path: pathlib.Path) -> None:
+    child = {
+        "id": "v0fs0o0",
+        "kind": "validation",
+        "candidate_id": "seasonal_naive",
+        "model_id": "seasonal_naive",
+        "variant_id": "default",
+        "adapter": "seasonal_naive",
+        "parameter_mode": "defaults",
+        "initialization": "fresh",
+        "seed": 0,
+        "origin": "2024-01-14",
+        "horizon": 2,
+        "budget": {},
+        "parent_stage": None,
+    }
+    record = {field: None for field in subject._CHILD_RESULT_FIELDS}  # noqa: SLF001
+    record.update(
+        {
+            "schema": "autoforecast.forecast-campaign-child-result.v3",
+            "status": "completed",
+            "kind": child["kind"],
+            "child_id": child["id"],
+            "candidate_id": child["candidate_id"],
+            "model_id": child["model_id"],
+            "variant_id": child["variant_id"],
+            "adapter": child["adapter"],
+            "parameter_mode": child["parameter_mode"],
+            "initialization": child["initialization"],
+            "seed": child["seed"],
+            "origin": child["origin"],
+            "horizon": child["horizon"],
+            "budget": child["budget"],
+            "training_data_sha256": "a" * 64,
+            "runtime_seconds": 1.0,
+        }
+    )
+    path = tmp_path / "child-result.json"
+    path.write_text(subject._json(record), encoding="utf-8")  # noqa: SLF001
+    with pytest.raises(subject.ForecastCampaignError, match="identity/status"):
+        subject._validated_child_result(  # noqa: SLF001
+            {}, child, path, require_score=True, completed=False
+        )
+
+
 @pytest.mark.parametrize("field", ["candidate_id", "model_id", "variant_id"])
 def test_child_result_rejects_each_candidate_identity_field_independently(
     tmp_path: pathlib.Path, field: str
@@ -4279,13 +4135,14 @@ def test_final_fit_uses_the_locked_winner_and_final_training_identity_only(
     monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {"git_commit": "a" * 40})
     compiled = _compile(request, tmp_path)
     resolved = json.loads(compiled.resolved_path.read_text())
+    winner = next(item for item in resolved["models"] if item["model_id"] == "seasonal_naive")
     lock = {
         "schema": subject.SELECTION_LOCK_SCHEMA,
         "resolved_sha256": subject._sha_file(compiled.resolved_path),  # noqa: SLF001
         "chosen": {
-            "candidate_id": "seasonal_naive",
+            "candidate_id": winner["candidate_id"],
             "model_id": "seasonal_naive",
-            "variant_id": "default",
+            "variant_id": winner["variant_id"],
             "initialization": "fresh",
             "final_seed": 0,
             "final_fit_budget": resolved["budgets"]["final_fit"],

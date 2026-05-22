@@ -64,7 +64,8 @@ class RunRequest:
     evaluation: EvaluationRequest | None = None
     calendar_events: tuple[tuple[str, str, str | None], ...] = ()
     event_max_support: int = 30
-    schema_version: int = 2
+    schema_version: int = 3
+    precision: str = "16-mixed"
 
 
 @dataclass(frozen=True)
@@ -154,23 +155,20 @@ def load_run_request(path: str | pathlib.Path) -> RunRequest:
         "tracking",
     }
     version = value.get("schema_version")
-    base = expected
-    if version == 2:
-        expected = expected | {"evaluation"}
-    allowed = expected | ({"features"} if version in (2, 3) else set())
-    accepted = (expected, allowed)
-    if version == 3:
-        accepted = (base, base | {"features"}, base | {"evaluation"},
-                    base | {"evaluation", "features"})
+    optional = {"features", "evaluation", "precision"}
     if (
         type(version) is not int
-        or version not in (1, 2, 3)
+        or version != 3
         or type(run) is not dict
-        or set(run) not in accepted
+        or not expected <= set(run)
+        or set(run) - expected - optional
     ):
         raise TrainWorkflowError(
-            "run request must be schema_version 1, 2, or 3 with an exact run mapping"
+            "run request must be schema_version 3 with an exact run mapping"
         )
+    precision = run.get("precision", "16-mixed")
+    if precision not in ("32-true", "16-mixed"):
+        raise TrainWorkflowError("run.precision must be 32-true or 16-mixed")
     models = run["models"]
     if models != "all":
         if type(models) is not list or not models:
@@ -198,7 +196,7 @@ def load_run_request(path: str | pathlib.Path) -> RunRequest:
     ):
         raise TrainWorkflowError("run.tracking.mlflow requires exactly boolean enabled")
     evaluation = None
-    if version in (2, 3) and "evaluation" in run:
+    if "evaluation" in run:
         raw_evaluation = run["evaluation"]
         base_evaluation = {"missing_actual", "metric"}
         extended_evaluation = base_evaluation | {"input_mode", "evidence_role"}
@@ -283,6 +281,7 @@ def load_run_request(path: str | pathlib.Path) -> RunRequest:
         events,
         event_max_support,
         version,
+        precision,
     )
 
 

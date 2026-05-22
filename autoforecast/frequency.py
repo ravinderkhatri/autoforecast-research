@@ -125,7 +125,7 @@ def frequency_is_supported(
 ) -> bool:
     """Apply both family and non-unit daily-stride capability declarations.
 
-    ``nD`` is retained for legacy daily-grid workflows, but membership in the ``D`` family does
+    ``nD`` represents a stride of multiple days, but membership in the ``D`` family does
     not prove that a model emits ``n``-day-spaced forecasts. Adapters must opt in separately.
     """
     cadence = parse_frequency(frequency)

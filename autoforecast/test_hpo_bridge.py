@@ -207,8 +207,9 @@ dataset:
     request_path = project / "configs/autoforecast/weekly.yaml"
     request_path.parent.mkdir(parents=True)
     request_path.write_text(
-        """schema_version: 2
+        """schema_version: 3
 run:
+  precision: 32-true
   name: weekly-hpo
   dataset_contract: configs/datasets/weekly.yaml
   model_catalog: configs/models
@@ -776,8 +777,9 @@ def test_builtin_optuna_bridge_runs_one_supported_trial_and_retains_its_model(
     )
     request = repository / f"configs/autoforecast/examples/hpo_{model_id}.yaml"
     request.write_text(
-        f"""schema_version: 2
+        f"""schema_version: 3
 run:
+  precision: 32-true
   name: hpo-{model_id.replace('_', '-')}
   dataset_contract: configs/datasets/synthetic_daily.yaml
   model_catalog: configs/models

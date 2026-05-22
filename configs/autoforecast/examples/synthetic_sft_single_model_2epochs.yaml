@@ -1,4 +1,4 @@
-schema_version: 5
+schema_version: 6
 forecast_campaign:
   name: synthetic-sft-single-model-2epochs
   purpose: single_model_benchmark
@@ -56,6 +56,7 @@ forecast_campaign:
       early_stopping_absolute_min_delta: 0.000001
       early_stopping_relative_min_delta: 0.0
   compute:
+    precision: 32-true
     device: cpu
     batch_size: 2
     gradient_microbatch_size: 2

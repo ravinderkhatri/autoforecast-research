@@ -42,12 +42,12 @@ def spark():
 
 def _inputs(tmp_path):
     project = tmp_path / "project"
-    create_example(project, recipe_version=1)
+    create_example(project)
     recipe = json.loads((project / "recipe.json").read_text())
     return (
         project,
         recipe,
-        {role: project / "data" for role in ("selection", "final_training", "final_score")},
+        {role: project / "data" for role in ("selection", "final_training", "validation_score", "final_score")},
     )
 
 
@@ -128,7 +128,7 @@ def test_freeze_composite_series_and_idempotent_identity(frozen, spark):
     assert len({g["logical_sha256"] for g in record["grids"].values()}) == 3
 
 
-def test_freeze_internal_and_trailing_gaps(tmp_path, spark):
+def test_freeze_fills_internal_and_trailing_gaps_with_original_missing_flags(tmp_path, spark):
     project, recipe, sources = _inputs(tmp_path)
     recipe.update(
         training_start="2024-01-01",
@@ -142,10 +142,14 @@ def test_freeze_internal_and_trailing_gaps(tmp_path, spark):
         for day in (1, 2, 3, 6, 9, 10, 11, 12)
     ]
     pq.write_table(pa.Table.from_pylist(rows), project / "data/observations.parquet")
-    with pytest.raises(
-        benchmark.BenchmarkError, match="internal/leading=2, trailing=2; unknown zeros refused"
-    ):
-        _freeze(project, recipe, sources, spark)
+    path = _freeze(project, recipe, sources, spark)
+    record = benchmark.verify_benchmark(path)[1]
+    prepared = pq.read_table(benchmark.artifact_path(path, record, "selection")).to_pylist()
+    assert len(prepared) == 8 and all(row["units"] == 0 for row in prepared)
+    assert {row["day"].day for row in prepared if row[benchmark.MISSING_COLUMN]} == {4, 5, 7, 8}
+    assert record["counts"]["selection"] == {
+        "required_observations": 8, "written_rows": 8, "originally_missing": 4, "zero_filled": 4,
+    }
 
 
 def test_freeze_rejects_duplicate_source_observations(tmp_path, spark):
@@ -160,9 +164,9 @@ def test_freeze_rejects_duplicate_source_observations(tmp_path, spark):
 
 def test_freeze_rejects_a_weekly_source_row_off_the_declared_phase(tmp_path, spark):
     project = tmp_path / "project"
-    create_example(project, frequency="W", recipe_version=1)
+    create_example(project, frequency="W")
     recipe = json.loads((project / "recipe.json").read_text())
-    sources = {role: project / "data" for role in ("selection", "final_training", "final_score")}
+    sources = {role: project / "data" for role in ("selection", "final_training", "validation_score", "final_score")}
     table = pq.read_table(project / "data")
     row = table.slice(0, 1).to_pylist()[0]
     row["day"] += dt.timedelta(days=1)
@@ -215,7 +219,7 @@ def test_freeze_source_mutation(tmp_path, spark, monkeypatch):
         return original(path, **kwargs)
 
     monkeypatch.setattr(benchmark, "directory_digest", changing)
-    with pytest.raises(benchmark.BenchmarkError, match="source changed"):
+    with pytest.raises(benchmark.BenchmarkError, match="changed before its snapshot"):
         _freeze(project, recipe, sources, spark)
 
 
@@ -270,7 +274,9 @@ def test_fixed_grid_rejects_population_changes(frozen, tmp_path, spark, defect):
             fixed_contract=fixed,
         )
         record = json.loads(result.read_text())
-        assert record["ranking"] is None and record["candidates"][0]["status"] == "not_scored"
+        assert record["ranking"] is None
+        assert record["candidates"][0]["status"] == "not_scored"
+        assert "actuals changed" in record["candidates"][0]["detail"]
     else:
         if defect == "wrong_origin":
             fixed = benchmark.evaluation_contract(
@@ -294,12 +300,12 @@ def test_fixed_grid_accepts_the_explicit_month_end_alias(tmp_path, spark):
     from autoforecast.adapters.naive import seasonal_naive
 
     project = tmp_path / "project"
-    create_example(project, frequency="M", recipe_version=1)
+    create_example(project, frequency="M")
     contract = yaml.safe_load((project / "dataset.yaml").read_text())
     contract["dataset"]["panel"]["frequency"] = "ME"
     (project / "dataset.yaml").write_text(yaml.safe_dump(contract, sort_keys=False))
     recipe = json.loads((project / "recipe.json").read_text())
-    sources = {role: project / "data" for role in ("selection", "final_training", "final_score")}
+    sources = {role: project / "data" for role in ("selection", "final_training", "validation_score", "final_score")}
     benchmark_path = _freeze(project, recipe, sources, spark)
     origin = recipe["validation_origins"][0]
     fixed = benchmark.evaluation_contract(
@@ -312,8 +318,11 @@ def test_fixed_grid_accepts_the_explicit_month_end_alias(tmp_path, spark):
         panel, origin, 7, spark=spark, out_dir=tmp_path / "month-end-forecast"
     )
 
+    scoring_panel = load_dataset_contract(benchmark_path.parent / "dataset.yaml").panel(
+        fixed["actuals"]["path"]
+    )
     result = compare_run_forecasts(
-        panel,
+        scoring_panel,
         {"seasonal_naive": forecast},
         spark,
         missing_actual="no_data",
@@ -516,7 +525,7 @@ def test_count_and_last_columns_freeze_and_run_a_baseline_with_integral_zero_key
     assert sorted(predictions["yhat"].to_pylist()) == sorted([*range(3, 10), *range(4, 11)])
 
 
-def test_last_time_column_reports_missing_observations_without_alias_collision(tmp_path, spark):
+def test_last_time_column_preserves_missing_observation_flags_without_alias_collision(tmp_path, spark):
     project, recipe, sources = _inputs(tmp_path)
     contract = yaml.safe_load((project / "dataset.yaml").read_text())
     contract["dataset"]["panel"]["time_col"] = "last"
@@ -525,5 +534,11 @@ def test_last_time_column_reports_missing_observations_without_alias_collision(t
     rows = [{**{key: value for key, value in row.items() if key != "day"}, "last": row["day"]}
             for row in rows if not (row["sku"] == 1 and row["day"] == dt.date(2024, 1, 7))]
     pq.write_table(pa.Table.from_pylist(rows), project / "data/observations.parquet")
-    with pytest.raises(benchmark.BenchmarkError, match="internal/leading=1, trailing=0"):
-        _freeze(project, recipe, sources, spark)
+    path = _freeze(project, recipe, sources, spark)
+    record = json.loads(path.read_text())
+    rows = pq.read_table(benchmark.artifact_path(path, record, "selection")).to_pylist()
+    missing = [row for row in rows if row[benchmark.MISSING_COLUMN]]
+    assert len(missing) == 1
+    assert missing[0]["sku"] == 1 and missing[0]["last"] == dt.date(2024, 1, 7)
+    assert missing[0]["units"] == 0
+    assert record["counts"]["selection"]["originally_missing"] == 1

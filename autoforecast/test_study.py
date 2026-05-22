@@ -165,16 +165,16 @@ def test_study_registration_reuses_bytes_and_rejects_changed_rules(tmp_path, spa
     assert new_path != path
 
 
-def test_legacy_recipe_keeps_strict_missing_observation_policy(tmp_path, spark):
+def test_obsolete_recipe_is_rejected_before_runtime(tmp_path):
     contract, sources, recipe = inputs(tmp_path)
     recipe["schema_version"] = 1
     for key in ("metric", "actual_missing", "series_starts"):
         recipe.pop(key)
     sources.pop("validation_score")
-    with pytest.raises(benchmark.BenchmarkError, match="missing observations"):
+    with pytest.raises(benchmark.BenchmarkError, match="schema_version must be 2"):
         benchmark.freeze_benchmark(
             contract_path=contract, sources=sources, recipe=recipe,
-            output_root=tmp_path / "frozen", spark=spark,
+            output_root=tmp_path / "frozen", spark=object(),
         )
 
 

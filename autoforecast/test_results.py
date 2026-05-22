@@ -36,7 +36,7 @@ def _reader_boundary(
                 "selection": {"metric": "rmse"},
                 "children": children,
                 "benchmark": benchmark,
-                **({"temporal": temporal} if temporal is not None else {}),
+                "temporal": {"frequency": "D"} if temporal is None else temporal,
             }
         )
     )
@@ -81,7 +81,7 @@ def test_empty_results_use_authenticated_campaign_frequency(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("frequency", ["W", "7D"])
-def test_legacy_seven_day_results_require_the_verified_dataset_cadence(
+def test_weekly_and_seven_day_results_preserve_the_verified_dataset_cadence(
     tmp_path, monkeypatch, frequency
 ):
     contract = tmp_path / "dataset.yaml"
@@ -99,7 +99,7 @@ def test_legacy_seven_day_results_require_the_verified_dataset_cadence(
         "dataset_contract_sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
     }
     _reader_boundary(
-        tmp_path, monkeypatch, [], [], source=source, temporal={"step_days": 7}
+        tmp_path, monkeypatch, [], [], source=source, temporal={"frequency": frequency}
     )
 
     results = read_results(tmp_path)
@@ -126,7 +126,7 @@ def test_verified_dataset_frequency_parses_the_authenticated_bytes(tmp_path, mon
         "dataset_contract_sha256": hashlib.sha256(raw).hexdigest(),
     }
     _reader_boundary(
-        tmp_path, monkeypatch, [], [], source=source, temporal={"step_days": 7}
+        tmp_path, monkeypatch, [], [], source=source, temporal={"frequency": "W"}
     )
     original_read_bytes = type(contract).read_bytes
     reads = 0
@@ -173,14 +173,34 @@ def test_campaign_and_verified_dataset_frequency_must_agree(tmp_path, monkeypatc
         read_results(tmp_path)
 
 
-def test_ambiguous_legacy_seven_day_results_do_not_guess(tmp_path, monkeypatch):
-    _reader_boundary(tmp_path, monkeypatch, [], [], temporal={"step_days": 7})
-
-    with pytest.raises(ValueError, match="verified dataset contract"):
+@pytest.mark.parametrize("temporal", [{"step_days": 7}, {"frequency": "D", "step_days": 1}])
+def test_results_reject_obsolete_step_days_even_with_frequency(tmp_path, monkeypatch, temporal):
+    _reader_boundary(tmp_path, monkeypatch, [], [], temporal=temporal)
+    with pytest.raises(ValueError, match="frequency without step_days"):
         read_results(tmp_path)
 
 
-def test_legacy_seven_day_results_reject_a_changed_dataset_contract(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        {"schema": "autoforecast.forecast-campaign-resolved.v4"},
+        {"schema": "autoforecast.forecast-campaign-resolved.v5"},
+        {"temporal": None},
+        {"temporal": True},
+        {"temporal": 1},
+        {"temporal": 1.0},
+        {"temporal": "D"},
+        {"temporal": []},
+    ],
+)
+def test_current_results_require_a_temporal_mapping(resolved):
+    import autoforecast.results as reader
+
+    with pytest.raises(ValueError, match="frequency without step_days"):
+        reader._resolved_frequency(resolved, "D")  # noqa: SLF001
+
+
+def test_results_reject_a_changed_dataset_contract(tmp_path, monkeypatch):
     contract = tmp_path / "dataset.yaml"
     contract.write_text(yaml.safe_dump({
         "schema_version": 1,
@@ -201,7 +221,7 @@ def test_legacy_seven_day_results_reject_a_changed_dataset_contract(tmp_path, mo
             "dataset_contract": contract.name,
             "dataset_contract_sha256": expected,
         },
-        temporal={"step_days": 7},
+        temporal={"frequency": "W"},
     )
     contract.write_text(contract.read_text() + "# changed\n")
 
@@ -372,6 +392,7 @@ def test_initialization_parent_is_not_validation_evidence(
         [
             {"id": "parent", "status": "completed", "attempts": 1},
         ],
+        temporal={"frequency": frequency},
     )
     parent = tmp_path / "parent"
     forecast_dir = parent / "forecast"
@@ -436,11 +457,13 @@ def test_initialization_parent_is_not_validation_evidence(
     from provenance.lineage import directory_digest
     frozen["dataset_sha256"] = hashlib.sha256((tmp_path / "dataset.yaml").read_bytes()).hexdigest()
     frozen["artifacts"]["source-keys"] = directory_digest(tmp_path / "source-keys", suffixes=(".parquet",))
+    frozen["role_paths"] = {role: role for role in frozen["artifacts"]}
     monkeypatch.setattr(reader, "verify_benchmark", lambda *args: (benchmark_path, frozen))
     _reader_boundary(
         tmp_path, monkeypatch, [child],
         [{"id": "parent", "status": "completed", "attempts": 1}],
         {"id": "benchmark", "path": str(benchmark_path), "sha256": "a" * 64, "evaluations": {}},
+        temporal={"frequency": "W" if frequency == "D" else "D"},
     )
     with pytest.raises(ValueError, match="forecast frequency differs"):
         read_results(tmp_path)
@@ -546,6 +569,7 @@ def test_reader_retains_selection_actual_snapshot_for_revised_history(tmp_path, 
     )
     from provenance.lineage import directory_digest
     frozen["artifacts"]["source-keys"] = directory_digest(tmp_path / "source-keys", suffixes=(".parquet",))
+    frozen["role_paths"] = {role: role for role in frozen["artifacts"]}
     monkeypatch.setattr(reader, "verify_benchmark", lambda *args: (benchmark_path, frozen))
     (tmp_path / "dataset.yaml").write_text(
         "schema_version: 1\ndataset:\n  id: meters\n  panel:\n"
@@ -569,6 +593,7 @@ def test_failed_run_without_fake_forecast(tmp_path):
                 "schema": "autoforecast.forecast-campaign-resolved.v4",
                 "source": {},
                 "selection": {"metric": "rmse"},
+                "temporal": {"frequency": "D"},
                 "children": [
                     {
                         "id": "v0",

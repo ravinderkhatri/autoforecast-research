@@ -97,13 +97,10 @@ from autoforecast.training_progress import PipelineProgress
 from provenance.lineage import directory_content_digest, directory_digest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-REQUEST_SCHEMA = "autoforecast.forecast-campaign-request.v4"
 RESOLVED_SCHEMA = "autoforecast.forecast-campaign-resolved.v4"
 INSTALLED_RESOLVED_SCHEMA = "autoforecast.forecast-campaign-resolved.v5"
-LEGACY_RESOLVED_SCHEMA = "autoforecast.forecast-campaign-resolved.v3"
 SCORE_INPUT_SCHEMA = "autoforecast.forecast-campaign-score-input.v1"
-CHILD_RESULT_SCHEMA = "autoforecast.forecast-campaign-child-result.v3"
-CHILD_RESULT_PRECISION_SCHEMA = "autoforecast.forecast-campaign-child-result.v4"
+CHILD_RESULT_SCHEMA = "autoforecast.forecast-campaign-child-result.v4"
 SELECTION_LOCK_SCHEMA = "autoforecast.forecast-campaign-selection-lock.v4"
 FINAL_SCORE_SCHEMA = "autoforecast.forecast-campaign-final-score.v3"
 REPLAY_SCHEMA = "autoforecast.forecast-campaign-replay.v3"
@@ -122,7 +119,6 @@ _ROLLING_BUDGET_ADAPTERS = _FIXED_BUDGET_ADAPTERS - {
     "tft_hnb",
 
 }
-_LEGACY_TIE_BREAK = ("mean_score", "score_stddev", "model_id", "initialization")
 _TIE_BREAK = (
     "mean_score",
     "score_stddev",
@@ -371,7 +367,6 @@ def _yaml_load(path: pathlib.Path) -> tuple[dict[str, object], bytes]:
 class DataInput:
     """One declared source whose concrete bytes are supplied as a runtime binding."""
 
-    snapshot_id: str | None
     reference: str
     expected_sha256: str | None = None
 
@@ -422,7 +417,6 @@ class ParameterSourceRequest:
     """Exactly one human-selected parameter source for one campaign model."""
 
     mode: ParameterMode
-    base: str | None = None
     values: dict[str, object] | None = None
     study_config: pathlib.Path | None = None
     selection: pathlib.Path | None = None
@@ -442,8 +436,6 @@ class ForecastCampaignRequest:
     final_score_data: DataInput
     catalog: pathlib.Path
     model_ids: tuple[str, ...]
-    variant_ids: tuple[str | None, ...]
-    candidate_ids: tuple[str | None, ...]
     parameter_sources: tuple[ParameterSourceRequest, ...]
     training_start: TimePoint | None
     initialization_origin: TimePoint | None
@@ -478,31 +470,23 @@ class CompiledForecastCampaign:
 
 def _candidate_id(model_id: str, variant_id: str) -> str:
     """Return the stable campaign-arm identity without changing the catalog model identity."""
-    return model_id if variant_id == "default" else f"@{len(model_id)}:{model_id}:{variant_id}"
+    return f"@{len(model_id)}:{model_id}:{variant_id}"
 
 
-def _data_input(value: object, label: str, *, schema_version: int) -> DataInput:
-    if schema_version >= 4:
-        if type(value) is not dict:
-            raise ForecastCampaignError(f"{label} must be a mapping")
-        body = _exact(value, {"source_uri"} | ({"sha256"} if "sha256" in value else set()), label)
-        snapshot = None
-        reference = body["source_uri"]
-        reference_label = f"{label}.source_uri"
-        expected_sha256 = body.get("sha256")
-        if expected_sha256 is not None and not _is_sha256(expected_sha256):
-            raise ForecastCampaignError(f"{label}.sha256 must be a lowercase SHA-256")
-    else:
-        body = _exact(value, {"snapshot_id", "reference"}, label)
-        snapshot = _identifier(body["snapshot_id"], f"{label}.snapshot_id")
-        reference = body["reference"]
-        reference_label = f"{label}.reference"
-        expected_sha256 = None
+def _data_input(value: object, label: str) -> DataInput:
+    if type(value) is not dict:
+        raise ForecastCampaignError(f"{label} must be a mapping")
+    body = _exact(value, {"source_uri"} | ({"sha256"} if "sha256" in value else set()), label)
+    reference = body["source_uri"]
+    reference_label = f"{label}.source_uri"
+    expected_sha256 = body.get("sha256")
+    if expected_sha256 is not None and not _is_sha256(expected_sha256):
+        raise ForecastCampaignError(f"{label}.sha256 must be a lowercase SHA-256")
     try:
         stable_reference = validate_data_reference(reference)
     except ProvenanceError as error:
         raise ForecastCampaignError(f"{reference_label} is unsafe: {error}") from error
-    return DataInput(snapshot, stable_reference, cast(str | None, expected_sha256))
+    return DataInput(stable_reference, cast(str | None, expected_sha256))
 
 
 def _request_path(value: object, label: str) -> pathlib.Path:
@@ -511,19 +495,17 @@ def _request_path(value: object, label: str) -> pathlib.Path:
     return pathlib.Path(value)
 
 
-def _parameter_source(value: object, label: str, *, schema_version: int) -> ParameterSourceRequest:
+def _parameter_source(value: object, label: str) -> ParameterSourceRequest:
     if type(value) is not dict:
         raise ForecastCampaignError(f"{label} must be a mapping")
-    field = "mode" if schema_version >= 4 else "source"
+    field = "mode"
     mode = value.get(field)
     if mode == "defaults":
         _exact(value, {field}, label)
         return ParameterSourceRequest("defaults")
     if mode == "manual":
-        keys = {field, "values"} if schema_version >= 4 else {field, "base", "values"}
+        keys = {field, "values"}
         body = _exact(value, keys, label)
-        if schema_version < 4 and body["base"] != "profile_defaults":
-            raise ForecastCampaignError(f"{label} manual source requires base: profile_defaults")
         if type(body["values"]) is not dict:
             raise ForecastCampaignError(f"{label} manual mode requires a values mapping")
         try:
@@ -532,7 +514,6 @@ def _parameter_source(value: object, label: str, *, schema_version: int) -> Para
             raise ForecastCampaignError(f"{label}.values is invalid: {error}") from error
         return ParameterSourceRequest(
             "manual",
-            base="profile_defaults",
             values=cast(dict[str, object], body["values"]),
         )
     if mode == "tune":
@@ -540,7 +521,7 @@ def _parameter_source(value: object, label: str, *, schema_version: int) -> Para
         return ParameterSourceRequest(
             "tune", study_config=_request_path(body["study_config"], f"{label}.study_config")
         )
-    reuse_mode = "reuse_tuned" if schema_version >= 4 else "reuse_selection"
+    reuse_mode = "reuse_tuned"
     if mode == reuse_mode:
         body = _exact(value, {field, "study_config", "selection"}, label)
         return ParameterSourceRequest(
@@ -586,9 +567,9 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
     value, raw = _yaml_load(source)
     top = _exact(value, {"schema_version", "forecast_campaign"}, "request")
     schema_version = top["schema_version"]
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6}:
+    if type(schema_version) is not int or schema_version != 6:
         raise ForecastCampaignError(
-            "forecast campaign schema_version must be integer 1, 2, 3, 4, 5 or 6"
+            "forecast campaign schema_version must be integer 6"
         )
     body_keys = {
         "name",
@@ -602,9 +583,8 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
         "budgets",
         "compute",
         "tracking",
+        "purpose",
     }
-    if schema_version >= 5:
-        body_keys.add("purpose")
     body = _exact(
         top["forecast_campaign"],
         body_keys,
@@ -614,10 +594,10 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
     if type(raw_dataset) is not dict:
         raise ForecastCampaignError("forecast_campaign.dataset must be a mapping")
     dataset_keys = {"contract", "selection", "final_training", "final_score"}
-    if schema_version < 4 or "run_template" in raw_dataset:
+    if "run_template" in raw_dataset:
         dataset_keys.add("run_template")
     dataset = _exact(raw_dataset, dataset_keys, "forecast_campaign.dataset")
-    model_keys = {"catalog", "ids"} if schema_version == 1 else {"catalog", "candidates"}
+    model_keys = {"catalog", "candidates"}
     models = _exact(body["models"], model_keys, "forecast_campaign.models")
     temporal = _exact(
         body["temporal"],
@@ -651,67 +631,33 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
     if selection["direction"] != "minimize":
         raise ForecastCampaignError("forecast error metrics must use selection.direction=minimize")
     tie_break = selection["tie_break"]
-    expected_tie_break = _TIE_BREAK if schema_version >= 3 else _LEGACY_TIE_BREAK
+    expected_tie_break = _TIE_BREAK
     if type(tie_break) is not list or tuple(tie_break) != expected_tie_break:
         raise ForecastCampaignError(
             f"selection.tie_break must be exactly {list(expected_tie_break)}"
         )
-    if schema_version == 1:
-        ids = models["ids"]
-        if type(ids) is not list or not ids:
-            raise ForecastCampaignError("models.ids must be a non-empty list")
-        model_ids = tuple(_identifier(item, "models.ids item") for item in ids)
-        variant_ids = tuple("default" for _ in model_ids)
-        parameter_sources = tuple(ParameterSourceRequest("defaults") for _ in model_ids)
-    else:
-        candidates = models["candidates"]
-        if type(candidates) is not list or not candidates:
-            raise ForecastCampaignError("models.candidates must be a non-empty list")
-        if schema_version >= 4:
-            candidate_keys = {"model_id", "parameters"}
-        elif schema_version == 3:
-            candidate_keys = {"model_id", "variant_id", "parameters"}
-        else:
-            candidate_keys = {"id", "parameters"}
-        parsed_candidates = [
-            _exact(item, candidate_keys, f"models.candidates[{index}]")
-            for index, item in enumerate(candidates)
-        ]
-        model_ids = tuple(
-            _identifier(
-                item["model_id"] if schema_version >= 3 else item["id"],
-                f"models.candidates[{index}].model_id"
-                if schema_version >= 3
-                else f"models.candidates[{index}].id",
-            )
-            for index, item in enumerate(parsed_candidates)
+    candidates = models["candidates"]
+    if type(candidates) is not list or not candidates:
+        raise ForecastCampaignError("models.candidates must be a non-empty list")
+    candidate_keys = {"model_id", "parameters"}
+    parsed_candidates = [
+        _exact(item, candidate_keys, f"models.candidates[{index}]")
+        for index, item in enumerate(candidates)
+    ]
+    model_ids = tuple(
+        _identifier(
+            item["model_id"],
+            f"models.candidates[{index}].model_id",
         )
-        variant_ids = tuple(
-            (
-                _identifier(item["variant_id"], f"models.candidates[{index}].variant_id")
-                if schema_version == 3
-                else None
-                if schema_version >= 4
-                else "default"
-            )
-            for index, item in enumerate(parsed_candidates)
-        )
-        parameter_sources = tuple(
-            _parameter_source(
-                item["parameters"],
-                f"models.candidates[{index}].parameters",
-                schema_version=schema_version,
-            )
-            for index, item in enumerate(parsed_candidates)
-        )
-    candidate_ids = tuple(
-        None if variant_id is None else _candidate_id(model_id, variant_id)
-        for model_id, variant_id in zip(model_ids, variant_ids, strict=True)
+        for index, item in enumerate(parsed_candidates)
     )
-    if schema_version < 4 and len(set(candidate_ids)) != len(candidate_ids):
-        raise ForecastCampaignError(
-            "models must not repeat the same (model_id, variant_id) candidate"
+    parameter_sources = tuple(
+        _parameter_source(
+            item["parameters"],
+            f"models.candidates[{index}].parameters",
         )
+        for index, item in enumerate(parsed_candidates)
+    )
     raw_origins = temporal["validation_origins"]
     if type(raw_origins) is not list or not raw_origins:
         raise ForecastCampaignError("temporal.validation_origins must be a non-empty list")
@@ -775,10 +721,10 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
         "device", "batch_size", "gradient_microbatch_size", "memory_gib", "min_free_disk_gib"
     }
     raw_compute = body["compute"]
-    if schema_version >= 6 and type(raw_compute) is dict and "precision" in raw_compute:
+    if type(raw_compute) is dict and "precision" in raw_compute:
         compute_keys.add("precision")
     compute = _exact(raw_compute, compute_keys, "compute")
-    precision = compute.get("precision", "16-mixed" if schema_version >= 6 else "32-true")
+    precision = compute.get("precision", "16-mixed")
     if precision not in ("16-mixed", "32-true"):
         raise ForecastCampaignError("compute.precision must be 16-mixed or 32-true")
     if type(compute["device"]) is not str or compute["device"] not in {
@@ -797,7 +743,7 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
     if type(tracking["mlflow"]) is not bool:
         raise ForecastCampaignError("tracking.mlflow must be boolean")
     evidence_role = _identifier(body["final_evidence_role"], "final_evidence_role")
-    purpose = "forecast_campaign" if schema_version < 5 else body["purpose"]
+    purpose = body["purpose"]
     if type(purpose) is not str or purpose not in {
         "forecast_campaign",
         "single_model_benchmark",
@@ -841,17 +787,14 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
             if "run_template" not in dataset
             else _request_path(dataset["run_template"], "forecast_campaign.dataset.run_template")
         ),
-        _data_input(dataset["selection"], "dataset.selection", schema_version=schema_version),
+        _data_input(dataset["selection"], "dataset.selection"),
         _data_input(
             dataset["final_training"],
             "dataset.final_training",
-            schema_version=schema_version,
         ),
-        _data_input(dataset["final_score"], "dataset.final_score", schema_version=schema_version),
+        _data_input(dataset["final_score"], "dataset.final_score"),
         _request_path(models["catalog"], "forecast_campaign.models.catalog"),
         model_ids,
-        variant_ids,
-        candidate_ids,
         parameter_sources,
         training_start,
         initialization_origin,
@@ -937,7 +880,7 @@ def _data_identity(
     role = label.removesuffix(" data").replace(" ", "-")
     return {
         "path": str(path),
-        "snapshot_id": value.snapshot_id or f"{role}-{digest[:16]}",
+        "snapshot_id": f"{role}-{digest[:16]}",
         "reference": value.reference,
         "sha256": digest,
     }
@@ -1041,7 +984,6 @@ def _campaign_hpo_study(
     selection_data: dict[str, object],
     validation_origins: tuple[TimePoint, ...],
     frequency: str,
-    require_data_id: bool,
 ) -> HPOStudySpec:
     """Load one inner-validation study and prove it cannot consume outer/test evidence."""
     if source.study_config is None:
@@ -1070,9 +1012,7 @@ def _campaign_hpo_study(
         or study.tuning.source_sha256 != candidate.source_sha256
     ):
         raise ForecastCampaignError("HPO study model profile differs from its campaign model")
-    if study.data.get("fingerprint") != selection_data["sha256"] or (
-        require_data_id and study.data.get("id") != selection_data["snapshot_id"]
-    ):
+    if study.data.get("fingerprint") != selection_data["sha256"]:
         raise ForecastCampaignError("HPO study data identity differs from campaign selection data")
     target = study.data.get("validation_target_date_range")
     if type(target) is not list or len(target) != 2:
@@ -1208,22 +1148,13 @@ def _parameter_profiles(
         "early_stopping_relative_min_delta": request.validation_budget.relative_min_delta,
     }
     profiles: list[dict[str, object]] = []
-    for index, (declared_candidate_id, model_id, declared_variant_id, source) in enumerate(
-        zip(
-            request.candidate_ids,
-            request.model_ids,
-            request.variant_ids,
-            request.parameter_sources,
-            strict=True,
-        )
+    for index, (model_id, source) in enumerate(
+        zip(request.model_ids, request.parameter_sources, strict=True)
     ):
         candidate = candidates[model_id]
         candidate_protocol = {
             **expected_protocol,
-            **(
-                {"precision": effective_precision(candidate.adapter, request.compute.precision)}
-                if request.schema_version >= 6 else {}
-            ),
+            "precision": effective_precision(candidate.adapter, request.compute.precision),
         }
         study: HPOStudySpec | None = None
         study_record: dict[str, object] | None = None
@@ -1242,7 +1173,6 @@ def _parameter_profiles(
                     selection_data=selection_data,
                     validation_origins=request.validation_origins,
                     frequency=frequency,
-                    require_data_id=request.schema_version < 4,
                 )
                 study_record = _study_record(study)
                 if source.mode == "tune":
@@ -1266,15 +1196,14 @@ def _parameter_profiles(
             raise ForecastCampaignError(
                 f"parameter source for {model_id!r} is invalid: {error}"
             ) from error
-        generated_variant_id, variant_spec_sha256 = _variant_spec_identity(
+        variant_id, variant_spec_sha256 = _variant_spec_identity(
             candidate,
             source.mode,
             resolution,
             study_record,
             candidate_protocol,
         )
-        variant_id = declared_variant_id or generated_variant_id
-        candidate_id = declared_candidate_id or _candidate_id(model_id, variant_id)
+        candidate_id = _candidate_id(model_id, variant_id)
         profiles.append(
             {
                 "candidate_id": candidate_id,
@@ -1432,7 +1361,7 @@ def compile_forecast_campaign(
             if not descriptor(candidates[model_id].adapter).supports_shared_studies:
                 raise ForecastCampaignError(
                     f"campaign model {model_id!r} does not support shared studies; "
-                    "native checkpoint selection requires a legacy strict benchmark"
+                    "native checkpoint selection is supported only in standalone campaigns"
                 )
     unsupported = sorted(
         model_id
@@ -1746,11 +1675,7 @@ def compile_forecast_campaign(
             "validation_horizon": request.validation_horizon,
             "final_train_cutoff": request.final_train_cutoff.isoformat(),
             "final_test_horizon": request.final_test_horizon,
-            **(
-                {"step_days": cadence.multiplier}
-                if cadence.unit == "D"
-                else {"frequency": cadence.code}
-            ),
+            "frequency": cadence.code,
         },
         "seeds": list(request.seeds),
         "initialization_capabilities": capability,
@@ -1772,7 +1697,7 @@ def compile_forecast_campaign(
             "gradient_microbatch_size": request.compute.gradient_microbatch_size,
             "memory_gib": request.compute.memory_gib,
             "min_free_disk_gib": request.compute.min_free_disk_gib,
-            **({"precision": request.compute.precision} if request.schema_version >= 6 else {}),
+            "precision": request.compute.precision,
         },
         "tracking": {"mlflow": request.mlflow_enabled},
         "template_features": {
@@ -2323,41 +2248,27 @@ def _resolved_cadence(resolved: dict[str, object]) -> Cadence:
     contract = load_dataset_contract(_root() / cast(str, source["dataset_contract"]))
     contract_cadence = parse_frequency(str(contract.panel_roles.get("frequency", "D")))
     declared = temporal.get("frequency")
-    cadence = contract_cadence if declared is None else parse_frequency(cast(str, declared))
+    if type(declared) is not str or "step_days" in temporal:
+        raise ForecastCampaignError("resolved temporal requires frequency without step_days")
+    cadence = parse_frequency(declared)
     if cadence.code != contract_cadence.code:
         raise ForecastCampaignError("resolved cadence differs from the dataset contract")
-    if declared is None:
-        step_days = _positive_int(temporal.get("step_days"), "resolved temporal.step_days")
-        expected_days = (
-            contract_cadence.multiplier
-            if contract_cadence.unit == "D"
-            else 7
-            if contract_cadence.unit == "W"
-            else None
-        )
-        if expected_days is None or step_days != expected_days:
-            raise ForecastCampaignError("legacy resolved step_days differs from dataset cadence")
-    elif "step_days" in temporal:
-        raise ForecastCampaignError("resolved cadence must not also declare legacy step_days")
     return cadence
 
 
 def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
     resolved_schema = resolved.get("schema")
     if type(resolved_schema) is not str or resolved_schema not in {
-        LEGACY_RESOLVED_SCHEMA,
         RESOLVED_SCHEMA,
         INSTALLED_RESOLVED_SCHEMA,
     }:
         raise ForecastCampaignError("resolved artifact schema is invalid")
-    if resolved_schema != LEGACY_RESOLVED_SCHEMA and "request_schema_version" not in resolved:
+    if "request_schema_version" not in resolved:
         raise ForecastCampaignError("resolved request schema version is missing")
-    if resolved_schema == LEGACY_RESOLVED_SCHEMA and "request_schema_version" in resolved:
-        raise ForecastCampaignError("legacy resolved artifact must not have request_schema_version")
-    request_schema_version = resolved.get("request_schema_version", 3)
-    if type(request_schema_version) is not int or request_schema_version not in {1, 2, 3, 4, 5, 6}:
+    request_schema_version = resolved["request_schema_version"]
+    if type(request_schema_version) is not int or request_schema_version != 6:
         raise ForecastCampaignError("resolved request schema version is invalid")
-    purpose = resolved.get("purpose", "forecast_campaign")
+    purpose = resolved.get("purpose")
     if type(purpose) is not str or purpose not in {
         "forecast_campaign",
         "single_model_benchmark",
@@ -2365,7 +2276,7 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
         "capacity_diagnostic",
     }:
         raise ForecastCampaignError("resolved campaign purpose is invalid")
-    if request_schema_version >= 5 and "purpose" not in resolved:
+    if "purpose" not in resolved:
         raise ForecastCampaignError("resolved campaign purpose is missing")
     candidates = _resolved_catalog_candidates(resolved)
     models = cast(list[dict[str, object]], resolved.get("models"))
@@ -2402,10 +2313,9 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
     resolved_compute_keys = {
         "device", "batch_size", "gradient_microbatch_size", "memory_gib", "min_free_disk_gib"
     }
-    if request_schema_version >= 6:
-        resolved_compute_keys.add("precision")
+    resolved_compute_keys.add("precision")
     compute = _exact(resolved["compute"], resolved_compute_keys, "resolved compute")
-    if request_schema_version >= 6 and compute["precision"] not in ("16-mixed", "32-true"):
+    if compute["precision"] not in ("16-mixed", "32-true"):
         raise ForecastCampaignError("resolved compute precision is invalid")
     expected_protocol = {
         "metric": selection["metric"],
@@ -2433,9 +2343,7 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
             "tune_stage",
             "resolution",
         }
-        has_variant_spec = resolved_schema != LEGACY_RESOLVED_SCHEMA
-        if has_variant_spec:
-            expected_keys.add("variant_spec_sha256")
+        expected_keys.add("variant_spec_sha256")
         profile = _exact(
             raw,
             expected_keys,
@@ -2450,7 +2358,7 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
             type(candidate_id) is not str
             or type(model_id) is not str
             or type(variant_id) is not str
-            or (has_variant_spec and not _is_sha256(variant_spec_sha256))
+            or not _is_sha256(variant_spec_sha256)
             or candidate_id != models[index]["candidate_id"]
             or model_id != models[index]["model_id"]
             or variant_id != models[index]["variant_id"]
@@ -2468,12 +2376,9 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
         candidate = candidates[cast(str, model_id)]
         candidate_protocol = {
             **expected_protocol,
-            **(
-                {"precision": effective_precision(
-                    candidate.adapter, cast(str, compute.get("precision", "32-true"))
-                )}
-                if request_schema_version >= 6 else {}
-            ),
+            "precision": effective_precision(
+                    candidate.adapter, cast(str, compute["precision"])
+                ),
         }
         study_value = profile["study"]
         if mode in {"tune", "reuse_selection"}:
@@ -2493,7 +2398,6 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
                 selection_data=cast(dict[str, object], data["selection"]),
                 validation_origins=origins,
                 frequency=cadence.code,
-                require_data_id=request_schema_version < 4,
             )
             if not _same_exact(study_record, _study_record(study)):
                 raise ForecastCampaignError("resolved HPO study identity changed")
@@ -2528,9 +2432,8 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
             cast(dict[str, object] | None, study_value),
             candidate_protocol,
         )
-        if (has_variant_spec and generated_spec_sha256 != variant_spec_sha256) or (
-            request_schema_version >= 4 and generated_variant_id != variant_id
-        ):
+        if (generated_spec_sha256 != variant_spec_sha256
+                or generated_variant_id != variant_id):
             raise ForecastCampaignError(
                 f"resolved parameter profile {model_id!r} variant specification differs"
             )
@@ -2557,7 +2460,7 @@ def _fixed_evaluation(resolved: dict, stage: str, origin: str, horizon: int) -> 
 
 def _load_resolved(path: pathlib.Path, expected_sha: str) -> dict[str, object]:
     resolved = _load_exact(
-        path, expected_sha, (LEGACY_RESOLVED_SCHEMA, RESOLVED_SCHEMA, INSTALLED_RESOLVED_SCHEMA)
+        path, expected_sha, (RESOLVED_SCHEMA, INSTALLED_RESOLVED_SCHEMA)
     )
     _verify_resolved_source(resolved)
     _verify_resolved_parameter_profiles(resolved)
@@ -2925,6 +2828,7 @@ def _write_hpo_request(
     source = cast(dict[str, object], resolved["source"])
     selection = cast(dict[str, object], resolved["selection"])
     run: dict[str, object] = {
+        "precision": cast(dict[str, object], resolved["compute"])["precision"],
         "name": f"hpo-{model_id}"[:64],
         "dataset_contract": source["dataset_contract"],
         "model_catalog": source["model_catalog"],
@@ -2944,10 +2848,9 @@ def _write_hpo_request(
         run["features"] = features
     import yaml
 
-    schema_version = 3 if cast(int, resolved.get("request_schema_version", 3)) >= 6 else 2
     path.write_text(
         yaml.safe_dump(
-            {"schema_version": schema_version, "run": run},
+            {"schema_version": 3, "run": run},
             sort_keys=False,
         ),
         encoding="utf-8",
@@ -2961,7 +2864,7 @@ def run_tune_parameters(
     model_id: str,
     campaign_root: pathlib.Path,
     attempt_dir: pathlib.Path,
-    variant_id: str = "default",
+    variant_id: str,
 ) -> None:
     """Run inner-validation HPO as a durable dependency and seal its rank-one values."""
     del campaign_root  # The supervisor owns this stage; HPO evidence stays below its attempt.
@@ -3134,11 +3037,8 @@ def run_tune_parameters(
                 "early_stopping_relative_min_delta": cast(dict[str, object], budget)[
                     "early_stopping_relative_min_delta"
                 ],
-                **(
-                    {"precision": effective_precision(
-                        candidate.adapter, cast(str, compute["precision"])
-                    )}
-                    if cast(int, resolved.get("request_schema_version", 3)) >= 6 else {}
+                "precision": effective_precision(
+                    candidate.adapter, cast(str, compute["precision"])
                 ),
             },
         )
@@ -3156,6 +3056,7 @@ def _write_child_request(
 ) -> None:
     source = cast(dict[str, object], resolved["source"])
     run: dict[str, object] = {
+        "precision": cast(dict[str, object], resolved["compute"])["precision"],
         "name": cast(str, child["id"]),
         "dataset_contract": source["dataset_contract"],
         "model_catalog": source["model_catalog"],
@@ -3173,9 +3074,7 @@ def _write_child_request(
     feature = _features(resolved)
     if feature is not None:
         run["features"] = feature
-    version = 1
     if evaluation:
-        version = 2
         selection = cast(dict[str, object], resolved["selection"])
         run["evaluation"] = {
             "missing_actual": selection["missing_actual"],
@@ -3183,12 +3082,10 @@ def _write_child_request(
             "input_mode": "post_training_score_only",
             "evidence_role": "rolling_validation",
         }
-    if cast(int, resolved.get("request_schema_version", 3)) >= 6:
-        version = 3
     import yaml
 
     path.write_text(
-        yaml.safe_dump({"schema_version": version, "run": run}, sort_keys=False),
+        yaml.safe_dump({"schema_version": 3, "run": run}, sort_keys=False),
         encoding="utf-8",
     )
 
@@ -3286,8 +3183,8 @@ _CHILD_RESULT_FIELDS = {
     "score",
     "comparison_sha256",
     "selection_lock_sha256",
+    "training_controls_sha256",
 }
-_CHILD_RESULT_PRECISION_FIELDS = _CHILD_RESULT_FIELDS | {"training_controls_sha256"}
 
 
 def _rolling_metrics_path(run_path: pathlib.Path, model_id: str) -> pathlib.Path:
@@ -3443,17 +3340,7 @@ def _governed_rolling_selection_origins(
     windows = effective.get("training.train_windows") if type(effective) is dict else None
     stride = effective.get("training.train_stride") if type(effective) is dict else None
     encoder = effective.get("model.encoder_days") if type(effective) is dict else None
-    # Full campaign records bind cadence to their authenticated dataset contract. Some callers
-    # of this daily-only verifier pass the legacy temporal evidence directly; retain that narrow
-    # compatibility path while still refusing non-daily production records.
-    temporal = resolved.get("temporal")
-    if "source" in resolved:
-        cadence = _resolved_cadence(resolved)
-    else:
-        legacy_step = temporal.get("step_days") if type(temporal) is dict else None
-        if type(legacy_step) is not int or legacy_step < 1:
-            raise ForecastCampaignError("governed rolling training cadence is missing")
-        cadence = parse_frequency("D" if legacy_step == 1 else f"{legacy_step}D")
+    cadence = _resolved_cadence(resolved)
     if cadence.unit != "D":
         raise ForecastCampaignError("governed rolling training origins require daily cadence")
     step_days = cadence.multiplier
@@ -4423,10 +4310,7 @@ def _validated_child_result(
         )
     except ExactJSONError as error:
         raise ForecastCampaignError(f"invalid child result: {error}") from error
-    precision_aware = cast(int, resolved.get("request_schema_version", 3)) >= 6
-    expected_fields = (
-        _CHILD_RESULT_PRECISION_FIELDS if precision_aware else _CHILD_RESULT_FIELDS
-    )
+    expected_fields = _CHILD_RESULT_FIELDS
     if type(value) is dict and value.get("adapter") in _ROLLING_BUDGET_ADAPTERS:
         expected_fields = expected_fields | {"training_metrics_sha256"}
     if type(value) is not dict or set(value) != expected_fields:
@@ -4447,9 +4331,7 @@ def _validated_child_result(
         "budget",
     )
     if (
-        result["schema"] != (
-            CHILD_RESULT_PRECISION_SCHEMA if precision_aware else CHILD_RESULT_SCHEMA
-        )
+        result["schema"] != CHILD_RESULT_SCHEMA
         or result["status"] != "completed"
         or any(
             result[field] != child[field if field != "child_id" else "id"]
@@ -4528,10 +4410,9 @@ def _validated_child_result(
     )
     if run_parameter is None or not _same_exact(run_parameter, observed_parameters):
         raise ForecastCampaignError(f"child run parameter evidence differs: {child['id']}")
-    if precision_aware:
-        _verify_child_precision_controls(
-            run_path, resolved, child, result["training_controls_sha256"]
-        )
+    _verify_child_precision_controls(
+        run_path, resolved, child, result["training_controls_sha256"]
+    )
     if child["parameter_mode"] in {"tune", "reuse_selection"}:
         try:
             validate_parameter_source_capsule(
@@ -4909,10 +4790,7 @@ def _run_generic_child(
     if run_parameter is None or not _same_exact(run_parameter, parameter_resolution):
         raise ForecastCampaignError("governed child did not retain its parameter resolution")
     result: dict[str, object] = {
-        "schema": (
-            CHILD_RESULT_PRECISION_SCHEMA
-            if cast(int, resolved.get("request_schema_version", 3)) >= 6 else CHILD_RESULT_SCHEMA
-        ),
+        "schema": CHILD_RESULT_SCHEMA,
         "status": "completed",
         "kind": child["kind"],
         "child_id": child["id"],
@@ -4950,15 +4828,14 @@ def _run_generic_child(
         result["training_metrics_sha256"] = _sha_file(
             _rolling_metrics_path(run, cast(str, child["model_id"]))
         )
-    if cast(int, resolved.get("request_schema_version", 3)) >= 6:
-        control_paths = list(
-            (run / "attempts" / cast(str, child["model_id"])).glob(
-                "*/metadata/training-controls.json"
-            )
+    control_paths = list(
+        (run / "attempts" / cast(str, child["model_id"])).glob(
+            "*/metadata/training-controls.json"
         )
-        if len(control_paths) != 1:
-            raise ForecastCampaignError("governed child has no unique training controls")
-        result["training_controls_sha256"] = _sha_file(control_paths[0])
+    )
+    if len(control_paths) != 1:
+        raise ForecastCampaignError("governed child has no unique training controls")
+    result["training_controls_sha256"] = _sha_file(control_paths[0])
     checkpoints = list((run / "attempts" / cast(str, child["model_id"])).glob("*/model/model.pt"))
     if checkpoints:
         if len(checkpoints) != 1:

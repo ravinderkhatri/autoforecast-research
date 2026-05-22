@@ -1039,16 +1039,14 @@ def _durable_worker_scratch_parent(output_root: pathlib.Path) -> pathlib.Path:
 
 
 def _resolved_precision(
-    request_schema_version: int, explicit: str | None, *, has_parent: bool
+    request_precision: str, explicit: str | None, *, has_parent: bool
 ) -> str:
-    """Keep legacy and continuation runs FP32; new-schema fresh runs default to FP16 AMP."""
+    """Use the declared precision; checkpoint continuations retain their FP32 contract."""
     if explicit not in (None, "32-true", "16-mixed"):
         raise TrainWorkflowError("precision must be 32-true, 16-mixed, or null")
     if has_parent and explicit == "16-mixed":
         raise TrainWorkflowError("mixed precision is unsupported for checkpoint continuations")
-    return explicit or (
-        "16-mixed" if request_schema_version >= 3 and not has_parent else "32-true"
-    )
+    return explicit or ("32-true" if has_parent else request_precision)
 
 
 @with_training_lease
@@ -1156,7 +1154,7 @@ def run_request(
     if request_path.read_bytes() != request_bytes:
         raise TrainWorkflowError("request changed while loading")
     precision = _resolved_precision(
-        request.schema_version, precision, has_parent=parent_checkpoint is not None
+        request.precision, precision, has_parent=parent_checkpoint is not None
     )
     score_input_values = (
         evaluation_data_path,
@@ -1217,6 +1215,7 @@ def run_request(
             request.calendar_events,
             request.event_max_support,
             request.schema_version,
+            request.precision,
         )
     source = installed_library_identity() if installed_mode() else capture_source_identity(_root())
     runtime = capture_runtime_identity(
@@ -1245,7 +1244,7 @@ def run_request(
             if not descriptor(candidate.adapter).supports_shared_studies:
                 raise TrainWorkflowError(
                     f"model {candidate.id!r} does not support shared studies; "
-                    "native checkpoint selection requires a legacy strict benchmark"
+                    "native checkpoint selection is supported only in standalone campaigns"
                 )
     if patience is None:
         patience = (
@@ -1520,23 +1519,12 @@ def run_request(
                 bundle.write_json(
                     "metadata/training-controls.json",
                     {
-                        "schema": (
-                            "autoforecast.training-controls.v2"
-                            if request.schema_version >= 3 or precision == "16-mixed"
-                            else "autoforecast.training-controls.v1"
-                        ),
+                        "schema": "autoforecast.training-controls.v2",
                         "maximum_epochs": epochs,
                         **{key: value for key, value in training_controls.items()
                            if key != "precision"},
-                        **(
-                            {
-                                "requested_precision": precision,
-                                "effective_precision": effective_precision(
-                                    candidate.adapter, precision
-                                ),
-                            }
-                            if request.schema_version >= 3 or precision == "16-mixed" else {}
-                        ),
+                        "requested_precision": precision,
+                        "effective_precision": effective_precision(candidate.adapter, precision),
                     },
                 )
                 if selection_lock is not None:
