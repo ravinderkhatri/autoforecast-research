@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin, period_points
+from autoforecast.parquet_time import validate_parquet_time_storage
 
 
 def read_forecast_grid(
@@ -55,7 +56,11 @@ def read_forecast_grid(
             f"origin must be canonical for frequency {frequency!r}, got {origin!r}"
         ) from exc
     end = requested_points[-1]
-    source = ds.dataset(path, format="parquet", partitioning="hive")
+    validate_parquet_time_storage(path, time_col, allow_hive_partition=True)
+    # INT96 has no physical unit: read proven-naive values at the same precision as the
+    # other readers, preserving wide-year values without nanosecond overflow.
+    parquet = ds.ParquetFileFormat(read_options={"coerce_int96_timestamp_unit": "us"})
+    source = ds.dataset(path, format=parquet, partitioning="hive")
     date_field = ds.field(time_col)  # pyright: ignore[reportPrivateImportUsage]
     field_type = source.schema.field(time_col).type
     if pa.types.is_timestamp(field_type):

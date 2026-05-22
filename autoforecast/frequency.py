@@ -232,6 +232,10 @@ def period_points(
 def _coerce_point(point: str | TimePoint, cadence: Cadence) -> TimePoint:
     if isinstance(point, str):
         return parse_origin(point, cadence)
+    # Arrow timestamp[ns] values may be pandas Timestamp subclasses. Their nanosecond
+    # remainder is not represented by datetime.microsecond, time(), or date().
+    if isinstance(point, dt.datetime) and getattr(point, "nanosecond", 0):
+        raise FrequencyError(f"time point has sub-microsecond precision: {point!r}")
     if cadence.key_kind == "timestamp":
         if not isinstance(point, dt.datetime):
             raise FrequencyError(f"{cadence.code} requires a datetime point, got {point!r}")

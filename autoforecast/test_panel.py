@@ -746,7 +746,7 @@ def test_calendar_forecast_uses_anchored_keys_and_rejects_lossy_timestamps() -> 
             [{"series_id": "a", "date": dt.datetime(2024, 2, 29, 1), "yhat": 1.0}],
             time_type=pa.timestamp("us"),
         )
-        with pytest.raises(ForecastError, match="cannot discard"):
+        with pytest.raises(ForecastError, match="requires a date or timezone-naive midnight"):
             Forecast(
                 "model", nonmidnight, "2024-01-31", 1, 1, {"emitted": 1}, frequency="M",
             ).validate()
@@ -829,6 +829,32 @@ def test_forecast_validate_refuses_an_existing_artifact_with_the_wrong_schema() 
             assert "missing required columns" in str(e) and "yhat" in str(e)
             return
     raise AssertionError("accepted a forecast artifact without yhat")
+
+
+@pytest.mark.parametrize("frequency,origin,point", [
+    ("H", "2024-01-01T00:00:00", "2024-01-01T01:00:00"),
+    ("D", "2024-01-01", "2024-01-02"), ("W", "2024-01-01", "2024-01-08"),
+    ("M", "2024-01-31", "2024-02-29"), ("MS", "2024-01-01", "2024-02-01"),
+    ("Y", "2023-12-31", "2024-12-31"), ("YS", "2024-01-01", "2025-01-01"),
+])
+@pytest.mark.parametrize("remainder", [0, 1])
+def test_forecast_native_nanoseconds_are_never_rounded_to_grid_keys(
+    tmp_path, frequency, origin, point, remainder,
+):
+    import pandas as pd
+
+    path = tmp_path / "forecast.parquet"
+    key = pd.Timestamp(point) + pd.Timedelta(remainder, unit="ns")
+    pq.write_table(pa.table({
+        "series_id": ["a"], "date": pa.array([key], type=pa.timestamp("ns")),
+        "yhat": [2.0],
+    }), path)
+    forecast = Forecast("external", path, origin, 1, 1, {"emitted": 1}, frequency=frequency)
+    if remainder:
+        with pytest.raises(ForecastError, match="sub-microsecond"):
+            forecast.validate()
+    else:
+        assert forecast.validate().n_emitted == 1
 
 
 if __name__ == "__main__":

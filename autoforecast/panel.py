@@ -28,7 +28,6 @@ from autoforecast.frequency import (
     Cadence,
     FrequencyError,
     TimePoint,
-    advance,
     canonical_origin,
     parse_frequency,
     parse_origin,
@@ -570,23 +569,9 @@ def _as_time_key(value: object, frequency: str, adapter: str) -> TimePoint:
     """Normalise one Arrow forecast key without truncating any timestamp component."""
     cadence = parse_frequency(frequency)
     try:
-        if isinstance(value, str):
-            return parse_origin(value, cadence)
-        if cadence.key_kind == "timestamp":
-            if not isinstance(value, dt.datetime):
-                raise FrequencyError(f"{cadence.code} requires a timestamp key, got {value!r}")
-            return parse_origin(canonical_origin(value, cadence), cadence)
-        if isinstance(value, dt.datetime):
-            if value.tzinfo is not None or value.time() != dt.time():
-                raise FrequencyError(
-                    f"{cadence.code} date key cannot discard a non-midnight or timezone-aware "
-                    f"timestamp: {value!r}"
-                )
-            value = value.date()
-        if not isinstance(value, dt.date):
-            raise FrequencyError(f"{cadence.code} requires a date key, got {value!r}")
-        # Asking for a zero-step calendar point validates M/Y anchor semantics.
-        return advance(value, cadence, 0)
+        if not isinstance(value, str | dt.date):
+            raise FrequencyError(f"{cadence.code} requires a date or timestamp key, got {value!r}")
+        return parse_origin(canonical_origin(value, cadence), cadence)
     except FrequencyError as exc:
         raise ForecastError(f"{adapter!r}: invalid forecast time key: {exc}") from exc
 

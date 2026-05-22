@@ -194,3 +194,26 @@ def test_horizon_and_period_count_are_strict_integers() -> None:
             period_points("2024-01-01", "D", horizon)  # type: ignore[arg-type]
     with pytest.raises(FrequencyError, match="periods"):
         advance(dt.date(2024, 1, 1), "D", True)
+
+
+@pytest.mark.parametrize("frequency,aligned", [
+    ("H", "2024-01-01T01:00:00"), ("D", "2024-01-02"),
+    ("W", "2024-01-08"), ("M", "2024-01-31"), ("MS", "2024-02-01"),
+    ("Y", "2024-12-31"), ("YS", "2025-01-01"),
+])
+@pytest.mark.parametrize("remainder", [1, 999])
+def test_datetime_subclasses_cannot_discard_nanosecond_remainders(
+    frequency, aligned, remainder,
+):
+    import pandas as pd
+
+    point = pd.Timestamp(aligned) + pd.Timedelta(remainder, unit="ns")
+    assert point.microsecond == 0 and point.nanosecond == remainder
+    with pytest.raises(FrequencyError, match="sub-microsecond"):
+        canonical_origin(point, frequency)
+    with pytest.raises(FrequencyError, match="sub-microsecond"):
+        advance(point, frequency, 1)
+    with pytest.raises(FrequencyError, match="sub-microsecond"):
+        period_points(point, frequency, 1)
+    # Zero remainder remains lossless, including all calendar anchors.
+    assert canonical_origin(pd.Timestamp(aligned), frequency) == aligned

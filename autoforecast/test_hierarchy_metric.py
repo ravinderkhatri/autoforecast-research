@@ -357,3 +357,91 @@ def test_read_forecast_grid_refuses_noncanonical_origin_identity(tmp_path):
             time_col="date",
             value_col="value",
         )
+
+
+@pytest.mark.parametrize("frequency,origin,points", [
+    ("H", "2024-01-01T00:00:00", ["2024-01-01T01:00:00", "2024-01-01T02:00:00"]),
+    ("D", "2024-01-01", ["2024-01-02", "2024-01-03"]),
+])
+@pytest.mark.parametrize("int96", [False, True])
+@pytest.mark.parametrize("filter_actuals", [False, True])
+@pytest.mark.parametrize("remainder", [0, 1])
+def test_read_forecast_grid_preserves_nanosecond_alignment(
+    tmp_path, frequency, origin, points, int96, filter_actuals, remainder,
+):
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    keys = [pd.Timestamp(point) for point in points]
+    keys[0] += pd.Timedelta(remainder, unit="ns")
+    path = tmp_path / "forecast.parquet"
+    pq.write_table(pa.table({
+        "id": ["a", "a"], "date": pa.array(keys, type=pa.timestamp("ns")),
+        "value": [1.0, 2.0],
+    }), path, use_deprecated_int96_timestamps=int96)
+    arguments = dict(
+        path=str(path), series_ids=("a",), origin=origin, horizon=2,
+        series_col="id", time_col="date", value_col="value",
+        frequency=frequency, filter_actuals=filter_actuals,
+    )
+    if remainder:
+        with pytest.raises(ValueError, match="sub-microsecond|malformed"):
+            read_forecast_grid(**arguments)
+    else:
+        np.testing.assert_array_equal(read_forecast_grid(**arguments), [[1.0, 2.0]])
+
+
+@pytest.mark.parametrize("timezone,store_schema", [("UTC", True), ("Asia/Kathmandu", True),
+                                                   (None, False)])
+@pytest.mark.parametrize("filter_actuals", [False, True])
+def test_read_forecast_grid_checks_all_int96_provenance_before_filtering(
+    tmp_path, timezone, store_schema, filter_actuals,
+):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({
+        "id": ["a"], "date": pa.array([dt.datetime(2024, 1, 1, 1)],
+                                      type=pa.timestamp("us")), "value": [1.0],
+    }), tmp_path / "a.parquet")
+    # The later legacy fragment is outside the requested window. Its erased timezone
+    # or absent provenance must not be hidden by the schema of the first native fragment.
+    pq.write_table(pa.table({
+        "id": ["a"], "date": pa.array([dt.datetime(2023, 12, 31)],
+                                      type=pa.timestamp("us", tz=timezone)), "value": [2.0],
+    }), tmp_path / "b.parquet", use_deprecated_int96_timestamps=True,
+        store_schema=store_schema)
+    with pytest.raises(ValueError, match="timezone-bearing|ARROW:schema"):
+        read_forecast_grid(
+            str(tmp_path), ("a",), "2024-01-01T00:00:00", 1,
+            series_col="id", time_col="date", value_col="value",
+            frequency="H", filter_actuals=filter_actuals,
+        )
+
+
+def test_read_forecast_grid_keeps_wide_year_int96_and_hive_dates(tmp_path):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    legacy = tmp_path / "legacy.parquet"
+    pq.write_table(pa.table({
+        "id": ["a"], "date": pa.array([dt.datetime(2500, 1, 1, 1)],
+                                      type=pa.timestamp("us")), "value": [3.0],
+    }), legacy, use_deprecated_int96_timestamps=True)
+    np.testing.assert_array_equal(read_forecast_grid(
+        str(legacy), ("a",), "2500-01-01T00:00:00", 1, series_col="id",
+        time_col="date", value_col="value", frequency="H",
+    ), [[3.0]])
+    partitioned = tmp_path / "partitioned"
+    pq.write_to_dataset(pa.table({
+        "id": ["a"], "date": [dt.date(2024, 1, 2)], "value": [4.0],
+    }), root_path=str(partitioned), partition_cols=["date"])
+    np.testing.assert_array_equal(read_forecast_grid(
+        str(partitioned), ("a",), "2024-01-01", 1, series_col="id",
+        time_col="date", value_col="value",
+    ), [[4.0]])
