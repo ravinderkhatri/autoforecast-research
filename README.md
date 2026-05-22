@@ -283,6 +283,85 @@ and any supplied weights and scales. Training loss remains model-specific. Final
 the selected update budget without test labels. These native adapters retain their daily-data,
 target, feature, and history requirements; use a compatible adapter for other frequencies.
 
+### Use a study from a notebook
+
+Install the `timeseries` extra and start a supported Spark session. The notebook interface
+borrows that session and never stops it. Set the experiment project once; its existing
+`.autoforecast/benchmarks` directory is the local study registry:
+
+```python
+from autoforecast.notebook import load_study
+from autoforecast.project import experiment_project
+
+with experiment_project("/absolute/path/to/my-experiment"):
+    with load_study(study_id) as study:
+        training = study.training_data
+        validation_actuals = study.validation_data
+        refit = study.refit_data
+        testing_actuals = study.testing_data
+
+        # Fit your existing model on training, then refit on refit.
+        # Keep testing_actuals outside all fitting and model selection.
+        # Produce two Forecast objects as shown in the runnable example below.
+        result = study.run_validation(
+            validation_forecasts=validation_forecasts,
+            testing_forecasts=testing_forecasts,
+            model_id="my-model",
+        )
+        print(result["validation"]["score"])
+        print(result["test"]["score"])
+        print(result["result_path"])
+```
+
+For a standalone registry, pass `registry_root=...` to `load_study`. Pass `spark=spark` when
+the caller's session is not active. An unknown ID raises `FileNotFoundError`; access failures
+and changed artifacts remain separate errors. Loading never creates a study.
+
+All four data properties return Spark DataFrames over verified private snapshots, sliced to
+the intended stage. They keep source key names, the frozen internal series ID, and
+`__af_original_missing`. `study.panel` exposes the column names, cadence and target estimand;
+`study.series_mapping` maps exact source keys to internal IDs. `study.series_starts` adds
+`__af_history_start`. `study.policies`, `study.metric_definition`, and
+`study.scoring_references` expose the frozen missingness and scoring settings.
+
+| Inclusive range | Meaning |
+|---|---|
+| `training_date_range` | Overall history start through the initial training cutoff |
+| `validation_date_range` | Validation forecast and actual comparison window |
+| `refit_date_range` | Overall history start through the final refit cutoff |
+| `testing_date_range` | Full planned final evaluation window |
+| `forecasting_date_range` | Alias of `testing_date_range` |
+
+Ranges contain Python dates, or datetimes for hourly studies. Each series also retains its
+own history start. Missing actuals never shorten a range. This interface requires exactly
+one validation origin; it rejects multi-origin studies explicitly. Study settings cannot be
+edited in place. Use the dataframes inside the study's lifetime; `close()` or leaving its
+context releases the private snapshots.
+
+Predictions use the existing `autoforecast.panel.Forecast` contract. Its Parquet rows must
+contain `series_id`, `date`, and finite nonnegative numeric `yhat`. For hourly predictions,
+use timezone-naive `TIMESTAMP_NTZ`; other cadences use `DATE`. Map original keys through
+`study.series_mapping`; do not construct internal IDs by concatenating keys. Supply the
+correct origin, horizon, cadence, target estimand, series count and emitted-cell count in
+each Forecast. Every frozen series/date cell is required, even where actuals are missing.
+Duplicate, missing, extra, or wrong-stage predictions are rejected.
+
+Run the complete [notebook example](scripts/notebook_study_example.py) from outside the checkout:
+
+```bash
+python -m scripts.notebook_study_example /absolute/path/to/new-notebook-example
+```
+
+It creates two tiny series with unequal history starts, freezes them using `freeze_benchmark`,
+loads the generated ID, accesses all roles and ranges, converts ordinary Spark predictions
+to Forecast objects, and scores both stages. It performs no model training or paid compute.
+
+Each check writes a new `notebook-runs/run-...` directory beside the registry, retaining
+forecasts, per-series scores, coverage, study/model/run IDs and artifact hashes. The existing
+scorer controls unavailable scores and WRMSSE weights. The result records verified input
+identities; it cannot prove which data arbitrary notebook code trained on. It is a notebook
+forecast check, not a registered model or managed campaign result for `read_results`.
+
 ### Tune within a study
 
 Declare inner tuning windows in `recipe.json` **before** freezing the study. For example,
