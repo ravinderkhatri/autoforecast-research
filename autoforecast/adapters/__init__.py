@@ -20,12 +20,12 @@ dependency is missing is skipped and REPORTED rather than taking the package dow
 
 from __future__ import annotations
 
-import datetime as dt
 import functools
 import importlib
 
 from autoforecast import registry
 from autoforecast.adapter_contracts import DESCRIPTORS, descriptor
+from autoforecast.frequency import advance, frequency_is_supported, parse_frequency, parse_origin
 from autoforecast.panel import Panel
 from autoforecast.resources import SparkProfile
 from autoforecast.tracking_plan import tracking_plan
@@ -42,28 +42,43 @@ __all__ = [
 _ISOLATED_MODULE = {name: descriptor(name).module for name in DESCRIPTORS}
 
 
-def _validate_daily_span(panel: Panel, origin: str, horizon: int, *, adapter: str) -> dt.date:
-    """Fail before runtime work when a daily-only adapter cannot represent the request."""
-    if panel.frequency != "D":
+def _validate_span(panel: Panel, origin: str, horizon: int, *, adapter: str):
+    """Fail before runtime work when an adapter cannot represent the requested period span."""
+    cadence = parse_frequency(panel.frequency)
+    definition = descriptor(adapter)
+    supported = definition.supported_frequency_families
+    if not frequency_is_supported(
+        cadence,
+        supported,
+        supports_strided_daily=definition.supports_strided_daily,
+    ):
         raise ValueError(
-            f"{adapter} supports daily panels only, got frequency {panel.frequency!r}"
+            f"{adapter} supports frequency families {supported} with "
+            f"supports_strided_daily={definition.supports_strided_daily}, "
+            f"got {panel.frequency!r}"
         )
     if type(horizon) is not int or horizon < 1:
         raise ValueError(f"horizon must be a positive integer, got {horizon!r}")
     try:
-        origin_day = dt.date.fromisoformat(origin)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"origin must be canonical ISO YYYY-MM-DD, got {origin!r}") from exc
-    if origin_day.isoformat() != origin:
-        raise ValueError(f"origin must be canonical ISO YYYY-MM-DD, got {origin!r}")
-    try:
-        origin_day + dt.timedelta(days=horizon)
-    except OverflowError as exc:
+        origin_point = parse_origin(origin, cadence)
+        advance(origin_point, cadence, horizon)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
-            f"origin and horizon must produce a representable daily span, got "
+            "origin and horizon must produce a canonical representable "
+            f"{panel.frequency!r} span, got "
             f"origin={origin!r}, horizon={horizon!r}"
         ) from exc
-    return origin_day
+    return origin_point
+
+
+def _validate_daily_span(panel: Panel, origin: str, horizon: int, *, adapter: str):
+    """Compatibility validator for implementations that still require exact daily input."""
+    cadence = parse_frequency(panel.frequency)
+    if cadence.unit != "D" or cadence.multiplier != 1:
+        raise ValueError(
+            f"{adapter} supports exact daily panels only, got frequency {panel.frequency!r}"
+        )
+    return _validate_span(panel, origin, horizon, adapter=adapter)
 
 
 def known_adapter_names() -> tuple[str, ...]:
@@ -144,6 +159,10 @@ def _registration(name: str) -> dict[str, object]:
         "consumes_exposure": definition.consumes_exposure,
         "handles_right_censoring": definition.handles_right_censoring,
         "supported_estimands": frozenset(definition.target_estimands),
+        "supported_frequency_families": frozenset(
+            definition.supported_frequency_families
+        ),
+        "supports_strided_daily": definition.supports_strided_daily,
     }
     if definition.handles_right_censoring:
         return result

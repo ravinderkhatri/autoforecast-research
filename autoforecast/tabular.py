@@ -1,9 +1,8 @@
-"""Convert explicitly mapped CSV observations to the daily Parquet input contract."""
+"""Convert explicitly mapped CSV observations to the typed Parquet input contract."""
 
 from __future__ import annotations
 
 import csv
-import datetime as dt
 import hashlib
 import io
 import json
@@ -12,6 +11,7 @@ import pathlib
 import re
 
 from autoforecast.column_names import validate_column_names
+from autoforecast.frequency import FrequencyError, parse_frequency, parse_origin
 
 
 def import_csv(
@@ -21,6 +21,7 @@ def import_csv(
     source_keys: list[str],
     time_col: str,
     target_col: str,
+    frequency: str = "D",
 ) -> pathlib.Path:
     """Preserve string keys and observed zeros; reject ambiguous or invalid observations.
 
@@ -33,6 +34,10 @@ def import_csv(
     import pyarrow.parquet as pq
     from mlops._safe_files import publish_bytes_set
 
+    try:
+        cadence = parse_frequency(frequency)
+    except FrequencyError as error:
+        raise ValueError(f"invalid import frequency: {error}") from error
     columns = [*source_keys, time_col, target_col]
     if (
         not source_keys
@@ -58,22 +63,30 @@ def import_csv(
                 raise ValueError(f"CSV row {line}: field count differs from header")
             if any(not row[key].strip() for key in source_keys):
                 raise ValueError(f"CSV row {line}: empty series key")
-            date = row[time_col]
-            if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date):
+            raw_time = row[time_col]
+            if cadence.code == "D" and re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}", raw_time
+            ) is None:
                 raise ValueError(f"CSV row {line}: date must be YYYY-MM-DD")
             try:
-                day = dt.date.fromisoformat(date)
+                point = parse_origin(raw_time, cadence)
                 target = float(row[target_col])
             except ValueError as exc:
-                raise ValueError(f"CSV row {line}: invalid date or numeric target") from exc
+                detail = (
+                    "invalid date or numeric target"
+                    if cadence.code == "D"
+                    else f"invalid {cadence.code} time key or numeric target"
+                )
+                raise ValueError(f"CSV row {line}: {detail}") from exc
             if not math.isfinite(target) or target < 0:
                 raise ValueError(f"CSV row {line}: target must be finite and nonnegative")
-            key = (*(row[name] for name in source_keys), day)
+            key = (*(row[name] for name in source_keys), point)
             if key in seen:
-                raise ValueError(f"CSV row {line}: duplicate series/date observation")
+                label = "date" if cadence.code == "D" else "time"
+                raise ValueError(f"CSV row {line}: duplicate series/{label} observation")
             seen.add(key)
             rows.append(
-                {**{name: row[name] for name in source_keys}, time_col: day, target_col: target}
+                {**{name: row[name] for name in source_keys}, time_col: point, target_col: target}
             )
     except csv.Error as error:
         raise ValueError(f"CSV row {reader.reader.line_num}: malformed CSV: {error}") from error
@@ -81,10 +94,17 @@ def import_csv(
         raise ValueError("CSV contains no observations")
     schema = pa.schema(
         [(name, pa.string()) for name in source_keys]
-        + [(time_col, pa.date32()), (target_col, pa.float64())]
+        + [
+            (time_col, pa.timestamp("us") if cadence.key_kind == "timestamp" else pa.date32()),
+            (target_col, pa.float64()),
+        ]
     )
     record = {
-        "schema": "autoforecast.csv-import.v1",
+        "schema": (
+            "autoforecast.csv-import.v1"
+            if cadence.code == "D"
+            else "autoforecast.csv-import.v2"
+        ),
         "source_path": str(source.resolve()),
         "source_sha256": hashlib.sha256(payload).hexdigest(),
         "source_keys": source_keys,
@@ -95,6 +115,7 @@ def import_csv(
         "row_count": len(rows),
         "first_date": min(row[time_col] for row in rows).isoformat(),
         "last_date": max(row[time_col] for row in rows).isoformat(),
+        **({"frequency": cadence.code} if cadence.code != "D" else {}),
     }
     schema = schema.with_metadata({b"autoforecast.csv_import": json.dumps(record).encode()})
     sink = pa.BufferOutputStream()

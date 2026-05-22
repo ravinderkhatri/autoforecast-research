@@ -42,14 +42,25 @@ from autoforecast import resources
 from autoforecast._exact_json import ExactJSONError, load_exact_json, loads_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast._numeric import is_finite_real
+from autoforecast.adapter_contracts import descriptor
 from autoforecast.adapters import validate_execution_controls
 from autoforecast.benchmarks.policy import is_m5_daily
 from autoforecast.campaign import CampaignError, CampaignStore
 from autoforecast.data_admission import load_dataset_contract
+from autoforecast.frequency import (
+    Cadence,
+    FrequencyError,
+    TimePoint,
+    advance,
+    canonical_origin,
+    frequency_is_supported,
+    parse_frequency,
+    parse_origin,
+)
 from autoforecast.hpo import HPOError, HPOStudySpec, load_hpo_study, run_hpo_study
 from autoforecast.hpo_bridge import ForecastTrialBridge
 from autoforecast.model_catalog import Candidate, discover_candidates
-from autoforecast.panel import Forecast, period_days
+from autoforecast.panel import Forecast
 from autoforecast.parameter_sources import (
     ParameterSourceError,
     _training_controls_are_valid,
@@ -203,6 +214,64 @@ def _date(value: object, label: str) -> dt.date:
         raise ForecastCampaignError(f"{label} must be an ISO date") from error
     if parsed.isoformat() != value:
         raise ForecastCampaignError(f"{label} must be a canonical ISO date")
+    return parsed
+
+
+def _time_point(value: object, label: str) -> TimePoint:
+    """Parse request text without guessing its dataset cadence or losing an hourly key."""
+    if type(value) is not str:
+        raise ForecastCampaignError(f"{label} must be a canonical ISO date or exact-hour timestamp")
+    try:
+        return parse_origin(value, "H" if "T" in value else "D")
+    except FrequencyError as error:
+        raise ForecastCampaignError(
+            f"{label} must be a canonical ISO date or exact-hour timestamp"
+        ) from error
+
+
+def _period_span(start: TimePoint, end: TimePoint, cadence: Cadence, label: str) -> int:
+    """Count cadence intervals between aligned endpoints using the shared anchor arithmetic."""
+    if start > end:
+        raise ForecastCampaignError(f"{label} start must not follow its end")
+    try:
+        if cadence.unit == "H":
+            assert isinstance(start, dt.datetime) and isinstance(end, dt.datetime)
+            seconds = int((end - start).total_seconds())
+            periods, remainder = divmod(seconds, 3600)
+        elif cadence.unit in {"D", "W"}:
+            assert isinstance(start, dt.date) and not isinstance(start, dt.datetime)
+            assert isinstance(end, dt.date) and not isinstance(end, dt.datetime)
+            stride = cadence.multiplier if cadence.unit == "D" else 7
+            periods, remainder = divmod((end - start).days, stride)
+        elif cadence.unit == "M":
+            assert isinstance(start, dt.date) and not isinstance(start, dt.datetime)
+            assert isinstance(end, dt.date) and not isinstance(end, dt.datetime)
+            periods = (end.year - start.year) * 12 + end.month - start.month
+            remainder = 0
+        else:
+            assert isinstance(start, dt.date) and not isinstance(start, dt.datetime)
+            assert isinstance(end, dt.date) and not isinstance(end, dt.datetime)
+            periods = end.year - start.year
+            remainder = 0
+        if remainder or advance(start, cadence, periods) != end:
+            raise ForecastCampaignError(
+                f"{label} endpoints do not align to frequency {cadence.code}"
+            )
+    except FrequencyError as error:
+        raise ForecastCampaignError(f"{label} is invalid for frequency {cadence.code}") from error
+    return periods
+
+
+def _canonical_request_point(point: TimePoint, cadence: Cadence, label: str) -> TimePoint:
+    text = point.isoformat()
+    try:
+        parsed = parse_origin(text, cadence)
+    except FrequencyError as error:
+        raise ForecastCampaignError(
+            f"{label} is invalid for frequency {cadence.code}: {error}"
+        ) from error
+    if canonical_origin(parsed, cadence) != text:
+        raise ForecastCampaignError(f"{label} is not canonical for frequency {cadence.code}")
     return parsed
 
 
@@ -365,11 +434,11 @@ class ForecastCampaignRequest:
     variant_ids: tuple[str | None, ...]
     candidate_ids: tuple[str | None, ...]
     parameter_sources: tuple[ParameterSourceRequest, ...]
-    training_start: dt.date | None
-    initialization_origin: dt.date | None
-    validation_origins: tuple[dt.date, ...]
+    training_start: TimePoint | None
+    initialization_origin: TimePoint | None
+    validation_origins: tuple[TimePoint, ...]
     validation_horizon: int
-    final_train_cutoff: dt.date
+    final_train_cutoff: TimePoint
     final_test_horizon: int
     seeds: tuple[int, ...]
     initialization_arms: tuple[InitializationArm, ...]
@@ -635,24 +704,33 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
     raw_origins = temporal["validation_origins"]
     if type(raw_origins) is not list or not raw_origins:
         raise ForecastCampaignError("temporal.validation_origins must be a non-empty list")
-    origins = tuple(_date(item, "validation origin") for item in raw_origins)
+    origins = tuple(_time_point(item, "validation origin") for item in raw_origins)
+    if len({type(origin) for origin in origins}) != 1:
+        raise ForecastCampaignError("validation origins must use one consistent key type")
     if tuple(sorted(set(origins))) != origins:
         raise ForecastCampaignError("validation origins must be unique and strictly increasing")
     training_start = (
         None
         if temporal["training_start"] is None
-        else _date(temporal["training_start"], "temporal.training_start")
+        else _time_point(temporal["training_start"], "temporal.training_start")
     )
     initialization_origin = (
         None
         if temporal["initialization_origin"] is None
-        else _date(temporal["initialization_origin"], "temporal.initialization_origin")
+        else _time_point(temporal["initialization_origin"], "temporal.initialization_origin")
     )
     validation_horizon = _positive_int(
         temporal["validation_horizon"], "temporal.validation_horizon"
     )
-    final_cutoff = _date(temporal["final_train_cutoff"], "temporal.final_train_cutoff")
+    final_cutoff = _time_point(temporal["final_train_cutoff"], "temporal.final_train_cutoff")
     final_horizon = _positive_int(temporal["final_test_horizon"], "temporal.final_test_horizon")
+    points = [*origins, final_cutoff]
+    if training_start is not None:
+        points.append(training_start)
+    if initialization_origin is not None:
+        points.append(initialization_origin)
+    if len({type(point) for point in points}) != 1:
+        raise ForecastCampaignError("campaign temporal points must use one consistent key type")
     if training_start is not None and training_start >= origins[0]:
         raise ForecastCampaignError("training_start must precede every validation origin")
     if initialization_origin is not None and not (
@@ -662,8 +740,6 @@ def load_forecast_campaign_request(path: str | pathlib.Path) -> ForecastCampaign
         raise ForecastCampaignError(
             "initialization_origin must follow start and precede validation"
         )
-    if any(origin + dt.timedelta(days=validation_horizon) > final_cutoff for origin in origins):
-        raise ForecastCampaignError("validation windows must end on or before final_train_cutoff")
     seeds = body["seeds"]
     if (
         type(seeds) is not list
@@ -952,8 +1028,8 @@ def _campaign_hpo_study(
     candidate: Candidate,
     *,
     selection_data: dict[str, object],
-    validation_origins: tuple[dt.date, ...],
-    step_days: int,
+    validation_origins: tuple[TimePoint, ...],
+    frequency: str,
     require_data_id: bool,
 ) -> HPOStudySpec:
     """Load one inner-validation study and prove it cannot consume outer/test evidence."""
@@ -990,10 +1066,14 @@ def _campaign_hpo_study(
     target = study.data.get("validation_target_date_range")
     if type(target) is not list or len(target) != 2:
         raise ForecastCampaignError("HPO validation target range is invalid")
-    start, end = (_date(value, "HPO validation target") for value in target)
-    span = (end - start).days
-    if span < 0 or span % step_days:
-        raise ForecastCampaignError("HPO validation target range does not match dataset cadence")
+    cadence = parse_frequency(frequency)
+    try:
+        start, end = (parse_origin(value, cadence) for value in target)
+        _period_span(start, end, cadence, "HPO validation target range")
+    except (FrequencyError, TypeError) as error:
+        raise ForecastCampaignError(
+            "HPO validation target range does not match dataset cadence"
+        ) from error
     # HPO is an inner selection problem. Its last target must precede the first outer target,
     # which starts one data period after the first campaign validation origin.
     if end > validation_origins[0]:
@@ -1097,7 +1177,7 @@ def _parameter_profiles(
     candidates: dict[str, Candidate],
     selection_data: dict[str, object],
     *,
-    step_days: int,
+    frequency: str,
     dataset_contract_sha256: str,
     features: dict[str, object] | None,
 ) -> list[dict[str, object]]:
@@ -1150,7 +1230,7 @@ def _parameter_profiles(
                     candidate,
                     selection_data=selection_data,
                     validation_origins=request.validation_origins,
-                    step_days=step_days,
+                    frequency=frequency,
                     require_data_id=request.schema_version < 4,
                 )
                 study_record = _study_record(study)
@@ -1239,6 +1319,38 @@ def compile_forecast_campaign(
     catalog = catalog_lexical.resolve()
     if not catalog.is_relative_to(_root().resolve()) or not catalog.is_dir():
         raise ForecastCampaignError("model catalog must be a source directory below the repository")
+    try:
+        contract_definition = load_dataset_contract(contract)
+        selection_panel = contract_definition.panel(selection_data_path)
+        cadence = parse_frequency(selection_panel.frequency)
+        request = replace(
+            request,
+            training_start=(
+                None
+                if request.training_start is None
+                else _canonical_request_point(
+                    request.training_start, cadence, "temporal.training_start"
+                )
+            ),
+            initialization_origin=(
+                None
+                if request.initialization_origin is None
+                else _canonical_request_point(
+                    request.initialization_origin, cadence, "temporal.initialization_origin"
+                )
+            ),
+            validation_origins=tuple(
+                _canonical_request_point(origin, cadence, "validation origin")
+                for origin in request.validation_origins
+            ),
+            final_train_cutoff=_canonical_request_point(
+                request.final_train_cutoff, cadence, "temporal.final_train_cutoff"
+            ),
+        )
+    except Exception as error:
+        raise ForecastCampaignError(
+            f"dataset contract cannot define campaign cadence: {error}"
+        ) from error
     if (
         is_m5_daily(contract)
         and request.final_train_cutoff == dt.date(2016, 5, 22)
@@ -1250,18 +1362,17 @@ def compile_forecast_campaign(
             "archived_private_replay_not_blind"
         )
     try:
-        contract_definition = load_dataset_contract(contract)
-        selection_panel = contract_definition.panel(selection_data_path)
-        step_days = period_days(selection_panel.frequency)
-    except Exception as error:
+        invalid_window = any(
+            advance(origin, cadence, request.validation_horizon)
+            > request.final_train_cutoff
+            for origin in request.validation_origins
+        )
+        advance(request.final_train_cutoff, cadence, request.final_test_horizon)
+    except FrequencyError as error:
         raise ForecastCampaignError(
-            f"dataset contract cannot define campaign cadence: {error}"
+            "campaign horizons are outside the representable dataset cadence"
         ) from error
-    if any(
-        origin + dt.timedelta(days=request.validation_horizon * step_days)
-        > request.final_train_cutoff
-        for origin in request.validation_origins
-    ):
+    if invalid_window:
         raise ForecastCampaignError(
             "validation windows must end on or before final_train_cutoff at dataset frequency"
         )
@@ -1280,6 +1391,21 @@ def compile_forecast_campaign(
     unknown = sorted(set(request.model_ids) - set(candidates))
     if unknown:
         raise ForecastCampaignError(f"campaign model IDs are absent from catalog: {unknown}")
+    unsupported = sorted(
+        model_id
+        for model_id in request.model_ids
+        if not frequency_is_supported(
+            cadence,
+            descriptor(candidates[model_id].adapter).supported_frequency_families,
+            supports_strided_daily=descriptor(
+                candidates[model_id].adapter
+            ).supports_strided_daily,
+        )
+    )
+    if unsupported:
+        raise ForecastCampaignError(
+            f"campaign models do not support {cadence.code} cadence: {unsupported}"
+        )
     if (
         request.purpose == "single_model_benchmark"
         and any(
@@ -1444,7 +1570,7 @@ def compile_forecast_campaign(
         request,
         candidates,
         selection_data,
-        step_days=step_days,
+        frequency=cadence.code,
         dataset_contract_sha256=_sha_file(contract),
         features=template_features,
     )
@@ -1577,7 +1703,11 @@ def compile_forecast_campaign(
             "validation_horizon": request.validation_horizon,
             "final_train_cutoff": request.final_train_cutoff.isoformat(),
             "final_test_horizon": request.final_test_horizon,
-            "step_days": step_days,
+            **(
+                {"step_days": cadence.multiplier}
+                if cadence.unit == "D"
+                else {"frequency": cadence.code}
+            ),
         },
         "seeds": list(request.seeds),
         "initialization_capabilities": capability,
@@ -1612,7 +1742,9 @@ def compile_forecast_campaign(
         benchmark_sha256 = _sha_file(benchmark_path)
         benchmark_path, benchmark = verify_benchmark(benchmark_path, benchmark_sha256)
         recipe = benchmark["recipe"]
-        if (recipe["validation_origins"] != cast(dict, resolved["temporal"])["validation_origins"]
+        if (parse_frequency(recipe.get("frequency", "D")).code != cadence.code
+            or recipe["validation_origins"]
+            != cast(dict, resolved["temporal"])["validation_origins"]
             or recipe["validation_horizon"] != request.validation_horizon
             or recipe["final_train_cutoff"] != request.final_train_cutoff.isoformat()
             or recipe["final_test_horizon"] != request.final_test_horizon
@@ -2123,6 +2255,32 @@ def _resolved_catalog_candidates(resolved: dict[str, object]) -> dict[str, Candi
     return candidates
 
 
+def _resolved_cadence(resolved: dict[str, object]) -> Cadence:
+    """Recover cadence from the authenticated dataset contract and validate its serialization."""
+    source = cast(dict[str, object], resolved["source"])
+    temporal = cast(dict[str, object], resolved["temporal"])
+    contract = load_dataset_contract(_root() / cast(str, source["dataset_contract"]))
+    contract_cadence = parse_frequency(str(contract.panel_roles.get("frequency", "D")))
+    declared = temporal.get("frequency")
+    cadence = contract_cadence if declared is None else parse_frequency(cast(str, declared))
+    if cadence.code != contract_cadence.code:
+        raise ForecastCampaignError("resolved cadence differs from the dataset contract")
+    if declared is None:
+        step_days = _positive_int(temporal.get("step_days"), "resolved temporal.step_days")
+        expected_days = (
+            contract_cadence.multiplier
+            if contract_cadence.unit == "D"
+            else 7
+            if contract_cadence.unit == "W"
+            else None
+        )
+        if expected_days is None or step_days != expected_days:
+            raise ForecastCampaignError("legacy resolved step_days differs from dataset cadence")
+    elif "step_days" in temporal:
+        raise ForecastCampaignError("resolved cadence must not also declare legacy step_days")
+    return cadence
+
+
 def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
     resolved_schema = resolved.get("schema")
     if type(resolved_schema) is not str or resolved_schema not in {
@@ -2155,11 +2313,27 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
         raise ForecastCampaignError("resolved parameter profiles are incomplete")
     data = cast(dict[str, object], resolved["data"])
     temporal = cast(dict[str, object], resolved["temporal"])
-    origins = tuple(
-        _date(value, "resolved validation origin")
-        for value in cast(list[object], temporal["validation_origins"])
+    cadence = _resolved_cadence(resolved)
+    try:
+        origins = tuple(
+            parse_origin(cast(str, value), cadence)
+            for value in cast(list[object], temporal["validation_origins"])
+        )
+    except (FrequencyError, TypeError) as error:
+        raise ForecastCampaignError("resolved validation origins are invalid") from error
+    unsupported = sorted(
+        model_id
+        for model_id, candidate in candidates.items()
+        if not frequency_is_supported(
+            cadence,
+            descriptor(candidate.adapter).supported_frequency_families,
+            supports_strided_daily=descriptor(candidate.adapter).supports_strided_daily,
+        )
     )
-    step_days = _positive_int(temporal.get("step_days"), "resolved temporal.step_days")
+    if unsupported:
+        raise ForecastCampaignError(
+            f"resolved campaign models do not support {cadence.code} cadence: {unsupported}"
+        )
     source = cast(dict[str, object], resolved["source"])
     selection = cast(dict[str, object], resolved["selection"])
     budgets = cast(dict[str, object], resolved["budgets"])
@@ -2257,7 +2431,7 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
                 candidate,
                 selection_data=cast(dict[str, object], data["selection"]),
                 validation_origins=origins,
-                step_days=step_days,
+                frequency=cadence.code,
                 require_data_id=request_schema_version < 4,
             )
             if not _same_exact(study_record, _study_record(study)):
@@ -2310,7 +2484,8 @@ def _fixed_evaluation(resolved: dict, stage: str, origin: str, horizon: int) -> 
     from autoforecast.benchmark import boundary, verify_benchmark
     benchmark = resolved["benchmark"]
     verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
-    return benchmark["evaluations"][boundary(stage, origin, horizon)]
+    cadence = _resolved_cadence(resolved)
+    return benchmark["evaluations"][boundary(stage, origin, horizon, cadence.code)]
 
 
 def _load_resolved(path: pathlib.Path, expected_sha: str) -> dict[str, object]:
@@ -2405,13 +2580,16 @@ def _materialize_training_panel(
         raise ForecastCampaignError("training source changed before materialization")
     contract = load_dataset_contract(contract_path)
     panel = contract.panel(source).validate()
-    cutoff = dt.date.fromisoformat(origin)
-    end = cutoff + dt.timedelta(days=horizon * period_days(panel.frequency))
+    cadence = parse_frequency(panel.frequency)
+    cutoff = parse_origin(origin, cadence)
+    end = advance(cutoff, cadence, horizon)
     dataset = pads.dataset(source, format="parquet", partitioning="hive")
     date_field = pc.field(panel.time_col)
     condition = date_field <= pa.scalar(end if panel.known_future else cutoff)
     if training_start is not None:
-        condition = condition & (date_field >= pa.scalar(dt.date.fromisoformat(training_start)))
+        condition = condition & (
+            date_field >= pa.scalar(parse_origin(training_start, cadence))
+        )
     if panel.known_future and panel.exposure_col is None:
         raise ForecastCampaignError(
             "physical future-label masking requires an exposure column when known-future rows "
@@ -2465,29 +2643,29 @@ def _panel_range_facts(
     start: str | None = None,
     end: str | None = None,
 ) -> tuple[str, str, int]:
-    """Return exact date bounds and series cardinality for one declared panel slice."""
+    """Return exact time bounds and series cardinality for one declared panel slice."""
     panel = load_dataset_contract(contract_path).panel(source).validate()
+    cadence = parse_frequency(panel.frequency)
     dataset = pads.dataset(source, format="parquet", partitioning="hive")
     condition = None
     if start is not None:
-        condition = pc.field(panel.time_col) >= pa.scalar(dt.date.fromisoformat(start))
+        condition = pc.field(panel.time_col) >= pa.scalar(parse_origin(start, cadence))
     if end is not None:
-        upper = pc.field(panel.time_col) <= pa.scalar(dt.date.fromisoformat(end))
+        upper = pc.field(panel.time_col) <= pa.scalar(parse_origin(end, cadence))
         condition = upper if condition is None else condition & upper
-    first: dt.date | None = None
-    last: dt.date | None = None
+    first: TimePoint | None = None
+    last: TimePoint | None = None
     series: set[object] = set()
     for batch in dataset.scanner(
         columns=[panel.series_col, panel.time_col], filter=condition, batch_size=131072
     ).to_batches():
         for raw in batch[panel.time_col].to_pylist():
-            day = raw.date() if isinstance(raw, dt.datetime) else raw
-            if isinstance(day, str):
-                day = dt.date.fromisoformat(day)
-            if not isinstance(day, dt.date):
-                raise ForecastCampaignError("HPO panel contains a non-date time value")
-            first = day if first is None or day < first else first
-            last = day if last is None or day > last else last
+            try:
+                point = parse_origin(canonical_origin(raw, cadence), cadence)
+            except (AttributeError, FrequencyError, TypeError) as error:
+                raise ForecastCampaignError("HPO panel contains an invalid time value") from error
+            first = point if first is None or point < first else first
+            last = point if last is None or point > last else last
         series.update(item for item in batch[panel.series_col].to_pylist() if item is not None)
     if first is None or last is None or not series:
         raise ForecastCampaignError("HPO declared panel slice is empty")
@@ -2507,11 +2685,12 @@ def _materialize_panel_range(
     if directory_digest(source, suffixes=(".parquet",)) != expected_source_sha256:
         raise ForecastCampaignError("HPO source changed before validation materialization")
     panel = load_dataset_contract(contract_path).panel(source).validate()
+    cadence = parse_frequency(panel.frequency)
     dataset = pads.dataset(source, format="parquet", partitioning="hive")
-    condition = pc.field(panel.time_col) <= pa.scalar(dt.date.fromisoformat(end))
+    condition = pc.field(panel.time_col) <= pa.scalar(parse_origin(end, cadence))
     if start is not None:
         condition = condition & (
-            pc.field(panel.time_col) >= pa.scalar(dt.date.fromisoformat(start))
+            pc.field(panel.time_col) >= pa.scalar(parse_origin(start, cadence))
         )
     destination.mkdir()
     output = destination / "part-00000.parquet"
@@ -2625,7 +2804,7 @@ def _write_hpo_request(
     resolved: dict[str, object],
     *,
     model_id: str,
-    origin: dt.date,
+    origin: TimePoint,
     horizon: int,
 ) -> None:
     source = cast(dict[str, object], resolved["source"])
@@ -2687,11 +2866,10 @@ def run_tune_parameters(
     if not _same_exact(_study_record(study), study_record):
         raise ForecastCampaignError("HPO study changed after campaign compilation")
     target = cast(list[str], study.data["validation_target_date_range"])
-    start, end = (dt.date.fromisoformat(value) for value in target)
-    step_days = cast(int, cast(dict[str, object], resolved["temporal"])["step_days"])
-    span = (end - start).days
-    horizon = span // step_days + 1
-    origin = start - dt.timedelta(days=step_days)
+    cadence = _resolved_cadence(resolved)
+    start, end = (parse_origin(value, cadence) for value in target)
+    horizon = _period_span(start, end, cadence, "HPO validation target range") + 1
+    origin = advance(start, cadence, -1)
     request_path = attempt_dir / "hpo-run-request.yaml"
     _write_hpo_request(request_path, resolved, model_id=model_id, origin=origin, horizon=horizon)
     data_record = cast(dict[str, object], cast(dict[str, object], resolved["data"])["selection"])
@@ -3026,6 +3204,9 @@ def _rolling_selection_objective_masks(
     source = cast(dict[str, object], resolved["source"])
     contract_path = _root() / cast(str, source["dataset_contract"])
     panel = load_dataset_contract(contract_path).panel(panel_path).validate()
+    cadence = parse_frequency(panel.frequency)
+    if cadence.unit != "D":
+        raise ForecastCampaignError("revision rolling objective masks require daily cadence")
     dataset = pads.dataset(panel_path, format="parquet", partitioning="hive")
     time_field = pc.field(panel.time_col)
     earliest: dt.date | None = None
@@ -3051,7 +3232,7 @@ def _rolling_selection_objective_masks(
     horizon = result.get("horizon")
     if type(horizon) is not int or horizon < 1 or not origins:
         raise ForecastCampaignError("revision training windows are invalid")
-    stride = period_days(panel.frequency)
+    stride = cadence.multiplier
     masks: dict[str, object] = {}
     for origin in origins:
         try:
@@ -3123,11 +3304,23 @@ def _governed_rolling_selection_origins(
     parameters = result.get("parameter_resolution")
     effective = parameters.get("effective_parameters") if type(parameters) is dict else None
     config = training.get("config")
-    temporal = resolved.get("temporal")
     windows = effective.get("training.train_windows") if type(effective) is dict else None
     stride = effective.get("training.train_stride") if type(effective) is dict else None
     encoder = effective.get("model.encoder_days") if type(effective) is dict else None
-    step_days = temporal.get("step_days") if type(temporal) is dict else None
+    # Full campaign records bind cadence to their authenticated dataset contract. Some callers
+    # of this daily-only verifier pass the legacy temporal evidence directly; retain that narrow
+    # compatibility path while still refusing non-daily production records.
+    temporal = resolved.get("temporal")
+    if "source" in resolved:
+        cadence = _resolved_cadence(resolved)
+    else:
+        legacy_step = temporal.get("step_days") if type(temporal) is dict else None
+        if type(legacy_step) is not int or legacy_step < 1:
+            raise ForecastCampaignError("governed rolling training cadence is missing")
+        cadence = parse_frequency("D" if legacy_step == 1 else f"{legacy_step}D")
+    if cadence.unit != "D":
+        raise ForecastCampaignError("governed rolling training origins require daily cadence")
+    step_days = cadence.multiplier
     horizon = result.get("horizon")
     origin = result.get("origin")
     if (
@@ -4462,8 +4655,11 @@ def _run_generic_child(
             evaluation_record = cast(dict[str, object], data["final_training"])
             evaluation_source_path = _verify_data(evaluation_record, "final training data")
             temporal = cast(dict[str, object], resolved["temporal"])
-            target_end = dt.date.fromisoformat(cast(str, child["origin"])) + dt.timedelta(
-                days=cast(int, child["horizon"]) * cast(int, temporal["step_days"])
+            cadence = _resolved_cadence(resolved)
+            target_end = advance(
+                parse_origin(cast(str, child["origin"]), cadence),
+                cadence,
+                cast(int, child["horizon"]),
             )
             evaluation_path = attempt_dir / "evaluation-panel"
             _materialize_panel_range(
@@ -4471,7 +4667,7 @@ def _run_generic_child(
                 evaluation_path,
                 contract_path=contract_path,
                 start=cast(str | None, temporal["training_start"]),
-                end=target_end.isoformat(),
+                end=canonical_origin(target_end, cadence),
                 expected_source_sha256=cast(str, evaluation_record["sha256"]),
             )
         command.extend(
@@ -4482,7 +4678,7 @@ def _run_generic_child(
                 f"{evaluation_record['snapshot_id']}-{child['id']}-evaluation",
                 "--evaluation-data-reference",
                 f"{str(evaluation_record['reference']).rstrip('/')}"
-                f"/__autoforecast_slice__/through-{target_end.isoformat()}",
+                f"/__autoforecast_slice__/through-{canonical_origin(target_end, cadence)}",
             ]
         )
     parent_stage = child.get("parent_stage")

@@ -371,6 +371,62 @@ def test_stability_uses_the_declared_period_grid_and_refuses_frequency_mismatch(
         )
 
 
+def test_stability_preserves_hourly_overlap_across_midnight() -> None:
+    root = pathlib.Path(tempfile.mkdtemp())
+
+    def hourly_forecast(name: str, origin: str, rows: list[tuple[str, str, float]]) -> Forecast:
+        path = root / name
+        (
+            spark().createDataFrame(
+                rows, "series_id string, raw_date string, yhat double"
+            )
+            .selectExpr("series_id", "cast(raw_date as timestamp_ntz) as date", "yhat")
+            .write.parquet(str(path))
+        )
+        return Forecast(
+            "candidate", path, origin, 3, 1, {"emitted": 3}, frequency="H"
+        )
+
+    earlier = hourly_forecast(
+        "hourly-earlier",
+        "2024-03-01T20:00:00",
+        [
+            ("s1", "2024-03-01T21:00:00", 1.0),
+            ("s1", "2024-03-01T22:00:00", 2.0),
+            ("s1", "2024-03-01T23:00:00", 4.0),
+        ],
+    )
+    later = hourly_forecast(
+        "hourly-later",
+        "2024-03-01T21:00:00",
+        [
+            ("s1", "2024-03-01T22:00:00", 3.0),
+            ("s1", "2024-03-01T23:00:00", 2.0),
+            ("s1", "2024-03-02T00:00:00", 9.0),
+        ],
+    )
+    overlap = root / "hourly-overlap"
+    (
+        spark().createDataFrame(
+            [
+                ("s1", "2024-03-01T22:00:00"),
+                ("s1", "2024-03-01T23:00:00"),
+            ],
+            "series_id string, raw_date string",
+        )
+        .selectExpr("series_id", "cast(raw_date as timestamp_ntz) as date")
+        .write.parquet(str(overlap))
+    )
+    digest = grid.content_hash(overlap, spark(), frequency="H")
+
+    result = measure(
+        earlier, later, spark(), expected_overlap=overlap, expected_overlap_hash=digest
+    )
+
+    assert result.n_shared_cells == 2
+    assert result.mean_absolute_revision == pytest.approx(1.5)
+
+
 def test_stability_refuses_a_selectively_missing_or_extra_overlap_cell() -> None:
     """The former inner join silently dropped either discrepancy and improved the metric."""
     root = pathlib.Path(tempfile.mkdtemp())

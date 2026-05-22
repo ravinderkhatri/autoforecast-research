@@ -7,6 +7,7 @@ selection is reproducible, that intermittency is actually spanned, and that a fi
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import pathlib
 import sys
@@ -18,6 +19,7 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
+from autoforecast import plots
 from autoforecast.adapters.naive import seasonal_naive
 from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 from autoforecast.plots import diagnostic_plot, series_across_zero_rate_deciles
@@ -103,6 +105,57 @@ def test_a_series_with_too_little_history_is_not_offered() -> None:
     assert series_across_zero_rate_deciles(panel(), spark(), ORIGIN, n=8, min_history=10**6) == []
 
 
+def test_series_selection_preserves_mapped_columns_that_match_temporary_names(tmp_path) -> None:
+    source = tmp_path / "colliding-panel"
+    spark().createDataFrame(
+        [
+            ("series", dt.date(2024, 1, 1), 0.0),
+            ("series", dt.date(2024, 1, 2), 2.0),
+        ],
+        "__AF_PLOT_VALID_TIME string, day date, __AF_PLOT_TIME double",
+    ).write.parquet(str(source))
+    described = Panel(
+        source,
+        "__AF_PLOT_VALID_TIME",
+        "day",
+        "__AF_PLOT_TIME",
+    )
+
+    picked = series_across_zero_rate_deciles(
+        described, spark(), "2024-01-02", n=1, min_history=1
+    )
+
+    assert picked == [("series", 0.5)]
+
+
+@pytest.mark.parametrize(
+    "frequency,origin,point,expected",
+    [
+        ("D", "2024-01-01", dt.datetime(2024, 1, 2), dt.date(2024, 1, 2)),
+        (
+            "H",
+            "2024-01-01T00:00:00",
+            dt.datetime(2024, 1, 1, 1),
+            dt.datetime(2024, 1, 1, 1),
+        ),
+    ],
+)
+def test_forecast_collection_uses_declared_canonical_time_keys(
+    tmp_path, frequency, origin, point, expected
+) -> None:
+    path = tmp_path / "forecast"
+    spark().createDataFrame(
+        [("a", point, 1.0)], "series_id string, date timestamp_ntz, yhat double"
+    ).write.parquet(str(path))
+    forecast = Forecast(
+        "candidate", path, origin, 1, 1, {"emitted": 1}, frequency=frequency
+    ).validate()
+
+    assert plots._collect_forecast(forecast, spark(), ["a"]) == {  # noqa: SLF001
+        "a": [(expected, 1.0)]
+    }
+
+
 def test_diagnostic_plot_writes_a_png_for_a_real_forecast() -> None:
     p = panel()
     d = tempfile.mkdtemp()
@@ -128,7 +181,7 @@ def test_diagnostic_plot_refuses_when_nothing_has_enough_history() -> None:
     raise AssertionError("drew a figure with no series")
 
 
-def test_diagnostic_plot_requests_the_full_declared_forecast_span(monkeypatch, tmp_path) -> None:
+def test_diagnostic_plot_requests_the_full_declared_forecast_period_count(monkeypatch, tmp_path) -> None:
     import autoforecast.plots as plots
 
     seen: list[int] = []
@@ -151,7 +204,7 @@ def test_diagnostic_plot_requests_the_full_declared_forecast_span(monkeypatch, t
         tmp_path / "weekly.png",
         n_series=1,
     )
-    assert seen == [14]
+    assert seen == [2]
 
 
 def test_diagnostic_plot_refuses_panel_forecast_cadence_mismatch(monkeypatch, tmp_path) -> None:

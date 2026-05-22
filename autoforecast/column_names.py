@@ -22,3 +22,18 @@ def validate_column_names(names: Iterable[object]) -> None:
                 "rename headers so names are distinct ignoring case"
             )
         seen[folded] = name
+
+
+def fresh_internal_names(existing: Iterable[str], stems: Iterable[str]) -> tuple[str, ...]:
+    """Return deterministic Spark column names distinct from caller columns ignoring case."""
+    used = {name.casefold() for name in existing}
+    names = []
+    for stem in stems:
+        candidate = stem
+        suffix = 2
+        while candidate.casefold() in used:
+            candidate = f"{stem}_{suffix}"
+            suffix += 1
+        names.append(candidate)
+        used.add(candidate.casefold())
+    return tuple(names)

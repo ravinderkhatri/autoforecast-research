@@ -99,12 +99,28 @@ def test_public_inventory_and_wheel_include_maintained_forecast_data(clean_wheel
             assert archive.read(name) == (ROOT / name).read_bytes()
 
 
+def test_public_inventory_accepts_the_approved_readme_diagram(clean_wheel, tmp_path):
+    original, _ = clean_wheel
+    root = tmp_path / "repo"
+    shutil.copytree(original, root)
+    name = "assets/autoforecast-overview.svg"
+    path = root / name
+    path.parent.mkdir()
+    shutil.copyfile(ROOT / name, path)
+    command(root, "git", "add", name)
+
+    names, _ = tracked_inventory(root)
+
+    assert name in names
+
+
 @pytest.mark.parametrize(
     "name, content",
     [
         ("INTERNAL.md", "private notes"),
         ("autoforecast/notes.md", "private notes"),
         ("configs/diagram.svg", "<svg/>"),
+        ("assets/internal.svg", "<svg/>"),
         ("configs/conversation.json", "{}"),
         ("configs/messages.json", '[{"ro' + 'le": "assistant", "content": "private"}]'),
         ("configs/session.jsonl", "{}\n"),

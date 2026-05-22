@@ -46,7 +46,8 @@ from pyspark.sql import functions as F
 
 from autoforecast import grid, registry
 from autoforecast._exact_json import ExactJSONError, load_exact_json
-from autoforecast.panel import Forecast, Panel, PanelError, period_days
+from autoforecast.frequency import Cadence, advance, parse_frequency, parse_origin, period_points
+from autoforecast.panel import Forecast, Panel
 from autoforecast.protocol import EvaluationManifest
 from autoforecast.score import Score
 from autoforecast.score_spark import MissingActual, score_forecast
@@ -453,6 +454,17 @@ def _best(scores: dict[str, Score], metric: str) -> str:
     return min(sorted(scores), key=lambda a: _value(scores[a], metric))
 
 
+def _require_hourly_key_type(frame: DataFrame, cadence: Cadence, label: str) -> None:
+    """Keep a date column from satisfying an hourly contract through a lossy cast."""
+    if cadence.key_kind == "timestamp" and (
+        frame.schema["date"].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise SelectionError(
+            f"{label} hourly date must have Spark timestamp_ntz type, got "
+            f"{frame.schema['date'].dataType.simpleString()}"
+        )
+
+
 def common_cells(
     forecasts: list[Forecast], spark: SparkSession, out_dir: str | pathlib.Path
 ) -> tuple[str, int]:
@@ -479,25 +491,33 @@ def common_cells(
                 f"{forecast.horizon!r}"
             )
         try:
-            origin = dt.date.fromisoformat(forecast.origin)
-            stride = period_days(forecast.frequency)
-            origin + dt.timedelta(days=forecast.horizon * stride)
-        except (TypeError, ValueError, OverflowError, PanelError) as exc:
+            forecast.validate()
+            cadence = parse_frequency(forecast.frequency)
+            origin = parse_origin(forecast.origin, cadence)
+            advance(origin, cadence, forecast.horizon)
+        except (TypeError, ValueError, OverflowError) as exc:
             raise SelectionError(
-                f"{forecast.adapter}: origin/frequency does not define a supported span"
+                f"{forecast.adapter}: forecast does not define a valid canonical artifact and "
+                f"span: {exc}"
             ) from exc
-        if origin.isoformat() != forecast.origin:
-            raise SelectionError(
-                f"{forecast.adapter}: origin must be canonical ISO YYYY-MM-DD, got "
-                f"{forecast.origin!r}"
-            )
     spans = {(f.origin, f.horizon, f.frequency) for f in forecasts}
     if len(spans) > 1:
         raise SelectionError(
             f"forecasts span different (origin, horizon, frequency): {sorted(spans)}. "
             "Intersecting cells "
             "across different windows compares forecasts of different things")
-    frames = [spark.read.parquet(f.path).select("series_id", "date") for f in forecasts]
+    frames = []
+    for forecast in forecasts:
+        try:
+            frames.append(
+                grid.read_grid_keys(
+                    forecast.path, spark, frequency=forecast.frequency
+                )
+            )
+        except grid.GridError as exc:
+            raise SelectionError(
+                f"{forecast.adapter}: forecast keys are invalid: {exc}"
+            ) from exc
     keep = reduce(lambda a, b: a.intersect(b), frames).distinct()
     out = str(pathlib.Path(out_dir))
     keep.write.mode("overwrite").parquet(out)
@@ -591,62 +611,72 @@ def _exact_grid_restrictions(
         horizon = next(iter(spans))[1]
         frequency = next(iter(spans))[2]
         path = eligible_grids[origin]
-        raw_grid = spark.read.parquet(path)
+        raw_grid = grid.read_time_parquet(spark, path, "date")
         missing_columns = sorted({"series_id", "date"} - set(raw_grid.columns))
         if missing_columns:
             raise SelectionError(
                 f"eligible grid for {origin} lacks required columns {missing_columns}")
-        grid = raw_grid.select(
+        cadence = parse_frequency(frequency)
+        _require_hourly_key_type(raw_grid, cadence, f"eligible grid for {origin}")
+        grid_key, valid_grid_key = grid.canonical_key("date", cadence)
+        canonical_grid = raw_grid.select(
             F.col("series_id").cast("string").alias("series_id"),
-            F.expr("try_cast(date as date)").alias("date"),
+            grid_key.alias("date"),
+            valid_grid_key.alias("_valid_date"),
         )
-        if grid.filter(
+        if canonical_grid.filter(
                 F.col("series_id").isNull()
                 | (F.trim("series_id") == F.lit(""))
-                | F.col("date").isNull()).limit(1).count():
+                | ~F.col("_valid_date")).limit(1).count():
             raise SelectionError(
-                f"eligible grid for {origin} contains a null/blank series_id or invalid date")
-        if (grid.groupBy("series_id", "date").count()
+                f"eligible grid for {origin} contains a null/blank series_id or invalid time key")
+        canonical_grid = canonical_grid.drop("_valid_date")
+        if (canonical_grid.groupBy("series_id", "date").count()
                 .filter(F.col("count") != 1).limit(1).count()):
             raise SelectionError(
                 f"eligible grid for {origin} contains duplicate (series_id, date) keys")
         try:
-            d0 = dt.date.fromisoformat(origin)
-            stride = period_days(frequency)
-            allowed_dates = tuple(
-                d0 + dt.timedelta(days=stride * step) for step in range(1, horizon + 1)
-            )
-        except (TypeError, ValueError, OverflowError, PanelError) as exc:
+            allowed_dates = period_points(origin, cadence, horizon)
+        except (TypeError, ValueError, OverflowError) as exc:
             raise SelectionError(
                 f"forecasts for {origin} do not define a supported period grid") from exc
         start, end = allowed_dates[0], allowed_dates[-1]
-        if grid.filter(~F.col("date").isin(*allowed_dates)).limit(1).count():
+        if canonical_grid.filter(
+            ~grid.period_membership("date", allowed_dates, cadence)
+        ).limit(1).count():
             raise SelectionError(
                 f"eligible grid for {origin} contains dates outside the exact period grid "
                 f"[{start}, {end}]")
-        n_grid = grid.count()
+        n_grid = canonical_grid.count()
         if n_grid == 0:
             raise SelectionError(f"eligible grid for {origin} is empty")
 
         for adapter in sorted(runs):
             forecast = runs[adapter][origin]
-            raw_forecast = spark.read.parquet(forecast.path)
+            raw_forecast = grid.read_time_parquet(spark, forecast.path, "date")
             missing_forecast_columns = sorted(
                 {"series_id", "date"} - set(raw_forecast.columns))
             if missing_forecast_columns:
                 raise SelectionError(
                     f"{adapter}/{origin}: forecast lacks key columns "
                     f"{missing_forecast_columns}")
+            _require_hourly_key_type(raw_forecast, cadence, f"{adapter}/{origin} forecast")
+            forecast_key, valid_forecast_key = grid.canonical_key("date", cadence)
             keys = raw_forecast.select(
                 F.col("series_id").cast("string").alias("series_id"),
-                F.expr("try_cast(date as date)").alias("date"),
+                forecast_key.alias("date"),
+                valid_forecast_key.alias("_valid_date"),
             )
+            if keys.filter(~F.col("_valid_date")).limit(1).count():
+                raise SelectionError(
+                    f"{adapter}/{origin}: forecast contains an invalid time key")
+            keys = keys.drop("_valid_date")
             if (keys.groupBy("series_id", "date").count()
                     .filter(F.col("count") != 1).limit(1).count()):
                 raise SelectionError(
                     f"{adapter}/{origin}: forecast contains duplicate comparison keys")
-            missing = grid.join(keys, ["series_id", "date"], "left_anti").count()
-            extra = keys.join(grid, ["series_id", "date"], "left_anti").count()
+            missing = canonical_grid.join(keys, ["series_id", "date"], "left_anti").count()
+            extra = keys.join(canonical_grid, ["series_id", "date"], "left_anti").count()
             if missing or extra:
                 raise SelectionError(
                     f"{adapter}/{origin}: forecast does not equal the canonical eligible grid: "
@@ -665,42 +695,45 @@ def _canonical_grid(
     frequency: str,
 ) -> DataFrame:
     """Read one eligible grid into canonical join keys after validating its full contract."""
-    raw = spark.read.parquet(str(path))
+    raw = grid.read_time_parquet(spark, path, "date")
     missing = sorted({"series_id", "date"} - set(raw.columns))
     if missing:
         raise SelectionError(f"eligible grid for {origin} lacks required columns {missing}")
-    grid = raw.select(
+    cadence = parse_frequency(frequency)
+    _require_hourly_key_type(raw, cadence, f"eligible grid for {origin}")
+    time_key, valid_time_key = grid.canonical_key("date", cadence)
+    canonical_grid = raw.select(
         F.col("series_id").alias("_grid_series_id"),
         F.col("series_id").cast("string").alias("_series_key"),
-        F.expr("try_cast(date as date)").alias("date"),
+        time_key.alias("date"),
+        valid_time_key.alias("_valid_date"),
     )
-    if grid.filter(
+    if canonical_grid.filter(
             F.col("_series_key").isNull()
             | (F.trim("_series_key") == F.lit(""))
-            | F.col("date").isNull()).limit(1).count():
+            | ~F.col("_valid_date")).limit(1).count():
         raise SelectionError(
-            f"eligible grid for {origin} contains a null/blank series_id or invalid date")
-    if (grid.groupBy("_series_key", "date").count()
+            f"eligible grid for {origin} contains a null/blank series_id or invalid time key")
+    canonical_grid = canonical_grid.drop("_valid_date")
+    if (canonical_grid.groupBy("_series_key", "date").count()
             .filter(F.col("count") != 1).limit(1).count()):
         raise SelectionError(
             f"eligible grid for {origin} contains duplicate canonical (series_id, date) keys")
     try:
-        d0 = dt.date.fromisoformat(origin)
-        stride = period_days(frequency)
-        allowed_dates = tuple(
-            d0 + dt.timedelta(days=stride * step) for step in range(1, horizon + 1)
-        )
-    except (TypeError, ValueError, OverflowError, PanelError) as exc:
+        allowed_dates = period_points(origin, cadence, horizon)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise SelectionError(
             f"eligible grid for {origin} does not have a supported period cadence") from exc
     start, end = allowed_dates[0], allowed_dates[-1]
-    if grid.filter(~F.col("date").isin(*allowed_dates)).limit(1).count():
+    if canonical_grid.filter(
+        ~grid.period_membership("date", allowed_dates, cadence)
+    ).limit(1).count():
         raise SelectionError(
             f"eligible grid for {origin} contains dates outside the exact period grid "
             f"[{start}, {end}]")
-    if grid.limit(1).count() == 0:
+    if canonical_grid.limit(1).count() == 0:
         raise SelectionError(f"eligible grid for {origin} is empty")
-    return grid
+    return canonical_grid
 
 
 def _validated_source_frame(forecast: Forecast, spark: SparkSession) -> DataFrame | None:
@@ -718,24 +751,29 @@ def _validated_source_frame(forecast: Forecast, spark: SparkSession) -> DataFram
                 f"not materialise its forecast artifact at {forecast.path!r}")
         return None
 
-    raw = spark.read.parquet(forecast.path)
+    raw = grid.read_time_parquet(spark, forecast.path, "date")
     missing = sorted({"series_id", "date", "yhat"} - set(raw.columns))
     if missing:
         raise SelectionError(
             f"{forecast.adapter}/{forecast.origin}: forecast lacks required columns {missing}")
     yhat = F.expr("try_cast(yhat as double)")
+    cadence = parse_frequency(forecast.frequency)
+    _require_hourly_key_type(raw, cadence, f"{forecast.adapter}/{forecast.origin} forecast")
+    time_key, valid_time_key = grid.canonical_key("date", cadence)
     source = raw.select(
         F.col("series_id").cast("string").alias("_series_key"),
-        F.expr("try_cast(date as date)").alias("date"),
+        time_key.alias("date"),
+        valid_time_key.alias("_valid_date"),
         yhat.alias("yhat"),
     )
     if source.filter(
             F.col("_series_key").isNull()
             | (F.trim("_series_key") == F.lit(""))
-            | F.col("date").isNull()).limit(1).count():
+            | ~F.col("_valid_date")).limit(1).count():
         raise SelectionError(
             f"{forecast.adapter}/{forecast.origin}: forecast contains a null/blank series_id or "
-            "invalid date")
+            "invalid time key")
+    source = source.drop("_valid_date")
     if source.filter(
             F.col("yhat").isNull()
             | F.isnan("yhat")
@@ -775,7 +813,7 @@ def _reconcile_zero_fallback(
         raise SelectionError(
             f"{forecast.adapter}/{forecast.origin}: invalid raw forecast: {exc}") from exc
 
-    grid = _canonical_grid(
+    grid_frame = _canonical_grid(
         eligible_grid,
         forecast.origin,
         forecast.horizon,
@@ -785,22 +823,22 @@ def _reconcile_zero_fallback(
     try:
         source = _validated_source_frame(forecast, spark)
         if source is None:
-            source = grid.limit(0).select("_series_key", "date").withColumn(
+            source = grid_frame.limit(0).select("_series_key", "date").withColumn(
                 "yhat", F.lit(None).cast("double"))
         else:
-            d0 = dt.date.fromisoformat(forecast.origin)
-            stride = period_days(forecast.frequency)
-            allowed_dates = tuple(
-                d0 + dt.timedelta(days=stride * step)
-                for step in range(1, forecast.horizon + 1)
+            allowed_dates = period_points(
+                forecast.origin, forecast.frequency, forecast.horizon
             )
             start, end = allowed_dates[0], allowed_dates[-1]
-            if source.filter(~F.col("date").isin(*allowed_dates)).limit(1).count():
+            cadence = parse_frequency(forecast.frequency)
+            if source.filter(
+                ~grid.period_membership("date", allowed_dates, cadence)
+            ).limit(1).count():
                 raise SelectionError(
                     f"{forecast.adapter}/{forecast.origin}: forecast contains dates outside "
                     f"[{start}, {end}]")
 
-        grid_keys = grid.select("_series_key", "date")
+        grid_keys = grid_frame.select("_series_key", "date")
         extra = source.join(grid_keys, ["_series_key", "date"], "left_anti").count()
         if extra:
             raise SelectionError(
@@ -809,7 +847,7 @@ def _reconcile_zero_fallback(
                 "extras are a malformed forecast and are never hidden")
 
         present = source.withColumn("_adapter_emitted", F.lit(True))
-        joined = grid.join(present, ["_series_key", "date"], "left")
+        joined = grid_frame.join(present, ["_series_key", "date"], "left")
         stats = joined.agg(
             F.count(F.lit(1)).alias("n_grid"),
             F.countDistinct("_series_key").alias("n_series"),
@@ -870,7 +908,7 @@ def _reconcile_zero_fallback(
         }
         return result, reconciliation
     finally:
-        grid.unpersist()
+        grid_frame.unpersist()
 
 
 def _validate_reconciliation_record(

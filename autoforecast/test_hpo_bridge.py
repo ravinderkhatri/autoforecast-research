@@ -178,21 +178,28 @@ def test_bridge_refuses_linked_governed_artifact_sources(tmp_path: pathlib.Path)
         _copy_run_artifact_directory(source, destination)
 
 
-def test_builtin_bridge_validates_horizons_in_declared_dataset_periods(
+@pytest.mark.parametrize(
+    "frequency,adapter,accepted",
+    [("W", "seasonal_naive", True), ("7D", "auto_ets", False)],
+)
+def test_builtin_bridge_validates_cadence_capability_and_horizon_periods(
+    frequency: str,
+    adapter: str,
+    accepted: bool,
     tmp_path: pathlib.Path,
 ) -> None:
     project = tmp_path / "project"
     contract = project / "configs/datasets/weekly.yaml"
     contract.parent.mkdir(parents=True)
     contract.write_text(
-        """schema_version: 1
+        f"""schema_version: 1
 dataset:
   id: weekly
   panel:
     series_col: series_id
     time_col: date
     target_col: target
-    frequency: W
+    frequency: {frequency}
     season_length: 52
 """,
         encoding="utf-8",
@@ -230,11 +237,15 @@ run:
         source_data_fingerprint="a" * 64,
     )
     study = SimpleNamespace(
-        tuning=SimpleNamespace(model_id="weekly_model"),
+        tuning=SimpleNamespace(model_id="weekly_model", adapter=adapter),
         data={"validation_target_date_range": ["2024-01-14", "2024-01-21"]},
     )
 
-    assert bridge._request(study).horizon == 2
+    if accepted:
+        assert bridge._request(study).horizon == 2
+    else:
+        with pytest.raises(HPOError, match="does not support 7D cadence"):
+            bridge._request(study)
 
 
 def test_builtin_bridge_requires_source_identity(tmp_path: pathlib.Path) -> None:

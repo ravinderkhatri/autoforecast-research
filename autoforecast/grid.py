@@ -22,20 +22,80 @@ that the deployed metric could not see, and it has to be IN the grid for the met
 
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import pathlib
+from collections.abc import Iterable
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructField, StructType, TimestampNTZType
 
-from autoforecast.panel import PanelError, period_days
+from autoforecast.column_names import fresh_internal_names
+from autoforecast.frequency import (
+    Cadence,
+    FrequencyError,
+    TimePoint,
+    canonical_origin,
+    parse_frequency,
+    period_points,
+)
+from autoforecast.parquet_time import ParquetTimeError, validate_parquet_time_storage
 
-__all__ = ["GridError", "agrees_with", "build", "content_hash", "summarise"]
+__all__ = [
+    "GridError",
+    "agrees_with",
+    "build",
+    "canonical_key",
+    "content_hash",
+    "period_membership",
+    "read_grid_keys",
+    "read_time_parquet",
+    "summarise",
+    "time_literal",
+]
 
 
 class GridError(ValueError):
     """A grid was requested that would not describe what is actually being scored."""
+
+
+def read_time_parquet(
+    spark: SparkSession, path: str | pathlib.Path, time_col: str,
+) -> DataFrame:
+    """Read proven naive INT96 keys without assigning a session timezone or losing precision.
+
+    INT96 has no timezone annotation. Spark infers it as ``timestamp`` even when the writer's
+    embedded Arrow schema declares a naive timestamp. Refuse unknown or aware storage before any
+    read; only an original naive declaration in every visible INT96 fragment permits an NTZ read.
+    An exact-name Hive time partition has no footer field; its values remain subject to the same
+    strict canonical-key validation as a physical date column.
+    """
+    try:
+        storage = validate_parquet_time_storage(path, time_col, allow_hive_partition=True)
+    except ParquetTimeError as error:
+        raise GridError(str(error)) from error
+    if storage.has_int96 and not storage.all_physical_timestamps:
+        raise GridError(
+            "mixed INT96 and non-timestamp time fields require a uniform time schema"
+        )
+    frame = spark.read.parquet(str(path))
+    if not storage.has_int96:
+        if (
+            time_col in frame.columns
+            and frame.schema[time_col].dataType.typeName() == "timestamp"
+        ):
+            raise GridError(
+                f"time column {time_col!r} has timezone-sensitive Spark timestamp storage "
+                "without proven naive INT96 evidence"
+            )
+        return frame
+
+    schema = StructType([
+        StructField(field.name, TimestampNTZType(), field.nullable, field.metadata)
+        if field.name == time_col else field
+        for field in frame.schema.fields
+    ])
+    return spark.read.schema(schema).parquet(str(path))
 
 
 def build(
@@ -54,13 +114,13 @@ def build(
 
     Args:
         panel_path: Parquet source, used for the series list and the eligibility flag.
-        origin: Forecast origin. The grid covers `(origin, origin + horizon]`.
+        origin: Canonical forecast origin. The grid covers the next ``horizon`` cadence points.
         horizon: Periods.
         spark: Active session.
         out_dir: Parquet destination.
         series_col: Series identifier.
-        time_col: Date column.
-        eligible_col: Eligibility flag from `exposure.apply`. When None, every series-day in the
+        time_col: Cadence-dependent time-key column.
+        eligible_col: Eligibility flag from `exposure.apply`. When None, every series-period in the
             window enters the grid -- correct only for a dataset with no exposure information at
             all, and the caller is asserting that by omitting it.
 
@@ -74,28 +134,45 @@ def build(
     if type(horizon) is not int or horizon < 1:
         raise GridError(f"horizon must be >= 1, got {horizon}")
     try:
-        d0 = dt.date.fromisoformat(origin)
-        stride = period_days(frequency)
-        period_dates = tuple(
-            d0 + dt.timedelta(days=i * stride) for i in range(1, horizon + 1)
-        )
-    except (TypeError, ValueError, OverflowError, PanelError) as exc:
-        raise GridError("origin/frequency does not define a supported period grid") from exc
-    if d0.isoformat() != origin:
-        raise GridError(f"origin must be canonical ISO YYYY-MM-DD, got {origin!r}")
-    dates = spark.createDataFrame([(day,) for day in period_dates], "date date")
+        cadence = parse_frequency(frequency)
+        period_dates = period_points(origin, cadence, horizon)
+    except (TypeError, ValueError, OverflowError, FrequencyError) as exc:
+        raise GridError(
+            "origin/frequency does not define a supported canonical period grid") from exc
+    key_type = "timestamp_ntz" if cadence.key_kind == "timestamp" else "date"
+    dates = spark.createDataFrame([(day,) for day in period_dates], f"date {key_type}")
 
-    df = spark.read.parquet(str(panel_path))
     if eligible_col is None:
+        df = spark.read.parquet(str(panel_path))
         series = df.select(F.col(series_col).alias("series_id")).distinct()
         grid = series.crossJoin(F.broadcast(dates))
     else:
+        df = read_time_parquet(spark, panel_path, time_col)
+        if cadence.key_kind == "timestamp" and (
+            df.schema[time_col].dataType.typeName() != "timestamp_ntz"
+        ):
+            raise GridError(
+                f"panel time column {time_col!r} must have timestamp_ntz physical type for "
+                f"hourly cadence, got {df.schema[time_col].dataType.simpleString()}"
+            )
         # Eligibility is EFFECTIVE-DATED, so it is taken from the window itself rather than from
         # a series-level summary. A series eligible in March and delisted in April must not be
         # eligible in April's grid, and a `distinct()` over series would say it was.
-        window = df.filter(F.to_date(F.col(time_col)).isin(*period_dates))
+        key, valid = canonical_key(time_col, cadence)
+        if df.filter(~valid).limit(1).count():
+            raise GridError(
+                f"panel time column {time_col!r} contains a null, malformed, lossy, or "
+                f"off-anchor {cadence.code} key"
+            )
+        (time_name,) = fresh_internal_names(df.columns, ("__af_grid_time",))
+        window = df.withColumn(time_name, key).join(
+            F.broadcast(dates),
+            F.col(time_name) == dates["date"],
+            "left_semi",
+        )
         grid = (window.filter(F.col(eligible_col))
-                .select(F.col(series_col).alias("series_id"), F.col(time_col).alias("date"))
+                .select(F.col(series_col).alias("series_id"),
+                        F.col(time_name).alias("date"))
                 .distinct())
     n = grid.count()
     if n == 0:
@@ -107,9 +184,63 @@ def build(
     return pathlib.Path(str(out_dir))
 
 
-def summarise(grid_path: str | pathlib.Path, spark: SparkSession) -> DataFrame:
-    """Summarize the grid size, series count, time span, and density."""
-    g = spark.read.parquet(str(grid_path))
+def read_grid_keys(
+    grid_path: str | pathlib.Path,
+    spark: SparkSession,
+    *,
+    frequency: str | None = None,
+) -> DataFrame:
+    """Read one grid as unique, nonblank, cadence-canonical ``series_id · date`` keys."""
+    raw = read_time_parquet(spark, grid_path, "date")
+    missing = sorted({"series_id", "date"} - set(raw.columns))
+    if missing:
+        raise GridError(f"grid lacks required columns {missing}")
+    if frequency is None:
+        physical_type = raw.schema["date"].dataType.typeName()
+        frequency = "H" if physical_type in ("timestamp", "timestamp_ntz") else "D"
+    try:
+        cadence = parse_frequency(frequency)
+    except FrequencyError as exc:
+        raise GridError(str(exc)) from exc
+    if cadence.key_kind == "timestamp" and (
+        raw.schema["date"].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise GridError(
+            "hourly grid date must have timestamp_ntz physical type, got "
+            f"{raw.schema['date'].dataType.simpleString()}"
+        )
+    date, valid_date = canonical_key("date", cadence)
+    keys = raw.select(
+        F.col("series_id").cast("string").alias("series_id"),
+        date.alias("date"),
+        valid_date.alias("_valid_date"),
+    )
+    if keys.filter(
+        F.col("series_id").isNull()
+        | (F.trim("series_id") == F.lit(""))
+        | ~F.col("_valid_date")
+    ).limit(1).count():
+        raise GridError("grid contains a null/blank series_id or invalid time key")
+    keys = keys.drop("_valid_date")
+    if (
+        keys.groupBy("series_id", "date")
+        .count()
+        .filter(F.col("count") != 1)
+        .limit(1)
+        .count()
+    ):
+        raise GridError("grid contains duplicate (series_id, date) keys")
+    return keys
+
+
+def summarise(
+    grid_path: str | pathlib.Path,
+    spark: SparkSession,
+    *,
+    frequency: str | None = None,
+) -> DataFrame:
+    """Summarize a validated grid's size, series count, time span, and density."""
+    g = read_grid_keys(grid_path, spark, frequency=frequency)
     return g.agg(
         F.count(F.lit(1)).alias("n_cells"),
         F.countDistinct("series_id").alias("n_series"),
@@ -118,7 +249,12 @@ def summarise(grid_path: str | pathlib.Path, spark: SparkSession) -> DataFrame:
                  F.col("n_cells") / (F.col("n_series") * F.col("n_days")))
 
 
-def content_hash(grid_path: str | pathlib.Path, spark: SparkSession) -> str:
+def content_hash(
+    grid_path: str | pathlib.Path,
+    spark: SparkSession,
+    *,
+    frequency: str | None = None,
+) -> str:
     """Stable SHA-256 of the grid's actual key content, independent of Parquet layout.
 
     Spark gives output part files generated names, so hashing the directory bytes makes an
@@ -129,22 +265,7 @@ def content_hash(grid_path: str | pathlib.Path, spark: SparkSession) -> str:
     Raises:
         GridError: required columns are absent, keys are invalid, or keys are duplicated.
     """
-    raw = spark.read.parquet(str(grid_path))
-    missing = sorted({"series_id", "date"} - set(raw.columns))
-    if missing:
-        raise GridError(f"grid lacks required columns {missing}")
-    keys = raw.select(
-        F.col("series_id").cast("string").alias("series_id"),
-        F.expr("try_cast(date as date)").alias("date"),
-    )
-    if keys.filter(
-            F.col("series_id").isNull()
-            | (F.trim("series_id") == F.lit(""))
-            | F.col("date").isNull()).limit(1).count():
-        raise GridError("grid contains a null/blank series_id or invalid date")
-    if (keys.groupBy("series_id", "date").count()
-            .filter(F.col("count") != 1).limit(1).count()):
-        raise GridError("grid contains duplicate (series_id, date) keys")
+    keys = read_grid_keys(grid_path, spark, frequency=frequency)
 
     digest = hashlib.sha256(b"autoforecast-eligible-grid-v1\0")
     for row in keys.orderBy("series_id", "date").toLocalIterator(prefetchPartitions=True):
@@ -156,14 +277,80 @@ def content_hash(grid_path: str | pathlib.Path, spark: SparkSession) -> str:
     return digest.hexdigest()
 
 
-def agrees_with(grid_path: str | pathlib.Path, other_path: str | pathlib.Path,
-                spark: SparkSession) -> tuple[int, int]:
+def canonical_key(column: str, cadence: Cadence) -> tuple[Column, Column]:
+    """Return a lossless canonical Spark key and the predicate proving it is valid."""
+    escaped = column.replace("`", "``")
+    timestamp = F.expr(f"try_cast(`{escaped}` as timestamp_ntz)")
+    raw = F.col(column)
+    source_type = F.expr(f"typeof(`{escaped}`)")
+    text = raw.cast("string")
+    if cadence.key_kind == "timestamp":
+        key = timestamp
+        representation = (source_type == F.lit("timestamp_ntz")) | (
+            (source_type == F.lit("string"))
+            & text.rlike(
+                r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:00:00\z"
+            )
+        )
+        valid = (
+            raw.isNotNull()
+            & timestamp.isNotNull()
+            & (F.date_trunc("hour", timestamp) == timestamp)
+            & representation
+        )
+        return key, valid
+
+    key = F.expr(f"try_cast(`{escaped}` as date)")
+    representation = source_type.isin("date", "timestamp_ntz") | (
+        (source_type == F.lit("string"))
+        & text.rlike(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z")
+    )
+    valid = (
+        raw.isNotNull()
+        & timestamp.isNotNull()
+        & key.isNotNull()
+        & (F.date_trunc("day", timestamp) == timestamp)
+        & representation
+    )
+    if cadence.unit == "M":
+        expected_day = F.lit(1) if cadence.anchor == "start" else F.dayofmonth(F.last_day(key))
+        valid = valid & (F.dayofmonth(key) == expected_day)
+    elif cadence.unit == "Y":
+        expected_month, expected_day = (1, 1) if cadence.anchor == "start" else (12, 31)
+        valid = valid & (F.month(key) == expected_month) & (F.dayofmonth(key) == expected_day)
+    return key, valid
+
+
+def time_literal(point: str | TimePoint, cadence: Cadence) -> Column:
+    """Build a Spark literal without routing a naive H point through session-zone timestamp."""
+    spark_type = "timestamp_ntz" if cadence.key_kind == "timestamp" else "date"
+    return F.lit(canonical_origin(point, cadence)).cast(spark_type)
+
+
+def period_membership(
+    column: str | Column,
+    points: Iterable[str | TimePoint],
+    cadence: Cadence,
+) -> Column:
+    """Test membership using cadence-typed literals, including timezone-stable H values."""
+    key = F.col(column) if isinstance(column, str) else column
+    literals = tuple(time_literal(point, cadence) for point in points)
+    return key.isin(*literals) if literals else F.lit(False)
+
+
+def agrees_with(
+    grid_path: str | pathlib.Path,
+    other_path: str | pathlib.Path,
+    spark: SparkSession,
+    *,
+    frequency: str | None = None,
+) -> tuple[int, int]:
     """Cells in one grid and not the other, both directions. `(0, 0)` means they are identical.
 
     The check that makes "the model trained and the metric scored on the same cells" verifiable
     rather than assumed. Two derivations of the same rule drift the moment one is edited, and the
     resulting comparison is between a model and a metric that disagree about what exists.
     """
-    a = spark.read.parquet(str(grid_path)).select("series_id", "date")
-    b = spark.read.parquet(str(other_path)).select("series_id", "date")
+    a = read_grid_keys(grid_path, spark, frequency=frequency)
+    b = read_grid_keys(other_path, spark, frequency=frequency)
     return a.subtract(b).count(), b.subtract(a).count()

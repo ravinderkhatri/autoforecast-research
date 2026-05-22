@@ -77,6 +77,33 @@ def test_local_attempt_tensorboard_dir_is_precreated_inside_the_attempt(
     assert attempt.tensorboard_dir.is_dir()
 
 
+def test_local_attempt_preserves_same_day_hourly_range_ordering(tmp_path: pathlib.Path) -> None:
+    metadata = _metadata(learning_rate=0.001)
+    data = metadata["data"]
+    assert isinstance(data, dict)
+    data.update(
+        observed_date_range=["2024-01-01T00:00:00", "2024-01-01T11:00:00"],
+        training_date_range=["2024-01-01T00:00:00", "2024-01-01T07:00:00"],
+        validation_date_range=["2024-01-01T00:00:00", "2024-01-01T09:00:00"],
+        test_date_range=["2024-01-01T10:00:00", "2024-01-01T11:00:00"],
+        validation_target_date_range=["2024-01-01T08:00:00", "2024-01-01T09:00:00"],
+        test_target_date_range=["2024-01-01T10:00:00", "2024-01-01T11:00:00"],
+    )
+
+    attempt = open_local_attempt(
+        tmp_path,
+        study_id="hourly",
+        trial_id="trial1",
+        attempt_id="attempt1",
+        metadata=metadata,
+    )
+
+    stored = json.loads((attempt.path / "metadata/attempt.json").read_text())
+    assert stored["data"]["validation_target_date_range"] == [
+        "2024-01-01T08:00:00", "2024-01-01T09:00:00",
+    ]
+
+
 def test_attempt_copy_refuses_a_symlinked_destination_parent(tmp_path: pathlib.Path) -> None:
     attempt = open_local_attempt(
         tmp_path,

@@ -1,9 +1,11 @@
 """Malformed user inputs fail at the command boundary without starting a runtime."""
 
+import datetime as dt
 import json
 import subprocess
 import sys
 
+import pyarrow.parquet as pq
 import pytest
 import yaml
 
@@ -22,6 +24,55 @@ def assert_input_error(result, message):
     assert message in result.stderr
     assert "Traceback" not in result.stderr
     assert "SparkContext" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "frequency,second",
+    [
+        ("H", dt.datetime(2024, 1, 1, 1)),
+        ("D", dt.date(2024, 1, 2)),
+        ("W", dt.date(2024, 1, 8)),
+        ("M", dt.date(2024, 2, 29)),
+        ("MS", dt.date(2024, 2, 1)),
+        ("Y", dt.date(2025, 12, 31)),
+        ("YS", dt.date(2025, 1, 1)),
+    ],
+)
+def test_example_projects_keep_42_exact_periods_per_series(frequency, second, tmp_path):
+    project = tmp_path / frequency
+    create_example(project, frequency=frequency)
+    table = pq.read_table(project / "data")
+    points = sorted(set(table["day"].to_pylist()))
+    recipe = json.loads((project / "recipe.json").read_text())
+    dataset = yaml.safe_load((project / "dataset.yaml").read_text())
+    campaign = yaml.safe_load((project / "campaign.yaml").read_text())
+
+    assert table.num_rows == 84 and len(points) == 42
+    assert points[1] == second
+    assert recipe["training_start"] == points[0].isoformat()
+    assert recipe["validation_origins"] == [points[20].isoformat(), points[27].isoformat()]
+    assert recipe["final_train_cutoff"] == points[34].isoformat()
+    assert recipe["validation_horizon"] == recipe["final_test_horizon"] == 7
+    assert recipe.get("frequency", "D") == frequency
+    assert ("frequency" in recipe) is (frequency != "D")
+    assert dataset["dataset"]["panel"]["frequency"] == frequency
+    assert dataset["dataset"]["panel"]["season_length"] == 7
+    assert campaign["forecast_campaign"]["temporal"]["validation_origins"] == recipe[
+        "validation_origins"
+    ]
+
+
+@pytest.mark.parametrize("alias,canonical", [("ME", "M"), ("YE", "Y")])
+def test_init_example_cli_accepts_and_canonicalizes_end_aliases(
+    alias, canonical, tmp_path,
+):
+    project = tmp_path / alias
+    result = cli("init-example", project, "--frequency", alias)
+    assert result.returncode == 0, result.stderr
+    recipe = json.loads((project / "recipe.json").read_text())
+    dataset = yaml.safe_load((project / "dataset.yaml").read_text())
+    assert recipe["frequency"] == canonical
+    assert dataset["dataset"]["panel"]["frequency"] == canonical
 
 
 @pytest.mark.parametrize("field,value,message", [

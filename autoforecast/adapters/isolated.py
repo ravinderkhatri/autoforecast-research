@@ -25,7 +25,7 @@ from typing import Any
 from autoforecast import resources
 from autoforecast._exact_json import ExactJSONError, loads_exact_json
 from autoforecast.acceptance_retirement import canonical_json_sha256
-from autoforecast.adapters import _validate_daily_span
+from autoforecast.adapters import _validate_span
 from autoforecast.executable_source import validate_executable_source_snapshot
 from autoforecast.panel import Forecast, Panel
 
@@ -355,7 +355,7 @@ def run(adapter: str, panel: Panel, origin: str, horizon: int, *,
         raise ValueError(
             "worker_runtime_identity is unsupported; select the interpreter with worker_python"
         )
-    _validate_daily_span(panel, origin, horizon, adapter=adapter)
+    _validate_span(panel, origin, horizon, adapter=adapter)
     source = validate_executable_source_snapshot(source_snapshot)
     if not isinstance(worker_profile, resources.SparkProfile):
         raise TypeError(

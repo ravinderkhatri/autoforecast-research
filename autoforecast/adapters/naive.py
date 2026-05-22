@@ -11,7 +11,16 @@ import pathlib
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from autoforecast.adapters import _validate_daily_span
+from autoforecast.adapters import _validate_span
+from autoforecast.column_names import fresh_internal_names
+from autoforecast.frequency import (
+    advance,
+    canonical_origin,
+    parse_frequency,
+    parse_origin,
+    period_points,
+)
+from autoforecast.grid import canonical_key, period_membership, read_time_parquet, time_literal
 from autoforecast.panel import Forecast, Panel
 
 REUSE_EXEMPTION = (
@@ -68,12 +77,32 @@ def seasonal_naive(
         ValueError: `horizon` is not positive.
         ForecastError: the dispositions do not account for every requested cell.
     """
-    _validate_daily_span(panel, origin, horizon, adapter=NAME)
+    _validate_span(panel, origin, horizon, adapter=NAME)
+    panel.validate()
     m = panel.season_length
 
-    raw = spark.read.parquet(panel.path)
-    source = _source_window(raw, panel, origin, m)
-    grid = _future_grid(spark, raw, panel, origin, horizon, m)
+    cadence = parse_frequency(panel.frequency)
+    time_key, valid_time_key = canonical_key(panel.time_col, cadence)
+    raw_source = read_time_parquet(spark, panel.path, panel.time_col)
+    if cadence.key_kind == "timestamp" and (
+        raw_source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ValueError(
+            f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type; "
+            "timezone-sensitive timestamp storage is lossy for wall-clock keys"
+        )
+    time_name, valid_time_name = fresh_internal_names(
+        raw_source.columns, ("__af_naive_time", "__af_naive_valid_time")
+    )
+    raw = raw_source.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time_key)
+    if raw.filter(~F.col(valid_time_name)).limit(1).count():
+        raise ValueError(
+            f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    source = _source_window(raw, panel, origin, m, normalized_time_col=time_name)
+    grid = _future_grid(
+        spark, raw, panel, origin, horizon, m, normalized_time_col=time_name
+    )
 
     joined = grid.join(
         source,
@@ -116,8 +145,15 @@ def seasonal_naive(
         labelled.unpersist()
 
 
-def _source_window(raw: DataFrame, panel: Panel, origin: str, m: int) -> DataFrame:
-    """The only history a seasonal naive can read: the `m` days ending at `origin`.
+def _source_window(
+    raw: DataFrame,
+    panel: Panel,
+    origin: str,
+    m: int,
+    *,
+    normalized_time_col: str | None = None,
+) -> DataFrame:
+    """The only history a seasonal naive can read: the `m` periods ending at `origin`.
 
     Writing `h = q*m + r` with `0 <= r < m`, the source date is `origin + r - m` when `r > 0` and
     `origin` when `r = 0`. So it lies in `[origin - m + 1, origin]` for EVERY horizon -- a 28-day
@@ -131,20 +167,36 @@ def _source_window(raw: DataFrame, panel: Panel, origin: str, m: int) -> DataFra
     argument spans two functions, and a leak resting on an off-by-one staying correct is the kind
     this project keeps finding.
     """
-    lo = F.date_sub(F.to_date(F.lit(origin)), m - 1)
+    cadence = parse_frequency(panel.frequency)
+    origin_point = parse_origin(origin, cadence)
+    source_points = tuple(
+        advance(origin_point, cadence, offset) for offset in range(-(m - 1), 1)
+    )
+    history_key = (
+        F.col(normalized_time_col)
+        if normalized_time_col is not None
+        else canonical_key(panel.time_col, cadence)[0]
+    )
     cols = [
         F.col(panel.series_col).alias("_sid"),
-        F.col(panel.time_col).alias("_hist_date"),
+        history_key.alias("_hist_date"),
         F.col(panel.target_col).alias("_y"),
     ]
     if panel.has_exposure:
         cols.append(F.col(panel.exposure_col).alias("_state"))
-    return raw.select(*cols).filter(
-        (F.col("_hist_date") <= F.to_date(F.lit(origin))) & (F.col("_hist_date") >= lo))
+    selected = raw.select(*cols)
+    return selected.filter(period_membership("_hist_date", source_points, cadence))
 
 
 def _future_grid(
-    spark: SparkSession, raw: DataFrame, panel: Panel, origin: str, horizon: int, m: int
+    spark: SparkSession,
+    raw: DataFrame,
+    panel: Panel,
+    origin: str,
+    horizon: int,
+    m: int,
+    *,
+    normalized_time_col: str | None = None,
 ) -> DataFrame:
     """One row per (series, future date), carrying the source date its value is copied from.
 
@@ -157,15 +209,35 @@ def _future_grid(
     and taking the list from the narrow window would drop it from the grid entirely -- silently
     shrinking `n_series` instead of declining its cells with a reason.
     """
-    steps = spark.createDataFrame([(i,) for i in range(1, horizon + 1)], "step int")
-    series = (raw.filter(F.col(panel.time_col) <= F.to_date(F.lit(origin)))
-              .select(F.col(panel.series_col).alias("series_id")).distinct())
-    return (
-        series.crossJoin(F.broadcast(steps))
-        .withColumn("ds", F.date_add(F.to_date(F.lit(origin)), F.col("step")))
-        .withColumn("source_date",
-                    F.expr(f"date_sub(ds, cast({m} * ceil(step / {m}.0) as int))"))
+    cadence = parse_frequency(panel.frequency)
+    origin_point = parse_origin(origin, cadence)
+    targets = period_points(origin_point, cadence, horizon)
+    rows = [
+        (
+            step,
+            canonical_origin(target, cadence),
+            canonical_origin(
+                advance(target, cadence, -m * ((step + m - 1) // m)), cadence
+            ),
+        )
+        for step, target in enumerate(targets, 1)
+    ]
+    key_type = "timestamp_ntz" if cadence.unit == "H" else "date"
+    steps = spark.createDataFrame(
+        rows, "step int, ds string, source_date string"
+    ).select(
+        "step",
+        F.col("ds").cast(key_type).alias("ds"),
+        F.col("source_date").cast(key_type).alias("source_date"),
     )
+    history_key = (
+        F.col(normalized_time_col)
+        if normalized_time_col is not None
+        else canonical_key(panel.time_col, cadence)[0]
+    )
+    series = (raw.filter(history_key <= time_literal(origin_point, cadence))
+              .select(F.col(panel.series_col).alias("series_id")).distinct())
+    return series.crossJoin(F.broadcast(steps))
 
 
 __all__ = ["NAME", "REUSE_EXEMPTION", "seasonal_naive"]

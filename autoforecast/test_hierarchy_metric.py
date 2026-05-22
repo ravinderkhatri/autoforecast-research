@@ -270,6 +270,41 @@ def test_read_forecast_grid(tmp_path, fault):
         np.testing.assert_array_equal(read_forecast_grid(**arguments, filter_actuals=True), [[1], [2]])
 
 
+def test_read_forecast_grid_preserves_distinct_hourly_keys_on_one_date(tmp_path):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "hourly-forecast.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": ["a", "a"],
+                "date": pa.array(
+                    [dt.datetime(2024, 3, 1, 23), dt.datetime(2024, 3, 2, 0)],
+                    type=pa.timestamp("us"),
+                ),
+                "value": [1.0, 2.0],
+            }
+        ),
+        path,
+    )
+
+    result = read_forecast_grid(
+        str(path),
+        ("a",),
+        "2024-03-01T22:00:00",
+        2,
+        series_col="id",
+        time_col="date",
+        value_col="value",
+        frequency="H",
+    )
+
+    np.testing.assert_array_equal(result, [[1.0, 2.0]])
+
+
 def test_read_forecast_grid_refuses_boolean_values_before_numeric_coercion(tmp_path):
     """Boolean actuals are a corrupt count schema, not the numeric values zero and one."""
     import datetime as dt
@@ -322,3 +357,165 @@ def test_read_forecast_grid_refuses_noncanonical_origin_identity(tmp_path):
             time_col="date",
             value_col="value",
         )
+
+
+@pytest.mark.parametrize("frequency,origin,points", [
+    ("H", "2024-01-01T00:00:00", ["2024-01-01T01:00:00", "2024-01-01T02:00:00"]),
+    ("D", "2024-01-01", ["2024-01-02", "2024-01-03"]),
+])
+@pytest.mark.parametrize("int96", [False, True])
+@pytest.mark.parametrize("filter_actuals", [False, True])
+@pytest.mark.parametrize("remainder", [0, 1])
+def test_read_forecast_grid_preserves_nanosecond_alignment(
+    tmp_path, frequency, origin, points, int96, filter_actuals, remainder,
+):
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    keys = [pd.Timestamp(point) for point in points]
+    keys[0] += pd.Timedelta(remainder, unit="ns")
+    path = tmp_path / "forecast.parquet"
+    pq.write_table(pa.table({
+        "id": ["a", "a"], "date": pa.array(keys, type=pa.timestamp("ns")),
+        "value": [1.0, 2.0],
+    }), path, use_deprecated_int96_timestamps=int96)
+    arguments = dict(
+        path=str(path), series_ids=("a",), origin=origin, horizon=2,
+        series_col="id", time_col="date", value_col="value",
+        frequency=frequency, filter_actuals=filter_actuals,
+    )
+    if remainder:
+        with pytest.raises(ValueError, match="sub-microsecond|malformed"):
+            read_forecast_grid(**arguments)
+    else:
+        np.testing.assert_array_equal(read_forecast_grid(**arguments), [[1.0, 2.0]])
+
+
+@pytest.mark.parametrize("timezone,store_schema", [("UTC", True), ("Asia/Kathmandu", True),
+                                                   (None, False)])
+@pytest.mark.parametrize("filter_actuals", [False, True])
+def test_read_forecast_grid_checks_all_int96_provenance_before_filtering(
+    tmp_path, timezone, store_schema, filter_actuals,
+):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({
+        "id": ["a"], "date": pa.array([dt.datetime(2024, 1, 1, 1)],
+                                      type=pa.timestamp("us")), "value": [1.0],
+    }), tmp_path / "a.parquet")
+    # The later legacy fragment is outside the requested window. Its erased timezone
+    # or absent provenance must not be hidden by the schema of the first native fragment.
+    pq.write_table(pa.table({
+        "id": ["a"], "date": pa.array([dt.datetime(2023, 12, 31)],
+                                      type=pa.timestamp("us", tz=timezone)), "value": [2.0],
+    }), tmp_path / "b.parquet", use_deprecated_int96_timestamps=True,
+        store_schema=store_schema)
+    with pytest.raises(ValueError, match="timezone-bearing|ARROW:schema"):
+        read_forecast_grid(
+            str(tmp_path), ("a",), "2024-01-01T00:00:00", 1,
+            series_col="id", time_col="date", value_col="value",
+            frequency="H", filter_actuals=filter_actuals,
+        )
+
+
+@pytest.mark.parametrize("filter_actuals", [False, True])
+def test_read_forecast_grid_keeps_wide_year_int96_and_hive_dates(tmp_path, filter_actuals):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    legacy = tmp_path / "legacy.parquet"
+    pq.write_table(pa.table({
+        "id": ["a"], "date": pa.array([dt.datetime(2500, 1, 1, 1)],
+                                      type=pa.timestamp("us")), "value": [3.0],
+    }), legacy, use_deprecated_int96_timestamps=True)
+    np.testing.assert_array_equal(read_forecast_grid(
+        str(legacy), ("a",), "2500-01-01T00:00:00", 1, series_col="id",
+        time_col="date", value_col="value", frequency="H", filter_actuals=filter_actuals,
+    ), [[3.0]])
+    partitioned = tmp_path / "partitioned"
+    pq.write_to_dataset(pa.table({
+        "id": ["a"], "date": [dt.date(2024, 1, 2)], "value": [4.0],
+    }), root_path=str(partitioned), partition_cols=["date"])
+    np.testing.assert_array_equal(read_forecast_grid(
+        str(partitioned), ("a",), "2024-01-01", 1, series_col="id",
+        time_col="date", value_col="value", filter_actuals=filter_actuals,
+    ), [[4.0]])
+
+
+@pytest.mark.parametrize("frequency,origin", [
+    ("H", "2024-01-01T00:00:00"), ("D", "2024-01-01"), ("W", "2024-01-01"),
+    ("M", "2024-01-31"), ("MS", "2024-01-01"),
+    ("Y", "2023-12-31"), ("YS", "2024-01-01"),
+])
+def test_filtered_hive_grid_uses_temporal_bounds_and_preserves_raw_keys(
+    tmp_path, frequency, origin,
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from autoforecast.frequency import period_points
+
+    points = [origin, *(point.isoformat() for point in period_points(origin, frequency, 3))]
+    pq.write_to_dataset(pa.table({
+        "id": ["a"] * 4, "date": points, "value": [99.0, 1.0, 2.0, 99.0],
+    }), root_path=str(tmp_path), partition_cols=["date"])
+    np.testing.assert_array_equal(read_forecast_grid(
+        str(tmp_path), ("a",), origin, 2, series_col="id", time_col="date",
+        value_col="value", frequency=frequency, filter_actuals=True,
+    ), [[1.0, 2.0]])
+
+
+@pytest.mark.parametrize("frequency,origin,bad_key", [
+    ("H", "2024-01-01T00:00:00", "2024-01-01T01:00:00.000000001"),
+    ("H", "2024-01-01T00:00:00", "2024-01-01 01:00:00"),
+    ("M", "2024-01-31", "2024-02-15"),
+])
+def test_filtered_hive_grid_does_not_normalize_invalid_original_keys(
+    tmp_path, frequency, origin, bad_key,
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_to_dataset(pa.table({"id": ["a"], "date": [bad_key], "value": [1.0]}),
+                        root_path=str(tmp_path), partition_cols=["date"])
+    with pytest.raises(ValueError, match="malformed|misaligned|Failed to parse"):
+        read_forecast_grid(
+            str(tmp_path), ("a",), origin, 1, series_col="id", time_col="date",
+            value_col="value", frequency=frequency, filter_actuals=True,
+        )
+
+
+def test_hierarchy_arithmetic_does_not_require_optional_arrow():
+    import subprocess
+    import sys
+
+    code = """
+import importlib.abc
+import sys
+import numpy as np
+import torch
+
+for name in list(sys.modules):
+    if name == 'pyarrow' or name.startswith('pyarrow.'):
+        del sys.modules[name]
+
+class NoArrow(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'pyarrow' or fullname.startswith('pyarrow.'):
+            raise ModuleNotFoundError('optional Arrow unavailable', name=fullname)
+
+sys.meta_path.insert(0, NoArrow())
+from autoforecast.hierarchy_metric import HierarchyMetric
+metric = HierarchyMetric.build(
+    {}, np.array([[1., 2., 4.], [2., 4., 8.]]), None, ((),), weighting='uniform',
+)
+assert metric.n_bottom == 2
+assert not any(name == 'pyarrow' or name.startswith('pyarrow.') for name in sys.modules)
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)

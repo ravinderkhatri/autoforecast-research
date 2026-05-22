@@ -5,14 +5,16 @@ intervals are not drawn by this module.
 
 from __future__ import annotations
 
-import datetime as dt
 import pathlib
 
 import matplotlib
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
-from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel, period_days
+from autoforecast.column_names import fresh_internal_names
+from autoforecast.frequency import TimePoint, advance, parse_frequency, parse_origin
+from autoforecast.grid import canonical_key, read_time_parquet, time_literal
+from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 
 matplotlib.use("Agg")  # headless: these are written to disk, never shown
 import matplotlib.pyplot as plt  # noqa: E402  must follow the backend selection
@@ -49,8 +51,26 @@ def series_across_zero_rate_deciles(
         rather than raised, because a small benchmark is a legitimate input and a caller can see
         the length.
     """
-    df = spark.read.parquet(panel.path).filter(
-        F.col(panel.time_col) <= F.to_date(F.lit(origin)))
+    panel.validate()
+    cadence = parse_frequency(panel.frequency)
+    origin_point = parse_origin(origin, cadence)
+    time_key, valid_time_key = canonical_key(panel.time_col, cadence)
+    source = read_time_parquet(spark, panel.path, panel.time_col)
+    if cadence.key_kind == "timestamp" and (
+        source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ValueError(
+            f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type"
+        )
+    time_name, valid_time_name = fresh_internal_names(
+        source.columns, ("__af_plot_time", "__af_plot_valid_time")
+    )
+    prepared = source.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time_key)
+    if prepared.filter(~F.col(valid_time_name)).limit(1).count():
+        raise ValueError(
+            f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    df = prepared.filter(F.col(time_name) <= time_literal(origin_point, cadence))
     if panel.has_exposure:
         df = df.filter(F.col(panel.exposure_col).isin(*sorted(ELIGIBLE_STATES)))
     rates = (df.groupBy(F.col(panel.series_col).alias("sid"))
@@ -92,7 +112,8 @@ def diagnostic_plot(
         spark: Active session.
         out_path: PNG destination. Parent directories are created.
         n_series: Series to draw, one per zero-rate decile.
-        encoder_days: Days of history before the origin to show.
+        encoder_days: Historical periods before the origin to show. The name is retained for
+            daily-call compatibility.
 
     Returns:
         The written path.
@@ -109,17 +130,19 @@ def diagnostic_plot(
         raise ValueError(
             f"forecast horizon must be a positive integer, got {forecast.horizon!r}"
         )
+    if type(encoder_days) is not int or encoder_days < 1:
+        raise ValueError(f"encoder_days must be a positive period count, got {encoder_days!r}")
+    forecast.validate()
     out_path = pathlib.Path(out_path)
     try:
-        origin = dt.date.fromisoformat(forecast.origin)
-    except (TypeError, ValueError) as exc:
+        cadence = parse_frequency(forecast.frequency)
+        origin = parse_origin(forecast.origin, cadence)
+        advance(origin, cadence, forecast.horizon)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
-            f"forecast origin must be canonical ISO YYYY-MM-DD, got {forecast.origin!r}"
+            f"forecast origin must be canonical for {forecast.frequency!r}, got "
+            f"{forecast.origin!r}"
         ) from exc
-    if origin.isoformat() != forecast.origin:
-        raise ValueError(
-            f"forecast origin must be canonical ISO YYYY-MM-DD, got {forecast.origin!r}"
-        )
     picked = series_across_zero_rate_deciles(panel, spark, forecast.origin, n=n_series)
     ids = [sid for sid, _ in picked]
     if not ids:
@@ -132,14 +155,22 @@ def diagnostic_plot(
         ids,
         origin,
         encoder_days,
-        forecast.horizon * period_days(forecast.frequency),
+        forecast.horizon,
     )
     pred = _collect_forecast(forecast, spark, ids)
 
     fig, axes = plt.subplots(len(ids), 1, figsize=(11, 2.1 * len(ids)), sharex=True)
     axes = axes if len(ids) > 1 else [axes]
     for ax, (sid, zero_rate) in zip(axes, picked, strict=True):
-        _draw_series(ax, sid, hist.get(sid, []), pred.get(sid, []), origin, zero_rate)
+        _draw_series(
+            ax,
+            sid,
+            hist.get(sid, []),
+            pred.get(sid, []),
+            origin,
+            zero_rate,
+            forecast.frequency,
+        )
     axes[0].legend(loc="upper left", fontsize=7, ncol=4)
     axes[-1].set_xlabel("date")
     fig.suptitle(f"{forecast.adapter} · origin {forecast.origin} · h={forecast.horizon} · "
@@ -152,24 +183,38 @@ def diagnostic_plot(
 
 
 def _collect_history(
-    panel: Panel, spark: SparkSession, ids: list[str], origin: dt.date,
+    panel: Panel, spark: SparkSession, ids: list[str], origin: TimePoint,
     encoder_days: int, horizon: int,
-) -> dict[str, list[tuple[dt.date, float, bool]]]:
+) -> dict[str, list[tuple[TimePoint, float, bool]]]:
     """Pull (date, qty, eligible) for the chosen series only, over the drawn window.
 
     Filtered in Spark before collecting. Reading the panel and then subsetting on the driver is
     the step that works on M5 and dies on an estate.
     """
-    lo, hi = origin - dt.timedelta(days=encoder_days), origin + dt.timedelta(days=horizon)
-    cols = [F.col(panel.series_col).alias("sid"), F.col(panel.time_col).alias("d"),
+    cadence = parse_frequency(panel.frequency)
+    lo, hi = advance(origin, cadence, -encoder_days), advance(origin, cadence, horizon)
+    source = read_time_parquet(spark, panel.path, panel.time_col)
+    if cadence.key_kind == "timestamp" and (
+        source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ValueError(
+            f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type"
+        )
+    time_key, valid_time_key = canonical_key(panel.time_col, cadence)
+    cols = [F.col(panel.series_col).alias("sid"), time_key.alias("d"),
+            valid_time_key.alias("_valid_time"),
             F.col(panel.target_col).cast("double").alias("y")]
     cols.append(F.col(panel.exposure_col).alias("st") if panel.has_exposure
                 else F.lit("exact").alias("st"))
-    rows = (spark.read.parquet(panel.path).select(*cols)
+    rows = (source.select(*cols)
             .filter(F.col("sid").isin(*ids))
-            .filter((F.col("d") >= F.lit(lo.isoformat())) & (F.col("d") <= F.lit(hi.isoformat())))
+            .filter(F.col("_valid_time"))
+            .filter(
+                (F.col("d") >= time_literal(lo, cadence))
+                & (F.col("d") <= time_literal(hi, cadence))
+            )
             .orderBy("sid", "d").collect())
-    out: dict[str, list[tuple[dt.date, float, bool]]] = {}
+    out: dict[str, list[tuple[TimePoint, float, bool]]] = {}
     for r in rows:
         out.setdefault(r["sid"], []).append((r["d"], r["y"], r["st"] in ELIGIBLE_STATES))
     return out
@@ -177,18 +222,39 @@ def _collect_history(
 
 def _collect_forecast(
     forecast: Forecast, spark: SparkSession, ids: list[str]
-) -> dict[str, list[tuple[dt.date, float]]]:
+) -> dict[str, list[tuple[TimePoint, float]]]:
     """Pull (date, yhat) for the chosen series only."""
-    rows = (spark.read.parquet(forecast.path)
-            .filter(F.col("series_id").isin(*ids))
-            .select("series_id", "date", "yhat").orderBy("series_id", "date").collect())
-    out: dict[str, list[tuple[dt.date, float]]] = {}
+    cadence = parse_frequency(forecast.frequency)
+    source = read_time_parquet(spark, forecast.path, "date")
+    if cadence.key_kind == "timestamp" and (
+        source.schema["date"].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ValueError(
+            "hourly forecast date must have timestamp_ntz physical type"
+        )
+    date, valid_date = canonical_key("date", cadence)
+    canonical = source.select(
+        "series_id", date.alias("date"), valid_date.alias("_valid_date"), "yhat"
+    )
+    if canonical.filter(~F.col("_valid_date")).limit(1).count():
+        raise ValueError(
+            f"forecast contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    rows = (
+        canonical.filter(F.col("series_id").isin(*ids))
+        .select("series_id", "date", "yhat")
+        .orderBy("series_id", "date")
+        .collect()
+    )
+    out: dict[str, list[tuple[TimePoint, float]]] = {}
     for r in rows:
         out.setdefault(r["series_id"], []).append((r["date"], float(r["yhat"])))
     return out
 
 
-def _draw_series(ax, sid: str, hist, pred, origin: dt.date, zero_rate: float) -> None:
+def _draw_series(
+    ax, sid: str, hist, pred, origin: TimePoint, zero_rate: float, frequency: str
+) -> None:
     """One panel: history, held-out actuals, forecast, and shaded ineligible spans.
 
     `zero_rate` is the SELECTION's rate -- eligible cells over the whole history to the origin --
@@ -208,7 +274,7 @@ def _draw_series(ax, sid: str, hist, pred, origin: dt.date, zero_rate: float) ->
         if not el:
             # One span per ineligible day. Drawn rather than omitted so a gap in the line is
             # visibly "not ranged" instead of ambiguously "no data".
-            ax.axvspan(d, d + dt.timedelta(days=1), color=INELIGIBLE_SHADE, lw=0,
+            ax.axvspan(d, advance(d, frequency, 1), color=INELIGIBLE_SHADE, lw=0,
                        label="ineligible" if d == hist[0][0] else None)
     ax.axvline(origin, color="#000000", lw=0.8, ls=":")
     ax.set_ylabel(f"{sid[:18]}\nzero {zero_rate:.0%}", fontsize=6)

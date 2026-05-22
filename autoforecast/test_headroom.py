@@ -120,6 +120,71 @@ def test_the_oracle_uses_the_panels_declared_period_grid() -> None:
     assert rows == [(dt.date(2020, 1, 8), 6.0), (dt.date(2020, 1, 15), 2.0)]
 
 
+def test_oracle_preserves_mapped_columns_that_match_temporary_names(tmp_path) -> None:
+    import datetime as dt
+
+    panel_path = tmp_path / "colliding-panel"
+    first = dt.date(2024, 1, 2)
+    second = first + dt.timedelta(days=7)
+    spark().createDataFrame(
+        [("series", first, 2.0), ("series", second, 6.0)],
+        "__AF_ORACLE_VALID_TIME string, day date, __AF_ORACLE_TIME double",
+    ).write.parquet(str(panel_path))
+    source = Panel(
+        panel_path,
+        "__AF_ORACLE_VALID_TIME",
+        "day",
+        "__AF_ORACLE_TIME",
+        target_estimand="observed_count",
+    )
+
+    forecast = headroom.oracle_forecast(
+        source, "2024-01-01", 8, spark=spark(), out_dir=tmp_path / "oracle"
+    )
+
+    rows = spark().read.parquet(forecast.path).orderBy("date").collect()
+    assert [(row["date"], row["yhat"]) for row in rows] == [
+        (first, 6.0),
+        (second, 2.0),
+    ]
+    assert forecast.n_series == 1
+
+
+def test_the_oracle_preserves_hourly_keys_and_uses_hour_of_week_slots() -> None:
+    import datetime as dt
+
+    root = pathlib.Path(tempfile.mkdtemp())
+    panel_path = root / "hourly-panel"
+    first = dt.datetime(2024, 3, 1, 23)
+    second = first + dt.timedelta(days=7)
+    spark().createDataFrame(
+        [("series", first, 2.0), ("series", second, 6.0)],
+        "id string, timestamp timestamp_ntz, qty double",
+    ).write.parquet(str(panel_path))
+    source = Panel(
+        panel_path,
+        "id",
+        "timestamp",
+        "qty",
+        frequency="H",
+        target_estimand="observed_count",
+    ).validate()
+
+    forecast = headroom.oracle_forecast(
+        source,
+        "2024-03-01T22:00:00",
+        169,
+        spark=spark(),
+        out_dir=root / "oracle",
+    )
+
+    rows = sorted(
+        (row["date"], row["yhat"])
+        for row in spark().read.parquet(forecast.path).collect()
+    )
+    assert rows == [(first, 6.0), (second, 2.0)]
+
+
 @pytest.mark.parametrize("origin,horizon", [(ORIGIN, True), ("20160424", HORIZON)])
 def test_oracle_refuses_noncanonical_span_before_spark_io(origin, horizon) -> None:
     """Malformed identities must fail before the oracle reads held-out actuals."""

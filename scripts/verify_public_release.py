@@ -47,7 +47,7 @@ def git(root: pathlib.Path, *arguments: str) -> bytes:
 
 
 def tracked_inventory(root: pathlib.Path) -> tuple[set[str], dict]:
-    """Only maintained code, configuration, CI and the public README are distributable."""
+    """Allow maintained source, configuration, CI, README and its approved overview."""
     if pathlib.Path(git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve() != root:
         raise ValueError("public inventory requires the repository root")
     if git(root, "rev-parse", "--is-shallow-repository").strip() == b"true":
@@ -64,6 +64,7 @@ def tracked_inventory(root: pathlib.Path) -> tuple[set[str], dict]:
         path = pathlib.PurePosixPath(name)
         allowed = (
             name in ROOT_FILES
+            or name == "assets/autoforecast-overview.svg"
             or (path.parts[0] in roots and path.suffix == ".py")
             or (path.parts[0] == "configs" and path.suffix in {".json", ".yaml", ".yml"})
             or (path.parent.as_posix() == ".github/workflows" and path.suffix in {".yaml", ".yml"})

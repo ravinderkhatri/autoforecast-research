@@ -25,7 +25,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 
 from autoforecast import resources
 from autoforecast.acceptance_retirement import canonical_json_sha256
-from autoforecast.adapters import isolated, worker
+from autoforecast.adapters import _validate_daily_span, isolated, worker
 from autoforecast.panel import Forecast, Panel, PlanSource
 
 
@@ -54,6 +54,21 @@ def _request_envelope(request: dict[str, object]) -> dict[str, object]:
         "request_sha256": canonical_json_sha256(request),
         "request": request,
     }
+
+
+def test_daily_compatibility_helper_rejects_a_nonunit_daily_stride() -> None:
+    for frequency in ("D", "1D"):
+        panel = Panel("/not-read", "id", "date", "qty", frequency=frequency)
+        assert _validate_daily_span(
+            panel, "2024-01-01", 2, adapter="auto_ets"
+        ) == dt.date(2024, 1, 1)
+    with pytest.raises(ValueError, match="exact daily"):
+        _validate_daily_span(
+            Panel("/not-read", "id", "date", "qty", frequency="7D"),
+            "2024-01-01",
+            2,
+            adapter="auto_ets",
+        )
 
 
 def _response_envelope(
@@ -304,17 +319,20 @@ def test_arrow_only_worker_does_not_start_an_unused_spark_runtime(adapter: str) 
     )
 
 
-def test_worker_refuses_weekly_adapter_before_registration_or_spark() -> None:
+@pytest.mark.parametrize("frequency", ["W", "7D"])
+def test_worker_refuses_unsupported_cadence_before_registration_or_spark(
+    frequency: str,
+) -> None:
     root = pathlib.Path(tempfile.mkdtemp())
     request_path = root / "request.json"
     response_path = root / "response.json"
     source_root = pathlib.Path(__file__).resolve().parent.parent.parent
     source = {"root": str(source_root), "manifest_sha256": "a" * 64}
     selected_python = pathlib.Path(sys.executable).absolute()
-    weekly = Panel("panel-A", "id", "date", "qty", frequency="W")
+    panel = Panel("panel-A", "id", "date", "qty", frequency=frequency)
     request = {
-        "adapter": "seasonal_naive",
-        "panel": weekly.__dict__,
+        "adapter": "tft",
+        "panel": panel.__dict__,
         "origin": "2024-01-01",
         "horizon": 2,
         "kwargs": {},
@@ -330,13 +348,13 @@ def test_worker_refuses_weekly_adapter_before_registration_or_spark() -> None:
             worker, "validate_executable_source_snapshot", return_value=source), \
             mock.patch.object(
                 worker, "register_defaults",
-                side_effect=AssertionError("weekly request registered a runtime adapter")):
+                side_effect=AssertionError("unsupported request registered a runtime adapter")):
         try:
             worker.main(str(request_path), str(response_path))
         except ValueError as exc:
-            assert "daily" in str(exc)
+            assert "frequency families" in str(exc) and repr(frequency) in str(exc)
             return
-    raise AssertionError("isolated worker accepted a weekly panel")
+    raise AssertionError(f"isolated worker accepted {frequency} for a daily-only adapter")
 
 
 @pytest.mark.parametrize(
@@ -770,30 +788,33 @@ def test_parent_refuses_nonfinite_request_before_starting_worker() -> None:
             raise AssertionError("colliding isolated request keys started the worker")
 
 
-def test_parent_refuses_weekly_adapter_before_starting_worker() -> None:
+@pytest.mark.parametrize("frequency", ["W", "7D"])
+def test_parent_refuses_unsupported_cadence_before_starting_worker(
+    frequency: str,
+) -> None:
     root = pathlib.Path(tempfile.mkdtemp())
     source = _source_snapshot(root)
-    weekly = Panel("/not-read", "id", "date", "qty", frequency="W")
+    panel = Panel("/not-read", "id", "date", "qty", frequency=frequency)
     with mock.patch.object(
             isolated, "validate_executable_source_snapshot", return_value=source), \
             mock.patch.object(
                 isolated, "_run_monitored_worker",
-                side_effect=AssertionError("weekly request started an isolated worker")):
+                side_effect=AssertionError("unsupported request started an isolated worker")):
         try:
             isolated.run(
-                "seasonal_naive",
-                weekly,
+                "tft",
+                panel,
                 "2024-01-01",
                 2,
                 source_snapshot=source,
                 worker_profile=_profile(),
                 out_dir=str(root / "forecast"),
-                **_controls(root, "weekly"),
+                **_controls(root, "unsupported-cadence"),
             )
         except ValueError as exc:
-            assert "daily" in str(exc)
+            assert "frequency families" in str(exc) and repr(frequency) in str(exc)
             return
-    raise AssertionError("isolated adapter accepted a weekly panel")
+    raise AssertionError(f"isolated parent accepted {frequency} for a daily-only adapter")
 
 
 def _worker_source(root: pathlib.Path, program: str) -> dict[str, object]:

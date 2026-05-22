@@ -16,7 +16,6 @@ import dataclasses
 import datetime as dt
 import math
 import pathlib
-import re
 import sys
 from dataclasses import dataclass, field
 
@@ -25,6 +24,16 @@ import pyarrow.parquet as pq
 import pyarrow.types as patypes
 
 from autoforecast.column_names import validate_column_names
+from autoforecast.frequency import (
+    Cadence,
+    FrequencyError,
+    TimePoint,
+    canonical_origin,
+    parse_frequency,
+    parse_origin,
+    period_points,
+)
+from autoforecast.parquet_time import ParquetTimeError, validate_parquet_time_storage
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 # noqa: E402 -- sys.path must be extended before the spec can be imported.
@@ -36,16 +45,30 @@ class PanelError(ValueError):
 
 
 def period_days(frequency: str) -> int:
-    """Integral-day revision grid; ``test_period_days_and_grid`` covers supported/refused forms.
+    """Compatibility helper for callers that still require an integral-day stride.
 
-    Calendar months and subdaily/timezone grids are not approximated as a number of days.
+    Hourly, monthly, and yearly cadences must use :mod:`autoforecast.frequency`; they are never
+    approximated as a number of days.
     """
-    if frequency == "W":
+    try:
+        cadence = parse_frequency(frequency)
+    except FrequencyError as exc:
+        raise PanelError(str(exc)) from exc
+    if cadence.unit == "W":
         return 7
-    match = re.fullmatch(r"([1-9][0-9]*)?D", frequency) if isinstance(frequency, str) else None
-    if match is None:
-        raise PanelError("supported revision cadences are D, W, or a positive integral nD")
-    return int(match.group(1) or 1)
+    if cadence.unit == "D":
+        return cadence.multiplier
+    raise PanelError(
+        f"frequency {frequency!r} is not an integral-day cadence; use period_points instead"
+    )
+
+
+class _DefaultSeasonLength(int):
+    """Distinguish an omitted default from an explicitly supplied integer without changing API."""
+
+
+_DEFAULT_SEASON_LENGTH = _DefaultSeasonLength(7)
+_SEASON_DEFAULTS = {"H": 24, "D": 7, "W": 52, "M": 12, "Y": 1}
 
 
 @dataclass(frozen=True)
@@ -95,8 +118,9 @@ class Panel:
     Attributes:
         path: Parquet file or partitioned directory. Normalised to `str` on construction.
         series_col: Identifies one time series. Forecasts are produced per distinct value.
-        time_col: The date. One row per (series, time) -- `validate` does not check uniqueness,
-            which needs a full scan; `autoforecast.score` checks it where it matters.
+        time_col: The cadence key: a timezone-naive exact-hour timestamp for H, and a date or
+            exact-midnight timestamp for date cadences. One row per (series, time) -- `validate`
+            does not check uniqueness, which needs a full scan; scoring checks it in-window.
         target_col: The quantity to forecast.
         status_prob_cols: SOFT observation states -- `{state: probability column}` over
             exactly the three contract states, for feeds where the state is inferred rather
@@ -184,19 +208,32 @@ class Panel:
     store_col: str | None = None
     category_col: str | None = None
     plan: PlanSource | None = None
-    season_length: int = 7
+    season_length: int = _DEFAULT_SEASON_LENGTH
     frequency: str = "D"
     target_estimand: str = "sales_given_availability"
     negative_target_policy: str = "refuse"
     past_only: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Normalise `path` so a `pathlib.Path` caller and a `str` caller hash identically."""
+        """Normalise path and every valid cadence spelling to their semantic identities."""
         if not isinstance(self.path, str | pathlib.Path):
             raise PanelError(f"panel path must be a string or Path, got {type(self.path).__name__}")
         if not str(self.path).strip():
             raise PanelError("panel path cannot be blank")
         object.__setattr__(self, "path", str(self.path))
+        default_season = isinstance(self.season_length, _DefaultSeasonLength)
+        try:
+            cadence = parse_frequency(self.frequency)
+        except FrequencyError as exc:
+            if isinstance(self.frequency, Cadence):
+                raise PanelError(str(exc)) from exc
+            # An explicit season length historically defers a malformed string to ``validate``.
+            if default_season:
+                raise PanelError(str(exc)) from exc
+        else:
+            object.__setattr__(self, "frequency", cadence.code)
+            if default_season:
+                object.__setattr__(self, "season_length", _SEASON_DEFAULTS[cadence.unit])
 
     @classmethod
     def from_record(cls, record: dict[str, object]) -> Panel:
@@ -316,9 +353,10 @@ class Panel:
         if (not isinstance(self.season_length, int) or isinstance(self.season_length, bool)
                 or self.season_length < 1):
             raise PanelError(f"season_length must be >= 1, got {self.season_length}")
-        if not isinstance(self.frequency, str) or not self.frequency.strip():
-            raise PanelError(f"frequency must be a non-blank declared cadence, got {self.frequency!r}")
-        period_days(self.frequency)
+        try:
+            cadence = parse_frequency(self.frequency)
+        except FrequencyError as exc:
+            raise PanelError(str(exc)) from exc
         if self.target_estimand not in ("sales_given_availability", "unconstrained_demand",
                                         "observed_count", "observed_nonnegative"):
             raise PanelError(f"unsupported target_estimand {self.target_estimand!r}")
@@ -436,7 +474,22 @@ class Panel:
                 f"present: {sorted(present)}"
             )
         fields = {field.name: field.type for field in schema}
-        _require_type(fields, self.time_col, "time_col", patypes.is_date, patypes.is_timestamp)
+        time_type = fields.get(self.time_col)
+        if cadence.key_kind == "timestamp":
+            if not patypes.is_timestamp(time_type):
+                raise PanelError(
+                    f"time_col={self.time_col!r} for hourly cadence requires a timezone-naive "
+                    f"Arrow timestamp, got {time_type}")
+        else:
+            _require_type(fields, self.time_col, "time_col", patypes.is_date,
+                          patypes.is_timestamp)
+        if patypes.is_timestamp(time_type) and getattr(time_type, "tz", None) is not None:
+            raise PanelError(
+                f"time_col={self.time_col!r} must be timezone-naive, got {time_type}")
+        try:
+            validate_parquet_time_storage(p, self.time_col)
+        except ParquetTimeError as exc:
+            raise PanelError(f"time_col={self.time_col!r} has invalid storage: {exc}") from exc
         _require_type(fields, self.target_col, "target_col", patypes.is_integer,
                       patypes.is_floating, patypes.is_decimal)
         for column in self.static_reals:
@@ -495,12 +548,12 @@ def _any_fragment(p: pathlib.Path) -> pathlib.Path:
     Reading one fragment's schema is O(1); opening the whole dataset walks every partition, which
     on a client estate with 100k files is the difference between milliseconds and minutes.
 
-    LIMIT, stated because it was hit: this does NOT detect a directory whose fragments disagree
-    with each other. `m5.build_parquet` appended rather than replacing, leaving two generations
-    with different date types in one directory -- `validate` passed on the first fragment and
-    Spark failed on the second. The fix belongs with the PRODUCER, which now clears its output;
-    checking every footer here would push a per-file cost onto every panel to catch a defect only
-    a broken writer can create.
+    LIMIT, stated because it was hit: this does NOT detect general schema disagreement between
+    fragments. `m5.build_parquet` appended rather than replacing, leaving two generations with
+    different date types in one directory -- `validate` passed on the first fragment and Spark
+    failed on the second. The fix belongs with the PRODUCER, which now clears its output. Time
+    storage is the narrow exception: timezone and INT96 proof are checked across every visible
+    footer because reconstruction can otherwise erase the evidence before any row is inspected.
 
     Raises:
         PanelError: `p` is a directory containing no `.parquet` file.
@@ -512,22 +565,15 @@ def _any_fragment(p: pathlib.Path) -> pathlib.Path:
     raise PanelError(f"no .parquet fragment under {p}")
 
 
-def _as_date(value: object, adapter: str) -> dt.date:
-    """Normalise Arrow date, timestamp, or ISO string values without accepting a time shift."""
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        try:
-            return dt.date.fromisoformat(value)
-        except ValueError as exc:
-            raise ForecastError(
-                f"{adapter!r}: forecast date must be ISO YYYY-MM-DD, got {value!r}"
-            ) from exc
-    raise ForecastError(
-        f"{adapter!r}: forecast date must be a date, timestamp, or ISO string, got {value!r}"
-    )
+def _as_time_key(value: object, frequency: str, adapter: str) -> TimePoint:
+    """Normalise one Arrow forecast key without truncating any timestamp component."""
+    cadence = parse_frequency(frequency)
+    try:
+        if not isinstance(value, str | dt.date):
+            raise FrequencyError(f"{cadence.code} requires a date or timestamp key, got {value!r}")
+        return parse_origin(canonical_origin(value, cadence), cadence)
+    except FrequencyError as exc:
+        raise ForecastError(f"{adapter!r}: invalid forecast time key: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -536,8 +582,10 @@ class Forecast:
 
     Attributes:
         adapter: Registry name of the implementation that produced this.
-        path: Parquet of `series · date · yhat`. A path, for the same reason `Panel` carries one.
-        origin: Last date the adapter was allowed to see, ISO `YYYY-MM-DD`.
+        path: Parquet of `series · date · yhat`, where `date` is the cadence-dependent time key.
+            A path, for the same reason `Panel` carries one.
+        origin: Last key the adapter was allowed to see: canonical exact-hour ISO for H and an
+            ISO date for all date cadences.
         horizon: Periods forecast beyond `origin`.
         n_series: Distinct series the adapter was asked to forecast.
         disposition: Bucket -> count, covering EVERY requested cell exactly once. Buckets whose
@@ -547,7 +595,7 @@ class Forecast:
             that quietly drops the hard cells would otherwise score well on what is left.
         target_estimand: Quantity forecast by ``yhat``. It must match both the input Panel and the
             evaluation manifest; the scorer rejects cross-estimand comparisons.
-        frequency: Integral-day cadence. The horizon counts periods, not necessarily days.
+        frequency: Declared cadence. The horizon counts periods.
     """
 
     adapter: str
@@ -560,7 +608,7 @@ class Forecast:
     frequency: str = "D"
 
     def __post_init__(self) -> None:
-        """Normalise `path`, matching `Panel`."""
+        """Normalise path and valid cadence aliases, matching `Panel`."""
         if not isinstance(self.path, str | pathlib.Path):
             raise ForecastError(
                 f"{self.adapter!r}: forecast path must be a string or Path, got "
@@ -568,6 +616,17 @@ class Forecast:
         if not str(self.path).strip():
             raise ForecastError(f"{self.adapter!r}: forecast path cannot be blank")
         object.__setattr__(self, "path", str(self.path))
+        try:
+            cadence = parse_frequency(self.frequency)
+        except FrequencyError as exc:
+            if isinstance(self.frequency, Cadence):
+                raise ForecastError(
+                    f"{self.adapter!r}: invalid frequency contract: {exc}"
+                ) from exc
+            # Preserve the existing contract: malformed strings fail when ``validate`` is called.
+            pass
+        else:
+            object.__setattr__(self, "frequency", cadence.code)
 
     @property
     def n_emitted(self) -> int:
@@ -590,14 +649,10 @@ class Forecast:
         if not isinstance(self.adapter, str) or not self.adapter.strip():
             raise ForecastError("forecast adapter must be a non-blank string")
         try:
-            parsed_origin = dt.date.fromisoformat(self.origin)
-        except (TypeError, ValueError) as exc:
+            parse_origin(self.origin, self.frequency)
+        except FrequencyError as exc:
             raise ForecastError(
-                f"{self.adapter!r}: origin must be ISO YYYY-MM-DD, got {self.origin!r}"
-            ) from exc
-        if parsed_origin.isoformat() != self.origin:
-            raise ForecastError(
-                f"{self.adapter!r}: origin must be canonical ISO YYYY-MM-DD, got {self.origin!r}")
+                f"{self.adapter!r}: invalid origin/frequency contract: {exc}") from exc
         if (not isinstance(self.horizon, int) or isinstance(self.horizon, bool)
                 or not isinstance(self.n_series, int) or isinstance(self.n_series, bool)
                 or self.horizon < 1 or self.n_series < 1):
@@ -606,9 +661,8 @@ class Forecast:
                 f"horizon={self.horizon}, n_series={self.n_series}"
             )
         try:
-            stride = period_days(self.frequency)
-            parsed_origin + dt.timedelta(days=self.horizon * stride)
-        except (ValueError, OverflowError) as exc:
+            period_points(self.origin, self.frequency, self.horizon)
+        except (FrequencyError, OverflowError) as exc:
             raise ForecastError(
                 f"{self.adapter!r}: frequency {self.frequency!r} does not produce a supported "
                 "representable forecast calendar"
@@ -663,13 +717,28 @@ class Forecast:
                 f"{self.adapter!r}: forecast Parquet is missing required columns {missing}; "
                 f"present: {dataset.schema.names}"
             )
-        origin = dt.date.fromisoformat(self.origin)
-        stride = period_days(self.frequency)
-        allowed_dates = {origin + dt.timedelta(days=step * stride)
-                         for step in range(1, self.horizon + 1)}
+        cadence = parse_frequency(self.frequency)
+        date_type = dataset.schema.field("date").type
+        if cadence.key_kind == "timestamp" and (
+            not patypes.is_timestamp(date_type) or getattr(date_type, "tz", None) is not None
+        ):
+            raise ForecastError(
+                f"{self.adapter!r}: hourly forecast date must be a timezone-naive Arrow "
+                f"timestamp, got {date_type}"
+            )
+        if patypes.is_timestamp(date_type) and getattr(date_type, "tz", None) is not None:
+            raise ForecastError(
+                f"{self.adapter!r}: forecast date must be timezone-naive, got {date_type}")
+        try:
+            validate_parquet_time_storage(artifact, "date", allow_hive_partition=True)
+        except ParquetTimeError as exc:
+            raise ForecastError(
+                f"{self.adapter!r}: forecast date has invalid storage: {exc}"
+            ) from exc
+        allowed_dates = set(period_points(self.origin, cadence, self.horizon))
 
         n_rows = 0
-        seen: set[tuple[object, dt.date]] = set()
+        seen: set[tuple[object, TimePoint]] = set()
         emitted_series: set[object] = set()
         try:
             batches = dataset.scanner(columns=list(required)).to_batches()
@@ -681,7 +750,7 @@ class Forecast:
                         raise ForecastError(
                             f"{self.adapter!r}: forecast Parquet contains a null/blank series_id"
                         )
-                    day = _as_date(row["date"], self.adapter)
+                    day = _as_time_key(row["date"], self.frequency, self.adapter)
                     if day not in allowed_dates:
                         raise ForecastError(
                             f"{self.adapter!r}: forecast date {day.isoformat()} is outside the "

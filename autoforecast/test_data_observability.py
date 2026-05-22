@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import pathlib
 import subprocess
@@ -20,6 +21,7 @@ from autoforecast.data_observability import (
     run_incident_from_error,
     write_data_observability_report,
 )
+from autoforecast.frequency import canonical_origin, parse_origin, period_points
 from autoforecast.panel import Panel
 
 
@@ -51,6 +53,52 @@ def _panel(path: pathlib.Path) -> Panel:
         known_future=("promo",),
         season_length=7,
     ).validate()
+
+
+@pytest.mark.parametrize(
+    "series_col,time_col,target_col",
+    [
+        ("sid", "day", "_time_key"),
+        ("_time_key", "day", "value"),
+        ("sid", "day", "_valid_time_key"),
+        ("COUNT", "day", "value"),
+        ("LEVELS", "day", "value"),
+        ("FIRST", "day", "value"),
+        ("M", "__AF_PROFILE_TIME", "__AF_PROFILE_VALID_TIME"),
+    ],
+)
+def test_inspection_temporary_columns_cannot_collide_with_mapped_columns(
+    tmp_path, series_col: str, time_col: str, target_col: str
+) -> None:
+    spark = _spark()
+    source = tmp_path / f"collision-{series_col}-{time_col}-{target_col}"
+    rows = []
+    for offset, value in enumerate((1.0, 2.0)):
+        rows.append({
+            series_col: "a",
+            time_col: dt.date(2024, 1, 1) + dt.timedelta(days=offset),
+            target_col: value,
+            "feature": "x",
+        })
+    spark.createDataFrame(rows).write.parquet(str(source))
+    panel = Panel(
+        source,
+        series_col,
+        time_col,
+        target_col,
+        static=("feature",),
+    )
+
+    report = inspect_panel(panel, spark, as_of="2024-01-02")
+
+    assert isinstance(report, CheckReport)
+    assert report.accepted
+    assert report.facts.n_rows == 2
+    assert report.facts.n_series == 1
+    assert report.facts.n_dates == 2
+    assert report.facts.profile is not None
+    assert report.facts.profile.n_cells == 2
+    assert report.facts.profile.n_series == 1
 
 
 def test_run_incident_from_error_uses_the_first_nonblank_error_line() -> None:
@@ -130,6 +178,203 @@ def test_duplicate_index_and_changing_static_values_block_data_admission() -> No
         assert admission.reasons == ("Data checks failed. Model checks were not run.",)
 
 
+@pytest.mark.parametrize(
+    "frequency,anchor",
+    [
+        ("H", "2024-03-01T20:00:00"),
+        ("D", "2024-03-01"),
+        ("W", "2024-02-23"),
+        ("M", "2023-12-31"),
+        ("MS", "2024-01-01"),
+        ("Y", "2021-12-31"),
+        ("YS", "2022-01-01"),
+    ],
+)
+def test_every_cadence_reports_a_missing_internal_period(
+    tmp_path, frequency: str, anchor: str
+) -> None:
+    spark = _spark()
+    points = period_points(anchor, frequency, 3)
+    source = tmp_path / f"gap-{frequency}"
+    key_type = "timestamp_ntz" if frequency == "H" else "date"
+    spark.createDataFrame(
+        [("a", points[0], 1.0), ("a", points[2], 3.0)],
+        f"id string, date {key_type}, qty double",
+    ).write.parquet(str(source))
+    panel = Panel(source, "id", "date", "qty", frequency=frequency)
+
+    report = inspect_panel(
+        panel, spark, as_of=canonical_origin(points[-1], frequency)
+    )
+
+    assert isinstance(report, CheckReport)
+    assert report.accepted
+    assert report.facts.missing_timestamps == (None if frequency == "D" else 1)
+    assert report.facts.missing_daily_timestamps == (1 if frequency == "D" else None)
+    check = next(item for item in report.checks if item.id == "time_grain")
+    assert check.status == "warning" and check.numerator == 1
+
+
+@pytest.mark.parametrize(
+    "frequency,origin,aligned,shifted",
+    [
+        (
+            "W",
+            "2024-01-10",
+            (dt.date(2023, 12, 27), dt.date(2024, 1, 3), dt.date(2024, 1, 10)),
+            (dt.date(2023, 12, 21), dt.date(2023, 12, 28), dt.date(2024, 1, 4)),
+        ),
+        (
+            "3D",
+            "2024-01-10",
+            (dt.date(2024, 1, 4), dt.date(2024, 1, 7), dt.date(2024, 1, 10)),
+            (dt.date(2024, 1, 3), dt.date(2024, 1, 6), dt.date(2024, 1, 9)),
+        ),
+    ],
+)
+def test_generic_preflight_rejects_consistent_wrong_origin_phase_for_weekly_and_strided_daily(
+    tmp_path, frequency: str, origin: str,
+    aligned: tuple[dt.date, ...], shifted: tuple[dt.date, ...],
+) -> None:
+    spark = _spark()
+    populations = {
+        "aligned": [("aligned", point, 1.0) for point in aligned],
+        "mixed": (
+            [("aligned", point, 1.0) for point in aligned]
+            + [("shifted", point, 1.0) for point in shifted]
+        ),
+        "all-shifted": [("shifted", point, 1.0) for point in shifted],
+    }
+
+    for population, rows in populations.items():
+        source = tmp_path / f"{frequency}-{population}"
+        spark.createDataFrame(rows, "id string, date date, qty double").write.parquet(
+            str(source)
+        )
+        panel = Panel(
+            source, "id", "date", "qty", frequency=frequency, season_length=3,
+        )
+        report = inspect_panel(panel, spark, as_of=origin)
+        assert isinstance(report, CheckReport)
+        time_grain = next(item for item in report.checks if item.id == "time_grain")
+
+        if population == "aligned":
+            assert report.accepted
+            assert time_grain.status == "passed" and time_grain.numerator == 0
+            continue
+
+        assert not report.accepted
+        assert time_grain.status == "failed"
+        assert time_grain.numerator == len(shifted)
+        admission = validate_model_compatibility(
+            "seasonal_naive",
+            panel,
+            report.facts.profile,
+            horizon=1,
+            data_checks=report,
+        )
+        assert admission.status == "ineligible"
+        assert admission.reasons == ("Data checks failed. Model checks were not run.",)
+
+
+def test_hourly_inspection_excludes_later_hours_on_the_same_day(tmp_path) -> None:
+    spark = _spark()
+    source = tmp_path / "hourly"
+    rows = [
+        ("a", parse_origin("2024-03-01T08:00:00", "H"), 2.0),
+        ("a", parse_origin("2024-03-01T09:00:00", "H"), 4.0),
+        ("a", parse_origin("2024-03-01T10:00:00", "H"), 0.0),
+    ]
+    spark.createDataFrame(rows, "id string, date timestamp_ntz, qty double").write.parquet(
+        str(source)
+    )
+
+    report = inspect_panel(
+        Panel(source, "id", "date", "qty", frequency="H"),
+        spark,
+        as_of="2024-03-01T09:00:00",
+    )
+
+    assert isinstance(report, CheckReport) and report.accepted
+    assert report.facts.n_rows == 2
+    assert report.facts.data_range[-1] == "2024-03-01T09:00:00"
+    assert report.facts.profile is not None
+    assert report.facts.profile.n_cells == 2
+
+
+@pytest.mark.parametrize(
+    "frequency,as_of,bad_key",
+    [
+        ("H", "2024-03-01T10:00:00", dt.datetime(2024, 3, 1, 9, 30)),
+        ("D", "2024-03-01", dt.datetime(2024, 3, 1, 12)),
+        ("M", "2024-03-31", dt.datetime(2024, 3, 30)),
+    ],
+)
+def test_inspection_rejects_lossy_and_off_anchor_time_keys(
+    tmp_path, frequency: str, as_of: str, bad_key: dt.datetime
+) -> None:
+    spark = _spark()
+    source = tmp_path / f"off-grid-{frequency}"
+    spark.createDataFrame(
+        [("a", bad_key, 1.0)], "id string, date timestamp_ntz, qty double"
+    ).write.parquet(str(source))
+
+    report = inspect_panel(
+        Panel(source, "id", "date", "qty", frequency=frequency), spark, as_of=as_of
+    )
+
+    assert isinstance(report, CheckReport) and not report.accepted
+    check = next(item for item in report.checks if item.id == "time_grain")
+    assert check.status == "failed" and check.numerator == 1
+
+
+def test_inspection_does_not_drop_a_malformed_time_key_during_cutoff_filtering(
+    tmp_path,
+) -> None:
+    spark = _spark()
+    source = tmp_path / "malformed-hourly-key"
+    spark.createDataFrame(
+        [("a", dt.datetime(2024, 3, 1, 9), 1.0), ("a", None, 2.0)],
+        "id string, date timestamp_ntz, qty double",
+    ).write.parquet(str(source))
+
+    report = inspect_panel(
+        Panel(source, "id", "date", "qty", frequency="H"),
+        spark,
+        as_of="2024-03-01T10:00:00",
+    )
+
+    assert isinstance(report, CheckReport) and not report.accepted
+    check = next(item for item in report.checks if item.id == "time_grain")
+    assert check.status == "failed" and check.numerator == 1
+
+
+def test_hourly_inspection_rejects_timezone_sensitive_spark_timestamp_storage(
+    tmp_path,
+) -> None:
+    spark = _spark()
+    source = tmp_path / "hourly-ltz"
+    spark.createDataFrame(
+        [("a", dt.datetime(2024, 3, 1, 9), 1.0)],
+        "id string, date timestamp, qty double",
+    ).write.parquet(str(source))
+
+    report = inspect_panel(
+        Panel(source, "id", "date", "qty", frequency="H"),
+        spark,
+        as_of="2024-03-01T10:00:00",
+    )
+
+    assert isinstance(report, CheckReport) and not report.accepted
+    check = next(item for item in report.checks if item.id == "data_definition")
+    assert check.status == "failed" and check.numerator is None
+    assert "ARROW:schema" in check.technical_detail
+    assert "timezone-naive" in check.technical_detail
+    assert report.facts.n_rows == report.facts.n_series == report.facts.n_dates == 0
+    assert report.facts.data_range == ("", "")
+    assert report.facts.profile is None and report.facts.spark_schema == {}
+
+
 def test_preflight_cli_writes_an_accepted_snapshot_report() -> None:
     if not os.environ.get("JAVA_HOME"):
         pytest.skip("Spark functional test needs JAVA_HOME")
@@ -172,6 +417,57 @@ def test_preflight_cli_writes_an_accepted_snapshot_report() -> None:
         assert result.returncode == 0, result.stderr
         assert "Data check report:" in result.stdout
         assert (root / "report" / "report.html").exists()
+
+
+def test_preflight_cli_rejects_a_complete_weekly_lattice_on_the_wrong_as_of_phase() -> None:
+    if not os.environ.get("JAVA_HOME"):
+        pytest.skip("Spark functional test needs JAVA_HOME")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "panel.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "item": ["shifted"] * 3,
+                    "day": [
+                        dt.date(2023, 12, 21),
+                        dt.date(2023, 12, 28),
+                        dt.date(2024, 1, 4),
+                    ],
+                    "units": [1.0, 2.0, 3.0],
+                }
+            ),
+            source,
+        )
+        contract = root / "contract.yaml"
+        contract.write_text(
+            "schema_version: 1\ndataset:\n  id: cli-weekly\n  panel:\n"
+            "    series_col: item\n    time_col: day\n    target_col: units\n"
+            "    frequency: W\n    season_length: 3\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/run_data_preflight.py",
+                str(contract),
+                str(source),
+                "--as-of",
+                "2024-01-10",
+                "--output",
+                str(root / "report"),
+            ],
+            cwd=pathlib.Path(__file__).resolve().parents[1],
+            env=os.environ.copy(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, result.stdout + result.stderr
+        record = json.loads((root / "report" / "data_validation_report.json").read_text())
+        assert not record["accepted"]
+        time_grain = next(check for check in record["checks"] if check["id"] == "time_grain")
+        assert time_grain["status"] == "failed" and time_grain["numerator"] == 3
 
 
 def test_preflight_cli_keeps_a_read_failure_out_of_the_data_check_report() -> None:

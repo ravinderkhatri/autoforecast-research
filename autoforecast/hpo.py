@@ -19,7 +19,6 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import date
 from typing import Any, Literal, Protocol, cast
 
 from autoforecast._exact_json import load_exact_json
@@ -35,6 +34,7 @@ from autoforecast.experiments import (
     require_heldout_evaluation_approval,
     seal_study_selection,
 )
+from autoforecast.frequency import TimePoint, parse_origin
 from autoforecast.mlflow_export import MLflowTrainingRun, start_training_tracking
 from autoforecast.tuning import (
     PARAMETER_EXECUTION_COMPATIBILITY,
@@ -216,17 +216,22 @@ def _mapping(value: object, label: str) -> dict[str, object]:
     return value
 
 
-def _date_range(value: object, label: str) -> tuple[date, date]:
+def _date_range(value: object, label: str) -> tuple[TimePoint, TimePoint]:
     if (
         not isinstance(value, list)
         or len(value) != 2
         or not all(isinstance(item, str) for item in value)
     ):
-        raise HPOError(f"{label} must be a two-item ISO-8601 date range")
+        raise HPOError(f"{label} must be a two-item ISO-8601 date/time range")
     try:
-        start, end = (date.fromisoformat(item) for item in value)
+        start, end = (
+            parse_origin(item, "H" if "T" in item else "D")
+            for item in value
+        )
     except ValueError as exc:
-        raise HPOError(f"{label} must be a two-item ISO-8601 date range") from exc
+        raise HPOError(f"{label} must be a two-item ISO-8601 date/time range") from exc
+    if type(start) is not type(end):
+        raise HPOError(f"{label} endpoints must use the same temporal key type")
     if start > end:
         raise HPOError(f"{label} start must not be after its end")
     return start, end
@@ -259,6 +264,8 @@ def _validate_data(data: dict[str, object]) -> None:
             "test_target_date_range",
         )
     }
+    if len({type(point) for bounds in ranges.values() for point in bounds}) != 1:
+        raise HPOError("all study data ranges must use the same temporal key type")
     observed_start, observed_end = ranges["observed_date_range"]
     validation_start, validation_end = ranges["validation_target_date_range"]
     test_start, test_end = ranges["test_target_date_range"]

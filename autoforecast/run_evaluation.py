@@ -16,6 +16,7 @@ from typing import Literal, cast
 from pyspark.sql import SparkSession
 
 from autoforecast.benchmarks.m5 import M5_LEVELS
+from autoforecast.frequency import parse_frequency
 from autoforecast.panel import Forecast, Panel
 from autoforecast.ranking import SelectionError, _exact_grid_restrictions, common_cells
 from autoforecast.score import Score
@@ -158,11 +159,12 @@ def compare_run_forecasts(
             raise EvaluationError("frozen scoring grid changed")
         from autoforecast.grid import content_hash
 
-        if content_hash(grid_path, spark) != grid_record["logical_sha256"]:
+        frequency = parse_frequency(items[0][1].frequency).code
+        if content_hash(grid_path, spark, frequency=frequency) != grid_record["logical_sha256"]:
             raise EvaluationError("frozen scoring grid logical identity changed")
         origin = items[0][1].origin
         forecast = items[0][1]
-        expected_suffix = f"/{origin}/{forecast.horizon}/{forecast.frequency}"
+        expected_suffix = f"/{origin}/{forecast.horizon}/{frequency}"
         if not str(fixed_contract["boundary"]).endswith(expected_suffix):
             raise EvaluationError("forecast uses the wrong evaluation boundary")
         try:

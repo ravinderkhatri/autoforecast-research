@@ -1,4 +1,4 @@
-"""Freeze a daily benchmark before any candidate can choose its scoring population."""
+"""Freeze a time-series benchmark before any candidate can choose its scoring population."""
 
 from __future__ import annotations
 
@@ -16,6 +16,15 @@ from functools import partial
 from autoforecast._exact_json import loads_exact_json
 from autoforecast.column_names import validate_column_names
 from autoforecast.data_admission import load_dataset_contract
+from autoforecast.frequency import (
+    Cadence,
+    FrequencyError,
+    TimePoint,
+    advance,
+    canonical_origin,
+    parse_frequency,
+    parse_origin,
+)
 from provenance.lineage import directory_digest
 
 SCHEMA = "autoforecast.frozen-benchmark.v1"
@@ -32,7 +41,82 @@ def digest(value) -> str:
 
 
 def boundary(stage: str, origin: str, horizon: int, frequency: str = "D") -> str:
-    return f"{stage}/{origin}/{horizon}/{frequency}"
+    cadence = parse_frequency(frequency)
+    return f"{stage}/{canonical_origin(origin, cadence)}/{horizon}/{cadence.code}"
+
+
+def _recipe_cadence(recipe: dict) -> Cadence:
+    try:
+        return parse_frequency(recipe.get("frequency", "D"))
+    except FrequencyError as error:
+        raise BenchmarkError(f"preparation recipe frequency is invalid: {error}") from error
+
+
+def _recipe_point(value: object, cadence: Cadence) -> TimePoint:
+    if type(value) is not str:
+        message = (
+            "recipe dates must be ISO YYYY-MM-DD strings"
+            if cadence.code == "D"
+            else f"recipe time points must be canonical for frequency {cadence.code}"
+        )
+        raise BenchmarkError(message)
+    try:
+        return parse_origin(value, cadence)
+    except FrequencyError as error:
+        message = (
+            "recipe dates must be ISO YYYY-MM-DD strings"
+            if cadence.code == "D"
+            else f"recipe time points must be canonical for frequency {cadence.code}"
+        )
+        raise BenchmarkError(message) from error
+
+
+def _inclusive_period_count(
+    start: TimePoint, end: TimePoint, cadence: Cadence, *, label: str
+) -> int:
+    """Count an aligned inclusive grid without enumerating its historical observations."""
+    if start > end:
+        raise BenchmarkError(f"{label} start must not follow its end")
+    if cadence.unit == "H":
+        assert isinstance(start, dt.datetime) and isinstance(end, dt.datetime)
+        periods = (end - start) // dt.timedelta(hours=1)
+    elif cadence.unit in {"D", "W"}:
+        stride = cadence.multiplier if cadence.unit == "D" else 7
+        periods = (end.toordinal() - start.toordinal()) // stride
+    elif cadence.unit == "M":
+        periods = (end.year - start.year) * 12 + end.month - start.month
+    else:
+        periods = end.year - start.year
+    try:
+        if advance(start, cadence, periods) == end:
+            return periods + 1
+    except (FrequencyError, OverflowError) as error:
+        raise BenchmarkError(f"{label} is outside the representable cadence grid") from error
+    raise BenchmarkError(f"{label} endpoints are not aligned to frequency {cadence.code}")
+
+
+def _period_frame(spark, start: TimePoint, end: TimePoint, cadence: Cadence, column: str):
+    """Generate historical keys in Spark, keeping driver memory independent of the span."""
+    from pyspark.sql import functions as F
+
+    from autoforecast.grid import time_literal
+
+    count = _inclusive_period_count(start, end, cadence, label="observation window")
+    index = F.col("id")
+    first = time_literal(start, cadence)
+    if cadence.unit == "H":
+        point = F.timestamp_add("HOUR", index, first)
+    elif cadence.unit in {"D", "W"}:
+        stride = cadence.multiplier if cadence.unit == "D" else 7
+        point = F.date_add(first, (index * stride).cast("int"))
+    else:
+        months = index * (12 if cadence.unit == "Y" else 1)
+        point = F.add_months(first, months.cast("int"))
+        if cadence.anchor == "end":
+            point = F.last_day(point)
+    # Python's representable dates bound even an hourly span below 88 million periods, within
+    # Spark range's signed-long index and the integer day/month arithmetic above.
+    return spark.range(count).select(point.alias(column))
 
 
 _PYTHON_WHITESPACE = "".join(chr(value) for value in range(0x110000) if chr(value).isspace())
@@ -126,7 +210,7 @@ def _identity(record: dict) -> dict:
 
 
 def validate_recipe(recipe: dict) -> None:
-    """Validate exact daily preparation fields before acquiring a runtime."""
+    """Validate exact preparation fields before acquiring a runtime."""
     expected = {
         "schema_version",
         "source_keys",
@@ -140,9 +224,11 @@ def validate_recipe(recipe: dict) -> None:
         "target_unit",
         "feature_availability",
     }
-    if (type(recipe) is not dict or set(recipe) != expected
+    accepted_fields = (expected, expected | {"frequency"})
+    if (type(recipe) is not dict or set(recipe) not in accepted_fields
             or type(recipe["schema_version"]) is not int or recipe["schema_version"] != 1):
         raise BenchmarkError("preparation recipe requires exactly the documented v1 fields")
+    cadence = _recipe_cadence(recipe)
     if (type(recipe["history_policy"]) is not str
             or recipe["history_policy"] not in {"fixed", "revised_snapshot"}):
         raise BenchmarkError("history_policy must be fixed or revised_snapshot")
@@ -160,19 +246,8 @@ def validate_recipe(recipe: dict) -> None:
         validate_column_names(keys)
     except ValueError as error:
         raise BenchmarkError(str(error)) from error
-    def date(value):
-        if type(value) is not str:
-            raise BenchmarkError("recipe dates must be ISO YYYY-MM-DD strings")
-        try:
-            parsed = dt.date.fromisoformat(value)
-        except ValueError as error:
-            raise BenchmarkError("recipe dates must be ISO YYYY-MM-DD strings") from error
-        if parsed.isoformat() != value:
-            raise BenchmarkError("recipe dates must be ISO YYYY-MM-DD strings")
-        return parsed
-
     if type(recipe["validation_origins"]) is not list:
-        raise BenchmarkError("validation_origins must be a list of ISO dates")
+        raise BenchmarkError("validation_origins must be a list of canonical time points")
     if type(recipe["feature_availability"]) is not dict or any(
         type(key) is not str or not key.strip() or type(value) is not str or not value.strip()
         for key, value in recipe["feature_availability"].items()
@@ -184,19 +259,28 @@ def validate_recipe(recipe: dict) -> None:
         ])
     except ValueError as error:
         raise BenchmarkError(str(error)) from error
-    start = date(recipe["training_start"])
-    origins = [date(day) for day in recipe["validation_origins"]]
-    cutoff = date(recipe["final_train_cutoff"])
+    start = _recipe_point(recipe["training_start"], cadence)
+    origins = [_recipe_point(day, cadence) for day in recipe["validation_origins"]]
+    cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
     horizon, test_horizon = recipe["validation_horizon"], recipe["final_test_horizon"]
-    if (
-        not origins
-        or origins != sorted(set(origins))
-        or start > origins[0]
-        or any(type(h) is not int or h < 1 for h in (horizon, test_horizon))
-        or horizon > (cutoff - origins[-1]).days
-        or test_horizon > (dt.date.max - cutoff).days
-    ):
-        raise BenchmarkError("invalid daily training/validation/testing boundaries")
+    try:
+        invalid = (
+            not origins
+            or origins != sorted(set(origins))
+            or start > origins[0]
+            or any(type(h) is not int or h < 1 for h in (horizon, test_horizon))
+            or advance(origins[-1], cadence, horizon) > cutoff
+        )
+        advance(cutoff, cadence, test_horizon)
+    except (FrequencyError, OverflowError):
+        invalid = True
+    if invalid:
+        raise BenchmarkError("invalid training/validation/testing boundaries")
+    for label, point in [
+        *(('validation window', origin) for origin in origins),
+        ("final training window", cutoff),
+    ]:
+        _inclusive_period_count(start, point, cadence, label=label)
 
 
 def freeze_benchmark(
@@ -211,34 +295,39 @@ def freeze_benchmark(
 
     Population: all distinct source keys observed by the earliest validation origin.
     New series can only be excluded by the explicit pre-test rule in the recipe.
-    Every retained series must have every daily observation in each required role.
+    Every retained series must have every cadence observation in each required role.
     """
     from pyspark.sql import functions as F
-    from pyspark.sql.types import DateType, IntegralType, StringType
+    from pyspark.sql.types import (
+        DateType,
+        IntegralType,
+        StringType,
+    )
 
     from autoforecast import grid
 
     validate_recipe(recipe)
+    cadence = _recipe_cadence(recipe)
     if set(sources) != {"selection", "final_training", "final_score"}:
         raise BenchmarkError("provide selection, final_training, and final_score sources")
     keys = recipe["source_keys"]
-    start = dt.date.fromisoformat(recipe["training_start"])
-    origins = [dt.date.fromisoformat(day) for day in recipe["validation_origins"]]
-    cutoff = dt.date.fromisoformat(recipe["final_train_cutoff"])
+    start = _recipe_point(recipe["training_start"], cadence)
+    origins = [_recipe_point(day, cadence) for day in recipe["validation_origins"]]
+    cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
     horizon, test_horizon = recipe["validation_horizon"], recipe["final_test_horizon"]
-    end = cutoff + dt.timedelta(days=test_horizon)
+    end = advance(cutoff, cadence, test_horizon)
     contract_bytes = contract_path.read_bytes()
     contract = load_dataset_contract(contract_path)
     panel = contract.panel(sources["selection"])
     if (
-        panel.frequency != "D"
+        parse_frequency(panel.frequency).code != cadence.code
         or panel.target_estimand not in ("sales_given_availability", "observed_nonnegative")
         or panel.negative_target_policy != "refuse"
         or panel.status_prob_cols
         or panel.plan
     ):
         raise BenchmarkError(
-            "release supports daily nonnegative observed targets and prepared snapshots"
+            "recipe frequency must match a supported nonnegative observed-target panel"
         )
     availability = recipe["feature_availability"]
     try:
@@ -262,7 +351,7 @@ def freeze_benchmark(
     key_types = None
     internal = "__af_series_id"
     for name, path in sources.items():
-        frame = spark.read.parquet(str(path))
+        frame = grid.read_time_parquet(spark, path, panel.time_col)
         try:
             validate_column_names(frame.columns)
         except ValueError as error:
@@ -277,25 +366,35 @@ def freeze_benchmark(
         key_types = types
         if any(not isinstance(frame.schema[k].dataType, IntegralType | StringType) for k in keys):
             raise BenchmarkError("source keys must be integral or string, without lossy casts")
-        if not isinstance(frame.schema[panel.time_col].dataType, DateType):
-            raise BenchmarkError("source dates must be Parquet date values")
-        invalid = F.col(panel.time_col).isNull()
+        time_type = frame.schema[panel.time_col].dataType
+        time_type_name = time_type.typeName()
+        if cadence.key_kind == "timestamp" and time_type_name != "timestamp_ntz":
+            raise BenchmarkError("hourly source keys must be timezone-naive Parquet timestamps")
+        if cadence.key_kind != "timestamp" and not (
+            isinstance(time_type, DateType)
+            or time_type_name in {"timestamp", "timestamp_ntz"}
+        ):
+            raise BenchmarkError("non-hourly source keys must be Parquet date values")
+        canonical_time, valid_time = grid.canonical_key(panel.time_col, cadence)
+        invalid = ~valid_time
         for key in keys:
             invalid = invalid | F.col(key).isNull()
             if isinstance(frame.schema[key].dataType, StringType):
                 invalid = invalid | (F.translate(F.col(key), _PYTHON_WHITESPACE, "") == "")
         if frame.filter(invalid).limit(1).count():
-            raise BenchmarkError("source contains null date/key or blank string key")
-        frame = frame.withColumn(internal, F.to_json(F.struct(*[F.col(k) for k in keys])))
+            raise BenchmarkError("source contains null time/key or blank string key")
+        frame = frame.withColumn(panel.time_col, canonical_time).withColumn(
+            internal, F.to_json(F.struct(*[F.col(k) for k in keys]))
+        )
         if (frame.groupBy(internal, panel.time_col)
                 .agg(F.count(F.lit(1)).alias("__af_count"))
                 .filter(F.col("__af_count") != 1).limit(1).count()):
             raise BenchmarkError("duplicate source observations")
         frames[name] = frame
     selection = frames["selection"]
-    cohort = (
-        selection.filter(F.col(panel.time_col) <= F.lit(origins[0])).select(internal).distinct()
-    )
+    cohort = selection.filter(
+        F.col(panel.time_col) <= grid.time_literal(origins[0], cadence)
+    ).select(internal).distinct()
     all_keys = frames["selection"].select(internal)
     for frame in (frames["final_training"], frames["final_score"]):
         all_keys = all_keys.unionByName(frame.select(internal))
@@ -310,15 +409,27 @@ def freeze_benchmark(
     for name, frame in frames.items():
         retained = frame.join(cohort, internal)
         low, high = (
-            (cutoff + dt.timedelta(days=1), end)
+            (advance(cutoff, cadence, 1), end)
             if name == "final_score"
             else (start, origins[-1] if name == "selection" else cutoff)
         )
-        required = retained.filter(F.col(panel.time_col).between(low, high))
-        days = spark.range((high - low).days + 1).select(
-            F.date_add(F.lit(low), F.col("id").cast("int")).alias(panel.time_col)
+        upper = end if panel.known_future and name != "final_score" else high
+        window = retained.filter(
+            F.col(panel.time_col).between(
+                grid.time_literal(low, cadence), grid.time_literal(upper, cadence)
+            )
         )
-        expected_cells = cohort.crossJoin(days)
+        periods = _period_frame(spark, low, upper, cadence, panel.time_col)
+        if window.join(periods, panel.time_col, "left_anti").limit(1).count():
+            raise BenchmarkError(
+                f"{name}: source contains time keys off the declared {cadence.code} grid"
+            )
+        required = window.filter(
+            F.col(panel.time_col) <= grid.time_literal(high, cadence)
+        )
+        expected_cells = cohort.crossJoin(
+            periods.filter(F.col(panel.time_col) <= grid.time_literal(high, cadence))
+        )
         absent = expected_cells.join(required, [internal, panel.time_col], "left_anti")
         if absent.limit(1).count():
             bounds = required.groupBy(internal).agg(F.max(panel.time_col).alias("__af_last"))
@@ -353,32 +464,27 @@ def freeze_benchmark(
                 "late/unobserved feeds refused"
             )
         for feature, known_at in availability.items():
+            known_time = F.expr(f"try_cast(`{known_at}` as timestamp_ntz)")
+            first_origin = grid.time_literal(origins[0], cadence).cast("timestamp_ntz")
             if (
                 known_at not in retained.columns
                 or retained.filter(
-                    F.to_timestamp(F.col(known_at)).isNull()
-                    | (
-                        F.to_timestamp(F.col(known_at))
-                        > F.lit(dt.datetime.combine(origins[0], dt.time.min))
-                    )
+                    known_time.isNull() | (known_time > first_origin)
                 )
                 .limit(1)
                 .count()
             ):
                 raise BenchmarkError(f"unknown future feature at first origin: {feature}")
         # Keep verified future-known rows for the existing physical target-mask materializer.
-        frames[name] = retained.filter(
-            F.col(panel.time_col).between(
-                low, end if panel.known_future and name != "final_score" else high
-            )
-        )
+        frames[name] = window
         counts[name] = {
             "required_observations": required.count(),
             "written_rows": frames[name].count(),
         }
     if recipe["history_policy"] == "fixed":
-        left = frames["selection"].filter(F.col(panel.time_col) <= F.lit(origins[-1]))
-        right = frames["final_training"].filter(F.col(panel.time_col) <= F.lit(origins[-1]))
+        last_origin = grid.time_literal(origins[-1], cadence)
+        left = frames["selection"].filter(F.col(panel.time_col) <= last_origin)
+        right = frames["final_training"].filter(F.col(panel.time_col) <= last_origin)
         if (
             set(left.columns) != set(right.columns)
             or left.select(sorted(left.columns))
@@ -423,20 +529,22 @@ def freeze_benchmark(
         for stage, origin, span in [("validation", o, horizon) for o in origins] + [
             ("test", cutoff, test_horizon)
         ]:
-            key = boundary(stage, origin.isoformat(), span)
+            origin_text = canonical_origin(origin, cadence)
+            key = boundary(stage, origin_text, span, cadence.code)
             relative = "grids/" + key
             path = grid.build(
                 scratch / "source-keys",
-                origin.isoformat(),
+                origin_text,
                 span,
                 spark,
                 scratch / relative,
                 series_col=internal,
                 time_col=panel.time_col,
+                frequency=cadence.code,
             )
             grids[key] = {
                 "path": relative,
-                "logical_sha256": grid.content_hash(path, spark),
+                "logical_sha256": grid.content_hash(path, spark, frequency=cadence.code),
                 "sha256": directory_digest(path, suffixes=(".parquet",)),
                 "n_cells": final_count * span,
             }
@@ -562,26 +670,35 @@ def _validate_manifest(record: object) -> dict:
     }
     if record["policies"] != policies:
         raise BenchmarkError("benchmark observation policies changed")
-    start = dt.date.fromisoformat(recipe["training_start"])
-    cutoff = dt.date.fromisoformat(recipe["final_train_cutoff"])
-    selection_end = dt.date.fromisoformat(recipe["validation_origins"][-1])
-    role_days = {
-        "selection": (selection_end - start).days + 1,
-        "final_training": (cutoff - start).days + 1,
+    cadence = _recipe_cadence(recipe)
+    start = _recipe_point(recipe["training_start"], cadence)
+    cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
+    selection_end = _recipe_point(recipe["validation_origins"][-1], cadence)
+    role_periods = {
+        "selection": _inclusive_period_count(
+            start, selection_end, cadence, label="selection role"
+        ),
+        "final_training": _inclusive_period_count(
+            start, cutoff, cadence, label="final training role"
+        ),
         "final_score": recipe["final_test_horizon"],
     }
     for role, values in mapping(record["counts"], source_roles, "counts").items():
         mapping(values, {"required_observations", "written_rows"}, f"counts.{role}")
         for key, value in values.items():
             count(value, f"counts.{role}.{key}")
-        if (values["required_observations"] != cohort * role_days[role]
+        if (values["required_observations"] != cohort * role_periods[role]
                 or values["written_rows"] < values["required_observations"]):
             raise BenchmarkError("benchmark observation counts do not reconcile")
     boundaries = {
-        boundary("validation", origin, recipe["validation_horizon"]): recipe["validation_horizon"]
+        boundary(
+            "validation", origin, recipe["validation_horizon"], cadence.code
+        ): recipe["validation_horizon"]
         for origin in recipe["validation_origins"]
     }
-    boundaries[boundary("test", recipe["final_train_cutoff"], recipe["final_test_horizon"])] = (
+    boundaries[boundary(
+        "test", recipe["final_train_cutoff"], recipe["final_test_horizon"], cadence.code
+    )] = (
         recipe["final_test_horizon"]
     )
     grids = mapping(record["grids"], boundaries, "grid inventory")
@@ -670,7 +787,8 @@ def _evaluation_contract_from_record(
     path: pathlib.Path, record: dict, *, stage: str, origin: str, horizon: int, metric: str,
 ) -> dict:
     """Derive a boundary from the record authenticated by the current compilation."""
-    key = boundary(stage, origin, horizon)
+    cadence = _recipe_cadence(record["recipe"])
+    key = boundary(stage, origin, horizon, cadence.code)
     if key not in record["grids"]:
         raise BenchmarkError("evaluation boundary absent from frozen benchmark")
     if metric not in {"rmse", "mae", "wape"}:

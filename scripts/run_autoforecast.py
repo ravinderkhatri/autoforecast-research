@@ -1371,6 +1371,7 @@ def run_request(
                         origin=request.origin,
                         horizon=request.horizon,
                         settings=dict(plan.readiness_settings),
+                        frequency=panel.frequency,
                     )
                     model_input = prepare_model_check_input(
                         panel, spark, data_outcome.facts, resolved
@@ -1462,6 +1463,11 @@ def run_request(
                         "origin": context.input.run.origin,
                         "horizon": context.input.run.horizon,
                         "settings": list(context.input.run.settings),
+                        **(
+                            {"frequency": context.input.run.frequency}
+                            if context.input.run.frequency != "D"
+                            else {}
+                        ),
                         "runtime": candidate.runtime,
                     },
                 )

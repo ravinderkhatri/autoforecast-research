@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from autoforecast import adapters
-from autoforecast.adapter_contracts import descriptor
+from autoforecast.adapter_contracts import DESCRIPTORS, descriptor
 from autoforecast.adapters import adapter_capabilities, known_adapter_names
 from autoforecast.data_admission import (
     get_model_input_contract,
@@ -93,6 +93,8 @@ def test_revision_adapter_registration_contracts_are_exact() -> None:
             "consumes_exposure": True,
             "handles_right_censoring": True,
             "supported_estimands": frozenset({"sales_given_availability", "unconstrained_demand"}),
+            "supported_frequency_families": frozenset({"D"}),
+            "supports_strided_daily": False,
             "tracking": tracking_plan(adapter),
             "descriptor": descriptor(adapter),
         }
@@ -209,6 +211,38 @@ def test_model_compatibility_admits_only_data_that_meets_each_model_contract() -
             ).status
             == "ineligible"
         )
+        invalid_frequency = validate_model_compatibility(
+            "seasonal_naive",
+            Panel(
+                str(path), "client_sku", "trading_day", "units_sold",
+                frequency="hourly", season_length=7,
+            ),
+            _profile(7, 7),
+            horizon=1,
+        )
+        assert invalid_frequency.status == "ineligible"
+        assert any("supported frequencies" in reason for reason in invalid_frequency.reasons)
+
+
+def test_every_adapter_explicitly_declares_family_and_daily_stride_support() -> None:
+    all_families = ("H", "D", "W", "M", "Y")
+    for name in DESCRIPTORS:
+        declared = descriptor(name).supported_frequency_families
+        if name in {"seasonal_naive", "last_value"}:
+            assert declared == all_families
+            assert descriptor(name).supports_strided_daily
+            assert all(get_model_input_contract(name).supports(code) for code in all_families)
+            assert get_model_input_contract(name).supports("MS")
+            assert get_model_input_contract(name).supports("YS")
+            assert get_model_input_contract(name).supports("7D")
+        else:
+            assert declared == ("D",)
+            assert not descriptor(name).supports_strided_daily
+            assert get_model_input_contract(name).supports("D")
+            assert not get_model_input_contract(name).supports("7D")
+            assert not any(
+                get_model_input_contract(name).supports(code) for code in ("H", "W", "M", "Y")
+            )
 
 
 def test_preflight_selects_data_compatible_catalog_candidates_before_fitting() -> None:

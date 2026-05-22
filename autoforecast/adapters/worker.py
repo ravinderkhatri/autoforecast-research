@@ -6,7 +6,6 @@ needed for this process.
 
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import json
 import os
@@ -18,7 +17,7 @@ from pyspark.sql import SparkSession
 from autoforecast import registry, resources
 from autoforecast._exact_json import ExactJSONError, load_exact_json
 from autoforecast.acceptance_retirement import canonical_json_sha256
-from autoforecast.adapters import _ISOLATED_MODULE, _validate_daily_span, register_defaults
+from autoforecast.adapters import _ISOLATED_MODULE, _validate_span, register_defaults
 from autoforecast.executable_source import validate_executable_source_snapshot
 from autoforecast.panel import Panel
 from autoforecast.tracking_plan import enable_autologging, tracking_plan
@@ -93,16 +92,10 @@ def main(request_name: str, response_name: str) -> int:
     if type(request["kwargs"]) is not dict:
         raise ValueError("isolated request kwargs must be one JSON object")
     origin = request["origin"]
-    try:
-        origin_day = dt.date.fromisoformat(origin) if type(origin) is str else None
-    except ValueError as exc:
-        raise ValueError("isolated request origin must be a canonical ISO date") from exc
-    if origin_day is None or origin_day.isoformat() != origin:
-        raise ValueError("isolated request origin must be a canonical ISO date")
     horizon = request["horizon"]
     if type(horizon) is not int or horizon < 1:
         raise ValueError("isolated request horizon must be a positive integer")
-    _validate_daily_span(panel, origin, horizon, adapter=adapter)
+    _validate_span(panel, origin, horizon, adapter=adapter)
     kwargs = dict(request["kwargs"])
     tracking_context = request.get("tracking_context")
     if tracking_context is not None:

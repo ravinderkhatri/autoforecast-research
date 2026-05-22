@@ -68,6 +68,51 @@ def frozen(tmp_path_factory, spark):
     return path, project, recipe, sources
 
 
+@pytest.mark.parametrize("frequency,start,end,expected", [
+    ("H", "2024-02-29T23:00:00", "2024-03-01T01:00:00",
+     ["2024-02-29T23:00:00", "2024-03-01T00:00:00", "2024-03-01T01:00:00"]),
+    ("D", "2024-02-28", "2024-03-01", ["2024-02-28", "2024-02-29", "2024-03-01"]),
+    ("W", "2024-02-23", "2024-03-08", ["2024-02-23", "2024-03-01", "2024-03-08"]),
+    ("3D", "2024-02-26", "2024-03-03", ["2024-02-26", "2024-02-29", "2024-03-03"]),
+    ("M", "2024-02-29", "2024-04-30", ["2024-02-29", "2024-03-31", "2024-04-30"]),
+    ("MS", "2023-12-01", "2024-02-01", ["2023-12-01", "2024-01-01", "2024-02-01"]),
+    ("Y", "2099-12-31", "2101-12-31", ["2099-12-31", "2100-12-31", "2101-12-31"]),
+    ("YS", "2099-01-01", "2101-01-01", ["2099-01-01", "2100-01-01", "2101-01-01"]),
+])
+def test_historical_grid_is_distributed_and_preserves_exact_keys(
+    spark, monkeypatch, frequency, start, end, expected,
+):
+    monkeypatch.setattr(
+        spark, "createDataFrame", lambda *a, **k: pytest.fail("historical keys reached the driver")
+    )
+    original_zone = spark.conf.get("spark.sql.session.timeZone")
+    spark.conf.set("spark.sql.session.timeZone", "Asia/Kolkata")
+    try:
+        cadence = benchmark.parse_frequency(frequency)
+        frame = benchmark._period_frame(
+            spark, benchmark.parse_origin(start, cadence), benchmark.parse_origin(end, cadence),
+            cadence, "time",
+        )
+        assert frame.schema["time"].dataType.typeName() == (
+            "timestamp_ntz" if frequency == "H" else "date"
+        )
+        assert [row["time"].isoformat() for row in frame.orderBy("time").collect()] == expected
+    finally:
+        spark.conf.set("spark.sql.session.timeZone", original_zone)
+
+
+def test_large_hourly_history_can_be_planned_without_driver_enumeration(spark, monkeypatch):
+    monkeypatch.setattr(
+        spark, "createDataFrame", lambda *a, **k: pytest.fail("historical keys reached the driver")
+    )
+    cadence = benchmark.parse_frequency("H")
+    start, end = dt.datetime(1, 1, 1), dt.datetime(9998, 1, 1)
+    frame = benchmark._period_frame(spark, start, end, cadence, "time")
+    assert [row["time"] for row in frame.limit(2).collect()] == [
+        start, start + dt.timedelta(hours=1),
+    ]
+
+
 def test_freeze_composite_series_and_idempotent_identity(frozen, spark):
     path, project, recipe, sources = frozen
     record = benchmark.verify_benchmark(path)[1]
@@ -100,6 +145,33 @@ def test_freeze_internal_and_trailing_gaps(tmp_path, spark):
     with pytest.raises(
         benchmark.BenchmarkError, match="internal/leading=2, trailing=2; unknown zeros refused"
     ):
+        _freeze(project, recipe, sources, spark)
+
+
+def test_freeze_rejects_duplicate_source_observations(tmp_path, spark):
+    project, recipe, sources = _inputs(tmp_path)
+    table = pq.read_table(project / "data")
+    duplicate = table.slice(0, 1)
+    pq.write_table(pa.concat_tables([table, duplicate]), project / "data/observations.parquet")
+
+    with pytest.raises(benchmark.BenchmarkError, match="duplicate source observations"):
+        _freeze(project, recipe, sources, spark)
+
+
+def test_freeze_rejects_a_weekly_source_row_off_the_declared_phase(tmp_path, spark):
+    project = tmp_path / "project"
+    create_example(project, frequency="W")
+    recipe = json.loads((project / "recipe.json").read_text())
+    sources = {role: project / "data" for role in ("selection", "final_training", "final_score")}
+    table = pq.read_table(project / "data")
+    row = table.slice(0, 1).to_pylist()[0]
+    row["day"] += dt.timedelta(days=1)
+    pq.write_table(
+        pa.concat_tables([table, pa.Table.from_pylist([row], schema=table.schema)]),
+        project / "data/observations.parquet",
+    )
+
+    with pytest.raises(benchmark.BenchmarkError, match="off the declared W grid"):
         _freeze(project, recipe, sources, spark)
 
 
@@ -216,6 +288,42 @@ def test_fixed_grid_rejects_population_changes(frozen, tmp_path, spark, defect):
                 output_dir=tmp_path / "score",
                 fixed_contract=fixed,
             )
+
+
+def test_fixed_grid_accepts_the_explicit_month_end_alias(tmp_path, spark):
+    from autoforecast.adapters.naive import seasonal_naive
+
+    project = tmp_path / "project"
+    create_example(project, frequency="M")
+    contract = yaml.safe_load((project / "dataset.yaml").read_text())
+    contract["dataset"]["panel"]["frequency"] = "ME"
+    (project / "dataset.yaml").write_text(yaml.safe_dump(contract, sort_keys=False))
+    recipe = json.loads((project / "recipe.json").read_text())
+    sources = {role: project / "data" for role in ("selection", "final_training", "final_score")}
+    benchmark_path = _freeze(project, recipe, sources, spark)
+    origin = recipe["validation_origins"][0]
+    fixed = benchmark.evaluation_contract(
+        benchmark_path, stage="validation", origin=origin, horizon=7, metric="rmse"
+    )
+    panel = load_dataset_contract(benchmark_path.parent / "dataset.yaml").panel(
+        benchmark_path.parent / "selection"
+    )
+    forecast = seasonal_naive(
+        panel, origin, 7, spark=spark, out_dir=tmp_path / "month-end-forecast"
+    )
+
+    result = compare_run_forecasts(
+        panel,
+        {"seasonal_naive": forecast},
+        spark,
+        missing_actual="no_data",
+        metric="rmse",
+        output_dir=tmp_path / "score",
+        fixed_contract=fixed,
+    )
+
+    record = json.loads(result.read_text())
+    assert record["candidates"][0]["status"] == "scored"
 
 
 @pytest.mark.parametrize("existing", ["active", "default", "context"])

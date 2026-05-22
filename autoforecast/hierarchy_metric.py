@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from autoforecast.panel import period_days
+from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin, period_points
 
 
 def read_forecast_grid(
@@ -36,6 +36,8 @@ def read_forecast_grid(
     import pyarrow.compute as pc
     import pyarrow.dataset as ds
 
+    from autoforecast.parquet_time import validate_parquet_time_storage
+
     if (
         type(horizon) is not int
         or horizon < 1
@@ -47,20 +49,38 @@ def read_forecast_grid(
     ):
         raise ValueError("grid needs a positive horizon and unique nonempty series population")
     try:
-        start = dt.date.fromisoformat(origin)
+        cadence = parse_frequency(frequency)
+        start = parse_origin(origin, cadence)
+        requested_points = period_points(start, cadence, horizon)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"origin must be canonical ISO YYYY-MM-DD, got {origin!r}") from exc
-    if start.isoformat() != origin:
-        raise ValueError(f"origin must be canonical ISO YYYY-MM-DD, got {origin!r}")
-    try:
-        stride = period_days(frequency)
-        end = start + dt.timedelta(days=horizon * stride)
-    except (ValueError, OverflowError) as exc:
-        raise ValueError("frequency does not define a supported representable period grid") from exc
-    source = ds.dataset(path, format="parquet", partitioning="hive")
+        raise ValueError(
+            f"origin must be canonical for frequency {frequency!r}, got {origin!r}"
+        ) from exc
+    end = requested_points[-1]
+    validate_parquet_time_storage(path, time_col, allow_hive_partition=True)
+    # INT96 has no physical unit: read proven-naive values at the same precision as the
+    # other readers, preserving wide-year values without nanosecond overflow.
+    parquet = ds.ParquetFileFormat(read_options={"coerce_int96_timestamp_unit": "us"})
+    source = ds.dataset(path, format=parquet, partitioning="hive")
     date_field = ds.field(time_col)  # pyright: ignore[reportPrivateImportUsage]
+    field_type = source.schema.field(time_col).type
+    if filter_actuals and (pa.types.is_string(field_type) or pa.types.is_large_string(field_type)):
+        # Hive partition keys are strings. Cast only the predicate; keep original keys in
+        # the result so strict canonical validation can still reject malformed labels.
+        field_type = pa.timestamp("us") if cadence.key_kind == "timestamp" else pa.date32()
+        date_field = date_field.cast(field_type)
+    if pa.types.is_timestamp(field_type):
+        start_bound = start if isinstance(start, dt.datetime) else dt.datetime.combine(
+            start, dt.time()
+        )
+        end_bound = end if isinstance(end, dt.datetime) else dt.datetime.combine(end, dt.time())
+    else:
+        start_bound, end_bound = start, end
     condition = (
-        (date_field > pa.scalar(start)) & (date_field <= pa.scalar(end)) if filter_actuals else None
+        (date_field > pa.scalar(start_bound, type=field_type))
+        & (date_field <= pa.scalar(end_bound, type=field_type))
+        if filter_actuals
+        else None
     )
     table = source.to_table(columns=[series_col, time_col, value_col], filter=condition)
     if pa.types.is_boolean(table[value_col].type):
@@ -76,12 +96,16 @@ def read_forecast_grid(
     ):
         raise ValueError("grid contains missing/extra dates or unknown series")
     rows = indices.to_numpy().astype(np.int64)
-    offsets = (table[time_col].to_numpy().astype("datetime64[D]") - np.datetime64(start)).astype(
-        int
-    )
-    if np.any(offsets % stride):
-        raise ValueError("grid dates are misaligned with the declared cadence")
-    days = offsets // stride - 1
+    point_index = {point: index for index, point in enumerate(requested_points)}
+    try:
+        points = tuple(
+            parse_origin(canonical_origin(value, cadence), cadence)
+            for value in table[time_col].to_pylist()
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("grid time keys are malformed or misaligned with the declared cadence") \
+            from exc
+    days = np.array([point_index.get(point, -1) for point in points], dtype=np.int64)
     flat = rows * horizon + days
     if np.any(days < 0) or np.any(days >= horizon) or len(np.unique(flat)) != len(flat):
         raise ValueError("grid has duplicate or out-of-window cells")

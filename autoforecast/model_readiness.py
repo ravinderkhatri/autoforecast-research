@@ -6,7 +6,6 @@ This is the only Spark-aware part of model readiness.  Individual model check fu
 
 from __future__ import annotations
 
-import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
@@ -15,7 +14,16 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from autoforecast.adapters import adapter_capabilities, known_adapter_names
+from autoforecast.column_names import fresh_internal_names
 from autoforecast.data_admission import get_model_input_contract
+from autoforecast.frequency import (
+    advance,
+    canonical_origin,
+    parse_frequency,
+    parse_origin,
+    period_points,
+)
+from autoforecast.grid import canonical_key, period_membership, read_time_parquet, time_literal
 from autoforecast.model_api import (
     CheckReport,
     CheckResult,
@@ -164,6 +172,7 @@ def create_resolved_run(
     origin: str,
     horizon: int,
     settings: dict[str, object] | None = None,
+    frequency: str = "D",
 ) -> ResolvedRun:
     """Freeze allowlisted run settings before checking or executing a model."""
     if adapter not in known_adapter_names():
@@ -171,11 +180,17 @@ def create_resolved_run(
     if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon < 1:
         raise ValueError(f"horizon must be a positive integer, got {horizon!r}")
     try:
-        origin_day = dt.date.fromisoformat(origin)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"origin must be an ISO date, got {origin!r}") from exc
-    if origin_day.isoformat() != origin:
-        raise ValueError(f"origin must be canonical ISO YYYY-MM-DD, got {origin!r}")
+        cadence = parse_frequency(frequency)
+        origin_point = parse_origin(origin, cadence)
+        advance(origin_point, cadence, horizon)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"origin must be canonical for frequency {frequency!r}, got {origin!r}"
+        ) from exc
+    if canonical_origin(origin_point, cadence) != origin:
+        raise ValueError(
+            f"origin must be canonical for frequency {frequency!r}, got {origin!r}"
+        )
     if adapter == "timesfm_standalone":
         allowed = {"context_days"}
     elif adapter == "mft":
@@ -194,7 +209,14 @@ def create_resolved_run(
     unknown = set(supplied) - allowed
     if unknown:
         raise ValueError(f"settings are not declared by {adapter!r}: {sorted(unknown)}")
-    return ResolvedRun(model_id, adapter, origin, horizon, tuple(sorted(supplied.items())))
+    return ResolvedRun(
+        model_id,
+        adapter,
+        origin,
+        horizon,
+        tuple(sorted(supplied.items())),
+        frequency,
+    )
 
 
 def prepare_model_check_input(
@@ -204,11 +226,50 @@ def prepare_model_check_input(
     run: ResolvedRun,
 ) -> ModelCheckInput:
     """Measure the exact, bounded evidence required by one registered model checker."""
+    panel.validate()
     registration = model_registration(run.adapter)
+    cadence = parse_frequency(panel.frequency)
+    if parse_frequency(run.frequency) != cadence:
+        raise ValueError(
+            f"run frequency {run.frequency!r} does not match panel frequency {panel.frequency!r}"
+        )
+    origin_point = parse_origin(run.origin, cadence)
     required = registration.required_history(panel, run)
-    raw = spark.read.parquet(panel.path).filter(
-        F.to_date(F.col(panel.time_col)) <= F.lit(run.origin).cast("date")
+    time_key, valid_time_key = canonical_key(panel.time_col, cadence)
+    panel_source = read_time_parquet(spark, panel.path, panel.time_col)
+    if cadence.key_kind == "timestamp" and (
+        panel_source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ValueError(
+            f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type"
+        )
+    (
+        time_name,
+        valid_time_name,
+        history_name,
+        dates_name,
+        window_dates_name,
+        last_date_name,
+    ) = fresh_internal_names(
+        panel_source.columns,
+        (
+            "__af_readiness_time",
+            "__af_readiness_valid_time",
+            "history",
+            "dates",
+            "window_dates",
+            "last_date",
+        ),
     )
+    panel_rows = panel_source.withColumn(time_name, time_key).withColumn(
+        valid_time_name, valid_time_key
+    )
+    if panel_rows.filter(~F.col(valid_time_name)).limit(1).count():
+        raise ValueError(
+            f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    point = F.col(time_name)
+    raw = panel_rows.filter(point <= time_literal(origin_point, cadence))
     total = raw.select(panel.series_col).distinct().count()
     eligible = raw
     if panel.has_exposure:
@@ -216,25 +277,26 @@ def prepare_model_check_input(
         if exposure_col is None:
             raise ValueError("exposure-backed panel has no exposure column")
         eligible = eligible.filter(F.col(exposure_col).isin(*sorted(ELIGIBLE_STATES)))
-    window_start = (dt.date.fromisoformat(run.origin) - dt.timedelta(days=required - 1)).isoformat()
-    day = F.to_date(F.col(panel.time_col))
+    window_points = tuple(
+        advance(origin_point, cadence, offset) for offset in range(-(required - 1), 1)
+    )
     per_series = eligible.groupBy(panel.series_col).agg(
-        F.count(F.lit(1)).alias("history"),
-        F.count_distinct(day).alias("dates"),
+        F.count(F.lit(1)).alias(history_name),
+        F.count_distinct(point).alias(dates_name),
         F.count_distinct(
-            F.when(day >= F.lit(window_start).cast("date"), day)
-        ).alias("window_dates"),
-        F.max(day).alias("last_date"),
+            F.when(period_membership(point, window_points, cadence), point)
+        ).alias(window_dates_name),
+        F.max(point).alias(last_date_name),
     )
     eligible_series = per_series.count()
-    meets_history = per_series.filter(F.col("history") >= required).count()
-    irregular = per_series.filter(F.col("history") != F.col("dates")).count()
+    meets_history = per_series.filter(F.col(history_name) >= required).count()
+    irregular = per_series.filter(F.col(history_name) != F.col(dates_name)).count()
     complete: int | None = None
     if registration.requires_complete_window:
         complete = per_series.filter(
-            (F.col("history") >= required)
-            & (F.col("last_date") == F.lit(run.origin).cast("date"))
-            & (F.col("window_dates") == required)
+            (F.col(history_name) >= required)
+            & (F.col(last_date_name) == time_literal(origin_point, cadence))
+            & (F.col(window_dates_name) == required)
         ).count()
     training_examples = None
     positive_training_examples = None
@@ -272,25 +334,35 @@ def prepare_model_check_input(
 
 def _shallow_training_evidence(panel_rows, panel: Panel, run: ResolvedRun) -> tuple[int, int]:
     """Count the exact labelled rows the shallow adapter's default origins can form."""
-    origin_day = dt.date.fromisoformat(run.origin)
+    cadence = parse_frequency(panel.frequency)
+    origin_point = parse_origin(run.origin, cadence)
     origins = tuple(
-        (origin_day - dt.timedelta(days=run.horizon * index)).isoformat() for index in range(1, 9)
+        advance(origin_point, cadence, -run.horizon * index) for index in range(1, 9)
     )
+    time_key, valid_time_key = canonical_key(panel.time_col, cadence)
+    time_name, valid_time_name = fresh_internal_names(
+        panel_rows.columns, ("__af_shallow_time", "__af_shallow_valid_time")
+    )
+    keyed_rows = panel_rows.withColumn(time_name, time_key).withColumn(
+        valid_time_name, valid_time_key
+    )
+    if keyed_rows.filter(~F.col(valid_time_name)).limit(1).count():
+        raise ValueError(
+            f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    time_key = F.col(time_name)
     total = 0
     positive = 0
     for origin in origins:
         history = (
-            panel_rows.filter(F.to_date(F.col(panel.time_col)) <= F.lit(origin).cast("date"))
+            keyed_rows.filter(time_key <= time_literal(origin, cadence))
             .select(panel.series_col)
             .distinct()
         )
-        labels = panel_rows.filter(
-            (F.to_date(F.col(panel.time_col)) > F.lit(origin).cast("date"))
-            & (
-                F.to_date(F.col(panel.time_col))
-                <= F.date_add(F.lit(origin).cast("date"), run.horizon)
-            )
-        ).join(history, panel.series_col, "inner")
+        targets = period_points(origin, cadence, run.horizon)
+        labels = keyed_rows.filter(period_membership(time_key, targets, cadence)).join(
+            history, panel.series_col, "inner"
+        )
         row = labels.agg(
             F.count(F.lit(1)).alias("rows"),
             F.sum((F.col(panel.target_col) > 0).cast("long")).alias("positive"),
@@ -304,14 +376,18 @@ def run_model_checks(input: ModelCheckInput) -> CheckReport:
     """Apply the registered model's checks to prepared evidence only."""
     registration = model_registration(input.run.adapter)
     checks: list[CheckResult] = []
+    contract = get_model_input_contract(input.run.adapter)
     checks.append(
         CheckResult(
             "model_frequency",
             "Dates match this model",
-            "passed" if input.frequency == "D" else "failed",
-            "This model accepts daily data."
-            if input.frequency == "D"
-            else f"This model accepts daily data, not {input.frequency!r} data.",
+            "passed" if contract.supports(input.frequency) else "failed",
+            f"This model accepts {input.frequency!r} data."
+            if contract.supports(input.frequency)
+            else (
+                "This model accepts frequency families "
+                f"{contract.supported_frequency_families!r}, not {input.frequency!r}."
+            ),
             scope="model",
         )
     )
@@ -358,9 +434,9 @@ def run_model_checks(input: ModelCheckInput) -> CheckReport:
                 "model_horizon",
                 "Forecast length fits this model",
                 "passed" if input.run.horizon == wanted else "failed",
-                f"This governed model runs with a {wanted}-day forecast."
+                f"This governed model runs with a {wanted}-period forecast."
                 if input.run.horizon == wanted
-                else f"This governed model requires a {wanted}-day forecast.",
+                else f"This governed model requires a {wanted}-period forecast.",
                 scope="model",
             )
         )
@@ -370,9 +446,13 @@ def run_model_checks(input: ModelCheckInput) -> CheckReport:
             "model_history",
             "Enough usable history",
             "passed" if enough else "failed",
-            f"{enough:,} series meet this model's {input.required_history}-day history requirement."
+            f"{enough:,} series meet this model's {input.required_history}-period history "
+            "requirement."
             if enough
-            else f"No series meets this model's {input.required_history}-day history requirement.",
+            else (
+                f"No series meets this model's {input.required_history}-period history "
+                "requirement."
+            ),
             scope="model",
             numerator=enough,
             denominator=input.total_series,
@@ -385,10 +465,10 @@ def run_model_checks(input: ModelCheckInput) -> CheckReport:
                 "model_recent_window",
                 "Complete recent history",
                 "passed" if complete else "failed",
-                f"{complete:,} series have a complete {input.required_history}-day window "
+                f"{complete:,} series have a complete {input.required_history}-period window "
                 "ending on the forecast date."
                 if complete
-                else f"No series has a complete {input.required_history}-day window "
+                else f"No series has a complete {input.required_history}-period window "
                 "ending on the forecast date.",
                 scope="model",
                 numerator=complete,

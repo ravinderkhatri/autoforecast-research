@@ -342,3 +342,124 @@ def test_recipe_rejects_names_with_expression_meaning_before_runtime(tmp_path, n
         recipe["feature_availability"] = {"promotion": name}
     with pytest.raises(benchmark.BenchmarkError, match="ASCII identifiers"):
         benchmark.validate_recipe(recipe)
+
+
+@pytest.mark.parametrize(
+    "frequency,start,origin,cutoff",
+    [
+        ("H", "2024-03-01T22:00:00", "2024-03-02T00:00:00", "2024-03-02T02:00:00"),
+        ("W", "2024-01-03", "2024-01-10", "2024-01-24"),
+        ("M", "2024-01-31", "2024-02-29", "2024-04-30"),
+        ("Y", "2023-12-31", "2024-12-31", "2026-12-31"),
+    ],
+)
+def test_recipe_windows_count_cadence_periods(frequency, start, origin, cutoff):
+    recipe = {
+        "schema_version": 1,
+        "source_keys": ["series"],
+        "training_start": start,
+        "validation_origins": [origin],
+        "validation_horizon": 1,
+        "final_train_cutoff": cutoff,
+        "final_test_horizon": 1,
+        "history_policy": "fixed",
+        "new_series_policy": "error",
+        "target_unit": "units",
+        "feature_availability": {},
+        "frequency": frequency,
+    }
+    benchmark.validate_recipe(recipe)
+    assert benchmark.boundary("validation", origin, 1, frequency).endswith(f"/1/{frequency}")
+
+
+@pytest.mark.parametrize(
+    "frequency,start,origin,cutoff",
+    [
+        ("H", "2024-03-01T22:00:00", "2024-03-01T22:30:00", "2024-03-02T00:00:00"),
+        ("W", "2024-01-03", "2024-01-11", "2024-01-24"),
+        ("M", "2024-01-31", "2024-02-29", "2024-03-30"),
+        ("Y", "2023-12-31", "2024-02-29", "2026-12-31"),
+    ],
+)
+def test_recipe_refuses_off_grid_hour_week_month_or_year(frequency, start, origin, cutoff):
+    recipe = {
+        "schema_version": 1,
+        "source_keys": ["series"],
+        "training_start": start,
+        "validation_origins": [origin],
+        "validation_horizon": 1,
+        "final_train_cutoff": cutoff,
+        "final_test_horizon": 1,
+        "history_policy": "fixed",
+        "new_series_policy": "error",
+        "target_unit": "units",
+        "feature_availability": {},
+        "frequency": frequency,
+    }
+    with pytest.raises(benchmark.BenchmarkError):
+        benchmark.validate_recipe(recipe)
+
+
+def test_large_hourly_recipe_validation_does_not_enumerate_history(monkeypatch):
+    recipe = {
+        "schema_version": 1,
+        "source_keys": ["series"],
+        "training_start": "0001-01-01T00:00:00",
+        "validation_origins": ["9998-01-01T00:00:00"],
+        "validation_horizon": 1,
+        "final_train_cutoff": "9998-01-01T01:00:00",
+        "final_test_horizon": 1,
+        "history_policy": "fixed",
+        "new_series_policy": "error",
+        "target_unit": "units",
+        "feature_availability": {},
+        "frequency": "H",
+    }
+    calls = 0
+    real_advance = benchmark.advance
+
+    def bounded_advance(*args):
+        nonlocal calls
+        calls += 1
+        assert calls <= 8, "recipe validation enumerated the historical grid"
+        return real_advance(*args)
+
+    monkeypatch.setattr(benchmark, "advance", bounded_advance)
+    benchmark.validate_recipe(recipe)
+    assert calls > 0
+
+
+@pytest.mark.parametrize(
+    "frequency,start,end,count",
+    [
+        ("H", "2024-02-29T23:00:00", "2024-03-01T01:00:00", 3),
+        ("D", "2024-02-28", "2024-03-01", 3),
+        ("W", "2024-02-23", "2024-03-08", 3),
+        ("3D", "2024-02-26", "2024-03-03", 3),
+        ("M", "2024-02-29", "2024-04-30", 3),
+        ("MS", "2023-12-01", "2024-02-01", 3),
+        ("Y", "2099-12-31", "2101-12-31", 3),
+        ("YS", "2099-01-01", "2101-01-01", 3),
+        ("M", "2024-02-29", "2024-02-29", 1),
+    ],
+)
+def test_inclusive_period_count_preserves_calendar_and_stride(frequency, start, end, count):
+    cadence = benchmark.parse_frequency(frequency)
+    assert benchmark._inclusive_period_count(
+        benchmark.parse_origin(start, cadence), benchmark.parse_origin(end, cadence),
+        cadence, label="test window",
+    ) == count
+
+
+@pytest.mark.parametrize("frequency,start,end", [
+    ("W", "2024-01-03", "2024-01-11"),
+    ("3D", "2024-01-01", "2024-01-08"),
+    ("D", "2024-01-03", "2024-01-01"),
+])
+def test_inclusive_period_count_refuses_reversed_or_shifted_endpoints(frequency, start, end):
+    cadence = benchmark.parse_frequency(frequency)
+    with pytest.raises(benchmark.BenchmarkError):
+        benchmark._inclusive_period_count(
+            benchmark.parse_origin(start, cadence), benchmark.parse_origin(end, cadence),
+            cadence, label="test window",
+        )
