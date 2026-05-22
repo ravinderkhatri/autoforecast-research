@@ -13,7 +13,6 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from autoforecast.benchmark import (
-    START_COLUMN,
     BenchmarkError,
     artifact_path,
     evaluation_contract,
@@ -26,7 +25,7 @@ from autoforecast.frequency import TimePoint, advance, parse_frequency, parse_or
 from autoforecast.grid import time_literal
 from autoforecast.panel import Forecast, Panel
 from autoforecast.project import project_root
-from autoforecast.run_evaluation import compare_run_forecasts
+from autoforecast.study_scoring import score_study
 from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 
@@ -41,14 +40,17 @@ def load_study(
     snapshots, never the caller's session. Close it after using its dataframes.
     """
     registry = (pathlib.Path(registry_root) if registry_root is not None else
-                project_root(pathlib.Path.cwd()) / ".autoforecast/benchmarks").resolve()
+                project_root(pathlib.Path.cwd()) / ".autoforecast/benchmarks").absolute()
     try:
         path, _ = resolve_study(registry, study_id)
     except BenchmarkError as error:
         if (isinstance(error.__cause__, FileNotFoundError)
-                and error.__cause__.filename == str(registry / study_id / "benchmark.json")
-                and not (registry / study_id).exists()):
-            raise FileNotFoundError(f"Unknown study_id: {study_id}") from error
+                and error.__cause__.filename == str(registry / study_id / "benchmark.json")):
+            try:
+                (registry / study_id).lstat()
+            except FileNotFoundError:
+                if registry.is_dir():
+                    raise FileNotFoundError(f"Unknown study_id: {study_id}") from error
         raise
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     _, record = verify_benchmark(path, sha)
@@ -70,9 +72,14 @@ class Study:
     _sha256: str = dataclasses.field(repr=False)
     _spark: SparkSession = dataclasses.field(repr=False, compare=False)
     _snapshots: tempfile.TemporaryDirectory = dataclasses.field(repr=False, compare=False)
+    _closed: bool = dataclasses.field(default=False, init=False, repr=False, compare=False)
 
     def __enter__(self) -> Study:
-        self._record()
+        try:
+            self._record()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, *_exc) -> None:
@@ -80,10 +87,12 @@ class Study:
 
     def close(self) -> None:
         """Release notebook snapshots; returned lazy dataframes must no longer be used."""
-        self._snapshots.cleanup()
+        if not self._closed:
+            object.__setattr__(self, "_closed", True)
+            self._snapshots.cleanup()
 
     def _record(self, *, data: bool = False) -> dict:
-        if not pathlib.Path(self._snapshots.name).is_dir():
+        if self._closed or not pathlib.Path(self._snapshots.name).is_dir():
             raise ValueError("Study is closed")
         verify = verify_benchmark if data else read_benchmark_manifest
         return verify(self._path, self._sha256)[1]
@@ -174,6 +183,8 @@ class Study:
             frame = frame.filter(F.col(panel.time_col).between(
                 time_literal(start, cadence), time_literal(end, cadence),
             ))
+        if directory_digest(destination, suffixes=(".parquet",)) != expected:
+            raise BenchmarkError("notebook snapshot changed")
         self._record(data=True)
         return frame
 
@@ -200,9 +211,7 @@ class Study:
 
     @property
     def series_starts(self) -> DataFrame:
-        return self.series_mapping.select(
-            self.panel.series_col, *self.recipe["source_keys"], START_COLUMN,
-        )
+        return self.series_mapping
 
     @property
     def scoring_references(self) -> DataFrame | None:
@@ -223,7 +232,7 @@ class Study:
             raise ValueError("model_id must be a non-blank string")
         record = self._record(data=True)
         recipe = record["recipe"]
-        # Capture both manifests before invoking any scorer or caller-owned Spark runtime.
+        # Capture both inputs before invoking either scorer or the caller's Spark runtime.
         forecasts = {stage: Forecast.from_record(value.as_record()) for stage, value in (
             ("validation", validation_forecasts), ("test", testing_forecasts),
         )}
@@ -238,6 +247,10 @@ class Study:
                 horizon = recipe[
                     "validation_horizon" if stage == "validation" else "final_test_horizon"
                 ]
+                if (forecast.origin, forecast.horizon, forecast.frequency) != (
+                    origin, horizon, recipe["frequency"],
+                ):
+                    raise ValueError(f"{stage} forecast uses the wrong evaluation boundary")
                 fixed = evaluation_contract(
                     self._path, stage=stage, origin=origin, horizon=horizon,
                     metric=recipe["metric"],
@@ -256,26 +269,36 @@ class Study:
                 forecast_bytes = (json.dumps(forecast.as_record(), sort_keys=True) + "\n").encode()
                 forecast_path = directory / "forecast.json"
                 forecast_path.write_bytes(forecast_bytes)
-                comparison = compare_run_forecasts(
-                    dataclasses.replace(self.panel, path=fixed["actuals"]["path"]),
-                    {model_id: forecast}, self._spark, missing_actual="no_data",
-                    metric=recipe["metric"], output_dir=directory / "scores", fixed_contract=fixed,
-                )
-                comparison_bytes = comparison.read_bytes()
-                candidate = json.loads(comparison_bytes)["candidates"][0]
-                if candidate["status"] not in {"scored", "unavailable"}:
-                    raise ValueError(f"{stage} forecast could not be scored: {candidate['detail']}")
+                forecasts[stage] = forecast
                 stages[stage] = {
-                    **candidate, "evaluation_contract": fixed,
+                    "model_id": model_id, "evaluation_contract": fixed,
                     "forecast": str(forecast_path),
                     "forecast_sha256": hashlib.sha256(forecast_bytes).hexdigest(),
                     "forecast_artifact_sha256": sha,
-                    "comparison": str(comparison),
-                    "comparison_sha256": hashlib.sha256(comparison_bytes).hexdigest(),
                 }
+            for stage, forecast in forecasts.items():
+                evidence = stages[stage]
+                fixed = evidence["evaluation_contract"]
+                if (directory_digest(forecast.path, suffixes=(".parquet",))
+                        != evidence["forecast_artifact_sha256"]):
+                    raise BenchmarkError("retained notebook forecasts changed before scoring")
+                # The single-forecast scorer snapshots all inputs before its first Spark call.
+                # There is no comparison/ranking prepass that can reread mutable predictions.
+                score = score_study(
+                    dataclasses.replace(self.panel, path=fixed["actuals"]["path"]),
+                    forecast, self._spark, contract=fixed, output_dir=output / stage / "scores",
+                )
+                scoring = output / stage / "score.json"
+                payload = (json.dumps(score, sort_keys=True, allow_nan=False) + "\n").encode()
+                scoring.write_bytes(payload)
+                evidence.update(
+                    score=score,
+                    status="unavailable" if score[recipe["metric"]] is None else "scored",
+                    scoring=str(scoring), scoring_sha256=hashlib.sha256(payload).hexdigest(),
+                )
             self._record(data=True)
             for stage_name, stage in stages.items():
-                for name in ("forecast", "comparison"):
+                for name in ("forecast", "scoring"):
                     if (hashlib.sha256(pathlib.Path(stage[name]).read_bytes()).hexdigest()
                             != stage[name + "_sha256"]):
                         raise BenchmarkError("retained notebook evidence changed during scoring")

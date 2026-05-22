@@ -314,14 +314,25 @@ with experiment_project("/absolute/path/to/my-experiment"):
 ```
 
 For a standalone registry, pass `registry_root=...` to `load_study`. Pass `spark=spark` when
-the caller's session is not active. An unknown ID raises `FileNotFoundError`; access failures
-and changed artifacts remain separate errors. Loading never creates a study.
+the caller's session is not active. An absent ID in an existing registry raises
+`FileNotFoundError`; access failures and changed artifacts remain separate errors.
+Loading never creates a study.
+
+For setup shared across notebook cells, bind these arguments once with standard Python:
+
+```python
+from functools import partial
+from autoforecast.notebook import load_study as _load_study
+
+load_study = partial(_load_study, registry_root="/path/to/registry", spark=spark)
+study = load_study(study_id)  # Later cells need only the ID; close study when finished.
+```
 
 All four data properties return Spark DataFrames over verified private snapshots, sliced to
 the intended stage. They keep source key names, the frozen internal series ID, and
 `__af_original_missing`. `study.panel` exposes the column names, cadence and target estimand;
-`study.series_mapping` maps exact source keys to internal IDs. `study.series_starts` adds
-`__af_history_start`. `study.policies`, `study.metric_definition`, and
+`study.series_mapping` and `study.series_starts` provide exact source keys, internal IDs,
+and `__af_history_start`. `study.policies`, `study.metric_definition`, and
 `study.scoring_references` expose the frozen missingness and scoring settings.
 
 | Inclusive range | Meaning |

@@ -6,15 +6,17 @@ import argparse
 import datetime as dt
 import json
 import pathlib
+from functools import partial
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 from autoforecast.benchmark import freeze_benchmark, verify_benchmark
 from autoforecast.frequency import canonical_origin, period_points
-from autoforecast.notebook import Study, load_study
+from autoforecast.notebook import Study
+from autoforecast.notebook import load_study as _load_study
 from autoforecast.panel import Forecast
-from autoforecast.project import experiment_project
+from pyspark.errors import PySparkRuntimeError
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -24,6 +26,8 @@ def example_forecast(
     study: Study, spark: SparkSession, output: pathlib.Path, stage: str,
 ) -> Forecast:
     """Stand in for a notebook's predictions using a constant, without reading actuals."""
+    if stage not in {"validation", "test"}:
+        raise ValueError("stage must be validation or test")
     recipe, panel = study.recipe, study.panel
     origin = (study.training_date_range if stage == "validation" else study.refit_date_range)[1]
     origin_text = canonical_origin(origin, panel.frequency)
@@ -84,8 +88,9 @@ def run_example(project: pathlib.Path, spark: SparkSession) -> dict:
         ),
     )
     study_id = verify_benchmark(frozen)[1]["study_id"]
-    # One-time notebook setup: the project provides the registry, Spark is already active.
-    with experiment_project(project), load_study(study_id) as study:
+    # Bind the notebook environment once; model cells then need only the study ID.
+    load_study = partial(_load_study, registry_root=registry, spark=spark)
+    with load_study(study_id) as study:
         for stage in ("training", "validation", "refit", "testing"):
             frame = getattr(study, f"{stage}_data")
             print(stage, getattr(study, f"{stage}_date_range"), frame.count())
@@ -107,13 +112,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("project", type=pathlib.Path, help="new directory for this example")
     args = parser.parse_args()
-    spark = (SparkSession.builder.master("local[2]").appName("notebook-study-example")
-             .config("spark.sql.shuffle.partitions", "2")
-             .config("spark.ui.enabled", "false").getOrCreate())
+    try:
+        spark = SparkSession.active()
+        owned = False
+    except PySparkRuntimeError as error:
+        if error.getCondition() != "NO_ACTIVE_OR_DEFAULT_SESSION":
+            raise
+        spark = (SparkSession.builder.master("local[2]").appName("notebook-study-example")
+                 .config("spark.sql.shuffle.partitions", "2")
+                 .config("spark.ui.enabled", "false").getOrCreate())
+        owned = True
     try:
         run_example(args.project.resolve(), spark)
     finally:
-        spark.stop()  # This command created the session; load_study never owns it.
+        if owned:
+            spark.stop()
     return 0
 
 
