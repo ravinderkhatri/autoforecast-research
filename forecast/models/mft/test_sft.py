@@ -590,3 +590,23 @@ def test_sft_dispersion_domain(dtype, head):
         )
         assert theta.grad is not None
         torch.testing.assert_close(theta.grad, expected, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("head", ["negbin", "shifted_hurdle_negbin"])
+def test_likelihood_excludes_missing_labels_without_imputing_and_preserves_gradients(head):
+    target = torch.tensor([[float("nan"), 3.0]], dtype=torch.double)
+    observed = torch.tensor([[False, True]])
+    logit = torch.zeros_like(target, requires_grad=True)
+    excess = torch.ones_like(target, requires_grad=True)
+    distribution = ShiftedHurdlePrediction(logit, excess, torch.ones_like(target), head_kind=head)
+    actual = distribution.nll(target, observed)
+    single = ShiftedHurdlePrediction(logit[:, 1:], excess[:, 1:], torch.ones(1, 1), head_kind=head)
+    torch.testing.assert_close(actual[:, 1:], single.nll(target[:, 1:], observed[:, 1:]))
+    assert actual[0, 0] == 0 and torch.isnan(target[0, 0])
+    actual.sum().backward()
+    assert torch.isfinite(excess.grad).all() and excess.grad[0, 0] == 0
+    assert torch.isfinite(logit.grad).all() and logit.grad[0, 0] == 0
+    empty = distribution.nll(torch.full_like(target, float("nan")), torch.zeros_like(observed))
+    assert empty.sum() == 0
+    with pytest.raises(ValueError, match="finite nonnegative integers"):
+        distribution.nll(target, torch.ones_like(observed))

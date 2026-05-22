@@ -30,7 +30,7 @@ def rescore_campaign(
     study_sha = hashlib.sha256(study_path.read_bytes()).hexdigest()
     study_path, study = verify_benchmark(study_path, study_sha)
     if study["schema"] != STUDY_SCHEMA:
-        raise ValueError("rescoring requires an explicitly frozen version-2 study")
+        raise ValueError("rescoring requires an explicitly frozen version-3 study")
     dataset_path = study_path.parent / "dataset.yaml"
     dataset_bytes = dataset_path.read_bytes()
     if hashlib.sha256(dataset_bytes).hexdigest() != study["dataset_sha256"]:

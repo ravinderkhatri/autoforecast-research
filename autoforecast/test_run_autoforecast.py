@@ -770,7 +770,7 @@ selection_lock:
 @pytest.mark.parametrize("adapter", [
     "sft", "hmfnet", "pact", "tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8",
 ])
-@pytest.mark.parametrize("metric,policy", [("wrmsse", "zero"), ("rmse", "zero"), ("rmse", "mask")])
+@pytest.mark.parametrize("metric,policy", [("wrmsse", "error"), ("rmse", "error"), ("rmse", "mask")])
 def test_shared_study_refuses_an_adapter_without_declared_support_before_runtime(
     tmp_path, monkeypatch, adapter, metric, policy,
 ):

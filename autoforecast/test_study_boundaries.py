@@ -36,7 +36,7 @@ def test_study_manifest_rejects_changed_claims(study, field):
     elif field == "role_paths":
         record[field]["selection"] = "final_score"
     elif field == "metric_definition":
-        record[field]["actual_missing"] = "mask"
+        record[field]["actual_missing"] = "error"
     else:
         evidence = next(iter(record["coverage_identities"].values()))
         if field == "coverage_identity":

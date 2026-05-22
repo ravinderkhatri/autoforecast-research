@@ -1754,9 +1754,7 @@ def compile_forecast_campaign(
         if _sha_file(benchmark_path) != benchmark_sha256:
             raise ForecastCampaignError("benchmark manifest changed during compilation")
         recipe = benchmark["recipe"]
-        if (study and request.missing_actual != (
-            "sparse_zero" if recipe["actual_missing"] == "zero" else "no_data"
-        )):
+        if study and request.missing_actual != "no_data":
             raise ForecastCampaignError("campaign missing-actual policy differs from frozen study")
         if (parse_frequency(recipe.get("frequency", "D")).code != cadence.code
             or recipe["validation_origins"]

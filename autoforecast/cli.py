@@ -145,7 +145,7 @@ def create_example(
                 "initialization_arms": ["fresh"],
                 "selection": {
                     "metric": "rmse",
-                    "missing_actual": "sparse_zero",
+                    "missing_actual": "no_data",
                     "direction": "minimize",
                     "tie_break": [
                         "mean_score",
@@ -246,9 +246,7 @@ def run_campaign(
     if hashlib.sha256(contract.read_bytes()).hexdigest() != benchmark["contract_sha256"]:
         raise ValueError("request dataset contract differs from preparation")
     if "study_id" in benchmark:
-        request["forecast_campaign"]["selection"]["missing_actual"] = (
-            "sparse_zero" if benchmark["recipe"]["actual_missing"] == "zero" else "no_data"
-        )
+        request["forecast_campaign"]["selection"]["missing_actual"] = "no_data"
     request["forecast_campaign"]["dataset"]["contract"] = (
         (benchmark_path.parent / "dataset.yaml").relative_to(project).as_posix()
     )

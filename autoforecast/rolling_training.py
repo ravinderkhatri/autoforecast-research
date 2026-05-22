@@ -334,7 +334,7 @@ class RollingTrainingContract:
             ):
                 raise ValueError("fixed validation arrays are invalid")
             if window.study is not None and (
-                not np.array_equal(window.target, window.study.target)
+                not np.array_equal(window.target, window.study.target, equal_nan=True)
                 or not np.array_equal(window.observed, window.study.observed)
             ):
                 raise ValueError("fixed validation differs from its frozen study")

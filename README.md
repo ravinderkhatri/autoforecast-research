@@ -227,16 +227,25 @@ training, validation, and test windows.
   convert the source to typed dates or timezone-naive timestamps before importing it.
 - The cohort is fixed from series present by the first validation origin in the selection
   source. The manifest reconciles all source series, exclusions, and the retained cohort.
-- New studies use recipe version 2. `history_missing` and `actual_missing` default to `zero`.
-  Absent expected rows and null targets are filled with zero after the declared history start.
-  Original missingness is retained. A recorded zero remains an observed value. NaN, infinity,
-  negative targets, duplicate rows, and invalid keys are errors, not missing values.
-- Set `actual_missing` to `mask` to exclude originally missing actuals from both validation
-  and test metrics. Forecasts must still cover every expected cell. Coverage reports include
-  expected, originally missing, zero-filled, excluded, and scored counts for every series.
+- New studies use recipe version 2 and frozen manifest version 3. `actual_missing` defaults
+  to `error`: even one absent row or null actual in a scoring window rejects preparation
+  and scoring. Correct the source data before importing it.
+- `history_missing` is `preserve`. Preparation preserves null targets and records original
+  missingness; it never fills targets with zero or another value. Models that need complete
+  history require caller-prepared data. An explicitly observed zero is valid. NaN, infinity,
+  negative targets, duplicate rows, and invalid keys are always errors.
+- Set `actual_missing` to `mask` explicitly to score only observed actuals. Forecasts must
+  still cover every expected cell. Coverage reports include expected, originally missing,
+  excluded, and scored counts for every series; `zero_filled` is always zero.
+- With `mask`, the weighted score is labeled **masked WRMSSE** and keeps every series' frozen
+  weight. If any retained series has no observed actuals, WRMSSE raises an error. Missing or
+  zero historical scales remain unavailable; they are never replaced with invented scales.
+- The same frozen policy controls tuning, checkpoint selection, validation, and final scoring.
+  Old version-2 manifests and `zero` policies are rejected. Re-register from source data;
+  old results retain their original meaning and are not silently migrated.
 - Every model must meet its minimum history and window requirements for the whole frozen
   cohort before fitting. A model cannot silently drop short series.
-- Only the current version-2 preparation recipe and study manifest are supported.
+- Only recipe version 2 and study manifest version 3 are supported.
 - New series default to an error. The explicit `exclude_after_first_origin` recipe policy
   excludes series absent from the initial cohort and records the count.
 - `history_policy: fixed` requires overlapping history to agree across snapshots.

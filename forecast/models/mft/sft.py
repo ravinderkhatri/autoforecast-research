@@ -136,18 +136,23 @@ class ShiftedHurdlePrediction:
         observed = _binary_mask(
             observed, target, "likelihood observation mask", error_type=ValueError
         )
+        self._validate_parameters()
+        result = self.logit.double() * 0.0
+        target = target[observed]
         if (
             not torch.isfinite(target).all()
             or (target < 0).any()
             or (target != target.floor()).any()
         ):
             raise ValueError("shifted hurdle targets must be finite nonnegative integers")
-        self._validate_parameters()
+        if not observed.any():
+            return result
         positive = target > 0
-        # Exact float32 integer storage is insufficient for high-count lgamma differences.
-        # Promote the likelihood only; gradients flow back to the original neural dtype.
-        target, excess, dispersion, logit = (
-            value.double() for value in (target, self.excess, self.dispersion, self.logit)
+        # Evaluate only observed labels; missing counts never enter the distribution.
+        # Float64 preserves high-count lgamma differences and neural gradients.
+        target = target.double()
+        excess, dispersion, logit = (
+            value[observed].double() for value in (self.excess, self.dispersion, self.logit)
         )
         distribution = torch.distributions.NegativeBinomial(
             total_count=dispersion,
@@ -155,12 +160,11 @@ class ShiftedHurdlePrediction:
             validate_args=True,
         )
         if self.head_kind == "negbin":
-            return torch.where(observed, -distribution.log_prob(target), 0.0)
-        if self.head_kind != "shifted_hurdle_negbin":
-            raise ValueError("unsupported SFT count distribution")
+            return result.masked_scatter(observed, -distribution.log_prob(target))
         count_log_prob = distribution.log_prob((target - 1.0).clamp_min(0.0))
         log_prob = torch.where(positive, F.logsigmoid(logit) + count_log_prob, F.logsigmoid(-logit))
-        return torch.where(observed, -log_prob, torch.zeros_like(log_prob))
+        return result.masked_scatter(observed, -log_prob)
+
 
 
 class SFTModel(nn.Module):

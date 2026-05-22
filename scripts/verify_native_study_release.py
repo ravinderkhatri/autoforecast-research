@@ -71,17 +71,24 @@ def main() -> int:
     project = args.project.resolve()
     print(
         "Execution-test population: two synthetic series, 126 days each, no exclusions. "
-        "Each seven-period boundary requires 14 forecasts. One tuning actual and two outer "
+        "Each seven-period boundary requires 14 forecasts. The tuning actuals are complete; "
+        "two outer "
         "validation actuals are missing and masked. These fits make no accuracy claim.", flush=True,
     )
     run_cli("init-example", project, cwd=project.parent)
     start = dt.date(2024, 1, 1)
     rows = [{
         "series": series, "date": start + dt.timedelta(days=offset),
-        "sales": None if (series, offset) in {("a", 91), ("a", 112), ("b", 113)}
+        "sales": None if (series, offset) in {("a", 112), ("b", 113)}
         else (offset + index) % 5 + 1, "state": "exact",
     } for index, series in enumerate(("a", "b")) for offset in range(126)]
-    pq.write_table(pa.Table.from_pylist(rows), project / "data/observations.parquet")
+    labels = project / "validation-actuals.parquet"
+    pq.write_table(pa.Table.from_pylist(rows), labels)
+    # Training requires complete caller-supplied observations; scoring retains missing labels.
+    history_rows = [{**row, "sales": ((row["date"] - start).days
+                                     + (0 if row["series"] == "a" else 1)) % 5 + 1}
+                    for row in rows]
+    pq.write_table(pa.Table.from_pylist(history_rows), project / "data/observations.parquet")
     (project / "dataset.yaml").write_text(yaml.safe_dump({
         "schema_version": 1, "dataset": {"id": "native-study-example", "panel": {
             "series_col": "series", "time_col": "date", "target_col": "sales",
@@ -138,7 +145,8 @@ def main() -> int:
     for budget in campaign["budgets"].values():
         budget.update(maximum_epochs=2, patience=2)
     request_path.write_text(yaml.safe_dump(request))
-    frozen_path = run_cli("freeze", "--project-root", project, "--source", "data", cwd=project)
+    frozen_path = run_cli("freeze", "--project-root", project, "--source", "data",
+                          "--validation-score", labels, cwd=project)
     _, frozen = verify_benchmark(frozen_path)
     study = {
         "id": "native-inner-study", "model_config": "models/sft/model.yaml", "backend": "optuna",
@@ -173,7 +181,7 @@ def main() -> int:
         "source-run/*/evaluation/candidate-comparison.json",
     ))
     inner = json.loads(comparison.read_bytes())
-    assert inner["candidates"][0]["score"]["n_scored"] == 13
+    assert inner["candidates"][0]["score"]["n_scored"] == 14
     resumed = run_cli(
         "run", "--project-root", project, "--study-id", frozen["study_id"], cwd=project,
     )

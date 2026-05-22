@@ -178,15 +178,18 @@ def main() -> int:
     rows = []
     for row in table.to_pylist():
         day = (row["day"] - table["day"][0].as_py()).days + 1
-        if row["sku"] == 2 and (day < 15 or day == 23 or day > 35):
+        if row["sku"] == 2 and (day < 15 or day == 23 or day > 36):
             continue
         if row["sku"] == 1 and day in (22, 38):
             row["units"] = None
         if row["sku"] == 1 and day == 37:
             row["units"] = 0.0
         rows.append(row)
-    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), source)
+    # The caller supplies complete training history separately from incomplete scoring labels.
+    score_labels = project / "scoring-actuals.parquet"
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), score_labels)
     frozen_path = run_cli("freeze", "--project-root", project, "--source", "data",
+                          "--validation-score", score_labels, "--final-score", score_labels,
                           "--scoring-references", references, cwd=project)
     frozen = verify_benchmark(frozen_path)[1]
     study_id = frozen["study_id"]
@@ -194,8 +197,8 @@ def main() -> int:
     results = read_results(campaign)
     assert results.metadata["study_id"] == study_id
     assert results.metadata["final_score"]["metric"] == "wrmsse"
-    assert results.metadata["final_score"]["status"] == "unavailable"
-    assert results.metadata["final_score"]["score"] is None
+    assert results.metadata["final_score"]["status"] == "scored"
+    assert results.metadata["final_score"]["score"] is not None
     assert len(results.runs) == 5 and results.rows.num_rows == 70
     assert results.series_scores is not None and results.series_scores.num_rows == 10
     verify_scalar_identity(campaign, project)
@@ -209,10 +212,11 @@ def main() -> int:
         ))
         assert validation_coverage.setdefault(key, counts) == counts
     test = [row for row in results.series_scores.to_pylist() if row["stage"] == "test"]
-    assert sorted(row["scored"] for row in test) == [0, 6]
+    assert sorted(row["scored"] for row in test) == [1, 6]
     assert sum(row["expected"] for row in test) == 14
-    assert sum(row["originally_missing"] for row in test) == 8
-    assert next(row for row in test if row["scored"] == 0)["rmse"] is None
+    assert sum(row["originally_missing"] for row in test) == 7
+    assert all(row["rmse"] is not None for row in test)
+    assert frozen["metric_definition"]["label"] == "masked WRMSSE"
     export_results(results, project / "export")
     assert pq.read_table(project / "export/series-scores.parquet").equals(results.series_scores)
     resumed = run_cli("run", "--project-root", project, "--study-id", study_id, cwd=project)

@@ -56,7 +56,15 @@ class StudyValidation:
         if (prediction.shape != self.target.shape or not np.isfinite(prediction).all()
                 or np.any(prediction < 0)):
             raise ValueError("study checkpoint predictions must cover the finite nonnegative grid")
+        policy = json.loads(self.contract_json)["metric_policy"]
+        if policy["actual_missing"] not in {"error", "mask"}:
+            raise ValueError("actual_missing must be error or mask")
+        missing_count = int((~self.observed).sum())
+        if policy["actual_missing"] == "error" and missing_count:
+            raise ValueError(f"scoring requires complete actuals; missing={missing_count}")
         count = self.observed.sum(axis=1)
+        if self.metric == "wrmsse" and np.any(count == 0):
+            raise ValueError("WRMSSE requires observations for every retained series")
         n = int(count.sum())
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             error = np.where(self.observed, prediction - self.target, 0.0)
@@ -133,7 +141,7 @@ class StudyValidation:
                 contract, contract_sha256, snapshots, panel, origin, horizon, series_ids,
             )
         verify_study_evaluation(contract)
-        if result.score(result.target)[result.metric] is None:
+        if result.score(np.zeros_like(result.target))[result.metric] is None:
             raise ValueError("study checkpoint selection metric is unavailable")
         return result
 
@@ -173,21 +181,24 @@ def _read_window(contract, sha, snapshots, panel, origin, horizon, series_ids) -
     row, column = coordinates(table, panel.series_col, panel.time_col)
     values = table[panel.target_col].to_numpy().astype(np.float64)
     flags = table[MISSING_COLUMN].to_pylist()
-    if (any(type(flag) is not bool for flag in flags) or not np.isfinite(values).all()
-            or np.any(values < 0) or np.any(values[np.asarray(flags, dtype=bool)] != 0)):
+    if (any(type(flag) is not bool for flag in flags)
+            or flags != table[panel.target_col].is_null().to_pylist()
+            or not np.isfinite(values[~np.asarray(flags, dtype=bool)]).all()
+            or np.any(values[~np.asarray(flags, dtype=bool)] < 0)):
         raise ValueError("study checkpoint actuals or original missingness are invalid")
-    target = np.zeros(shape, dtype=np.float64)
+    target = np.full(shape, np.nan, dtype=np.float64)
     target[row, column] = values
     missing = np.zeros(shape, dtype=bool)
     missing[row, column] = flags
-    mask_missing = contract["metric_policy"]["actual_missing"] == "mask"
-    observed = ~missing if mask_missing else np.ones(shape, dtype=bool)
+    if contract["metric_policy"]["actual_missing"] == "error" and missing.any():
+        raise ValueError(f"scoring requires complete actuals; missing={int(missing.sum())}")
+    observed = ~missing
     coverage = ds.dataset(snapshots["coverage"], format="parquet").to_table().to_pylist()
     expected = [{
         "series_id": series, "expected": horizon,
         "originally_missing": int(missing[index].sum()),
-        "zero_filled": 0 if mask_missing else int(missing[index].sum()),
-        "excluded": int(missing[index].sum()) if mask_missing else 0,
+        "zero_filled": 0,
+        "excluded": int(missing[index].sum()),
         "scored": int(observed[index].sum()),
     } for index, series in enumerate(series_ids)]
     if sorted(coverage, key=lambda item: item["series_id"]) != sorted(

@@ -27,7 +27,7 @@ from autoforecast.frequency import (
 )
 from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
-STUDY_SCHEMA = "autoforecast.frozen-benchmark.v2"
+STUDY_SCHEMA = "autoforecast.frozen-benchmark.v3"
 MISSING_COLUMN = "__af_original_missing"
 START_COLUMN = "__af_history_start"
 
@@ -221,8 +221,8 @@ def _normalise_recipe(recipe: dict) -> dict:
     return {
         **recipe,
         "frequency": _recipe_cadence(recipe).code,
-        "history_missing": recipe.get("history_missing", "zero"),
-        "actual_missing": recipe.get("actual_missing", "zero"),
+        "history_missing": recipe.get("history_missing", "preserve"),
+        "actual_missing": recipe.get("actual_missing", "error"),
         "series_starts": recipe.get(
             "series_starts", {"rule": "study_lower_bound", "values": []},
         ),
@@ -233,10 +233,12 @@ def _metric_definition(recipe: dict) -> dict:
     weighted = recipe["metric"] == "wrmsse"
     return {
         "metric": recipe["metric"],
-        "version": "single-level-wrmsse.v1" if weighted else "cell-errors.v1",
+        "version": "single-level-wrmsse.v2" if weighted else "cell-errors.v2",
+        "label": ("masked WRMSSE" if recipe["actual_missing"] == "mask" else "WRMSSE")
+        if weighted else recipe["metric"],
         "actual_missing": recipe["actual_missing"],
         "aggregation": "all_frozen_series" if weighted else "available_cells",
-        "empty_series": "unavailable",
+        "empty_series": "error" if weighted else "unavailable",
         "empty_aggregate": "unavailable",
         "undefined_scale": "unavailable",
         "weight_redistribution": "forbidden",
@@ -258,7 +260,7 @@ def resolve_study(output_root: pathlib.Path, study_id: str) -> tuple[pathlib.Pat
     path, record = verify_benchmark(output_root / study_id / "benchmark.json")
     if (record["schema"] != STUDY_SCHEMA or record.get("study_id") != study_id
             or record["benchmark_id"] != study_id):
-        raise BenchmarkError("study_id must resolve to the matching version-2 study")
+        raise BenchmarkError("study_id must resolve to the matching version-3 study")
     return path, record
 
 
@@ -285,10 +287,12 @@ def validate_recipe(recipe: dict) -> None:
     optional = {"frequency", "history_missing", "actual_missing", "series_starts", "tuning_windows"}
     if not required <= set(recipe) or set(recipe) - required - optional:
         raise BenchmarkError("preparation recipe requires documented study fields")
-    if recipe.get("history_missing", "zero") != "zero":
-        raise BenchmarkError("history_missing must be zero")
-    if recipe.get("actual_missing", "zero") not in ("zero", "mask"):
-        raise BenchmarkError("actual_missing must be zero or mask")
+    if recipe.get("history_missing", "preserve") != "preserve":
+        raise BenchmarkError("history_missing must be preserve; correct source data before import")
+    if recipe.get("actual_missing", "error") not in ("error", "mask"):
+        raise BenchmarkError(
+            "actual_missing must be error or mask; scoring never fills missing targets"
+        )
     if recipe["metric"] not in ("rmse", "mae", "wape", "wrmsse"):
         raise BenchmarkError("study metric must be rmse, mae, wape, or single-level wrmsse")
     cadence = _recipe_cadence(recipe)
@@ -679,15 +683,7 @@ def _freeze_benchmark(
             .join(required.drop(*keys, START_COLUMN), [internal, panel.time_col], "left")
             .join(key_map.select(internal, *keys), internal)
             .withColumn(MISSING_COLUMN, F.col(panel.target_col).isNull())
-            .withColumn(panel.target_col, F.coalesce(
-                F.col(panel.target_col),
-                F.lit(0).cast(frame.schema[panel.target_col].dataType),
-            ))
         )
-        if panel.exposure_col:
-            required = required.withColumn(panel.exposure_col, F.when(
-                F.col(MISSING_COLUMN), F.lit("exact"),
-            ).otherwise(F.col(panel.exposure_col)))
         future = window.filter(
             F.col(panel.time_col) > grid.time_literal(high, cadence)
         ).drop(START_COLUMN).withColumn(MISSING_COLUMN, F.col(panel.target_col).isNull())
@@ -699,7 +695,7 @@ def _freeze_benchmark(
             "written_rows": frames[name].count(),
         }
         missing_count = required.filter(F.col(MISSING_COLUMN)).count()
-        counts[name].update(originally_missing=missing_count, zero_filled=missing_count)
+        counts[name].update(originally_missing=missing_count, zero_filled=0)
     if recipe["history_policy"] == "fixed":
         last_origin = grid.time_literal(origins[-1], cadence)
         left = frames["selection"].filter(F.col(panel.time_col) <= last_origin)
@@ -789,8 +785,7 @@ def _freeze_benchmark(
                 F.sum(F.col(MISSING_COLUMN).cast("long")).alias("originally_missing"),
             ).withColumnRenamed(internal, "series_id")
             per_series = per_series.withColumn(
-                "zero_filled", F.col("originally_missing")
-                if recipe["actual_missing"] == "zero" else F.lit(0).cast("long"),
+                "zero_filled", F.lit(0).cast("long"),
             ).withColumn(
                 "excluded", F.col("originally_missing")
                 if recipe["actual_missing"] == "mask" else F.lit(0).cast("long"),
@@ -798,6 +793,16 @@ def _freeze_benchmark(
             if (per_series.count() != final_count
                     or per_series.filter(F.col("expected") != span).limit(1).count()):
                 raise BenchmarkError("prepared actuals do not cover the frozen forecast grid")
+            missing_cells = cells.filter(F.col(MISSING_COLUMN))
+            if recipe["actual_missing"] == "error" and missing_cells.limit(1).count():
+                examples = [row.asDict() for row in missing_cells.select(
+                    internal, panel.time_col,
+                ).limit(5).collect()]
+                raise BenchmarkError(
+                    f"{key}: scoring requires complete actuals; expected={final_count * span}, "
+                    f"missing={missing_cells.count()}, examples={examples}. "
+                    "Correct the source data or explicitly select actual_missing=mask."
+                )
             names = ("expected", "originally_missing", "zero_filled", "excluded", "scored")
             totals = per_series.agg(*[F.sum(name).alias(name) for name in names]).first()
             assert totals is not None
@@ -853,7 +858,7 @@ def _freeze_benchmark(
             "coverage": coverage,
             "counts": counts,
             "policies": {
-                "history_missing": "zero", "actual_missing": recipe["actual_missing"],
+                "history_missing": "preserve", "actual_missing": recipe["actual_missing"],
                 "missing_definition": "absent_row_or_null_target",
                 "confirmed_zero": "observed", "missing_indicator": MISSING_COLUMN,
             },
@@ -1018,7 +1023,7 @@ def _validate_manifest(record: object) -> dict:
             raise BenchmarkError("benchmark source path must be a nonblank string")
         sha256(value["sha256"], f"sources.{role}.sha256")
     policies = {
-        "history_missing": "zero", "actual_missing": recipe["actual_missing"],
+        "history_missing": "preserve", "actual_missing": recipe["actual_missing"],
         "missing_definition": "absent_row_or_null_target",
         "confirmed_zero": "observed", "missing_indicator": MISSING_COLUMN,
     }
@@ -1050,8 +1055,8 @@ def _validate_manifest(record: object) -> dict:
                 or values["written_rows"] < values["required_observations"]):
             raise BenchmarkError("benchmark observation counts do not reconcile")
         if not (0 <= values["originally_missing"] <= required
-                and values["zero_filled"] == values["originally_missing"]):
-            raise BenchmarkError("study history filling counts do not reconcile")
+                and values["zero_filled"] == 0):
+            raise BenchmarkError("study missingness counts do not reconcile")
     boundaries = {boundary(stage, origin, span, cadence.code): span
                   for stage, origin, span in study_windows(recipe)}
     grids = mapping(record["grids"], boundaries, "grid inventory")
@@ -1088,8 +1093,8 @@ def _validate_manifest(record: object) -> dict:
             count(value, f"coverage.{name}")
         missing = totals["originally_missing"]
         if (totals["expected"] != cohort * horizon or missing > totals["expected"]
-                or totals["zero_filled"]
-                != (missing if recipe["actual_missing"] == "zero" else 0)
+                or totals["zero_filled"] != 0
+                or (recipe["actual_missing"] == "error" and missing != 0)
                 or totals["excluded"] != (missing if recipe["actual_missing"] == "mask" else 0)
                 or totals["scored"] != totals["expected"] - totals["excluded"]):
             raise BenchmarkError("study scoring coverage counts do not reconcile")
