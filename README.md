@@ -13,7 +13,8 @@ an external tracking service.
 
 ## Requirements and installation
 
-- Python 3.12 or 3.13 on Linux or macOS.
+- Python 3.12 or 3.13 on Linux (x86_64) or macOS (Apple Silicon).
+  Intel macOS is not supported by the bundled Ray version.
 - Java 17 for the local Spark preparation and evaluation runtime.
 - Enough local disk and memory for your dataset. The quickstart uses two small series.
 
@@ -51,6 +52,10 @@ the cloned repository:
 | Add MFT, SFT, HMFNet and PACT | `python -m pip install '.[custom-torch]'` |
 | Add TFT, TFT-Q and TFT-HNB | `python -m pip install '.[tft]'` |
 | Add the AutoGluon model collection | `python -m pip install '.[autogluon-zoo]'` |
+
+On macOS, the LightGBM-based options (`shallow` and `autogluon-zoo`) also need OpenMP:
+run `brew install libomp`, as described in the
+[LightGBM installation instructions](https://github.com/lightgbm-org/LightGBM/blob/master/python-package/README.rst#install-from-pypi).
 
 Install all compatible model families together:
 

@@ -60,7 +60,7 @@ _RUNTIMES = {
     "autogluon_zoo": ModelRuntime(
         "autogluon_zoo", ("autogluon.timeseries",), "autogluon-zoo"
     ),
-    "timesfm": ModelRuntime("timesfm", ("timesfm",), "timesfm"),
+    "timesfm": ModelRuntime("timesfm", ("timesfm", "torch"), "timesfm"),
 
 }
 

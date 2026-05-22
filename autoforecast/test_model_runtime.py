@@ -27,6 +27,19 @@ def test_builtin_runtime_is_available_without_optional_packages() -> None:
     assert {"builtin", "classical", "custom_torch"} <= set(runtime_ids())
 
 
+@pytest.mark.parametrize("missing", [None, "timesfm", "torch"])
+def test_standalone_timesfm_requires_its_torch_backend(missing: str | None) -> None:
+    with mock.patch(
+        "autoforecast.model_runtime.importlib.util.find_spec",
+        side_effect=lambda name: None if name == missing else object(),
+    ):
+        result = check_runtime("timesfm")
+    assert result.available is (missing is None)
+    assert result.missing_modules == (() if missing is None else (missing,))
+    if missing is not None:
+        assert "uv sync --extra timesfm" in result.summary
+
+
 @pytest.mark.parametrize(
     ("layout", "available"),
     [("absent", False), ("module", False), ("missing_child", False),

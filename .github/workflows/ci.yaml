@@ -112,6 +112,7 @@ jobs:
         run: |
           env -u PYTHONPATH timeseries-env/bin/python - <<'PY'
           import importlib.util
+          from pathlib import Path
           import numpy as np
           import optuna
           from mlflow.tracking import MlflowClient
@@ -131,8 +132,13 @@ jobs:
           study.optimize(lambda trial: trial.suggest_int("x", 1, 1), n_trials=1)
           assert study.best_value == 1
           assert tune.TuneConfig(num_samples=1).num_samples == 1
-          assert MlflowClient is not None
-          print("Standard install: statistical forecasts and Optuna trial passed; Ray and tracking import; no extra model libraries.")
+          client = MlflowClient(tracking_uri=f"sqlite:///{Path.cwd() / 'standard-tracking.db'}")
+          experiment = client.create_experiment("standard-install")
+          run = client.create_run(experiment)
+          client.log_metric(run.info.run_id, "check", 1.0)
+          client.set_terminated(run.info.run_id)
+          assert client.get_run(run.info.run_id).data.metrics["check"] == 1.0
+          print("Standard install: statistical forecasts, Optuna trial and local tracking passed; Ray imports; no extra model libraries.")
           PY
       - name: Verify installed package outside checkout
         env:
@@ -174,3 +180,38 @@ jobs:
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
         run: env -u PYTHONPATH "$RUNNER_TEMP/timeseries-env/bin/python" -m scripts.study_example "$RUNNER_TEMP/study-interface-project"
+  installed-timesfm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          version: '0.11.32'
+      - name: Install standalone TimesFM in isolation
+        run: |
+          uv export --frozen --no-hashes --no-emit-project --group ci --extra timesfm \
+            --output-file "$RUNNER_TEMP/constraints.txt"
+          uv venv --python "$(command -v python)" "$RUNNER_TEMP/timesfm-env"
+          uv pip install --python "$RUNNER_TEMP/timesfm-env/bin/python" --torch-backend cpu \
+            --constraint "$RUNNER_TEMP/constraints.txt" --build-constraints "$RUNNER_TEMP/constraints.txt" \
+            '.[timesfm]'
+          uv pip check --python "$RUNNER_TEMP/timesfm-env/bin/python"
+      - name: Verify provider API without downloading weights
+        working-directory: ${{ runner.temp }}
+        run: |
+          env -u PYTHONPATH timesfm-env/bin/python - <<'PY'
+          import importlib.metadata
+          import torch
+          import timesfm
+          from autoforecast.model_runtime import check_runtime
+
+          assert check_runtime("timesfm").available
+          assert callable(timesfm.TimesFM_2p5_200M_torch.from_pretrained)
+          assert callable(timesfm.ForecastConfig)
+          assert torch.__version__.endswith("+cpu"), torch.__version__
+          assert not any(d.metadata['Name'].startswith('nvidia-') for d in importlib.metadata.distributions())
+          print("Standalone TimesFM provider API and CPU backend are available; weights were not downloaded.")
+          PY

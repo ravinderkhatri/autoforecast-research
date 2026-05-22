@@ -55,7 +55,7 @@ tft = ["lightning>=2.5,<3", "pytorch-forecasting>=1.3,<2"]
 autogluon-zoo = ["autogluon.timeseries>=1.4,<2"]
 # PyPI's 1.x package does not expose the repository's governed TimesFM 2.5 API. Pin the official
 # source snapshot rather than silently installing an incompatible provider.
-timesfm = ["timesfm @ git+https://github.com/google-research/timesfm.git@2f1625c208cf99bd4c9f6650d54796d8f88486f8"]
+timesfm = ["timesfm[torch] @ git+https://github.com/google-research/timesfm.git@2f1625c208cf99bd4c9f6650d54796d8f88486f8"]
 
 [dependency-groups]
 ci = [
