@@ -7,16 +7,18 @@ import datetime as dt
 import json
 import pathlib
 from functools import partial
+from typing import cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
+from autoforecast import resources
 from autoforecast.benchmark import freeze_benchmark, verify_benchmark
 from autoforecast.frequency import canonical_origin, period_points
 from autoforecast.notebook import Study
 from autoforecast.notebook import load_study as _load_study
 from autoforecast.panel import Forecast
-from pyspark.errors import PySparkRuntimeError
+from pyspark import SparkContext
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -112,16 +114,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("project", type=pathlib.Path, help="new directory for this example")
     args = parser.parse_args()
-    try:
-        spark = SparkSession.active()
-        owned = False
-    except PySparkRuntimeError as error:
-        if error.getCondition() != "NO_ACTIVE_OR_DEFAULT_SESSION":
-            raise
-        spark = (SparkSession.builder.master("local[2]").appName("notebook-study-example")
-                 .config("spark.sql.shuffle.partitions", "2")
-                 .config("spark.ui.enabled", "false").getOrCreate())
-        owned = True
+    spark, owned = resources._acquire_embedded_spark_runtime(
+        SparkSession, SparkContext, app_name="notebook-study-example",
+        profile_factory=lambda: resources.SparkProfile(
+            cores=2, driver_memory="1g", shuffle_partitions=2, worker_reuse=True,
+            series_per_partition=1, python_worker_budget_gb=1.0,
+        ),
+    )
+    spark = cast(SparkSession, spark)
     try:
         run_example(args.project.resolve(), spark)
     finally:

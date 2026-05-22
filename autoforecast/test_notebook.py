@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import shutil
+import subprocess
 import sys
 
 import pyarrow as pa
@@ -554,3 +555,40 @@ def test_example_main_preserves_a_borrowed_session(spark, tmp_path, monkeypatch,
         assert example.main() == 0
     assert seen == [((tmp_path / "project").resolve(), spark)]
     assert spark.range(1).count() == 1
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_example_main_preserves_a_bare_spark_context(tmp_path, fail):
+    # A separate process supplies a real context with no pre-existing SQL session.
+    process = subprocess.run([sys.executable, "-c", """
+import sys
+from pyspark import SparkConf, SparkContext
+from pyspark.sql import SparkSession
+from scripts import notebook_study_example as example
+
+context = SparkContext(conf=SparkConf().setMaster('local[1]').setAppName('caller-context')
+                       .set('spark.ui.enabled', 'false'))
+assert SparkSession.getActiveSession() is None
+assert SparkSession._instantiatedSession is None
+fail = sys.argv.pop() == 'True'
+seen = []
+def run(project, session):
+    assert session.sparkContext is context
+    seen.append(project)
+    if fail:
+        raise RuntimeError('example failure')
+    return {}
+example.run_example = run
+try:
+    try:
+        example.main()
+    except RuntimeError as error:
+        assert fail and str(error) == 'example failure'
+    else:
+        assert not fail
+    assert len(seen) == 1
+    assert context.parallelize([1]).count() == 1
+finally:
+    context.stop()
+""", str(tmp_path / "project"), str(fail)], capture_output=True, text=True)
+    assert process.returncode == 0, process.stdout + process.stderr
