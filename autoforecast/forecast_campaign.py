@@ -2408,7 +2408,7 @@ def _materialize_training_panel(
     cutoff = dt.date.fromisoformat(origin)
     end = cutoff + dt.timedelta(days=horizon * period_days(panel.frequency))
     dataset = pads.dataset(source, format="parquet", partitioning="hive")
-    date_field = pads.field(panel.time_col)
+    date_field = pc.field(panel.time_col)
     condition = date_field <= pa.scalar(end if panel.known_future else cutoff)
     if training_start is not None:
         condition = condition & (date_field >= pa.scalar(dt.date.fromisoformat(training_start)))
@@ -2424,20 +2424,23 @@ def _materialize_training_panel(
     try:
         for batch in dataset.scanner(filter=condition, batch_size=131072).to_batches():
             if panel.known_future:
-                future = pc.greater(batch[panel.time_col], pa.scalar(cutoff))
+                # Arrow generates compute kernels at runtime; its stubs omit these exports.
+                future = pc.greater(  # pyright: ignore[reportAttributeAccessIssue]
+                    batch[panel.time_col], pa.scalar(cutoff)
+                )
                 target_index = batch.schema.get_field_index(panel.target_col)
                 zero = pa.scalar(0, type=batch[target_index].type)
                 batch = batch.set_column(
                     target_index,
                     panel.target_col,
-                    pc.if_else(future, zero, batch[target_index]),
+                    pc.if_else(future, zero, batch[target_index]),  # pyright: ignore[reportAttributeAccessIssue]
                 )
                 exposure_index = batch.schema.get_field_index(cast(str, panel.exposure_col))
                 hidden = pa.scalar("unobserved", type=batch[exposure_index].type)
                 batch = batch.set_column(
                     exposure_index,
                     cast(str, panel.exposure_col),
-                    pc.if_else(future, hidden, batch[exposure_index]),
+                    pc.if_else(future, hidden, batch[exposure_index]),  # pyright: ignore[reportAttributeAccessIssue]
                 )
             if writer is None:
                 writer = pq.ParquetWriter(output, batch.schema)
@@ -2467,9 +2470,9 @@ def _panel_range_facts(
     dataset = pads.dataset(source, format="parquet", partitioning="hive")
     condition = None
     if start is not None:
-        condition = pads.field(panel.time_col) >= pa.scalar(dt.date.fromisoformat(start))
+        condition = pc.field(panel.time_col) >= pa.scalar(dt.date.fromisoformat(start))
     if end is not None:
-        upper = pads.field(panel.time_col) <= pa.scalar(dt.date.fromisoformat(end))
+        upper = pc.field(panel.time_col) <= pa.scalar(dt.date.fromisoformat(end))
         condition = upper if condition is None else condition & upper
     first: dt.date | None = None
     last: dt.date | None = None
@@ -2505,10 +2508,10 @@ def _materialize_panel_range(
         raise ForecastCampaignError("HPO source changed before validation materialization")
     panel = load_dataset_contract(contract_path).panel(source).validate()
     dataset = pads.dataset(source, format="parquet", partitioning="hive")
-    condition = pads.field(panel.time_col) <= pa.scalar(dt.date.fromisoformat(end))
+    condition = pc.field(panel.time_col) <= pa.scalar(dt.date.fromisoformat(end))
     if start is not None:
         condition = condition & (
-            pads.field(panel.time_col) >= pa.scalar(dt.date.fromisoformat(start))
+            pc.field(panel.time_col) >= pa.scalar(dt.date.fromisoformat(start))
         )
     destination.mkdir()
     output = destination / "part-00000.parquet"
@@ -3024,10 +3027,11 @@ def _rolling_selection_objective_masks(
     contract_path = _root() / cast(str, source["dataset_contract"])
     panel = load_dataset_contract(contract_path).panel(panel_path).validate()
     dataset = pads.dataset(panel_path, format="parquet", partitioning="hive")
-    time_field = pads.field(panel.time_col)
+    time_field = pc.field(panel.time_col)
     earliest: dt.date | None = None
     for batch in dataset.scanner(columns=[panel.time_col], batch_size=131072).to_batches():
-        minimum = pc.min(batch[panel.time_col]).as_py()
+        # This public kernel is generated dynamically by Arrow.
+        minimum = pc.min(batch[panel.time_col]).as_py()  # pyright: ignore[reportAttributeAccessIssue]
         if isinstance(minimum, dt.datetime):
             minimum = minimum.date()
         if minimum is not None:

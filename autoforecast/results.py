@@ -266,7 +266,7 @@ def comparison_plot(
         origin = dt.date.fromisoformat(key[4])
         dates = [origin + dt.timedelta(days=i) for i in range(1, run["horizon"] + 1)]
         axis.plot(
-            dates,
+            dates,  # pyright: ignore[reportArgumentType]  # Matplotlib accepts date units.
             [by_date.get(day, float("nan")) for day in dates],
             marker=".",
             label=" / ".join(key),

@@ -48,7 +48,10 @@ def main() -> int:
              "date": row["day"], "kwh": row["units"] / 4}
             for row in pq.read_table(source / "observations.parquet").to_pylist()
         ]
-        csv.write_csv(pa.Table.from_pylist(rows), project / "observations.csv")
+        # Arrow re-exports this public API from its compiled extension.
+        csv.write_csv(  # pyright: ignore[reportPrivateImportUsage]
+            pa.Table.from_pylist(rows), project / "observations.csv"
+        )
         source = project / "csv-data"
         run_cli(
             "import-csv", project / "observations.csv", source / "observations.parquet",
