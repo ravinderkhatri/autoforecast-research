@@ -117,7 +117,7 @@ def test_external_sort_cleans_scratch_after_merge_failure(tmp_path, monkeypatch)
 def _frozen_example(tmp_path):
     """Two synthetic series, 42 dates each; no exclusions; 14 cells per evaluation boundary."""
     project = tmp_path / "project"
-    create_example(project)
+    create_example(project, recipe_version=1)
     root = project / "frozen"
     root.mkdir()
     recipe = json.loads((project / "recipe.json").read_text())
@@ -232,7 +232,7 @@ def test_run_rejects_malformed_benchmark_without_traceback(tmp_path):
     path = tmp_path / "benchmark.json"
     path.write_text(json.dumps({"schema": benchmark.SCHEMA}))
     project = tmp_path / "project"
-    create_example(project)
+    create_example(project, recipe_version=1)
     result = subprocess.run(
         [sys.executable, "-m", "autoforecast.cli", "run", "--project-root", str(project),
          "--request", str(project / "campaign.yaml"), "--benchmark", str(path),
@@ -332,7 +332,7 @@ def test_publication_refuses_a_different_or_corrupted_winner(tmp_path, monkeypat
 @pytest.mark.parametrize("role", ["source_key", "feature", "known_at"])
 def test_recipe_rejects_names_with_expression_meaning_before_runtime(tmp_path, name, role):
     project = tmp_path / "project"
-    create_example(project)
+    create_example(project, recipe_version=1)
     recipe = json.loads((project / "recipe.json").read_text())
     if role == "source_key":
         recipe["source_keys"] = [name]

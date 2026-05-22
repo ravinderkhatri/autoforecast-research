@@ -22,6 +22,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from dataclasses import asdict, dataclass, replace
@@ -36,17 +37,26 @@ from mlops._safe_files import (
     _create_fresh_directory,
     publish_bytes_set,
 )
-from mlops.provenance import ProvenanceError, capture_source_identity, validate_data_reference
+from mlops.provenance import (
+    ProvenanceError,
+    capture_source_identity,
+    local_data_reference,
+    validate_data_reference,
+)
 
 from autoforecast import resources
-from autoforecast._exact_json import ExactJSONError, load_exact_json, loads_exact_json
+from autoforecast._exact_json import ExactJSONError, loads_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast._numeric import is_finite_real
 from autoforecast.adapter_contracts import descriptor
 from autoforecast.adapters import validate_execution_controls
 from autoforecast.benchmarks.policy import is_m5_daily
 from autoforecast.campaign import CampaignError, CampaignStore
-from autoforecast.data_admission import load_dataset_contract
+from autoforecast.data_admission import (
+    DatasetContract,
+    _load_dataset_contract_bytes,
+    load_dataset_contract,
+)
 from autoforecast.frequency import (
     Cadence,
     FrequencyError,
@@ -146,12 +156,13 @@ def _json(value: object) -> str:
         raise ForecastCampaignError(f"campaign evidence is not finite JSON: {error}") from error
 
 
-def _metric_summary_banner(metric: str, validation: float, test: float) -> str:
+def _metric_summary_banner(metric: str, validation: float, test: float | None) -> str:
     """Render the final validation/test metric pair as one prominent terminal line."""
     name = metric.upper()
+    test_text = f"{test:.6f}" if test is not None else "unavailable"
     body = (
         f" FINAL {name} SUMMARY | Validation {name}: {validation:.6f} | "
-        f"Test {name}: {test:.6f} "
+        f"Test {name}: {test_text} "
     )
     columns = shutil.get_terminal_size(fallback=(120, 24)).columns
     width = max(len(body) + 12, min(max(columns, 80), 160))
@@ -1307,8 +1318,33 @@ def compile_forecast_campaign(
     benchmark_path: pathlib.Path | None = None,
 ) -> CompiledForecastCampaign:
     """Resolve and freeze a high-level request into idempotent durable stage commands."""
+    from autoforecast.benchmark import (
+        STUDY_SCHEMA,
+        _evaluation_contract_from_record,
+        artifact_path,
+        verify_benchmark,
+    )
+
     request = load_forecast_campaign_request(request_path)
     contract = _source_path(request.contract, "dataset contract")
+    contract_bytes = contract.read_bytes()
+    contract_sha256 = _sha_bytes(contract_bytes)
+    benchmark = None
+    benchmark_sha256 = None
+    if benchmark_path is not None:
+        benchmark_sha256 = _sha_file(benchmark_path)
+        benchmark_path, benchmark = verify_benchmark(benchmark_path, benchmark_sha256)
+        if benchmark["dataset_sha256"] != contract_sha256:
+            raise ForecastCampaignError("dataset contract differs from the frozen benchmark")
+    study = benchmark is not None and benchmark["schema"] == STUDY_SCHEMA
+    hierarchy_wrmsse = request.metric == "wrmsse" and not study
+    if study and any(
+        source.mode not in {"defaults", "manual"} for source in request.parameter_sources
+    ):
+        raise ForecastCampaignError(
+            "shared studies require defaults or manual fixed parameters: inner HPO windows "
+            "and reused HPO selections are not frozen in this study contract"
+        )
     template_path = (
         None if request.template is None else _source_path(request.template, "run template")
     )
@@ -1320,7 +1356,7 @@ def compile_forecast_campaign(
     if not catalog.is_relative_to(_root().resolve()) or not catalog.is_dir():
         raise ForecastCampaignError("model catalog must be a source directory below the repository")
     try:
-        contract_definition = load_dataset_contract(contract)
+        contract_definition = _load_dataset_contract_bytes(contract_bytes, contract)
         selection_panel = contract_definition.panel(selection_data_path)
         cadence = parse_frequency(selection_panel.frequency)
         request = replace(
@@ -1391,6 +1427,13 @@ def compile_forecast_campaign(
     unknown = sorted(set(request.model_ids) - set(candidates))
     if unknown:
         raise ForecastCampaignError(f"campaign model IDs are absent from catalog: {unknown}")
+    if study:
+        for model_id in request.model_ids:
+            if not descriptor(candidates[model_id].adapter).supports_shared_studies:
+                raise ForecastCampaignError(
+                    f"campaign model {model_id!r} does not support shared studies; "
+                    "native checkpoint selection requires a legacy strict benchmark"
+                )
     unsupported = sorted(
         model_id
         for model_id in request.model_ids
@@ -1480,7 +1523,7 @@ def compile_forecast_campaign(
                 "TFT-Q/TFT-HNB M5 requires the M5 daily contract, WRMSSE, 28-day horizons, "
                 "patience 10, zero relative min-delta, and pinned data-role digests"
             )
-    if request.metric == "wrmsse" and selection_panel.price_col is None:
+    if hierarchy_wrmsse and selection_panel.price_col is None:
         raise ForecastCampaignError(
             "WRMSSE selection requires a declared price column before training"
         )
@@ -1492,7 +1535,7 @@ def compile_forecast_campaign(
                 "TFT-Q/TFT-HNB capacity diagnostics require a validation window "
                 "and are unsupported"
             )
-        if request.metric == "wrmsse" and candidate.adapter in _ROLLING_BUDGET_ADAPTERS:
+        if hierarchy_wrmsse and candidate.adapter in _ROLLING_BUDGET_ADAPTERS:
             try:
                 recipe = loads_exact_json(candidate.implementation_config_bytes or b"")
             except ExactJSONError as error:
@@ -1571,7 +1614,7 @@ def compile_forecast_campaign(
         candidates,
         selection_data,
         frequency=cadence.code,
-        dataset_contract_sha256=_sha_file(contract),
+        dataset_contract_sha256=contract_sha256,
         features=template_features,
     )
     capability: list[dict[str, object]] = []
@@ -1652,7 +1695,7 @@ def compile_forecast_campaign(
             **source,
             "request_sha256": request_sha,
             "dataset_contract": contract.relative_to(_root()).as_posix(),
-            "dataset_contract_sha256": _sha_file(contract),
+            "dataset_contract_sha256": contract_sha256,
             "run_template": (
                 None if template_path is None else template_path.relative_to(_root()).as_posix()
             ),
@@ -1738,10 +1781,14 @@ def compile_forecast_campaign(
         },
     }
     if benchmark_path is not None:
-        from autoforecast.benchmark import _evaluation_contract_from_record, verify_benchmark
-        benchmark_sha256 = _sha_file(benchmark_path)
-        benchmark_path, benchmark = verify_benchmark(benchmark_path, benchmark_sha256)
+        assert benchmark is not None and benchmark_sha256 is not None
+        if _sha_file(benchmark_path) != benchmark_sha256:
+            raise ForecastCampaignError("benchmark manifest changed during compilation")
         recipe = benchmark["recipe"]
+        if (study and request.missing_actual != (
+            "sparse_zero" if recipe["actual_missing"] == "zero" else "no_data"
+        )):
+            raise ForecastCampaignError("campaign missing-actual policy differs from frozen study")
         if (parse_frequency(recipe.get("frequency", "D")).code != cadence.code
             or recipe["validation_origins"]
             != cast(dict, resolved["temporal"])["validation_origins"]
@@ -1768,8 +1815,20 @@ def compile_forecast_campaign(
             contracts[value["boundary"]] = value
         resolved["benchmark"] = {"id": benchmark["benchmark_id"], "path": str(benchmark_path),
                                  "sha256": benchmark_sha256, "evaluations": contracts}
+        if study:
+            resolved["study_id"] = benchmark["study_id"]
+            cast(dict, resolved["data"])["validation_score"] = {
+                "path": str(artifact_path(benchmark_path, benchmark, "validation_score")),
+                "sha256": benchmark["artifacts"]["validation_score"],
+                "snapshot_id": benchmark["study_id"] + "-validation-score",
+                "reference": local_data_reference(
+                    artifact_path(benchmark_path, benchmark, "validation_score"), authority="study",
+                ),
+            }
     elif installed_mode():
         raise ForecastCampaignError("installed campaigns require a frozen benchmark")
+    if contract.read_bytes() != contract_bytes:
+        raise ForecastCampaignError("dataset contract changed during campaign compilation")
     resolved_payload = _json(resolved).encode()
     resolved_sha = _sha_bytes(resolved_payload)
     score_input = {
@@ -1884,7 +1943,9 @@ def compile_forecast_campaign(
             "parameter-resolution.json",
         ]
         if child["kind"] == "validation" and request.purpose != "capacity_diagnostic":
-            required_outputs.append("evaluation-panel")
+            required_outputs.append(
+                "evaluation-contract.json" if "study_id" in resolved else "evaluation-panel"
+            )
         stages.append(
             _stage(
                 child_id,
@@ -2481,11 +2542,17 @@ def _verify_resolved_parameter_profiles(resolved: dict[str, object]) -> None:
 def _fixed_evaluation(resolved: dict, stage: str, origin: str, horizon: int) -> dict | None:
     if "benchmark" not in resolved:
         return None
-    from autoforecast.benchmark import boundary, verify_benchmark
+    from autoforecast.benchmark import _evaluation_contract_from_record, boundary, verify_benchmark
     benchmark = resolved["benchmark"]
-    verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+    path, record = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
     cadence = _resolved_cadence(resolved)
-    return benchmark["evaluations"][boundary(stage, origin, horizon, cadence.code)]
+    contract = benchmark["evaluations"][boundary(stage, origin, horizon, cadence.code)]
+    if contract != _evaluation_contract_from_record(
+        path, record, stage=stage, origin=origin, horizon=horizon,
+        metric=contract["metric_policy"]["metric"],
+    ):
+        raise ForecastCampaignError("evaluation contract differs from frozen benchmark")
+    return contract
 
 
 def _load_resolved(path: pathlib.Path, expected_sha: str) -> dict[str, object]:
@@ -2494,6 +2561,12 @@ def _load_resolved(path: pathlib.Path, expected_sha: str) -> dict[str, object]:
     )
     _verify_resolved_source(resolved)
     _verify_resolved_parameter_profiles(resolved)
+    if "benchmark" in resolved:
+        from autoforecast.benchmark import verify_benchmark
+        benchmark = cast(dict, resolved["benchmark"])
+        _, record = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+        if resolved.get("study_id") != record.get("study_id"):
+            raise ForecastCampaignError("shared study identity differs from the benchmark")
     return resolved
 
 
@@ -2526,6 +2599,33 @@ def _verify_data(record: dict[str, object], label: str) -> pathlib.Path:
     return path
 
 
+def _load_completed_json(path: pathlib.Path) -> tuple[dict[str, object], str]:
+    """Parse the exact output bytes pinned by the completed stage's journal entry."""
+    attempt_dir = path.parent
+    stage_id = attempt_dir.parent.name
+    if attempt_dir.parent.parent.name != "stages":
+        raise ForecastCampaignError("completed output is outside a campaign stage attempt")
+    store = CampaignStore.from_root(attempt_dir.parent.parent.parent)
+    item = next(
+        (item for item in cast(list[dict], store.state()["stages"])
+         if item["id"] == stage_id), None,
+    )
+    if (item is None or item["status"] != "completed"
+            or attempt_dir.name != f"attempt-{item['attempts']:04d}"):
+        raise ForecastCampaignError("output does not belong to the current completed attempt")
+    result = _load_hashed_json(
+        attempt_dir / "stage-result.json", item["last_result_sha256"],
+        "completed stage result",
+    )
+    artifacts = cast(list[dict], result["artifacts"])
+    matches = [entry for entry in artifacts
+               if entry.get("path") == path.name and entry.get("kind") == "file"]
+    if len(matches) != 1:
+        raise ForecastCampaignError("completed output is not a journal-pinned file")
+    expected = matches[0]["sha256"]
+    return _load_hashed_json(path, expected, "completed output"), expected
+
+
 def _snapshot_parquet_directory(
     source: pathlib.Path,
     destination: pathlib.Path,
@@ -2533,37 +2633,15 @@ def _snapshot_parquet_directory(
     expected_sha256: str,
     label: str,
 ) -> pathlib.Path:
-    """Copy authenticated Parquet bytes into a stage-owned immutable input boundary."""
-    if destination.exists():
-        raise ForecastCampaignError(f"{label} snapshot destination already exists")
-    if directory_digest(source, suffixes=(".parquet",)) != expected_sha256:
-        raise ForecastCampaignError(f"{label} changed before its scoring snapshot")
-    descendants = () if source.is_file() else tuple(source.rglob("*"))
-    if source.is_symlink() or any(item.is_symlink() for item in descendants):
-        raise ForecastCampaignError(f"{label} may not contain symlinks")
-    destination.mkdir()
-    parquet_files = (
-        ((pathlib.Path(source.name), source),)
-        if source.is_file()
-        else tuple(
-            (item.relative_to(source), item)
-            for item in descendants
-            if item.is_file() and item.suffix == ".parquet"
-        )
-    )
-    for relative, parquet in parquet_files:
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(parquet, target, follow_symlinks=False)
-    copied = directory_digest(destination, suffixes=(".parquet",))
-    if (
-        copied != expected_sha256
-        or directory_digest(source, suffixes=(".parquet",)) != expected_sha256
-    ):
-        shutil.rmtree(destination, ignore_errors=True)
-        raise ForecastCampaignError(f"{label} changed while its scoring snapshot was copied")
-    return destination
+    """Keep campaign errors at the shared authenticated Parquet snapshot boundary."""
+    from provenance.lineage import LineageError, snapshot_parquet_directory
 
+    try:
+        return snapshot_parquet_directory(
+            source, destination, expected_sha256=expected_sha256, label=label,
+        )
+    except LineageError as error:
+        raise ForecastCampaignError(str(error)) from error
 
 def _materialize_training_panel(
     source: pathlib.Path,
@@ -2574,11 +2652,45 @@ def _materialize_training_panel(
     horizon: int,
     training_start: str | None,
     expected_source_sha256: str,
+    expected_contract_sha256: str | None = None,
+) -> str:
+    """Build training rows only from captured contract bytes and a verified source copy."""
+    contract_path = _path_without_links(contract_path, "dataset contract")
+    contract_bytes = contract_path.read_bytes()
+    if (expected_contract_sha256 is not None
+            and _sha_bytes(contract_bytes) != expected_contract_sha256):
+        raise ForecastCampaignError("dataset contract changed before training materialization")
+    contract = _load_dataset_contract_bytes(contract_bytes, contract_path)
+    if directory_digest(source, suffixes=(".parquet",)) != expected_source_sha256:
+        raise ForecastCampaignError("training source changed before materialization")
+    with tempfile.TemporaryDirectory(prefix="autoforecast-training-") as temporary:
+        snapshot = _snapshot_parquet_directory(
+            source, pathlib.Path(temporary) / "source",
+            expected_sha256=expected_source_sha256, label="training source",
+        )
+        result = _write_training_panel(
+            snapshot, destination, contract=contract, origin=origin, horizon=horizon,
+            training_start=training_start, expected_source_sha256=expected_source_sha256,
+        )
+        if directory_digest(source, suffixes=(".parquet",)) != expected_source_sha256:
+            shutil.rmtree(destination)
+            raise ForecastCampaignError("training source changed during materialization")
+        return result
+
+
+def _write_training_panel(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+    *,
+    contract: DatasetContract,
+    origin: str,
+    horizon: int,
+    training_start: str | None,
+    expected_source_sha256: str,
 ) -> str:
     """Stream a chronological panel and physically mask future labels when features need rows."""
     if directory_digest(source, suffixes=(".parquet",)) != expected_source_sha256:
         raise ForecastCampaignError("training source changed before materialization")
-    contract = load_dataset_contract(contract_path)
     panel = contract.panel(source).validate()
     cadence = parse_frequency(panel.frequency)
     cutoff = parse_origin(origin, cadence)
@@ -2601,6 +2713,9 @@ def _materialize_training_panel(
     rows = 0
     try:
         for batch in dataset.scanner(filter=condition, batch_size=131072).to_batches():
+            from autoforecast.benchmark import MISSING_COLUMN
+            if MISSING_COLUMN in batch.schema.names:
+                batch = batch.drop_columns([MISSING_COLUMN]).replace_schema_metadata(None)
             if panel.known_future:
                 # Arrow generates compute kernels at runtime; its stubs omit these exports.
                 future = pc.greater(  # pyright: ignore[reportAttributeAccessIssue]
@@ -2780,7 +2895,7 @@ def _child_parameter_resolution(
             campaign_root, cast(str, profile["tune_stage"]), "parameter-resolution.json"
         )
         try:
-            value = load_exact_json(path)
+            value, _ = _load_completed_json(path)
         except ExactJSONError as error:
             raise ForecastCampaignError(
                 f"tuned parameter resolution is invalid: {error}"
@@ -2925,6 +3040,9 @@ def run_tune_parameters(
         horizon=horizon,
         training_start=declared_training[0],
         expected_source_sha256=cast(str, data_record["sha256"]),
+        expected_contract_sha256=cast(
+            str, cast(dict[str, object], resolved["source"])["dataset_contract_sha256"],
+        ),
     )
     validation_path = attempt_dir / "hpo-validation-panel"
     validation_fingerprint = _materialize_panel_range(
@@ -3117,6 +3235,24 @@ def _score_value(comparison: dict[str, object], metric: str, model_id: str) -> f
     if not is_finite_real(raw) or float(raw) < 0:
         raise ForecastCampaignError("child score is absent or non-finite")
     return float(raw)
+
+
+def _test_score_value(comparison: dict, metric: str, model_id: str, fixed: dict | None):
+    """An empty held-out score is reportable; it never becomes a selection score."""
+    if fixed is not None and comparison.get("evaluation_contract") != fixed:
+        raise ForecastCampaignError("test comparison differs from its frozen evaluation")
+    candidates = comparison.get("candidates")
+    if (fixed is not None and fixed.get("schema") == "autoforecast.fixed-evaluation.v2"
+            and type(candidates) is list and len(candidates) == 1
+            and candidates[0].get("model_id") == model_id
+            and candidates[0].get("status") == "unavailable"
+            and type(candidates[0].get("score")) is dict
+            and metric in candidates[0]["score"]
+            and candidates[0]["score"].get(metric) is None
+            and candidates[0]["score"].get("metric_definition") == fixed["metric_policy"]
+            and comparison.get("ranking") is None):
+        return None
+    return _score_value(comparison, metric, model_id)
 
 
 _CHILD_RESULT_FIELDS = {
@@ -4278,9 +4414,13 @@ def _validated_child_result(
     path: pathlib.Path,
     *,
     require_score: bool,
-) -> dict[str, object]:
+    completed: bool = True,
+) -> tuple[dict[str, object], str]:
     try:
-        value = load_exact_json(path)
+        value, result_sha = (
+            _load_completed_json(path) if completed
+            else _load_json_with_identity(path, "new child result")
+        )
     except ExactJSONError as error:
         raise ForecastCampaignError(f"invalid child result: {error}") from error
     precision_aware = cast(int, resolved.get("request_schema_version", 3)) >= 6
@@ -4479,7 +4619,9 @@ def _validated_child_result(
             cast(str, child["origin"]), cast(int, child["horizon"]),
         )
         if fixed is not None:
-            comparison = cast(dict, load_exact_json(comparison_path))
+            comparison = _load_hashed_json(
+                comparison_path, cast(str, comparison_sha), "child comparison",
+            )
             if (comparison.get("evaluation_contract") != fixed
                     or comparison.get("comparison_kind") != "fixed_benchmark"):
                 raise ForecastCampaignError("child did not score its frozen benchmark grid/metric")
@@ -4511,7 +4653,7 @@ def _validated_child_result(
         parent_result_path = _completed_output(
             campaign_root, cast(str, parent_stage), "child-result.json"
         )
-        parent_result = _validated_child_result(
+        parent_result, _ = _validated_child_result(
             resolved,
             parent_child,
             parent_result_path,
@@ -4528,7 +4670,7 @@ def _validated_child_result(
             raise ForecastCampaignError("final fit selection-lock identity is invalid")
     elif selection_lock_sha is not None:
         raise ForecastCampaignError(f"non-final child has selection authorization: {child['id']}")
-    return result
+    return result, result_sha
 
 
 def _run_generic_child(
@@ -4571,6 +4713,7 @@ def _run_generic_child(
                 str | None, cast(dict[str, object], resolved["temporal"])["training_start"]
             ),
             expected_source_sha256=cast(str, data_record["sha256"]),
+            expected_contract_sha256=cast(str, source_record["dataset_contract_sha256"]),
         )
     request_path = attempt_dir / "child-request.yaml"
     _write_child_request(request_path, resolved, child, evaluation=evaluate)
@@ -4652,7 +4795,9 @@ def _run_generic_child(
         # separately authenticated final-training snapshot.  Reusing ``source_path`` here
         # silently produced 28 null target days and then retrained the same doomed child.
         with input_progress.step("Authenticate and materialize the validation slice"):
-            evaluation_record = cast(dict[str, object], data["final_training"])
+            evaluation_record = cast(
+                dict[str, object], data.get("validation_score", data["final_training"]),
+            )
             evaluation_source_path = _verify_data(evaluation_record, "final training data")
             temporal = cast(dict[str, object], resolved["temporal"])
             cadence = _resolved_cadence(resolved)
@@ -4661,15 +4806,18 @@ def _run_generic_child(
                 cadence,
                 cast(int, child["horizon"]),
             )
-            evaluation_path = attempt_dir / "evaluation-panel"
-            _materialize_panel_range(
-                evaluation_source_path,
-                evaluation_path,
-                contract_path=contract_path,
-                start=cast(str | None, temporal["training_start"]),
-                end=canonical_origin(target_end, cadence),
-                expected_source_sha256=cast(str, evaluation_record["sha256"]),
-            )
+            if "study_id" in resolved:
+                evaluation_path = evaluation_source_path
+            else:
+                evaluation_path = attempt_dir / "evaluation-panel"
+                _materialize_panel_range(
+                    evaluation_source_path,
+                    evaluation_path,
+                    contract_path=contract_path,
+                    start=cast(str | None, temporal["training_start"]),
+                    end=canonical_origin(target_end, cadence),
+                    expected_source_sha256=cast(str, evaluation_record["sha256"]),
+                )
         command.extend(
             [
                 "--evaluation-data-path",
@@ -4692,7 +4840,7 @@ def _run_generic_child(
             for item in cast(list[dict[str, object]], resolved["children"])
             if item["id"] == parent_stage
         )
-        parent_result = _validated_child_result(
+        parent_result, _ = _validated_child_result(
             resolved,
             parent_child,
             parent_result_path,
@@ -4726,7 +4874,7 @@ def _run_generic_child(
         raise ForecastCampaignError("governed child did not publish exactly one run group")
     run = _run_group_path(attempt_dir, runs[0], "governed child run path")
     summary_path = run / "run-summary.json"
-    summary = json.loads(summary_path.read_text())
+    summary, run_summary_sha = _load_json_with_identity(summary_path, "new run summary")
     outcomes = summary.get("models")
     if (
         type(outcomes) is not list
@@ -4783,7 +4931,7 @@ def _run_generic_child(
         "training_data_sha256": training_digest,
         "parent": parent_identity,
         "run_path": str(run),
-        "run_summary_sha256": _sha_file(summary_path),
+        "run_summary_sha256": run_summary_sha,
         "forecast_record_path": str(forecast_paths[0]),
         "forecast_record_sha256": forecast_record_sha,
         "forecast_artifact_sha256": directory_digest(forecast.path, suffixes=(".parquet",)),
@@ -4818,18 +4966,22 @@ def _run_generic_child(
         result["checkpoint"] = {"path": str(checkpoints[0]), "sha256": _sha_file(checkpoints[0])}
     if evaluate:
         comparison_path = run / "evaluation/candidate-comparison.json"
-        comparison = cast(dict[str, object], json.loads(comparison_path.read_text()))
+        comparison, comparison_sha = _load_json_with_identity(
+            comparison_path, "new child comparison",
+        )
         metric = cast(str, cast(dict[str, object], resolved["selection"])["metric"])
         result["score"] = _score_value(comparison, metric, cast(str, child["model_id"]))
-        result["comparison_sha256"] = _sha_file(comparison_path)
+        result["comparison_sha256"] = comparison_sha
     result_path = attempt_dir / "child-result.json"
     result_path.write_text(_json(result), encoding="utf-8")
-    return _validated_child_result(
+    validated, _ = _validated_child_result(
         resolved,
         child,
         result_path,
         require_score=evaluate,
+        completed=False,
     )
+    return validated
 
 
 def run_child(
@@ -4863,9 +5015,10 @@ def run_child(
 
 def _selection_statistics(
     resolved: dict[str, object],
-    results: list[dict[str, object]],
-    campaign_root: pathlib.Path,
+    validated: list[tuple[dict[str, object], str]],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    results = [result for result, _ in validated]
+    child_hashes = {cast(str, result["child_id"]): sha for result, sha in validated}
     grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
     for result in results:
         grouped.setdefault(
@@ -4917,12 +5070,7 @@ def _selection_statistics(
                     cast(dict[str, object], item["replay"])["status"] for item in items
                 ],
                 "child_result_sha256": [
-                    _sha_file(
-                        _completed_output(
-                            campaign_root, cast(str, item["child_id"]), "child-result.json"
-                        )
-                    )
-                    for item in items
+                    child_hashes[cast(str, item["child_id"])] for item in items
                 ],
             }
         )
@@ -5098,10 +5246,10 @@ def aggregate_selection(
         for item in cast(list[dict[str, object]], resolved["children"])
         if item["kind"] == "validation"
     ]
-    results: list[dict[str, object]] = []
+    validated: list[tuple[dict[str, object], str]] = []
     for child in validations:
         path = _completed_output(campaign_root, cast(str, child["id"]), "child-result.json")
-        results.append(
+        validated.append(
             _validated_child_result(
                 resolved,
                 child,
@@ -5109,7 +5257,8 @@ def aggregate_selection(
                 require_score=True,
             )
         )
-    candidates, paired, ranked = _selection_statistics(resolved, results, campaign_root)
+    results = [result for result, _ in validated]
+    candidates, paired, ranked = _selection_statistics(resolved, validated)
     chosen = ranked[0]
     selected_update_budget = _locked_selected_update_budget(resolved, chosen, results)
     summary = {
@@ -5130,7 +5279,8 @@ def aggregate_selection(
         ],
     }
     summary_path = attempt_dir / "validation-summary.json"
-    summary_path.write_text(_json(summary), encoding="utf-8")
+    summary_bytes = _json(summary).encode("utf-8")
+    summary_path.write_bytes(summary_bytes)
     lock = {
         "schema": SELECTION_LOCK_SCHEMA,
         "status": "locked",
@@ -5143,7 +5293,7 @@ def aggregate_selection(
         "tie_break": list(_TIE_BREAK),
         "validation_origins": cast(dict[str, object], resolved["temporal"])["validation_origins"],
         "validation_horizon": cast(dict[str, object], resolved["temporal"])["validation_horizon"],
-        "validation_summary_sha256": _sha_file(summary_path),
+        "validation_summary_sha256": _sha_bytes(summary_bytes),
         "chosen": {
             "candidate_id": chosen["candidate_id"],
             "model_id": chosen["model_id"],
@@ -5176,7 +5326,7 @@ def _validated_selection_evidence(
         for item in cast(list[dict[str, object]], resolved["children"])
         if item["kind"] == "validation"
     ]
-    results = [
+    validated = [
         _validated_child_result(
             resolved,
             child,
@@ -5185,7 +5335,8 @@ def _validated_selection_evidence(
         )
         for child in validations
     ]
-    candidates, paired, ranked = _selection_statistics(resolved, results, campaign_root)
+    results = [result for result, _ in validated]
+    candidates, paired, ranked = _selection_statistics(resolved, validated)
     expected_summary = {
         "schema": VALIDATION_SUMMARY_SCHEMA,
         "resolved_sha256": resolved_sha,
@@ -5204,8 +5355,8 @@ def _validated_selection_evidence(
         ],
     }
     try:
-        summary = load_exact_json(summary_path)
-        lock = load_exact_json(lock_path)
+        summary, summary_sha = _load_completed_json(summary_path)
+        lock, _ = _load_completed_json(lock_path)
     except ExactJSONError as error:
         raise ForecastCampaignError(f"selection evidence is invalid JSON: {error}") from error
     if not _same_exact(summary, expected_summary):
@@ -5224,7 +5375,7 @@ def _validated_selection_evidence(
         "tie_break": list(_TIE_BREAK),
         "validation_origins": cast(dict[str, object], resolved["temporal"])["validation_origins"],
         "validation_horizon": cast(dict[str, object], resolved["temporal"])["validation_horizon"],
-        "validation_summary_sha256": _sha_file(summary_path),
+        "validation_summary_sha256": summary_sha,
         "chosen": {
             "candidate_id": chosen["candidate_id"],
             "model_id": chosen["model_id"],
@@ -5322,7 +5473,7 @@ def run_final_fit(
             result, selected_update_budget, batch_size=cast(int, compute["batch_size"]),
             resolved=resolved,
         )
-    result["selection_lock_sha256"] = _sha_file(lock_path)
+    result["selection_lock_sha256"] = _load_completed_json(lock_path)[1]
     (attempt_dir / "child-result.json").write_text(_json(result), encoding="utf-8")
 
 
@@ -5369,11 +5520,11 @@ def _validated_locked_final_result(
     lock_path: pathlib.Path, result_path: pathlib.Path,
 ) -> dict[str, object]:
     """Recheck the sealed refit frontier at every final-result consumption boundary."""
-    result = _validated_child_result(
+    result, _ = _validated_child_result(
         resolved, _resolved_final_child(resolved, lock), result_path,
         require_score=False,
     )
-    if result.get("selection_lock_sha256") != _sha_file(lock_path):
+    if result.get("selection_lock_sha256") != _load_completed_json(lock_path)[1]:
         raise ForecastCampaignError("final fit was not authorized by the current selection lock")
     selected = cast(dict[str, object], lock["chosen"]).get("selected_update_budget")
     if selected is not None:
@@ -5493,6 +5644,9 @@ def score_final(
     from pyspark import SparkContext
     from pyspark.sql import SparkSession
 
+    fixed = _fixed_evaluation(
+        resolved, "test", cast(str, score_input["origin"]), cast(int, score_input["horizon"]),
+    )
     score_progress = PipelineProgress("Final test scoring", 2, phase_key="score")
     with score_progress.step("Start the bounded Spark scoring runtime"):
         spark = resources.acquire_local_runtime(
@@ -5501,8 +5655,8 @@ def score_final(
         )
         spark.sparkContext.setLogLevel("ERROR")
     try:
-        with score_progress.step("Calculate and publish test WRMSSE", spark=spark):
-            score_progress.operation("Join the sealed forecast to test labels and calculate WRMSSE")
+        with score_progress.step("Calculate and publish the test score", spark=spark):
+            score_progress.operation("Score the sealed forecast against its declared test actuals")
             comparison_path = compare_run_forecasts(
                 panel,
                 {cast(str, final_result["model_id"]): forecast},
@@ -5510,15 +5664,16 @@ def score_final(
                 missing_actual=cast(Any, score_input["missing_actual"]),
                 metric=cast(Any, score_input["metric"]),
                 output_dir=attempt_dir / "evaluation",
-                fixed_contract=_fixed_evaluation(resolved, "test",
-                    cast(str, score_input["origin"]), cast(int, score_input["horizon"])),
+                fixed_contract=fixed,
             )
     finally:
         with contextlib.suppress(Exception):
             spark.stop()
-    comparison = cast(dict[str, object], json.loads(comparison_path.read_text()))
-    score = _score_value(
-        comparison, cast(str, score_input["metric"]), cast(str, final_result["model_id"])
+    comparison, comparison_sha = _load_json_with_identity(
+        comparison_path, "new final comparison",
+    )
+    score = _test_score_value(
+        comparison, cast(str, score_input["metric"]), cast(str, final_result["model_id"]), fixed,
     )
     if (
         directory_digest(score_snapshot, suffixes=(".parquet",)) != score_data["sha256"]
@@ -5529,10 +5684,10 @@ def score_final(
         raise ForecastCampaignError("stage-owned scoring inputs changed while evaluation ran")
     record = {
         "schema": FINAL_SCORE_SCHEMA,
-        "status": "scored",
+        "status": "scored" if score is not None else "unavailable",
         "resolved_sha256": resolved_sha,
-        "selection_lock_sha256": _sha_file(lock_path),
-        "final_fit_result_sha256": _sha_file(final_result_path),
+        "selection_lock_sha256": _load_completed_json(lock_path)[1],
+        "final_fit_result_sha256": _load_completed_json(final_result_path)[1],
         "score_input_sha256": score_input_sha,
         "score_data": {
             "snapshot_id": score_data["snapshot_id"],
@@ -5551,7 +5706,7 @@ def score_final(
         "horizon": score_input["horizon"],
         "metric": score_input["metric"],
         "score": score,
-        "comparison_sha256": _sha_file(comparison_path),
+        "comparison_sha256": comparison_sha,
     }
     (attempt_dir / "final-score.json").write_text(_json(record), encoding="utf-8")
 
@@ -5572,7 +5727,7 @@ def replay_report(
     final_score_path = _completed_output(campaign_root, "final_score", "final-score.json")
     final_fit = _validated_locked_final_result(resolved, lock, lock_path, final_fit_path)
     try:
-        final_score_value = load_exact_json(final_score_path)
+        final_score_value, _ = _load_completed_json(final_score_path)
     except ExactJSONError as error:
         raise ForecastCampaignError(f"final score record is invalid JSON: {error}") from error
     final_score_fields = {
@@ -5616,15 +5771,16 @@ def replay_report(
         "sha256": score_data["sha256"],
     }
     numeric_score = final_score["score"]
+    unavailable = "study_id" in resolved and numeric_score is None
     comparison_path = final_score_path.parent / "evaluation" / "candidate-comparison.json"
     retained_forecast = final_score_path.parent / "scoring-inputs" / "forecast"
     retained_actuals = final_score_path.parent / "scoring-inputs" / "actuals"
     if (
         final_score["schema"] != FINAL_SCORE_SCHEMA
-        or final_score["status"] != "scored"
+        or final_score["status"] != ("unavailable" if unavailable else "scored")
         or final_score["resolved_sha256"] != resolved_sha
-        or final_score["selection_lock_sha256"] != _sha_file(lock_path)
-        or final_score["final_fit_result_sha256"] != _sha_file(final_fit_path)
+        or final_score["selection_lock_sha256"] != _load_completed_json(lock_path)[1]
+        or final_score["final_fit_result_sha256"] != _load_completed_json(final_fit_path)[1]
         or not _same_exact(final_score["score_data"], reported_score_data)
         or final_score["forecast_input_artifact_sha256"] != final_fit["forecast_artifact_sha256"]
         or final_score["score_input_artifact_sha256"] != score_data["sha256"]
@@ -5637,8 +5793,7 @@ def replay_report(
         or final_score["origin"] != score_input["origin"]
         or final_score["horizon"] != score_input["horizon"]
         or final_score["metric"] != score_input["metric"]
-        or not is_finite_real(numeric_score)
-        or float(numeric_score) < 0
+        or (not unavailable and (not is_finite_real(numeric_score) or float(numeric_score) < 0))
         or not _is_sha256(final_score["comparison_sha256"])
         or _sha_file(comparison_path) != final_score["comparison_sha256"]
         or directory_digest(retained_forecast, suffixes=(".parquet",))
@@ -5647,23 +5802,29 @@ def replay_report(
         != final_score["score_input_artifact_sha256"]
     ):
         raise ForecastCampaignError("final score record differs from its sealed evidence")
-    comparison = cast(dict[str, object], load_exact_json(comparison_path))
-    if _score_value(
-        comparison, cast(str, final_score["metric"]), cast(str, final_score["model_id"])
-    ) != float(numeric_score):
+    comparison = _load_hashed_json(
+        comparison_path, cast(str, final_score["comparison_sha256"]), "final comparison",
+    )
+    if _test_score_value(
+        comparison, cast(str, final_score["metric"]), cast(str, final_score["model_id"]),
+        _fixed_evaluation(resolved, "test", cast(str, final_score["origin"]),
+                          cast(int, final_score["horizon"])),
+    ) != numeric_score:
         raise ForecastCampaignError("final score value differs from its candidate comparison")
     forecast_path = pathlib.Path(cast(str, final_fit["forecast_record_path"]))
     checks = {
         "selection_lock": lock.get("resolved_sha256") == resolved_sha,
-        "validation_summary": lock.get("validation_summary_sha256") == _sha_file(summary_path),
-        "final_fit_authorization": final_fit.get("selection_lock_sha256") == _sha_file(lock_path),
+        "validation_summary": lock.get("validation_summary_sha256")
+        == _load_completed_json(summary_path)[1],
+        "final_fit_authorization": final_fit.get("selection_lock_sha256")
+        == _load_completed_json(lock_path)[1],
         "parameter_identity": final_fit.get("parameter_resolution_sha256")
         == cast(dict[str, object], lock["chosen"]).get("parameter_resolution_sha256"),
         "final_score_authorization": final_score.get("selection_lock_sha256")
-        == _sha_file(lock_path),
+        == _load_completed_json(lock_path)[1],
         "final_forecast": final_fit.get("forecast_record_sha256") == _sha_file(forecast_path),
         "final_score_result": final_score.get("final_fit_result_sha256")
-        == _sha_file(final_fit_path),
+        == _load_completed_json(final_fit_path)[1],
     }
     if not all(checks.values()):
         raise ForecastCampaignError(f"campaign replay verification failed: {checks}")
@@ -5688,7 +5849,7 @@ def replay_report(
         "parameter_profiles": resolved["parameter_profiles"],
         "capabilities": resolved["initialization_capabilities"],
         "validation": summary,
-        "selection_lock_sha256": _sha_file(lock_path),
+        "selection_lock_sha256": _load_completed_json(lock_path)[1],
         "chosen": lock["chosen"],
         "final_fit": final_fit,
         "final_score": final_score,
@@ -5705,6 +5866,7 @@ def replay_report(
         f"<td>{html.escape(str(item['score_stddev']))}</td></tr>"
         for item in cast(list[dict[str, object]], summary["candidates"])
     )
+    display_test_score = final_score["score"] if final_score["score"] is not None else "unavailable"
     (attempt_dir / "report.html").write_text(
         "<!doctype html><meta charset='utf-8'><title>Forecast campaign</title>"
         "<style>body{font:14px system-ui;margin:32px}table{border-collapse:collapse}"
@@ -5714,7 +5876,7 @@ def replay_report(
         f"<b>{html.escape(str(chosen['variant_id']))}</b> with "
         f"{html.escape(str(chosen['initialization']))}. Final "
         f"{html.escape(str(final_score['metric']))}: "
-        f"<b>{html.escape(str(final_score['score']))}</b>.</p>"
+        f"<b>{html.escape(str(display_test_score))}</b>.</p>"
         "<p>MLflow and TensorBoard are optional read-only views; the files linked by this "
         "campaign journal are authoritative.</p>"
         "<table><tr><th>Model</th><th>Variant</th><th>Initialization</th>"
@@ -5726,7 +5888,8 @@ def replay_report(
         _metric_summary_banner(
             cast(str, final_score["metric"]),
             float(cast(float | int, chosen["mean_score"])),
-            float(cast(float | int, final_score["score"])),
+            (None if final_score["score"] is None
+             else float(cast(float | int, final_score["score"]))),
         ),
         file=sys.stderr,
         flush=True,

@@ -34,7 +34,9 @@ class EvaluationError(ValueError):
     """The declared run-local comparison cannot be performed honestly."""
 
 
-def _score_record(score: Score | Wrmsse) -> dict[str, object]:
+def _score_record(score: Score | Wrmsse | dict) -> dict[str, object]:
+    if isinstance(score, dict):
+        return score
     if isinstance(score, Wrmsse):
         return score.as_record()
     return {
@@ -49,8 +51,10 @@ def _score_record(score: Score | Wrmsse) -> dict[str, object]:
     }
 
 
-def _value(score: Score | Wrmsse, metric: Metric) -> float | None:
+def _value(score: Score | Wrmsse | dict, metric: Metric) -> float | None:
     """Extract only the declared metric family; never reinterpret hierarchy and cell scores."""
+    if isinstance(score, dict):
+        return score[metric]
     if isinstance(score, Wrmsse):
         if metric != "wrmsse":
             raise EvaluationError("a hierarchy score cannot supply a cell metric")
@@ -62,6 +66,8 @@ def _value(score: Score | Wrmsse, metric: Metric) -> float | None:
 
 def _write_html(path: pathlib.Path, record: Mapping[str, object]) -> None:
     is_wrmsse = record.get("metric") == "wrmsse"
+    fixed = record.get("evaluation_contract")
+    flat = isinstance(fixed, dict) and fixed.get("schema") == "autoforecast.fixed-evaluation.v2"
     rows = []
     for item in record["candidates"]:  # type: ignore[index]
         assert isinstance(item, dict)
@@ -69,7 +75,7 @@ def _write_html(path: pathlib.Path, record: Mapping[str, object]) -> None:
         if is_wrmsse and isinstance(score, dict):
             cells = (
                 f"<td>{html.escape(str(score.get('wrmsse')))}</td>"
-                f"<td>{html.escape(str(score.get('n_series_scored')))}</td>"
+                f"<td>{html.escape(str(score.get('n_scored' if flat else 'n_series_scored')))}</td>"
             )
         elif isinstance(score, dict):
             values = (score.get("rmse"), score.get("mae"), score.get("wape"), score.get("n_scored"))
@@ -85,7 +91,8 @@ def _write_html(path: pathlib.Path, record: Mapping[str, object]) -> None:
     ranking = record.get("ranking")
     if record.get("comparison_kind") == "fixed_benchmark":
         note = (
-            "Fixed benchmark: exact frozen population; missing forecasts and actuals are refused."
+            "Fixed benchmark: complete frozen forecast population; the declared actual policy "
+            "controls scored coverage. See per-series coverage for exclusions."
         )
     elif is_wrmsse:
         note = (
@@ -100,7 +107,8 @@ def _write_html(path: pathlib.Path, record: Mapping[str, object]) -> None:
             else "No rank was published; every candidate must have a valid common-cell score."
         )
     columns = (
-        "<th>WRMSSE</th><th>Series by level</th>"
+        ("<th>WRMSSE</th><th>Scored cells</th>" if flat
+         else "<th>WRMSSE</th><th>Series by level</th>")
         if is_wrmsse
         else "<th>RMSE</th><th>MAE</th><th>WAPE</th><th>Scored cells</th>"
     )
@@ -144,8 +152,18 @@ def compare_run_forecasts(
     common_count: int | None = None
     comparison_error: str | None = None
     grid_path = None
+    study = (fixed_contract is not None
+             and fixed_contract.get("schema") == "autoforecast.fixed-evaluation.v2")
+    if study:
+        assert fixed_contract is not None
+        from autoforecast.study_scoring import verify_study_evaluation
+        verify_study_evaluation(dict(fixed_contract))
+        policy = cast(dict, fixed_contract["metric_policy"])
+        missing_actual = "sparse_zero" if policy["actual_missing"] == "zero" else "no_data"
+        if policy["metric"] != metric:
+            raise EvaluationError("metric differs from the frozen study")
     if fixed_contract is not None:
-        if (
+        if not study and (
             fixed_contract.get("schema") != "autoforecast.fixed-evaluation.v1"
             or fixed_contract.get("metric_policy")
             != {"metric": metric, "missing_actual": "error", "fallback": "none"}
@@ -183,11 +201,18 @@ def compare_run_forecasts(
         except SelectionError as error:
             comparison_error = str(error)
     candidates: list[dict[str, object]] = []
-    scored: list[tuple[str, Score | Wrmsse]] = []
+    scored: list[tuple[str, Score | Wrmsse | dict]] = []
     for model_id, forecast in items:
         try:
-            score: Score | Wrmsse
-            if metric == "wrmsse":
+            score: Score | Wrmsse | dict
+            if study:
+                assert fixed_contract is not None
+                from autoforecast.study_scoring import score_study
+                score = score_study(
+                    panel, forecast, spark, contract=dict(fixed_contract),
+                    output_dir=out / f"candidate-{len(candidates):04d}",
+                )
+            elif metric == "wrmsse":
                 # This is explicitly the M5 convention: the metric owns M5's 12 hierarchy
                 # levels and dollar-sales weight column, and refuses a panel that lacks either.
                 # Unlike a common-cell point comparison, every candidate must cover the entire
@@ -213,13 +238,16 @@ def compare_run_forecasts(
             candidates.append(
                 {
                     "model_id": model_id,
-                    "status": "scored",
-                    "detail": "",
+                    "status": ("unavailable"
+                               if study and _value(score, metric) is None else "scored"),
+                    "detail": "" if not study or _value(score, metric) is not None else
+                        "The frozen policy has no defined aggregate for this coverage or scale.",
                     "score": _score_record(score),
                 }
             )
     ranking: dict[str, object] | None = None
-    if comparison_error is None and len(scored) == len(items):
+    if (comparison_error is None and len(scored) == len(items)
+            and (not study or all(_value(score, metric) is not None for _, score in scored))):
         ordered = sorted(
             scored,
             key=lambda pair: (
@@ -227,7 +255,9 @@ def compare_run_forecasts(
                 pair[0],
             ),
         )
-        if metric == "wrmsse":
+        if study:
+            n_common_cells = common_count
+        elif metric == "wrmsse":
             n_common_cells = items[0][1].n_series * items[0][1].horizon
         else:
             first_score = scored[0][1]

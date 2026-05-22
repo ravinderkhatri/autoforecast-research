@@ -358,7 +358,7 @@ def test_wrmsse_uniform_revision_weighting_is_rejected_before_training(
     request.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
     monkeypatch.setattr(subject, "_git_source_identity", lambda *_args: {})
     monkeypatch.setattr(
-        subject, "load_dataset_contract",
+        subject, "_load_dataset_contract_bytes",
         lambda *_args: SimpleNamespace(
             panel=lambda *_panel_args: SimpleNamespace(frequency="D", price_col="price")
         ),
@@ -1570,7 +1570,7 @@ def test_campaign_rejects_a_daily_only_adapter_before_unsupported_cadence_execut
     unsupported = SimpleNamespace(
         panel=lambda _path: SimpleNamespace(frequency=frequency, price_col=None)
     )
-    monkeypatch.setattr(subject, "load_dataset_contract", lambda _path: unsupported)
+    monkeypatch.setattr(subject, "_load_dataset_contract_bytes", lambda *_args: unsupported)
     with pytest.raises(
         subject.ForecastCampaignError, match=f"do not support {frequency} cadence"
     ):
@@ -1607,7 +1607,7 @@ def test_compile_propagates_supported_dataset_cadence(
     )
     path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
     contract = SimpleNamespace(panel=lambda _path: SimpleNamespace(frequency=frequency))
-    monkeypatch.setattr(subject, "load_dataset_contract", lambda _path: contract)
+    monkeypatch.setattr(subject, "_load_dataset_contract_bytes", lambda *_args: contract)
     monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {})
 
     compiled = _compile(path, tmp_path)
@@ -1686,7 +1686,7 @@ def test_compile_applies_dataset_frequency_to_validation_window(
     path = _request(tmp_path)
     monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {})
     weekly = SimpleNamespace(panel=lambda _path: SimpleNamespace(frequency="W"))
-    monkeypatch.setattr(subject, "load_dataset_contract", lambda _path: weekly)
+    monkeypatch.setattr(subject, "_load_dataset_contract_bytes", lambda *_args: weekly)
     with pytest.raises(subject.ForecastCampaignError, match="at dataset frequency"):
         _compile(path, tmp_path)
 
@@ -2317,13 +2317,16 @@ def test_research_selection_locks_lower_median_of_verified_update_frontiers(
 def test_final_result_rechecks_locked_refit_at_scoring_and_replay_boundary(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This fixture isolates refit semantics; journal authentication is exercised separately.
+    monkeypatch.setattr(subject, "_load_completed_json",
+                        lambda path: subject._load_json_with_identity(path, "fixture output"))
     lock_path = tmp_path / "selection-lock.json"
     lock_path.write_text("{}\n")
     lock = {"chosen": {"selected_update_budget": 17}}
     result = {"selection_lock_sha256": subject._sha_file(lock_path)}  # noqa: SLF001
     monkeypatch.setattr(subject, "_resolved_final_child", lambda *_args: {})
     monkeypatch.setattr(
-        subject, "_validated_child_result", lambda *_args, **_kwargs: result
+        subject, "_validated_child_result", lambda *_args, **_kwargs: (result, "a" * 64)
     )
     calls = []
     monkeypatch.setattr(
@@ -4030,7 +4033,7 @@ def test_child_result_rejects_failed_or_numerically_invalid_evidence(
     path.write_text(subject._json(record), encoding="utf-8")  # noqa: SLF001
     with pytest.raises(subject.ForecastCampaignError, match="identity/status"):
         subject._validated_child_result(  # noqa: SLF001
-            {}, child, path, require_score=True
+            {}, child, path, require_score=True, completed=False
         )
 
 
@@ -4080,7 +4083,7 @@ def test_child_result_rejects_each_candidate_identity_field_independently(
     path = tmp_path / "child-result.json"
     path.write_text(subject._json(record), encoding="utf-8")  # noqa: SLF001
     with pytest.raises(subject.ForecastCampaignError, match="identity/status"):
-        subject._validated_child_result({}, child, path, require_score=True)  # noqa: SLF001
+        subject._validated_child_result({}, child, path, require_score=True, completed=False)  # noqa: SLF001
 
 
 def test_selection_lock_status_and_values_are_recomputed_before_final_fit(
@@ -4165,10 +4168,12 @@ def test_selection_lock_status_and_values_are_recomputed_before_final_fit(
         return child_path
 
     monkeypatch.setattr(subject, "_completed_output", completed)
+    monkeypatch.setattr(subject, "_load_completed_json",
+                        lambda path: subject._load_json_with_identity(path, "fixture output"))
     monkeypatch.setattr(
         subject,
         "_validated_child_result",
-        lambda *_args, **_kwargs: {"score": 1.0},
+        lambda *_args, **_kwargs: ({"score": 1.0}, "a" * 64),
     )
     monkeypatch.setattr(
         subject,
@@ -4237,10 +4242,12 @@ def test_aggregation_requires_every_child_and_applies_the_predeclared_tie_break(
             raise subject.ForecastCampaignError("missing required child") from error
 
     monkeypatch.setattr(subject, "_completed_output", completed)
+    monkeypatch.setattr(subject, "_load_completed_json",
+                        lambda path: subject._load_json_with_identity(path, "fixture output"))
     monkeypatch.setattr(
         subject,
         "_validated_child_result",
-        lambda _resolved, _child, path, *, require_score: json.loads(path.read_text()),
+        lambda _resolved, _child, path, *, require_score: subject._load_completed_json(path),
     )
     monkeypatch.setattr(subject, "_verify_resolved_source", lambda _resolved: None)
     attempt = tmp_path / "aggregate"
@@ -4284,6 +4291,9 @@ def test_final_fit_uses_the_locked_winner_and_final_training_identity_only(
             "final_fit_budget": resolved["budgets"]["final_fit"],
         },
     }
+    # This fixture isolates refit semantics; journal authentication is exercised separately.
+    monkeypatch.setattr(subject, "_load_completed_json",
+                        lambda path: subject._load_json_with_identity(path, "fixture output"))
     lock_path = tmp_path / "selection-lock.json"
     lock_path.write_text(subject._json(lock), encoding="utf-8")  # noqa: SLF001
     monkeypatch.setattr(

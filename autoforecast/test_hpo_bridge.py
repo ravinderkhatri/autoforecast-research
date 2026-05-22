@@ -243,6 +243,12 @@ run:
 
     if accepted:
         assert bridge._request(study).horizon == 2
+        shared = yaml.safe_load(contract.read_text())
+        shared["schema_version"] = 2
+        shared["dataset"]["required_series_count"] = 2
+        contract.write_text(yaml.safe_dump(shared))
+        with pytest.raises(HPOError, match="shared-study inner HPO windows are not frozen"):
+            bridge._request(study)
     else:
         with pytest.raises(HPOError, match="does not support 7D cadence"):
             bridge._request(study)

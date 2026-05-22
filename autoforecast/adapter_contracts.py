@@ -19,6 +19,7 @@ class AdapterDescriptor:
     requires_complete_window: bool = False
     supported_frequency_families: tuple[str, ...] = ("D",)
     supports_strided_daily: bool = False
+    supports_shared_studies: bool = False
 
 
 DESCRIPTORS = {
@@ -27,28 +28,44 @@ DESCRIPTORS = {
         target_estimands=("sales_given_availability", "observed_nonnegative"),
         supported_frequency_families=("H", "D", "W", "M", "Y"),
         supports_strided_daily=True,
+        supports_shared_studies=True,
     ),
     "last_value": AdapterDescriptor(
         "last_value", "fit_predict", "builtin", "one", requires_complete_window=True,
         target_estimands=("sales_given_availability", "observed_nonnegative"),
         supported_frequency_families=("H", "D", "W", "M", "Y"),
         supports_strided_daily=True,
+        supports_shared_studies=True,
     ),
-    "croston": AdapterDescriptor("classical", "forecast_with", "classical", "two"),
-    "auto_ets": AdapterDescriptor("classical", "forecast_with", "classical", "auto_ets"),
-    "auto_theta": AdapterDescriptor("classical", "forecast_with", "classical", "auto_ets"),
-    "shallow_global": AdapterDescriptor("shallow", "fit_predict", "shallow", "one", "typed"),
-    "tft": AdapterDescriptor("tft", "fit_predict", "tft", "tft", "typed", ("autolog", "lightning")),
+    "croston": AdapterDescriptor(
+        "classical", "forecast_with", "classical", "two", supports_shared_studies=True,
+    ),
+    "auto_ets": AdapterDescriptor(
+        "classical", "forecast_with", "classical", "auto_ets", supports_shared_studies=True,
+    ),
+    "auto_theta": AdapterDescriptor(
+        "classical", "forecast_with", "classical", "auto_ets", supports_shared_studies=True,
+    ),
+    "shallow_global": AdapterDescriptor(
+        "shallow", "fit_predict", "shallow", "one", "typed", supports_shared_studies=True,
+    ),
+    "tft": AdapterDescriptor(
+        "tft", "fit_predict", "tft", "tft", "typed", ("autolog", "lightning"),
+        supports_shared_studies=True,
+    ),
     "tft_q": AdapterDescriptor(
-        "tft_q", "fit_predict_quantile", "tft", "tft_q", "typed", ("autolog", "lightning")
+        "tft_q", "fit_predict_quantile", "tft", "tft_q", "typed", ("autolog", "lightning"),
     ),
     "tft_hnb": AdapterDescriptor(
-        "tft_q", "fit_predict_hnb", "tft", "tft_q", "typed", ("autolog", "lightning")
+        "tft_q", "fit_predict_hnb", "tft", "tft_q", "typed", ("autolog", "lightning"),
     ),
     "autogluon_zoo": AdapterDescriptor(
-        "zoo", "fit_predict", "autogluon_zoo", "one", consumes_exposure=False
+        "zoo", "fit_predict", "autogluon_zoo", "one", consumes_exposure=False,
+        supports_shared_studies=True,
     ),
-    "timesfm_standalone": AdapterDescriptor("foundation", "fit_predict", "timesfm", "timesfm"),
+    "timesfm_standalone": AdapterDescriptor(
+        "foundation", "fit_predict", "timesfm", "timesfm", supports_shared_studies=True,
+    ),
     "mft": AdapterDescriptor(
         "mft",
         "fit_predict",
@@ -58,6 +75,7 @@ DESCRIPTORS = {
         ("reporter", "none"),
         target_estimands=("sales_given_availability", "unconstrained_demand"),
         handles_right_censoring=True,
+        supports_shared_studies=True,
     ),
     "sft": AdapterDescriptor(
         "mft",
@@ -105,6 +123,7 @@ def descriptor(name: str) -> AdapterDescriptor:
         != len(result.supported_frequency_families)
         or not set(result.supported_frequency_families) <= {"H", "D", "W", "M", "Y"}
         or type(result.supports_strided_daily) is not bool
+        or type(result.supports_shared_studies) is not bool
         or result.operations != ("fit_predict",)
     ):
         raise ValueError(f"incomplete or unsupported adapter descriptor: {name}")

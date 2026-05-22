@@ -61,6 +61,10 @@ def _reader_boundary(
     )
     monkeypatch.setattr(reader.CampaignStore, "from_root", lambda _: store)
     monkeypatch.setattr(reader, "_completed_output", lambda root, stage, name: root / stage / name)
+    # These tests isolate reader semantics; completed-stage authentication has separate
+    # journal-boundary and installed selection/reader regression coverage.
+    monkeypatch.setattr(reader, "_load_completed_json",
+                        lambda path: reader._load_json_with_identity(path, "fixture output"))
     return digest
 
 
@@ -418,7 +422,7 @@ def test_initialization_parent_is_not_validation_evidence(
     frozen = {
         "benchmark_id": "benchmark", "recipe": {"target_unit": "units"},
         "key_types": {}, "cohort_series_count": 1,
-        "artifacts": {role: "a" * 64 for role in ("selection", "final_training", "final_score")},
+        "artifacts": {role: "a" * 64 for role in ("selection", "final_training", "final_score", "source-keys")},
     }
     (tmp_path / "dataset.yaml").write_text(yaml.safe_dump({
         "schema_version": 1,
@@ -429,6 +433,9 @@ def test_initialization_parent_is_not_validation_evidence(
     }))
     (tmp_path / "source-keys").mkdir()
     pq.write_table(pa.table({"series_id": ["a"]}), tmp_path / "source-keys/part.parquet")
+    from provenance.lineage import directory_digest
+    frozen["dataset_sha256"] = hashlib.sha256((tmp_path / "dataset.yaml").read_bytes()).hexdigest()
+    frozen["artifacts"]["source-keys"] = directory_digest(tmp_path / "source-keys", suffixes=(".parquet",))
     monkeypatch.setattr(reader, "verify_benchmark", lambda *args: (benchmark_path, frozen))
     _reader_boundary(
         tmp_path, monkeypatch, [child],
@@ -530,23 +537,27 @@ def test_reader_retains_selection_actual_snapshot_for_revised_history(tmp_path, 
         "recipe": {"target_unit": "units", "history_policy": "revised_snapshot"},
         "key_types": {},
         "cohort_series_count": 1,
-        "artifacts": {"selection": "1" * 64, "final_training": "2" * 64, "final_score": "3" * 64},
+        "artifacts": {"selection": "1" * 64, "final_training": "2" * 64, "final_score": "3" * 64,
+                      "source-keys": "4" * 64},
     }
     (tmp_path / "source-keys").mkdir()
     pq.write_table(
         pa.Table.from_pylist([{"series_id": "a"}]), tmp_path / "source-keys/part.parquet"
     )
+    from provenance.lineage import directory_digest
+    frozen["artifacts"]["source-keys"] = directory_digest(tmp_path / "source-keys", suffixes=(".parquet",))
     monkeypatch.setattr(reader, "verify_benchmark", lambda *args: (benchmark_path, frozen))
     (tmp_path / "dataset.yaml").write_text(
         "schema_version: 1\ndataset:\n  id: meters\n  panel:\n"
         "    series_col: meter\n    time_col: date\n    target_col: kwh\n"
         "    target_estimand: observed_nonnegative\n"
     )
+    frozen["dataset_sha256"] = hashlib.sha256((tmp_path / "dataset.yaml").read_bytes()).hexdigest()
     result = read_results(tmp_path)
     assert result.metadata["target_estimand"] == "observed_nonnegative"
     assert result.metadata["actual_snapshots"] == {
         role: {"path": str(tmp_path / role), "sha256": digest}
-        for role, digest in frozen["artifacts"].items()
+        for role, digest in frozen["artifacts"].items() if role != "source-keys"
     }
 
 

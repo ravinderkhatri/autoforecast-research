@@ -15,7 +15,7 @@ from functools import partial
 
 from autoforecast._exact_json import loads_exact_json
 from autoforecast.column_names import validate_column_names
-from autoforecast.data_admission import load_dataset_contract
+from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.frequency import (
     Cadence,
     FrequencyError,
@@ -25,9 +25,12 @@ from autoforecast.frequency import (
     parse_frequency,
     parse_origin,
 )
-from provenance.lineage import directory_digest
+from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
 SCHEMA = "autoforecast.frozen-benchmark.v1"
+STUDY_SCHEMA = "autoforecast.frozen-benchmark.v2"
+MISSING_COLUMN = "__af_original_missing"
+START_COLUMN = "__af_history_start"
 
 
 class BenchmarkError(ValueError):
@@ -192,7 +195,7 @@ def _parquet_hash(path: pathlib.Path) -> str:
 
 
 def _identity(record: dict) -> dict:
-    return {
+    identity = {
         key: record[key]
         for key in (
             "schema",
@@ -207,6 +210,60 @@ def _identity(record: dict) -> dict:
             "grid_identities",
         )
     }
+    if record["schema"] == STUDY_SCHEMA:
+        identity.update({key: record[key] for key in (
+            "role_paths", "metric_definition", "coverage_identities", "counts",
+        )})
+    return identity
+
+
+def _normalise_recipe(recipe: dict) -> dict:
+    """Freeze defaults only for new studies; preserve every legacy identity byte."""
+    validate_recipe(recipe)
+    if recipe["schema_version"] == 1:
+        return dict(recipe)
+    return {
+        **recipe,
+        "frequency": _recipe_cadence(recipe).code,
+        "history_missing": recipe.get("history_missing", "zero"),
+        "actual_missing": recipe.get("actual_missing", "zero"),
+        "series_starts": recipe.get(
+            "series_starts", {"rule": "study_lower_bound", "values": []},
+        ),
+    }
+
+
+def _metric_definition(recipe: dict) -> dict:
+    weighted = recipe["metric"] == "wrmsse"
+    return {
+        "metric": recipe["metric"],
+        "version": "single-level-wrmsse.v1" if weighted else "cell-errors.v1",
+        "actual_missing": recipe["actual_missing"],
+        "aggregation": "all_frozen_series" if weighted else "available_cells",
+        "empty_series": "unavailable",
+        "empty_aggregate": "unavailable",
+        "undefined_scale": "unavailable",
+        "weight_redistribution": "forbidden",
+    }
+
+
+def artifact_path(path: pathlib.Path, record: dict, role: str) -> pathlib.Path:
+    """Resolve a logical role inside an already authenticated benchmark."""
+    if role not in record["artifacts"]:
+        raise BenchmarkError(f"unknown benchmark role: {role}")
+    return path.parent / record.get("role_paths", {}).get(role, role)
+
+
+def resolve_study(output_root: pathlib.Path, study_id: str) -> tuple[pathlib.Path, dict]:
+    """Resolve an existing content-addressed study; an ID never supplies business rules."""
+    if (type(study_id) is not str or len(study_id) != 64
+            or any(character not in "0123456789abcdef" for character in study_id)):
+        raise BenchmarkError("study_id must be a lowercase SHA-256 identity")
+    path, record = verify_benchmark(output_root / study_id / "benchmark.json")
+    if (record["schema"] != STUDY_SCHEMA or record.get("study_id") != study_id
+            or record["benchmark_id"] != study_id):
+        raise BenchmarkError("study_id must resolve to the matching version-2 study")
+    return path, record
 
 
 def validate_recipe(recipe: dict) -> None:
@@ -224,10 +281,25 @@ def validate_recipe(recipe: dict) -> None:
         "target_unit",
         "feature_availability",
     }
-    accepted_fields = (expected, expected | {"frequency"})
-    if (type(recipe) is not dict or set(recipe) not in accepted_fields
-            or type(recipe["schema_version"]) is not int or recipe["schema_version"] != 1):
-        raise BenchmarkError("preparation recipe requires exactly the documented v1 fields")
+    if type(recipe) is not dict or type(recipe.get("schema_version")) is not int:
+        raise BenchmarkError("preparation recipe requires documented versioned fields")
+    version = recipe["schema_version"]
+    if version == 1:
+        if set(recipe) not in (expected, expected | {"frequency"}):
+            raise BenchmarkError("preparation recipe requires exactly the documented v1 fields")
+    elif version == 2:
+        required = expected | {"metric"}
+        optional = {"frequency", "history_missing", "actual_missing", "series_starts"}
+        if not required <= set(recipe) or set(recipe) - required - optional:
+            raise BenchmarkError("preparation recipe requires documented v2 study fields")
+        if recipe.get("history_missing", "zero") != "zero":
+            raise BenchmarkError("history_missing must be zero")
+        if recipe.get("actual_missing", "zero") not in ("zero", "mask"):
+            raise BenchmarkError("actual_missing must be zero or mask")
+        if recipe["metric"] not in ("rmse", "mae", "wape", "wrmsse"):
+            raise BenchmarkError("study metric must be rmse, mae, wape, or single-level wrmsse")
+    else:
+        raise BenchmarkError("preparation recipe schema_version must be 1 or 2")
     cadence = _recipe_cadence(recipe)
     if (type(recipe["history_policy"]) is not str
             or recipe["history_policy"] not in {"fixed", "revised_snapshot"}):
@@ -281,6 +353,28 @@ def validate_recipe(recipe: dict) -> None:
         ("final training window", cutoff),
     ]:
         _inclusive_period_count(start, point, cadence, label=label)
+    if version == 2 and "series_starts" in recipe:
+        declaration = recipe["series_starts"]
+        if (type(declaration) is not dict or set(declaration) != {"rule", "values"}
+                or type(declaration["rule"]) is not str or not declaration["rule"].strip()
+                or type(declaration["values"]) is not list):
+            raise BenchmarkError("series_starts requires a nonblank rule and a values list")
+        seen = set()
+        for entry in declaration["values"]:
+            if (type(entry) is not dict or set(entry) != {"keys", "start"}
+                    or type(entry["keys"]) is not dict or set(entry["keys"]) != set(keys)):
+                raise BenchmarkError("each series start requires the exact source keys and start")
+            values = tuple(entry["keys"][key] for key in keys)
+            if any(type(value) not in (str, int) or (type(value) is str and not value.strip())
+                   for value in values):
+                raise BenchmarkError("series start keys must be nonblank strings or integers")
+            if values in seen:
+                raise BenchmarkError("duplicate declared series start")
+            seen.add(values)
+            first = _recipe_point(entry["start"], cadence)
+            if not start <= first <= origins[0]:
+                raise BenchmarkError("series starts must lie within history and the first origin")
+            _inclusive_period_count(start, first, cadence, label="series history start")
 
 
 def freeze_benchmark(
@@ -290,34 +384,75 @@ def freeze_benchmark(
     recipe: dict,
     output_root: pathlib.Path,
     spark,
+    study_id: str | None = None,
+    scoring_references: pathlib.Path | None = None,
+) -> pathlib.Path:
+    """Freeze one study from authenticated, operation-owned input snapshots."""
+    with ExitStack() as inputs:
+        try:
+            return _freeze_benchmark(
+                contract_path=contract_path, sources=sources, recipe=recipe,
+                output_root=output_root, spark=spark, study_id=study_id,
+                scoring_references=scoring_references, inputs=inputs,
+            )
+        except LineageError as error:
+            raise BenchmarkError(str(error)) from error
+
+
+def _freeze_benchmark(
+    *,
+    contract_path: pathlib.Path,
+    sources: dict[str, pathlib.Path],
+    recipe: dict,
+    output_root: pathlib.Path,
+    spark,
+    inputs: ExitStack,
+    study_id: str | None = None,
+    scoring_references: pathlib.Path | None = None,
 ) -> pathlib.Path:
     """Validate source scope, normalize keys, and publish immutable role snapshots and grids.
 
     Population: all distinct source keys observed by the earliest validation origin.
     New series can only be excluded by the explicit pre-test rule in the recipe.
-    Every retained series must have every cadence observation in each required role.
+    Legacy recipes require complete observations. New studies materialize declared
+    missing-target policies from each series' frozen history start.
     """
     from pyspark.sql import functions as F
     from pyspark.sql.types import (
         DateType,
         IntegralType,
+        NumericType,
         StringType,
+        StructField,
+        StructType,
     )
 
     from autoforecast import grid
 
-    validate_recipe(recipe)
+    recipe = _normalise_recipe(json.loads(json.dumps(recipe, allow_nan=False)))
+    study = recipe["schema_version"] == 2
     cadence = _recipe_cadence(recipe)
-    if set(sources) != {"selection", "final_training", "final_score"}:
-        raise BenchmarkError("provide selection, final_training, and final_score sources")
+    source_roles = {"selection", "final_training", "final_score"}
+    if study:
+        source_roles.add("validation_score")
+    if set(sources) != source_roles:
+        raise BenchmarkError(f"provide exactly these source roles: {sorted(source_roles)}")
+    if (study and recipe["metric"] == "wrmsse") != (scoring_references is not None):
+        raise BenchmarkError("single-level wrmsse requires frozen scoring_references only")
+    if study_id is not None:
+        if not study:
+            raise BenchmarkError("study_id registration requires a v2 recipe")
+        resolve_study(output_root, study_id)
     keys = recipe["source_keys"]
     start = _recipe_point(recipe["training_start"], cadence)
     origins = [_recipe_point(day, cadence) for day in recipe["validation_origins"]]
     cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
     horizon, test_horizon = recipe["validation_horizon"], recipe["final_test_horizon"]
     end = advance(cutoff, cadence, test_horizon)
+    if contract_path.is_symlink() or not contract_path.is_file():
+        raise BenchmarkError("dataset contract must be a regular file")
     contract_bytes = contract_path.read_bytes()
-    contract = load_dataset_contract(contract_path)
+    contract = _load_dataset_contract_bytes(contract_bytes, contract_path)
     panel = contract.panel(sources["selection"])
     if (
         parse_frequency(panel.frequency).code != cadence.code
@@ -344,14 +479,28 @@ def freeze_benchmark(
         raise BenchmarkError("future features require exposure_col for existing target masking")
     for path in sources.values():
         contract.panel(path).validate()
-    before = {
-        name: directory_digest(path, suffixes=(".parquet",)) for name, path in sources.items()
-    }
+    all_sources = dict(sources)
+    if scoring_references is not None:
+        all_sources["scoring_references"] = scoring_references
+    before = {name: directory_digest(path, suffixes=(".parquet",))
+              for name, path in all_sources.items()}
+    snapshot_root = pathlib.Path(inputs.enter_context(tempfile.TemporaryDirectory(
+        prefix="autoforecast-freeze-",
+    )))
+    read_paths = {}
+    physical_inputs = {}
+    for name, path in all_sources.items():
+        identity = (path.resolve(), before[name])
+        if identity not in physical_inputs:
+            physical_inputs[identity] = snapshot_parquet_directory(
+                path, snapshot_root / name, expected_sha256=before[name], label=name,
+            )
+        read_paths[name] = physical_inputs[identity]
     frames = {}
     key_types = None
     internal = "__af_series_id"
-    for name, path in sources.items():
-        frame = grid.read_time_parquet(spark, path, panel.time_col)
+    for name in sources:
+        frame = grid.read_time_parquet(spark, read_paths[name], panel.time_col)
         try:
             validate_column_names(frame.columns)
         except ValueError as error:
@@ -360,6 +509,8 @@ def freeze_benchmark(
             raise BenchmarkError("source columns beginning __af_ are reserved for preparation")
         if any(k not in frame.columns for k in keys):
             raise BenchmarkError("source keys absent")
+        if study and not isinstance(frame.schema[panel.target_col].dataType, NumericType):
+            raise BenchmarkError("study targets must have a numeric, non-boolean storage type")
         types = {key: frame.schema[key].dataType.simpleString() for key in keys}
         if key_types is not None and key_types != types:
             raise BenchmarkError("source key types differ between roles")
@@ -396,7 +547,9 @@ def freeze_benchmark(
         F.col(panel.time_col) <= grid.time_literal(origins[0], cadence)
     ).select(internal).distinct()
     all_keys = frames["selection"].select(internal)
-    for frame in (frames["final_training"], frames["final_score"]):
+    for name, frame in frames.items():
+        if name == "selection":
+            continue
         all_keys = all_keys.unionByName(frame.select(internal))
     original_count, final_count = all_keys.distinct().count(), cohort.count()
     if final_count == 0:
@@ -405,6 +558,29 @@ def freeze_benchmark(
     if excluded and recipe["new_series_policy"] == "error":
         raise BenchmarkError(f"{excluded} new series absent at the first validation origin")
     key_map = selection.join(cohort, internal).select(internal, *keys).distinct()
+    if study:
+        declarations = recipe["series_starts"]["values"]
+        if declarations:
+            schema = StructType([
+                *(selection.schema[key] for key in keys),
+                StructField(START_COLUMN, selection.schema[panel.time_col].dataType, False),
+            ])
+            try:
+                starts = spark.createDataFrame([
+                    (*[entry["keys"][key] for key in keys],
+                     _recipe_point(entry["start"], cadence))
+                    for entry in declarations
+                ], schema).withColumn(internal, F.to_json(F.struct(*[F.col(k) for k in keys])))
+            except (TypeError, ValueError) as error:
+                raise BenchmarkError("declared start keys differ from source key types") from error
+            declared_ids = starts.select(internal)
+            if (cohort.join(declared_ids, internal, "left_anti").limit(1).count()
+                    or declared_ids.join(cohort, internal, "left_anti").limit(1).count()):
+                raise BenchmarkError("declare exactly one history start for every retained series")
+            key_map = key_map.join(starts.select(internal, START_COLUMN), internal)
+        else:
+            key_map = key_map.withColumn(START_COLUMN, grid.time_literal(start, cadence))
+        cohort = key_map.select(internal, START_COLUMN)
     counts = {}
     for name, frame in frames.items():
         retained = frame.join(cohort, internal)
@@ -413,7 +589,7 @@ def freeze_benchmark(
             if name == "final_score"
             else (start, origins[-1] if name == "selection" else cutoff)
         )
-        upper = end if panel.known_future and name != "final_score" else high
+        upper = end if panel.known_future and name in {"selection", "final_training"} else high
         window = retained.filter(
             F.col(panel.time_col).between(
                 grid.time_literal(low, cadence), grid.time_literal(upper, cadence)
@@ -430,8 +606,12 @@ def freeze_benchmark(
         expected_cells = cohort.crossJoin(
             periods.filter(F.col(panel.time_col) <= grid.time_literal(high, cadence))
         )
+        if study:
+            expected_cells = expected_cells.filter(F.col(panel.time_col) >= F.col(START_COLUMN))
+            required = required.filter(F.col(panel.time_col) >= F.col(START_COLUMN))
+            window = window.filter(F.col(panel.time_col) >= F.col(START_COLUMN))
         absent = expected_cells.join(required, [internal, panel.time_col], "left_anti")
-        if absent.limit(1).count():
+        if not study and absent.limit(1).count():
             bounds = required.groupBy(internal).agg(F.max(panel.time_col).alias("__af_last"))
             gaps = absent.join(bounds, internal, "left")
             trailing = gaps.filter(
@@ -445,7 +625,9 @@ def freeze_benchmark(
         target = F.col(panel.target_col).cast("double")
         if (
             required.filter(
-                target.isNull() | F.isnan(target) | (target < 0) | (F.abs(target) == float("inf"))
+                (F.col(panel.target_col).isNotNull() if study else F.lit(True))
+                & (target.isNull() | F.isnan(target) | (target < 0)
+                   | (F.abs(target) == float("inf")))
             )
             .limit(1)
             .count()
@@ -454,7 +636,8 @@ def freeze_benchmark(
         if (
             panel.exposure_col
             and required.filter(
-                F.col(panel.exposure_col).isNull() | (F.col(panel.exposure_col) != "exact")
+                (F.col(panel.target_col).isNotNull() if study else F.lit(True))
+                & (F.col(panel.exposure_col).isNull() | (F.col(panel.exposure_col) != "exact"))
             )
             .limit(1)
             .count()
@@ -475,12 +658,34 @@ def freeze_benchmark(
                 .count()
             ):
                 raise BenchmarkError(f"unknown future feature at first origin: {feature}")
+        if study:
+            required = (
+                expected_cells.select(internal, panel.time_col)
+                .join(required.drop(*keys, START_COLUMN), [internal, panel.time_col], "left")
+                .join(key_map.select(internal, *keys), internal)
+                .withColumn(MISSING_COLUMN, F.col(panel.target_col).isNull())
+                .withColumn(panel.target_col, F.coalesce(
+                    F.col(panel.target_col),
+                    F.lit(0).cast(frame.schema[panel.target_col].dataType),
+                ))
+            )
+            if panel.exposure_col:
+                required = required.withColumn(panel.exposure_col, F.when(
+                    F.col(MISSING_COLUMN), F.lit("exact"),
+                ).otherwise(F.col(panel.exposure_col)))
+            future = window.filter(
+                F.col(panel.time_col) > grid.time_literal(high, cadence)
+            ).drop(START_COLUMN).withColumn(MISSING_COLUMN, F.col(panel.target_col).isNull())
+            window = required.unionByName(future)
         # Keep verified future-known rows for the existing physical target-mask materializer.
         frames[name] = window
         counts[name] = {
             "required_observations": required.count(),
             "written_rows": frames[name].count(),
         }
+        if study:
+            missing_count = required.filter(F.col(MISSING_COLUMN)).count()
+            counts[name].update(originally_missing=missing_count, zero_filled=missing_count)
     if recipe["history_policy"] == "fixed":
         last_origin = grid.time_literal(origins[-1], cadence)
         left = frames["selection"].filter(F.col(panel.time_col) <= last_origin)
@@ -496,7 +701,7 @@ def freeze_benchmark(
                 "conflicting overlapping history between selection and final training"
             )
     identity = {
-        "schema": SCHEMA,
+        "schema": STUDY_SCHEMA if study else SCHEMA,
         "recipe": recipe,
         "key_types": key_types,
         "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
@@ -508,7 +713,7 @@ def freeze_benchmark(
     def authenticate_sources():
         if contract_path.read_bytes() != contract_bytes or any(
             directory_digest(path, suffixes=(".parquet",)) != before[name]
-            for name, path in sources.items()
+            for name, path in all_sources.items()
         ):
             raise BenchmarkError("source changed during preparation")
 
@@ -519,13 +724,24 @@ def freeze_benchmark(
         import yaml
 
         roles = {**contract.panel_roles, "series_col": internal}
-        (scratch / "dataset.yaml").write_text(
-            yaml.safe_dump({"schema_version": 1, "dataset": {"id": contract.id, "panel": roles}})
-        )
+        prepared_contract = {"schema_version": 2 if study else 1,
+                             "dataset": {"id": contract.id, "panel": roles}}
+        if study:
+            prepared_contract["dataset"]["required_series_count"] = final_count
+        (scratch / "dataset.yaml").write_text(yaml.safe_dump(prepared_contract))
         key_map.write.parquet(str(scratch / "source-keys"))
         for name, frame in frames.items():
             frame.write.parquet(str(scratch / name))
+        artifact_roles = [*sorted(sources), "source-keys"]
+        if scoring_references is not None:
+            references = _prepare_scoring_references(
+                read_paths["scoring_references"], key_map, keys, recipe, spark,
+            )
+            references.write.parquet(str(scratch / "scoring_references"))
+            artifact_roles.append("scoring_references")
         grids = {}
+        coverage = {}
+        coverage_identities = {}
         for stage, origin, span in [("validation", o, horizon) for o in origins] + [
             ("test", cutoff, test_horizon)
         ]:
@@ -548,11 +764,56 @@ def freeze_benchmark(
                 "sha256": directory_digest(path, suffixes=(".parquet",)),
                 "n_cells": final_count * span,
             }
+            if study:
+                actuals = frames["validation_score" if stage == "validation" else "final_score"]
+                cells = actuals.filter(
+                    F.col(panel.time_col).between(
+                        grid.time_literal(advance(origin, cadence, 1), cadence),
+                        grid.time_literal(advance(origin, cadence, span), cadence),
+                    )
+                )
+                per_series = cells.groupBy(internal).agg(
+                    F.count(F.lit(1)).alias("expected"),
+                    F.sum(F.col(MISSING_COLUMN).cast("long")).alias("originally_missing"),
+                ).withColumnRenamed(internal, "series_id")
+                per_series = per_series.withColumn(
+                    "zero_filled", F.col("originally_missing")
+                    if recipe["actual_missing"] == "zero" else F.lit(0).cast("long"),
+                ).withColumn(
+                    "excluded", F.col("originally_missing")
+                    if recipe["actual_missing"] == "mask" else F.lit(0).cast("long"),
+                ).withColumn("scored", F.col("expected") - F.col("excluded"))
+                if (per_series.count() != final_count
+                        or per_series.filter(F.col("expected") != span).limit(1).count()):
+                    raise BenchmarkError("prepared actuals do not cover the frozen forecast grid")
+                names = ("expected", "originally_missing", "zero_filled", "excluded", "scored")
+                totals = per_series.agg(*[F.sum(name).alias(name) for name in names]).first()
+                assert totals is not None
+                coverage_path = "coverage/" + key
+                per_series.write.parquet(str(scratch / coverage_path))
+                coverage_identities[key] = {
+                    "content_sha256": _parquet_hash(scratch / coverage_path),
+                    "counts": {name: int(totals[name]) for name in names},
+                }
+                coverage[key] = {
+                    "path": coverage_path,
+                    "sha256": directory_digest(scratch / coverage_path, suffixes=(".parquet",)),
+                }
         authenticate_sources()
+        logical_snapshots = {name: _parquet_hash(scratch / name) for name in artifact_roles}
+        role_paths = {name: name for name in artifact_roles}
+        if study:
+            # Logical roles remain distinct even when their exact typed rows share storage.
+            written = {}
+            for name in artifact_roles:
+                logical = logical_snapshots[name]
+                if logical in written:
+                    role_paths[name] = written[logical]
+                    shutil.rmtree(scratch / name)
+                else:
+                    written[logical] = name
         identity.update(
-            logical_snapshots={
-                name: _parquet_hash(scratch / name) for name in (*sources, "source-keys")
-            },
+            logical_snapshots=logical_snapshots,
             dataset_sha256=hashlib.sha256((scratch / "dataset.yaml").read_bytes()).hexdigest(),
             grid_identities={
                 key: {
@@ -563,7 +824,16 @@ def freeze_benchmark(
                 for key, item in grids.items()
             },
         )
+        if study:
+            identity.update(
+                role_paths=role_paths, metric_definition=_metric_definition(recipe),
+                coverage_identities=coverage_identities, counts=counts,
+            )
         benchmark_id = digest(identity)
+        if study_id is not None and study_id != benchmark_id:
+            raise BenchmarkError(
+                "supplied study_id has different settings or data; create a new study"
+            )
         destination = output_root / benchmark_id
         record = {
             **identity,
@@ -579,20 +849,93 @@ def freeze_benchmark(
             },
             "sources": {
                 name: {"path": str(path.resolve()), "sha256": before[name]}
-                for name, path in sources.items()
+                for name, path in all_sources.items()
             },
             "artifacts": {
-                name: directory_digest(scratch / name, suffixes=(".parquet",))
-                for name in (*sources, "source-keys")
+                name: directory_digest(scratch / role_paths[name], suffixes=(".parquet",))
+                for name in artifact_roles
             },
             "dataset_sha256": hashlib.sha256((scratch / "dataset.yaml").read_bytes()).hexdigest(),
         }
+        if study:
+            record.update(
+                study_id=benchmark_id, coverage=coverage,
+                policies={
+                    "history_missing": "zero", "actual_missing": recipe["actual_missing"],
+                    "missing_definition": "absent_row_or_null_target",
+                    "confirmed_zero": "observed", "missing_indicator": MISSING_COLUMN,
+                },
+            )
         (scratch / "benchmark.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
         _publish_frozen_benchmark(scratch, destination, benchmark_id)
     finally:
         if scratch.exists():
             shutil.rmtree(scratch)
     return destination / "benchmark.json"
+
+
+def _prepare_scoring_references(path, key_map, keys, recipe, spark):
+    """Bind caller-supplied weights and scales to each complete frozen boundary.
+
+    The nested keys field keeps arbitrary source key names separate from metric fields.
+    Deriving business weights or scales is deliberately outside preparation.
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import NumericType, StringType, StructType
+
+    raw = spark.read.parquet(str(path))
+    if set(raw.columns) != {"keys", "stage", "origin", "weight", "scale"}:
+        raise BenchmarkError("scoring references require keys, stage, origin, weight, and scale")
+    key_type = raw.schema["keys"].dataType
+    if (not isinstance(key_type, StructType) or set(key_type.names) != set(keys)
+            or any(key_type[key].dataType != key_map.schema[key].dataType for key in keys)
+            or any(not isinstance(raw.schema[name].dataType, StringType)
+                   for name in ("stage", "origin"))
+            or any(not isinstance(raw.schema[name].dataType, NumericType)
+                   for name in ("weight", "scale"))):
+        raise BenchmarkError("scoring reference key, origin, weight, or scale types are invalid")
+    invalid = F.col("keys").isNull()
+    for key in keys:
+        invalid = invalid | F.col("keys")[key].isNull()
+    if raw.filter(invalid).limit(1).count():
+        raise BenchmarkError("scoring reference keys cannot be null")
+    frame = raw.select(
+        F.to_json(F.struct(*[F.col("keys")[key].alias(key) for key in keys])).alias("series_id"),
+        "stage", "origin", F.col("weight").cast("double").alias("weight"),
+        F.col("scale").cast("double").alias("scale"),
+    )
+    invalid_weight = (F.col("weight").isNull() | F.isnan("weight")
+                      | (F.abs(F.col("weight")) == float("inf")) | (F.col("weight") < 0))
+    invalid_scale = (F.col("scale").isNotNull()
+                     & (F.isnan("scale") | (F.abs(F.col("scale")) == float("inf"))
+                        | (F.col("scale") < 0)))
+    if frame.filter(invalid_weight | invalid_scale).limit(1).count():
+        raise BenchmarkError("scoring references contain invalid weights or scales")
+    cadence = _recipe_cadence(recipe)
+    boundaries = [("validation", origin, recipe["validation_horizon"])
+                  for origin in recipe["validation_origins"]]
+    boundaries.append(("test", recipe["final_train_cutoff"], recipe["final_test_horizon"]))
+    declared = spark.createDataFrame([
+        (stage, origin, boundary(stage, origin, horizon, cadence.code))
+        for stage, origin, horizon in boundaries
+    ], "stage string, origin string, boundary string")
+    expected = key_map.select(F.col("__af_series_id").alias("series_id")).crossJoin(declared)
+    columns = ["series_id", "stage", "origin"]
+    if (frame.groupBy(*columns).count().filter(F.col("count") != 1).limit(1).count()
+            or frame.join(expected, columns, "left_anti").limit(1).count()
+            or expected.join(frame, columns, "left_anti").limit(1).count()):
+        raise BenchmarkError(
+            "scoring references must cover every retained series and boundary once"
+        )
+    totals = frame.groupBy("stage", "origin").agg(F.sum("weight").alias("total"))
+    if totals.filter(
+        F.col("total").isNull() | (F.col("total") <= 0)
+        | F.isnan("total") | (F.col("total") == float("inf"))
+    ).limit(1).count():
+        raise BenchmarkError("each scoring boundary needs a finite positive total weight")
+    return frame.join(declared, ["stage", "origin"]).select(
+        "series_id", "boundary", "weight", "scale",
+    )
 
 
 def _publish_frozen_benchmark(
@@ -633,16 +976,28 @@ def _validate_manifest(record: object) -> dict:
 
     if type(record) is not dict:
         raise BenchmarkError("benchmark manifest must be an object")
-    mapping(record, {
+    study = record.get("schema") == STUDY_SCHEMA
+    fields = {
         "schema", "recipe", "key_types", "contract_sha256", "logical_snapshots",
         "source_series_count", "excluded_new_series", "cohort_series_count",
         "dataset_sha256", "grid_identities", "benchmark_id", "grids", "counts",
         "policies", "sources", "artifacts",
-    }, "manifest")
-    if record["schema"] != SCHEMA:
+    }
+    if study:
+        fields.update({
+            "study_id", "role_paths", "metric_definition", "coverage", "coverage_identities",
+        })
+    mapping(record, fields, "manifest")
+    if record["schema"] not in (SCHEMA, STUDY_SCHEMA):
         raise BenchmarkError("unsupported benchmark schema")
     recipe = record["recipe"]
     validate_recipe(recipe)
+    if recipe["schema_version"] != (2 if study else 1):
+        raise BenchmarkError("benchmark schema and recipe version disagree")
+    if study and (recipe != _normalise_recipe(recipe)
+                  or record["study_id"] != record["benchmark_id"]
+                  or record["metric_definition"] != _metric_definition(recipe)):
+        raise BenchmarkError("study identity, defaults, or metric definition changed")
     for name in ("benchmark_id", "contract_sha256", "dataset_sha256"):
         sha256(record[name], name)
     types = mapping(record["key_types"], recipe["source_keys"], "key_types")
@@ -655,10 +1010,18 @@ def _validate_manifest(record: object) -> dict:
     if record["source_series_count"] - cohort != record["excluded_new_series"]:
         raise BenchmarkError("benchmark population counts do not reconcile")
     source_roles = {"selection", "final_training", "final_score"}
+    if study:
+        source_roles.add("validation_score")
+        if recipe["metric"] == "wrmsse":
+            source_roles.add("scoring_references")
     roles = source_roles | {"source-keys"}
     for name in ("artifacts", "logical_snapshots"):
         for role, value in mapping(record[name], roles, name).items():
             sha256(value, f"{name}.{role}")
+    if study:
+        paths = mapping(record["role_paths"], roles, "role_paths")
+        if any(type(value) is not str or value not in roles for value in paths.values()):
+            raise BenchmarkError("study role paths must name frozen artifact directories")
     for role, value in mapping(record["sources"], source_roles, "sources").items():
         mapping(value, {"path", "sha256"}, f"sources.{role}")
         if type(value["path"]) is not str or not value["path"].strip():
@@ -668,6 +1031,12 @@ def _validate_manifest(record: object) -> dict:
         "absent_rows": "error", "null_targets": "error", "confirmed_zero": "observed",
         "late_feeds": "error", "retirement": "error",
     }
+    if study:
+        policies = {
+            "history_missing": "zero", "actual_missing": recipe["actual_missing"],
+            "missing_definition": "absent_row_or_null_target",
+            "confirmed_zero": "observed", "missing_indicator": MISSING_COLUMN,
+        }
     if record["policies"] != policies:
         raise BenchmarkError("benchmark observation policies changed")
     cadence = _recipe_cadence(recipe)
@@ -683,13 +1052,24 @@ def _validate_manifest(record: object) -> dict:
         ),
         "final_score": recipe["final_test_horizon"],
     }
-    for role, values in mapping(record["counts"], source_roles, "counts").items():
-        mapping(values, {"required_observations", "written_rows"}, f"counts.{role}")
+    if study:
+        role_periods["validation_score"] = role_periods["final_training"]
+    for role, values in mapping(record["counts"], role_periods, "counts").items():
+        fields = {"required_observations", "written_rows"}
+        if study:
+            fields.update({"originally_missing", "zero_filled"})
+        mapping(values, fields, f"counts.{role}")
         for key, value in values.items():
             count(value, f"counts.{role}.{key}")
-        if (values["required_observations"] != cohort * role_periods[role]
+        required = values["required_observations"]
+        variable_history = study and role != "final_score"
+        if ((not variable_history and required != cohort * role_periods[role])
+                or (variable_history and not cohort <= required <= cohort * role_periods[role])
                 or values["written_rows"] < values["required_observations"]):
             raise BenchmarkError("benchmark observation counts do not reconcile")
+        if study and not (0 <= values["originally_missing"] <= required
+                          and values["zero_filled"] == values["originally_missing"]):
+            raise BenchmarkError("study history filling counts do not reconcile")
     boundaries = {
         boundary(
             "validation", origin, recipe["validation_horizon"], cadence.code
@@ -720,6 +1100,27 @@ def _validate_manifest(record: object) -> dict:
                 raise BenchmarkError("benchmark grid population count changed")
         if item["logical_sha256"] != identity["logical_sha256"]:
             raise BenchmarkError("benchmark grid logical identity changed")
+    if study:
+        coverage = mapping(record["coverage"], boundaries, "coverage")
+        identities = mapping(record["coverage_identities"], boundaries, "coverage_identities")
+        names = {"expected", "originally_missing", "zero_filled", "excluded", "scored"}
+        for key, horizon in boundaries.items():
+            item = mapping(coverage[key], {"path", "sha256"}, "coverage artifact")
+            identity = mapping(identities[key], {"content_sha256", "counts"}, "coverage identity")
+            if item["path"] != "coverage/" + key:
+                raise BenchmarkError("study coverage path changed")
+            sha256(item["sha256"], "coverage sha256")
+            sha256(identity["content_sha256"], "coverage content_sha256")
+            totals = mapping(identity["counts"], names, "coverage counts")
+            for name, value in totals.items():
+                count(value, f"coverage.{name}")
+            missing = totals["originally_missing"]
+            if (totals["expected"] != cohort * horizon or missing > totals["expected"]
+                    or totals["zero_filled"]
+                    != (missing if recipe["actual_missing"] == "zero" else 0)
+                    or totals["excluded"] != (missing if recipe["actual_missing"] == "mask" else 0)
+                    or totals["scored"] != totals["expected"] - totals["excluded"]):
+                raise BenchmarkError("study scoring coverage counts do not reconcile")
     return record
 
 
@@ -747,13 +1148,17 @@ def verify_benchmark(
 ) -> tuple[pathlib.Path, dict]:
     """Authenticate frozen outputs; original mutable sources are recorded but never re-read."""
     path, record = read_benchmark_manifest(path, expected_sha256)
+    checked = {}
     for name, expected in record["artifacts"].items():
-        target = path.parent / name
-        if (
-            not target.resolve().is_relative_to(path.parent.resolve())
-            or directory_digest(target, suffixes=(".parquet",)) != expected
-            or _parquet_hash(target) != record["logical_snapshots"][name]
-        ):
+        target = artifact_path(path, record, name)
+        if not target.resolve().is_relative_to(path.parent.resolve()):
+            raise BenchmarkError(f"benchmark artifact escaped its directory: {name}")
+        if target not in checked:
+            physical = directory_digest(target, suffixes=(".parquet",))
+            if physical != expected:
+                raise BenchmarkError(f"benchmark artifact changed: {name}")
+            checked[target] = physical, _parquet_hash(target)
+        if checked[target] != (expected, record["logical_snapshots"][name]):
             raise BenchmarkError(f"benchmark artifact changed: {name}")
     for key, item in record["grids"].items():
         target = path.parent / item["path"]
@@ -765,6 +1170,12 @@ def verify_benchmark(
             or item["n_cells"] != record["grid_identities"][key]["n_cells"]
         ):
             raise BenchmarkError("benchmark scoring grid changed")
+    for key, item in record.get("coverage", {}).items():
+        target = path.parent / item["path"]
+        if (not target.resolve().is_relative_to(path.parent.resolve())
+                or directory_digest(target, suffixes=(".parquet",)) != item["sha256"]
+                or _parquet_hash(target) != record["coverage_identities"][key]["content_sha256"]):
+            raise BenchmarkError("study scoring coverage changed")
     if (
         hashlib.sha256((path.parent / "dataset.yaml").read_bytes()).hexdigest()
         != record["dataset_sha256"]
@@ -791,6 +1202,26 @@ def _evaluation_contract_from_record(
     key = boundary(stage, origin, horizon, cadence.code)
     if key not in record["grids"]:
         raise BenchmarkError("evaluation boundary absent from frozen benchmark")
+    if record["schema"] == STUDY_SCHEMA:
+        path = path.resolve()
+        if metric != record["recipe"]["metric"]:
+            raise BenchmarkError("metric differs from the frozen study")
+        role = "validation_score" if stage == "validation" else "final_score"
+        return {
+            "schema": "autoforecast.fixed-evaluation.v2",
+            "benchmark_id": record["benchmark_id"], "study_id": record["study_id"],
+            "study": {"path": str(path.resolve()),
+                      "sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+            "boundary": key,
+            "grid": {**record["grids"][key],
+                     "path": str(path.parent / record["grids"][key]["path"])},
+            "metric_policy": record["metric_definition"],
+            "actuals": {"role": role, "path": str(artifact_path(path, record, role)),
+                        "sha256": record["artifacts"][role]},
+            "coverage": {**record["coverage"][key],
+                         **record["coverage_identities"][key],
+                         "path": str(path.parent / record["coverage"][key]["path"])},
+        }
     if metric not in {"rmse", "mae", "wape"}:
         raise BenchmarkError("generic fixed benchmark supports rmse, mae, or wape; M5 owns WRMSSE")
     return {
