@@ -18,6 +18,7 @@ from autoforecast.forecast_campaign import (
     _load_json_with_identity,
     _verified_forecast,
 )
+from autoforecast.frequency import parse_frequency, period_points
 from provenance.lineage import directory_digest
 
 ROW_SCHEMA = pa.schema(
@@ -84,6 +85,7 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
             _completed_output(store.root, "final_score", "final-score.json")
         )
     source_keys = None
+    frequency = None
     if benchmark:
         path, frozen = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
         if frozen["benchmark_id"] != benchmark["id"]:
@@ -93,6 +95,7 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
         target = load_dataset_contract(path.parent / "dataset.yaml").panel(
             path.parent / "selection"
         )
+        frequency = parse_frequency(target.frequency).code
         source_keys = pq.read_table(path.parent / "source-keys")
         metadata.update(
             {
@@ -182,6 +185,10 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
             expected_origin=result["origin"],
             expected_horizon=result["horizon"],
         )
+        forecast_frequency = parse_frequency(forecast.frequency).code
+        if frequency is not None and forecast_frequency != frequency:
+            raise ValueError("forecast frequency differs from campaign results")
+        frequency = forecast_frequency
         if (
             directory_digest(forecast.path, suffixes=(".parquet",))
             != result["forecast_artifact_sha256"]
@@ -193,6 +200,7 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
                 **base,
                 **result,
                 "run_id": run_id,
+                "frequency": frequency,
                 "stage": stage_name,
                 "declined_cell_identity": "unavailable; aggregate disposition only",
             }
@@ -213,7 +221,13 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
                 }
             )
     store.verify_completed_outputs()
-    table = pa.Table.from_pylist(rows, schema=ROW_SCHEMA)
+    metadata["frequency"] = frequency or "D"
+    schema = ROW_SCHEMA
+    if parse_frequency(metadata["frequency"]).key_kind == "timestamp":
+        schema = schema.set(
+            schema.get_field_index("target_date"), pa.field("target_date", pa.timestamp("us"))
+        )
+    table = pa.Table.from_pylist(rows, schema=schema)
     identities = [(r["run_id"], r["series_id"], r["target_date"]) for r in rows]
     if len(set(identities)) != len(identities):
         raise ValueError("duplicate result cell identity")
@@ -258,13 +272,11 @@ def comparison_plot(
         key = (row["model_id"], row["variant_id"], row["run_id"], row["stage"], row["origin"])
         groups.setdefault(key, []).append(row)
     figure, axis = plt.subplots(figsize=(12, 5))
-    import datetime as dt
-
     for key, values in sorted(groups.items()):
         by_date = {row["target_date"]: row["prediction"] for row in values}
         run = next(item for item in results.runs if item.get("run_id") == key[2])
-        origin = dt.date.fromisoformat(key[4])
-        dates = [origin + dt.timedelta(days=i) for i in range(1, run["horizon"] + 1)]
+        frequency = run.get("frequency", results.metadata.get("frequency", "D"))
+        dates = period_points(key[4], frequency, run["horizon"])
         axis.plot(
             dates,  # pyright: ignore[reportArgumentType]  # Matplotlib accepts date units.
             [by_date.get(day, float("nan")) for day in dates],
@@ -274,7 +286,7 @@ def comparison_plot(
     axis.set(
         title=f"{series_id} — {results.metadata['comparison_scope']}",
         ylabel=results.metadata.get("target_unit", "prediction"),
-        xlabel="Target date",
+        xlabel="Target time",
     )
     axis.legend(fontsize="x-small")
     figure.autofmt_xdate()

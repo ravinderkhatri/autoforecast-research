@@ -1,12 +1,11 @@
 """Estimate residual headroom above a baseline with a leave-one-out oracle. The oracle uses the
-other observations with the same series and weekday within the held-out horizon. It is a
+other observations with the same series and cadence-specific seasonal slot in the horizon. It is a
 diagnostic proxy, never a deployable adapter or a fair model comparator. Its remaining error and
 reducible_share depend on the chosen horizon and available covariates.
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import pathlib
 from dataclasses import dataclass
 
@@ -14,7 +13,9 @@ from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
 from autoforecast._numeric import is_finite_real
-from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel, PanelError, period_days
+from autoforecast.frequency import parse_frequency, period_points
+from autoforecast.grid import canonical_key, period_membership
+from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 from autoforecast.ranking import MissingForecastPolicy, finalize_forecast_on_grid
 from autoforecast.score import Score
 from autoforecast.score_spark import MissingActual, score_forecast
@@ -103,10 +104,12 @@ def oracle_forecast(
     spark: SparkSession,
     out_dir: str | pathlib.Path,
 ) -> Forecast:
-    """A leave-one-out day-of-week oracle over the HELD-OUT window. Not a forecaster.
+    """A leave-one-out seasonal-slot oracle over the HELD-OUT window. Not a forecaster.
 
     For each eligible cell in the declared `horizon`-period grid, predicts the mean of the
-    other cells with the same series and day of week inside that window: `(sum - y) / (n - 1)`.
+    other cells with the same series and cadence-specific seasonal slot inside that window:
+    hour-of-week for H, weekday for D, one weekly phase for W, month for M, and one yearly phase
+    for Y. The leave-one-out value is `(sum - y) / (n - 1)`.
 
     It sees the answer. That is the point -- it bounds what any predictor could achieve if it knew
     the horizon's day-of-week structure exactly -- and it is why this function is not registered.
@@ -128,24 +131,44 @@ def oracle_forecast(
     if type(horizon) is not int or horizon < 1:
         raise HeadroomError(f"horizon must be a positive integer, got {horizon!r}")
     try:
-        d0 = dt.date.fromisoformat(origin)
-        stride = period_days(panel.frequency)
-        dates = tuple(
-            d0 + dt.timedelta(days=stride * step) for step in range(1, horizon + 1)
+        cadence = parse_frequency(panel.frequency)
+        dates = period_points(origin, cadence, horizon)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HeadroomError(
+            f"origin/frequency does not define a supported canonical period grid: {exc}"
+        ) from exc
+    panel.validate()
+    raw = spark.read.parquet(panel.path)
+    if cadence.key_kind == "timestamp" and (
+        raw.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise HeadroomError(
+            f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type"
         )
-    except (TypeError, ValueError, OverflowError, PanelError) as exc:
-        raise HeadroomError("origin/frequency does not define a supported period grid") from exc
-    if d0.isoformat() != origin:
-        raise HeadroomError(f"origin must be canonical ISO YYYY-MM-DD, got {origin!r}")
-    df = spark.read.parquet(panel.path).filter(
-        F.to_date(F.col(panel.time_col)).isin(*dates))
+    time_key, valid_time_key = canonical_key(panel.time_col, cadence)
+    prepared = raw.withColumn("__af_oracle_time", time_key).withColumn(
+        "__af_oracle_valid_time", valid_time_key
+    )
+    if prepared.filter(~F.col("__af_oracle_valid_time")).limit(1).count():
+        raise HeadroomError(
+            f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    df = prepared.filter(period_membership("__af_oracle_time", dates, cadence))
     if panel.has_exposure:
         df = df.filter(F.col(panel.exposure_col).isin(*sorted(ELIGIBLE_STATES)))
     df = df.select(F.col(panel.series_col).alias("series_id"),
-                   F.col(panel.time_col).alias("date"),
+                   F.col("__af_oracle_time").alias("date"),
                    F.col(panel.target_col).cast("double").alias("y"))
 
-    w = Window.partitionBy("series_id", F.dayofweek("date"))
+    if cadence.unit == "H":
+        seasonal_slot = (F.dayofweek("date") - 1) * 24 + F.hour("date")
+    elif cadence.unit == "D":
+        seasonal_slot = F.dayofweek("date")
+    elif cadence.unit == "M":
+        seasonal_slot = F.month("date")
+    else:
+        seasonal_slot = F.lit(0)
+    w = Window.partitionBy("series_id", seasonal_slot)
     scored = (df.withColumn("_sum", F.sum("y").over(w))
               .withColumn("_n", F.count(F.lit(1)).over(w))
               .filter(F.col("_n") > 1)
@@ -155,7 +178,7 @@ def oracle_forecast(
     if n_emitted == 0:
         raise HeadroomError(
             f"no eligible cell in the {horizon}-period grid after {origin} has another cell with "
-            "the same day of week, so a leave-one-out oracle is undefined")
+            "the same seasonal slot, so a leave-one-out oracle is undefined")
     n_series = df.select("series_id").distinct().count()
     scored.write.mode("overwrite").parquet(str(out_dir))
 

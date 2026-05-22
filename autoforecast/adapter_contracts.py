@@ -17,16 +17,22 @@ class AdapterDescriptor:
     consumes_exposure: bool = True
     handles_right_censoring: bool = False
     requires_complete_window: bool = False
+    supported_frequency_families: tuple[str, ...] = ("D",)
+    supports_strided_daily: bool = False
 
 
 DESCRIPTORS = {
     "seasonal_naive": AdapterDescriptor(
         "naive", "seasonal_naive", "builtin", "season",
         target_estimands=("sales_given_availability", "observed_nonnegative"),
+        supported_frequency_families=("H", "D", "W", "M", "Y"),
+        supports_strided_daily=True,
     ),
     "last_value": AdapterDescriptor(
         "last_value", "fit_predict", "builtin", "one", requires_complete_window=True,
         target_estimands=("sales_given_availability", "observed_nonnegative"),
+        supported_frequency_families=("H", "D", "W", "M", "Y"),
+        supports_strided_daily=True,
     ),
     "croston": AdapterDescriptor("classical", "forecast_with", "classical", "two"),
     "auto_ets": AdapterDescriptor("classical", "forecast_with", "classical", "auto_ets"),
@@ -94,6 +100,11 @@ def descriptor(name: str) -> AdapterDescriptor:
         or not result.callable.isidentifier()
         or result.parameters not in {"none", "typed"}
         or result.frequency != "D"
+        or not result.supported_frequency_families
+        or len(set(result.supported_frequency_families))
+        != len(result.supported_frequency_families)
+        or not set(result.supported_frequency_families) <= {"H", "D", "W", "M", "Y"}
+        or type(result.supports_strided_daily) is not bool
         or result.operations != ("fit_predict",)
     ):
         raise ValueError(f"incomplete or unsupported adapter descriptor: {name}")

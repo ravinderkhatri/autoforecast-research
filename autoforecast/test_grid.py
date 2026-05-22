@@ -8,6 +8,7 @@ the custom model's exposure implementation. Run with the repository's Java/Pytho
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import pathlib
 import sys
@@ -15,10 +16,12 @@ import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from autoforecast import grid
+from autoforecast.frequency import parse_frequency
 
 ORIGIN = "2024-01-03"
 HORIZON = 3
@@ -33,6 +36,7 @@ def spark() -> SparkSession:
             raise RuntimeError("JAVA_HOME unset; set JAVA_HOME to a Java 17 installation.")
         _SPARK = (SparkSession.builder.master("local[2]").appName("test_grid")
                   .config("spark.sql.shuffle.partitions", "2")
+                  .config("spark.sql.session.timeZone", "Asia/Kolkata")
                   .config("spark.driver.memory", "2g")
                   .config("spark.ui.enabled", "false")
                   .config("spark.ui.showConsoleProgress", "false").getOrCreate())
@@ -55,6 +59,22 @@ def source() -> pathlib.Path:
     (spark().createDataFrame(rows, "id string, day string, eligible boolean")
      .withColumn("day", F.to_date("day"))
      .write.parquet(str(path)))
+    return path
+
+
+def hourly_source() -> pathlib.Path:
+    path = pathlib.Path(tempfile.mkdtemp()) / "hourly-panel"
+    rows = [
+        ("a", dt.datetime(2024, 3, 1, 22), False),
+        ("a", dt.datetime(2024, 3, 1, 23), True),
+        ("a", dt.datetime(2024, 3, 2, 0), True),
+        ("b", dt.datetime(2024, 3, 1, 22), False),
+        ("b", dt.datetime(2024, 3, 1, 23), False),
+        ("b", dt.datetime(2024, 3, 2, 0), True),
+    ]
+    spark().createDataFrame(
+        rows, "id string, time timestamp_ntz, eligible boolean",
+    ).write.parquet(str(path))
     return path
 
 
@@ -85,6 +105,104 @@ def test_build_materialises_the_declared_integral_day_cadence() -> None:
     assert dates == {"2024-01-05", "2024-01-07"}
 
 
+def test_build_preserves_two_hourly_keys_on_one_calendar_day() -> None:
+    path = grid.build(
+        hourly_source(), "2024-03-01T22:00:00", 2, spark(), tempfile.mkdtemp(),
+        series_col="id", time_col="time", frequency="H",
+    )
+    rows = spark().read.parquet(str(path)).collect()
+    assert spark().conf.get("spark.sql.session.timeZone") == "Asia/Kolkata"
+    assert spark().read.parquet(str(path)).schema["date"].dataType.typeName() == "timestamp_ntz"
+    assert {(row["series_id"], row["date"]) for row in rows} == {
+        ("a", dt.datetime(2024, 3, 1, 23)),
+        ("a", dt.datetime(2024, 3, 2, 0)),
+        ("b", dt.datetime(2024, 3, 1, 23)),
+        ("b", dt.datetime(2024, 3, 2, 0)),
+    }
+
+
+def test_hourly_full_cross_product_only_requires_series_ids() -> None:
+    source_path = pathlib.Path(tempfile.mkdtemp()) / "series"
+    spark().createDataFrame([("a",), ("b",)], "id string").write.parquet(str(source_path))
+    path = grid.build(
+        source_path, "2024-03-01T22:00:00", 2, spark(), tempfile.mkdtemp(),
+        series_col="id", time_col="unused", frequency="H",
+    )
+    assert {(row["series_id"], row["date"])
+            for row in spark().read.parquet(str(path)).collect()} == {
+        ("a", dt.datetime(2024, 3, 1, 23)),
+        ("a", dt.datetime(2024, 3, 2, 0)),
+        ("b", dt.datetime(2024, 3, 1, 23)),
+        ("b", dt.datetime(2024, 3, 2, 0)),
+    }
+
+
+def test_hourly_literals_and_membership_ignore_the_non_utc_session_zone() -> None:
+    cadence = parse_frequency("H")
+    frame = spark().createDataFrame(
+        [(dt.datetime(2024, 3, 1, 22),), (dt.datetime(2024, 3, 1, 23),)],
+        "date timestamp_ntz",
+    )
+    literal = spark().range(1).select(
+        grid.time_literal(dt.datetime(2024, 3, 1, 22), cadence).alias("date"),
+    ).collect()[0]["date"]
+    assert literal == dt.datetime(2024, 3, 1, 22)
+    assert [row["date"] for row in frame.filter(
+        grid.period_membership("date", [dt.datetime(2024, 3, 1, 23)], cadence)
+    ).collect()] == [dt.datetime(2024, 3, 1, 23)]
+
+
+def test_period_membership_handles_a_large_hourly_history_as_one_native_predicate() -> None:
+    cadence = parse_frequency("H")
+    start = dt.datetime(2024, 1, 1)
+    history = tuple(start + dt.timedelta(hours=index) for index in range(1024))
+    frame = spark().createDataFrame(
+        [(point,) for point in (*history, start + dt.timedelta(hours=1024))],
+        "date timestamp_ntz",
+    )
+
+    predicate = grid.period_membership("date", history, cadence)
+    assert str(predicate).startswith("Column<'in(")
+    selected = frame.filter(predicate)
+
+    assert selected.count() == 1024
+    assert selected.agg(F.min("date"), F.max("date")).first() == (
+        history[0],
+        history[-1],
+    )
+    assert frame.filter(grid.period_membership("date", (), cadence)).count() == 0
+
+
+def test_hourly_effective_eligibility_uses_the_exact_timestamp_key() -> None:
+    path = grid.build(
+        hourly_source(), "2024-03-01T22:00:00", 2, spark(), tempfile.mkdtemp(),
+        series_col="id", time_col="time", eligible_col="eligible", frequency="H",
+    )
+    assert {(row["series_id"], row["date"])
+            for row in spark().read.parquet(str(path)).collect()} == {
+        ("a", dt.datetime(2024, 3, 1, 23)),
+        ("a", dt.datetime(2024, 3, 2, 0)),
+        ("b", dt.datetime(2024, 3, 2, 0)),
+    }
+
+
+def test_build_uses_anchored_calendar_points() -> None:
+    monthly = grid.build(
+        source(), "2024-01-31", 3, spark(), tempfile.mkdtemp(),
+        series_col="id", time_col="day", frequency="M",
+    )
+    assert {row["date"] for row in spark().read.parquet(str(monthly)).collect()} == {
+        dt.date(2024, 2, 29), dt.date(2024, 3, 31), dt.date(2024, 4, 30),
+    }
+    month_start = grid.build(
+        source(), "2024-01-01", 2, spark(), tempfile.mkdtemp(),
+        series_col="id", time_col="day", frequency="MS",
+    )
+    assert {row["date"] for row in spark().read.parquet(str(month_start)).collect()} == {
+        dt.date(2024, 2, 1), dt.date(2024, 3, 1),
+    }
+
+
 def test_summarise_reports_density_of_a_ragged_grid() -> None:
     path = grid.build(source(), ORIGIN, HORIZON, spark(), tempfile.mkdtemp(),
                       series_col="id", time_col="day", eligible_col="eligible")
@@ -113,6 +231,63 @@ def test_content_hash_refuses_duplicate_or_invalid_keys() -> None:
         assert "duplicate" in str(exc)
     else:
         raise AssertionError("hashed a grid with duplicate keys")
+
+
+def test_content_hash_preserves_hourly_keys_instead_of_collapsing_to_date() -> None:
+    one = pathlib.Path(tempfile.mkdtemp()) / "one"
+    two = pathlib.Path(tempfile.mkdtemp()) / "two"
+    spark().createDataFrame(
+        [("a", dt.datetime(2024, 3, 1, 22))], "series_id string, date timestamp_ntz",
+    ).write.parquet(str(one))
+    spark().createDataFrame(
+        [("a", dt.datetime(2024, 3, 1, 23))], "series_id string, date timestamp_ntz",
+    ).write.parquet(str(two))
+    assert grid.content_hash(one, spark(), frequency="H") != grid.content_hash(
+        two, spark(), frequency="H",
+    )
+
+
+def test_grid_key_validation_refuses_lossy_and_off_anchor_values() -> None:
+    lossy = pathlib.Path(tempfile.mkdtemp()) / "lossy"
+    spark().createDataFrame(
+        [("a", dt.datetime(2024, 1, 31, 1), True)],
+        "id string, time timestamp_ntz, eligible boolean",
+    ).write.parquet(str(lossy))
+    with pytest.raises(grid.GridError, match="lossy"):
+        grid.build(
+            lossy, "2024-01-30", 1, spark(), tempfile.mkdtemp(),
+            series_col="id", time_col="time", eligible_col="eligible", frequency="D",
+        )
+
+    off_anchor = pathlib.Path(tempfile.mkdtemp()) / "off-anchor"
+    spark().createDataFrame(
+        [("a", dt.date(2024, 2, 28), True)],
+        "id string, time date, eligible boolean",
+    ).write.parquet(str(off_anchor))
+    with pytest.raises(grid.GridError, match="off-anchor"):
+        grid.build(
+            off_anchor, "2024-01-31", 1, spark(), tempfile.mkdtemp(),
+            series_col="id", time_col="time", eligible_col="eligible", frequency="M",
+        )
+
+
+def test_hourly_grid_boundaries_require_timestamp_physical_type() -> None:
+    source_path = pathlib.Path(tempfile.mkdtemp()) / "date-panel"
+    spark().createDataFrame(
+        [("a", dt.date(2024, 3, 1), True)], "id string, time date, eligible boolean",
+    ).write.parquet(str(source_path))
+    with pytest.raises(grid.GridError, match="timestamp_ntz physical type"):
+        grid.build(
+            source_path, "2024-03-01T22:00:00", 1, spark(), tempfile.mkdtemp(),
+            series_col="id", time_col="time", eligible_col="eligible", frequency="H",
+        )
+
+    grid_path = pathlib.Path(tempfile.mkdtemp()) / "date-grid"
+    spark().createDataFrame(
+        [("a", dt.date(2024, 3, 1))], "series_id string, date date",
+    ).write.parquet(str(grid_path))
+    with pytest.raises(grid.GridError, match="timestamp_ntz physical type"):
+        grid.content_hash(grid_path, spark(), frequency="H")
 
 
 def test_agrees_with_detects_key_set_drift_in_both_directions() -> None:

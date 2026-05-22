@@ -231,9 +231,47 @@ def test_validate_refuses_a_non_positive_season_length() -> None:
 
 
 def test_validate_refuses_an_unsupported_panel_frequency() -> None:
-    for frequency in ("M", "0D", "1h", True):
-        with pytest.raises(PanelError, match="cadence"):
+    for frequency in ("0D", "1h", "YE-FEB", True):
+        with pytest.raises(PanelError, match="frequency|supported"):
             _structural_panel(frequency=frequency).validate()
+
+
+def test_panel_default_season_length_follows_the_cadence_family() -> None:
+    assert {
+        frequency: Panel("/not-read", "id", "date", "qty", frequency=frequency).season_length
+        for frequency in ("H", "D", "W", "M", "ME", "MS", "Y", "YE", "YS", "2D")
+    } == {
+        "H": 24, "D": 7, "W": 52, "M": 12, "ME": 12, "MS": 12,
+        "Y": 1, "YE": 1, "YS": 1, "2D": 7,
+    }
+    assert Panel(
+        "/not-read", "id", "date", "qty", frequency="W", season_length=7,
+    ).season_length == 7
+
+
+def test_hourly_panel_requires_a_timezone_naive_timestamp_column(tmp_path) -> None:
+    with pytest.raises(PanelError, match="time_col.*timestamp"):
+        _structural_panel(frequency="H").validate()
+
+    path = tmp_path / "hourly.parquet"
+    pq.write_table(pa.table({
+        "id": ["a"],
+        "date": pa.array([dt.datetime(2024, 1, 1, 3)], type=pa.timestamp("us")),
+        "qty": [1.0],
+    }), path)
+    Panel(path, "id", "date", "qty", frequency="H").validate()
+
+    aware = tmp_path / "aware.parquet"
+    pq.write_table(pa.table({
+        "id": ["a"],
+        "date": pa.array(
+            [dt.datetime(2024, 1, 1, 3, tzinfo=dt.UTC)],
+            type=pa.timestamp("us", tz="UTC"),
+        ),
+        "qty": [1.0],
+    }), aware)
+    with pytest.raises(PanelError, match="timezone-naive"):
+        Panel(aware, "id", "date", "qty", frequency="H").validate()
 
 
 def test_has_exposure_is_false_when_no_column_is_declared() -> None:
@@ -502,7 +540,7 @@ def test_forecast_validate_refuses_an_unknown_estimand() -> None:
 
 def test_forecast_validate_refuses_unsupported_or_unrepresentable_cadence() -> None:
     """Even an unmaterialised sidecar must describe a representable forecast calendar."""
-    for frequency in ("M", "100000000000000000000D"):
+    for frequency in ("Q", "100000000000000000000D"):
         with pytest.raises(ForecastError, match="frequency|calendar"):
             Forecast(
                 "naive",
@@ -513,6 +551,23 @@ def test_forecast_validate_refuses_unsupported_or_unrepresentable_cadence() -> N
                 {"emitted": 2},
                 frequency=frequency,
             ).validate()
+
+
+@pytest.mark.parametrize(
+    "origin,frequency",
+    [
+        ("2024-03-01T22:00:00", "H"),
+        ("2024-01-03", "W"),
+        ("2024-01-31", "M"),
+        ("2024-01-01", "MS"),
+        ("2023-12-31", "Y"),
+        ("2024-01-01", "YS"),
+    ],
+)
+def test_forecast_metadata_accepts_every_supported_cadence(origin, frequency) -> None:
+    Forecast(
+        "model", "/tmp/not-created", origin, 2, 1, {"emitted": 2}, frequency=frequency,
+    ).validate()
 
 
 def test_n_emitted_counts_every_emitted_prefixed_bucket() -> None:
@@ -556,16 +611,80 @@ def test_as_record_is_json_safe_and_states_the_derived_totals() -> None:
     assert rec["n_declined"] == 0
 
 
-def _write_forecast(root: pathlib.Path, rows: list[dict[str, object]]) -> pathlib.Path:
+def _write_forecast(
+    root: pathlib.Path,
+    rows: list[dict[str, object]],
+    *,
+    time_type: pa.DataType | None = None,
+) -> pathlib.Path:
     """Write a Spark-shaped directory (not a single file) for artifact-boundary tests."""
     root.mkdir()
     schema = pa.schema([
         ("series_id", pa.string()),
-        ("date", pa.date32()),
+        ("date", time_type or pa.date32()),
         ("yhat", pa.float64()),
     ])
     pq.write_table(pa.Table.from_pylist(rows, schema=schema), root / "part-00000.parquet")
     return root
+
+
+def test_hourly_forecast_keeps_two_hours_on_one_day_as_distinct_keys() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        root = _write_forecast(
+            pathlib.Path(d) / "forecast",
+            [
+                {"series_id": "a", "date": dt.datetime(2024, 3, 1, 23), "yhat": 1.0},
+                {"series_id": "a", "date": dt.datetime(2024, 3, 2, 0), "yhat": 2.0},
+            ],
+            time_type=pa.timestamp("us"),
+        )
+        Forecast(
+            "model", root, "2024-03-01T22:00:00", 2, 1, {"emitted": 2}, frequency="H",
+        ).validate()
+
+
+def test_hourly_forecast_refuses_date_physical_type_and_off_hour_keys() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        date_root = _write_forecast(pathlib.Path(d) / "date", [
+            {"series_id": "a", "date": dt.date(2024, 3, 2), "yhat": 1.0},
+        ])
+        with pytest.raises(ForecastError, match="Arrow timestamp"):
+            Forecast(
+                "model", date_root, "2024-03-01T22:00:00", 1, 1, {"emitted": 1},
+                frequency="H",
+            ).validate()
+
+        minute_root = _write_forecast(
+            pathlib.Path(d) / "minute",
+            [{"series_id": "a", "date": dt.datetime(2024, 3, 1, 23, 30), "yhat": 1.0}],
+            time_type=pa.timestamp("us"),
+        )
+        with pytest.raises(ForecastError, match="exact hour"):
+            Forecast(
+                "model", minute_root, "2024-03-01T22:00:00", 1, 1, {"emitted": 1},
+                frequency="H",
+            ).validate()
+
+
+def test_calendar_forecast_uses_anchored_keys_and_rejects_lossy_timestamps() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        root = _write_forecast(pathlib.Path(d) / "monthly", [
+            {"series_id": "a", "date": dt.date(2024, 2, 29), "yhat": 1.0},
+            {"series_id": "a", "date": dt.date(2024, 3, 31), "yhat": 2.0},
+        ])
+        Forecast(
+            "model", root, "2024-01-31", 2, 1, {"emitted": 2}, frequency="M",
+        ).validate()
+
+        nonmidnight = _write_forecast(
+            pathlib.Path(d) / "nonmidnight",
+            [{"series_id": "a", "date": dt.datetime(2024, 2, 29, 1), "yhat": 1.0}],
+            time_type=pa.timestamp("us"),
+        )
+        with pytest.raises(ForecastError, match="cannot discard"):
+            Forecast(
+                "model", nonmidnight, "2024-01-31", 1, 1, {"emitted": 1}, frequency="M",
+            ).validate()
 
 
 def test_forecast_validate_inspects_a_valid_existing_partition_directory() -> None:

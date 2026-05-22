@@ -29,7 +29,7 @@ jobs:
         run: |
           uv lock --check
           uv export --frozen --no-hashes --no-emit-project --group ci \
-            --extra daily --extra plots --extra catalog --extra classical --extra shallow \
+            --extra timeseries --extra plots --extra catalog --extra classical --extra shallow \
             --extra tft --extra hpo-optuna --extra hpo-ray --extra mlflow-tracking \
             --extra custom-torch --output-file "$RUNNER_TEMP/constraints.txt"
           uv pip install --system --no-deps --constraint "$RUNNER_TEMP/constraints.txt" \
@@ -40,7 +40,7 @@ jobs:
           python -m scripts.verify_public_release --wheel "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl"
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
             --build-constraints "$RUNNER_TEMP/constraints.txt" \
-            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[daily,plots,catalog,classical,shallow,tft,hpo-optuna,hpo-ray,mlflow-tracking,custom-torch]"
+            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[timeseries,plots,catalog,classical,shallow,tft,hpo-optuna,hpo-ray,mlflow-tracking,custom-torch]"
           uv pip check --system
           python - <<'PY'
           import importlib.metadata
@@ -63,7 +63,11 @@ jobs:
     strategy:
       matrix:
         input: [parquet, csv]
-        python: ['3.12', '3.13']
+        python: ['3.12']
+        frequency: ['H', 'D', 'W', 'M', 'MS', 'Y', 'YS']
+        include:
+          - {input: parquet, python: '3.13', frequency: 'D'}
+          - {input: csv, python: '3.13', frequency: 'D'}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -81,26 +85,27 @@ jobs:
       - name: Build and install wheel
         run: |
           uv lock --check
-          uv export --frozen --no-hashes --no-emit-project --group ci --extra daily --extra plots \
+          uv export --frozen --no-hashes --no-emit-project --group ci --extra timeseries --extra plots \
             --output-file "$RUNNER_TEMP/constraints.txt"
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
             --build-constraints "$RUNNER_TEMP/constraints.txt" --group ci
           python -m build --wheel --no-isolation --outdir "$RUNNER_TEMP/wheels"
           python -m scripts.verify_public_release --wheel "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl"
-          uv venv --python "$(command -v python)" "$RUNNER_TEMP/daily-env"
-          uv pip install --python "$RUNNER_TEMP/daily-env/bin/python" \
+          uv venv --python "$(command -v python)" "$RUNNER_TEMP/timeseries-env"
+          uv pip install --python "$RUNNER_TEMP/timeseries-env/bin/python" \
             --constraint "$RUNNER_TEMP/constraints.txt" --build-constraints "$RUNNER_TEMP/constraints.txt" \
-            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[daily,plots]"
-          uv pip check --python "$RUNNER_TEMP/daily-env/bin/python"
+            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[timeseries,plots]"
+          uv pip check --python "$RUNNER_TEMP/timeseries-env/bin/python"
       - name: Verify installed package outside checkout
         env:
           FORECAST_SPARK_CORES: '2'
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
           INPUT_FORMAT: ${{ matrix.input }}
+          FREQUENCY: ${{ matrix.frequency }}
         run: |
           cd "$RUNNER_TEMP"
-          daily-env/bin/python - <<'PY'
+          timeseries-env/bin/python - <<'PY'
           import pathlib
           import autoforecast
           root = pathlib.Path(autoforecast.__file__).parent.parent
@@ -111,7 +116,7 @@ jobs:
               package.chmod(0o555)
           PY
           if [ "$INPUT_FORMAT" = csv ]; then
-            env -u PYTHONPATH daily-env/bin/python -m scripts.verify_daily_release "$RUNNER_TEMP/project" --csv
+            env -u PYTHONPATH timeseries-env/bin/python -m scripts.verify_timeseries_release "$RUNNER_TEMP/project" --frequency "$FREQUENCY" --csv
           else
-            env -u PYTHONPATH daily-env/bin/python -m scripts.verify_daily_release "$RUNNER_TEMP/project"
+            env -u PYTHONPATH timeseries-env/bin/python -m scripts.verify_timeseries_release "$RUNNER_TEMP/project" --frequency "$FREQUENCY"
           fi

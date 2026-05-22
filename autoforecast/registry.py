@@ -8,11 +8,16 @@ limitation may still compete on a compatible estimand, but it may not compete si
 
 from __future__ import annotations
 
-import datetime as dt
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from autoforecast.panel import Forecast, Panel, PanelError, period_days
+from autoforecast.frequency import (
+    advance,
+    frequency_is_supported,
+    parse_frequency,
+    parse_origin,
+)
+from autoforecast.panel import Forecast, Panel
 
 ForecastFn = Callable[..., Forecast]
 
@@ -45,6 +50,8 @@ class Entry:
     consumes_exposure: bool
     handles_right_censoring: bool
     supported_estimands: frozenset[str]
+    supported_frequency_families: frozenset[str] = frozenset({"D"})
+    supports_strided_daily: bool = False
     handicap: str | None = None
 
 
@@ -58,6 +65,8 @@ def register(
     consumes_exposure: bool,
     handles_right_censoring: bool,
     supported_estimands: frozenset[str],
+    supported_frequency_families: frozenset[str] = frozenset({"D"}),
+    supports_strided_daily: bool = False,
     handicap: str | None = None,
 ) -> Entry:
     """Add an implementation to the registry.
@@ -94,6 +103,21 @@ def register(
         raise RegistryError(
             f"{name!r}: supported_estimands must be a non-empty frozenset within "
             f"{sorted(valid_estimands)}, got {supported_estimands!r}")
+    valid_frequencies = {"H", "D", "W", "M", "Y"}
+    if (
+        not isinstance(supported_frequency_families, frozenset)
+        or not supported_frequency_families
+        or not supported_frequency_families <= valid_frequencies
+    ):
+        raise RegistryError(
+            f"{name!r}: supported_frequency_families must be a non-empty frozenset within "
+            f"{sorted(valid_frequencies)}, got {supported_frequency_families!r}"
+        )
+    if type(supports_strided_daily) is not bool:
+        raise RegistryError(
+            f"{name!r}: supports_strided_daily must be a boolean, "
+            f"got {supports_strided_daily!r}"
+        )
     if "unconstrained_demand" in supported_estimands and not handles_right_censoring:
         raise RegistryError(
             f"{name!r} claims unconstrained_demand without right-censor handling. Filtering "
@@ -111,7 +135,10 @@ def register(
         )
     entry = Entry(name=name, forecast=forecast, consumes_exposure=consumes_exposure,
                   handles_right_censoring=handles_right_censoring,
-                  supported_estimands=supported_estimands, handicap=handicap)
+                  supported_estimands=supported_estimands,
+                  supported_frequency_families=supported_frequency_families,
+                  supports_strided_daily=supports_strided_daily,
+                  handicap=handicap)
     _ENTRIES[name] = entry
     return entry
 
@@ -168,13 +195,26 @@ def run(name: str, panel: Panel, origin: str, horizon: int, **kwargs: object) ->
     if type(horizon) is not int or horizon < 1:
         raise RegistryError(f"horizon must be a positive integer, got {horizon!r}")
     try:
-        origin_day = dt.date.fromisoformat(origin)
-        stride = period_days(panel.frequency)
-        origin_day + dt.timedelta(days=horizon * stride)
-    except (TypeError, ValueError, OverflowError, PanelError) as exc:
-        raise RegistryError("origin/frequency does not define a supported forecast span") from exc
-    if origin_day.isoformat() != origin:
-        raise RegistryError(f"origin must be canonical ISO YYYY-MM-DD, got {origin!r}")
+        cadence = parse_frequency(panel.frequency)
+        if not frequency_is_supported(
+            cadence,
+            entry.supported_frequency_families,
+            supports_strided_daily=entry.supports_strided_daily,
+        ):
+            raise RegistryError(
+                f"adapter {name!r} supports frequency families "
+                f"{sorted(entry.supported_frequency_families)} with "
+                f"supports_strided_daily={entry.supports_strided_daily}, "
+                f"got {panel.frequency!r}"
+            )
+        origin_point = parse_origin(origin, cadence)
+        advance(origin_point, cadence, horizon)
+    except RegistryError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RegistryError(
+            f"origin/frequency does not define a supported forecast span: {exc}"
+        ) from exc
     out = entry.forecast(panel, origin, horizon, **kwargs)
     if not isinstance(out, Forecast):
         raise RegistryError(

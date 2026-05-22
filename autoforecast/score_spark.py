@@ -21,7 +21,9 @@ from pyspark.sql import functions as F
 from spec.forecast_spec import STATE_CODES
 
 from autoforecast._numeric import is_finite_real
-from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel, PanelError, period_days
+from autoforecast.frequency import Cadence, FrequencyError, parse_frequency, period_points
+from autoforecast.grid import canonical_key
+from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 from autoforecast.score import Score
 
 MissingActual = Literal["sparse_zero", "no_data"]
@@ -95,12 +97,16 @@ def score_forecast(
             f"{forecast.adapter}: forecast target_estimand {forecast.target_estimand!r} does not "
             f"match panel actuals {panel.target_estimand!r}. These are different quantities and "
             "cannot share an error metric")
-    if forecast.frequency != panel.frequency:
+    try:
+        forecast_cadence = parse_frequency(forecast.frequency)
+        panel_cadence = parse_frequency(panel.frequency)
+    except FrequencyError as exc:
+        raise ScoreError(f"{forecast.adapter}: invalid forecast/panel frequency: {exc}") from exc
+    if forecast_cadence.code != panel_cadence.code:
         raise ScoreError(
             f"{forecast.adapter}: forecast frequency {forecast.frequency!r} does not match "
             f"panel frequency {panel.frequency!r}")
 
-    import datetime as dt
     if (
         type(forecast.horizon) is not int
         or forecast.horizon < 1
@@ -112,20 +118,16 @@ def score_forecast(
             f"{forecast.horizon!r} and {forecast.n_series!r}"
         )
     try:
-        origin = dt.date.fromisoformat(forecast.origin)
-        stride = period_days(forecast.frequency)
-        allowed_dates = tuple(
-            origin + dt.timedelta(days=stride * step)
-            for step in range(1, forecast.horizon + 1)
+        allowed_dates = period_points(
+            forecast.origin, forecast_cadence, forecast.horizon,
         )
-    except (TypeError, ValueError, OverflowError, PanelError) as exc:
+    except (TypeError, ValueError, OverflowError, FrequencyError) as exc:
         raise ScoreError(
-            f"{forecast.adapter}: invalid origin/frequency forecast grid") from exc
-    if origin.isoformat() != forecast.origin:
-        raise ScoreError(
-            f"{forecast.adapter}: origin must be canonical ISO YYYY-MM-DD, got "
-            f"{forecast.origin!r}"
-        )
+            f"{forecast.adapter}: invalid canonical origin/frequency forecast grid: {exc}") from exc
+    key_type = "timestamp_ntz" if forecast_cadence.key_kind == "timestamp" else "date"
+    allowed_grid = spark.createDataFrame(
+        [(point,) for point in allowed_dates], f"date {key_type}",
+    )
 
     fc = spark.read.parquet(forecast.path)
     required = {"series_id", "date", "yhat"}
@@ -147,15 +149,14 @@ def score_forecast(
             f"{forecast.adapter}: forecast series_id must be non-null and non-blank")
 
     # Normalise the relational key before checking duplicates, window membership or joining.
-    # Comparing a source string directly with ISO boundary strings let ``2020-01-02x`` pass the
-    # lexical window check; it then failed the date join and a yhat=999 cell vanished as no-data.
-    # Distinct timestamp/string spellings can also collapse to one day, so uniqueness belongs to
-    # the canonical key rather than to its untrusted source representation.
-    canonical_date = F.expr("try_cast(date as date)")
-    if fc.filter(canonical_date.isNull()).limit(1).count():
-        raise ScoreError(
-            f"{forecast.adapter}: forecast date must be a valid calendar date")
-    fc = fc.withColumn("date", canonical_date)
+    # Hourly keys remain timestamps; date cadences refuse non-midnight timestamps instead of
+    # silently truncating them.
+    fc = _normalise_key(
+        fc,
+        "date",
+        forecast_cadence,
+        f"{forecast.adapter}: forecast date",
+    )
     duplicates = (fc.groupBy("series_id", "date").count().filter(F.col("count") != 1).limit(1)
                   .count())
     if duplicates:
@@ -176,7 +177,9 @@ def score_forecast(
     fc = fc.withColumn("yhat", yhat)
 
     start, end = allowed_dates[0], allowed_dates[-1]
-    bad_date = fc.filter(~F.col("date").isin(*allowed_dates)).limit(1).count()
+    bad_date = fc.select("date").join(
+        F.broadcast(allowed_grid), ["date"], "left_anti",
+    ).limit(1).count()
     if bad_date:
         raise ScoreError(
             f"{forecast.adapter}: forecast keys fall outside [{start}, {end}] or contain null "
@@ -189,7 +192,9 @@ def score_forecast(
             "table is what makes a silent shortfall detectable -- it cannot be trusted here"
         )
 
-    grid = _read_eligible_grid(eligible_grid, forecast, spark) \
+    grid = _read_eligible_grid(
+        eligible_grid, forecast, forecast_cadence, allowed_dates, allowed_grid, spark,
+    ) \
         if eligible_grid is not None else None
 
     # A missing DATE for a known series can mean a true sparse zero.  A series identifier that
@@ -212,9 +217,18 @@ def score_forecast(
             "Only missing dates for known series can use the sparse-zero convention")
 
     if restrict_to is not None:
-        keep = spark.read.parquet(restrict_to).select("series_id", "date").distinct()
+        keep_raw = spark.read.parquet(restrict_to)
+        missing_keep = sorted({"series_id", "date"} - set(keep_raw.columns))
+        if missing_keep:
+            raise ScoreError(f"restrict_to lacks required columns {missing_keep}")
+        keep = _normalise_key(
+            keep_raw.select("series_id", "date"),
+            "date",
+            forecast_cadence,
+            "restrict_to date",
+        ).distinct()
         fc = fc.join(keep, ["series_id", "date"], "inner")
-    joined = _join_actuals(fc, panel, spark)
+    joined = _join_actuals(fc, panel, panel_cadence, spark)
     actual = F.col("_actual")
     bad_actual = (joined.filter(
         F.col("_actual_present")
@@ -280,6 +294,9 @@ def score_forecast(
 def _read_eligible_grid(
     path: str,
     forecast: Forecast,
+    cadence: Cadence,
+    allowed_dates: tuple[object, ...],
+    allowed_grid: DataFrame,
     spark: SparkSession,
 ) -> DataFrame:
     """Load and validate one origin's canonical eligible series-date set."""
@@ -289,38 +306,35 @@ def _read_eligible_grid(
     if missing:
         raise ScoreError(
             f"eligible_grid lacks {missing}; required columns are {sorted(required)}")
-    grid = raw.select("series_id", F.expr("try_cast(date as date)").alias("date"))
+    grid = _normalise_key(
+        raw.select("series_id", "date"), "date", cadence, "eligible_grid date",
+    )
     bad_identity = (grid.filter(
         F.col("series_id").isNull()
         | (F.trim(F.col("series_id").cast("string")) == F.lit(""))
-        | F.col("date").isNull()
     ).limit(1).count())
     if bad_identity:
-        raise ScoreError("eligible_grid contains a null/blank series_id or invalid date")
+        raise ScoreError("eligible_grid contains a null/blank series_id")
     if grid.groupBy("series_id", "date").count().filter(F.col("count") != 1).limit(1).count():
         raise ScoreError(
             "eligible_grid contains duplicate (series_id, date) keys; joining it would multiply "
             "scored cells")
 
-    import datetime as dt
-    try:
-        origin = dt.date.fromisoformat(forecast.origin)
-        stride = period_days(forecast.frequency)
-        allowed_dates = tuple(
-            origin + dt.timedelta(days=stride * step)
-            for step in range(1, forecast.horizon + 1)
-        )
-    except (TypeError, ValueError, OverflowError, PanelError) as exc:
-        raise ScoreError(
-            f"{forecast.adapter}: invalid origin/frequency eligible-grid contract") from exc
     start, end = allowed_dates[0], allowed_dates[-1]
-    if grid.filter(~F.col("date").isin(*allowed_dates)).limit(1).count():
+    if grid.select("date").join(
+        F.broadcast(allowed_grid), ["date"], "left_anti",
+    ).limit(1).count():
         raise ScoreError(
             f"eligible_grid contains dates outside [{start}, {end}] for this forecast")
     return grid.withColumn("_grid_eligible", F.lit(True))
 
 
-def _join_actuals(fc: DataFrame, panel: Panel, spark: SparkSession) -> DataFrame:
+def _join_actuals(
+    fc: DataFrame,
+    panel: Panel,
+    cadence: Cadence,
+    spark: SparkSession,
+) -> DataFrame:
     """Left-join emitted forecast cells to the panel's actuals.
 
     LEFT, not inner. An inner join drops every forecast cell with no actual row, which is exactly
@@ -338,14 +352,11 @@ def _join_actuals(fc: DataFrame, panel: Panel, spark: SparkSession) -> DataFrame
     if panel.has_exposure:
         cols.append(F.col(panel.exposure_col).alias("_state"))
     cols.append(F.lit(True).alias("_actual_present"))
-    actuals = (raw.select(*cols)
-               .withColumn("_date", F.expr("try_cast(_raw_date as date)"))
-               .withColumn("_actual", F.expr("try_cast(_raw_actual as double)"))
-               .drop("_raw_actual", "_raw_date"))
-    if actuals.filter(F.col("_date").isNull()).limit(1).count():
-        raise ScoreError(
-            f"panel time column {panel.time_col!r} contains a null or invalid calendar date. "
-            "An unjoinable actual must not disappear as no-data")
+    actuals = raw.select(*cols)
+    actuals = _normalise_key(
+        actuals, "_raw_date", cadence, f"panel time column {panel.time_col!r}", output="_date",
+    ).withColumn("_actual", F.expr("try_cast(_raw_actual as double)")) \
+        .drop("_raw_actual", "_raw_date")
     relevant = actuals.join(fc.select(F.col("series_id").alias("_f_sid"),
                                       F.col("date").alias("_f_date")),
                             (F.col("_sid") == F.col("_f_sid"))
@@ -357,6 +368,35 @@ def _join_actuals(fc: DataFrame, panel: Panel, spark: SparkSession) -> DataFrame
     return fc.join(actuals,
                    (fc["series_id"] == actuals["_sid"]) & (fc["date"] == actuals["_date"]),
                    "left")
+
+
+def _normalise_key(
+    frame: DataFrame,
+    column: str,
+    cadence: Cadence,
+    context: str,
+    *,
+    output: str | None = None,
+) -> DataFrame:
+    """Validate and losslessly normalise one Spark time-key column."""
+    if cadence.key_kind == "timestamp" and (
+        frame.schema[column].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ScoreError(
+            f"{context} must have timestamp_ntz physical type for hourly cadence, got "
+            f"{frame.schema[column].dataType.simpleString()}"
+        )
+    key, valid = canonical_key(column, cadence)
+    if frame.filter(~valid).limit(1).count():
+        if cadence.key_kind == "timestamp":
+            detail = "a valid timezone-naive exact-hour timestamp"
+        else:
+            detail = (
+                "a valid calendar date; an invalid calendar date, lossy non-midnight timestamp, "
+                "or off-anchor key is refused"
+            )
+        raise ScoreError(f"{context} must be {detail}")
+    return frame.withColumn(output or column, key)
 
 
 def _eligible(panel: Panel, has_grid: bool) -> Column:

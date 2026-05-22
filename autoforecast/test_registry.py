@@ -10,6 +10,8 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from autoforecast import registry
@@ -38,7 +40,8 @@ def stub(name: str):
     """An adapter that returns a well-formed Forecast labelled `name`."""
     def fn(panel: Panel, origin: str, horizon: int, **kw: object) -> Forecast:
         return Forecast(name, "/tmp/f", origin, horizon, 1, {"emitted": horizon},
-                        target_estimand=panel.target_estimand).validate()
+                        target_estimand=panel.target_estimand,
+                        frequency=panel.frequency).validate()
     return fn
 
 
@@ -129,6 +132,8 @@ def test_register_refuses_malformed_capability_metadata() -> None:
         dict(name="blank_handicap", forecast=stub("blank_handicap"), consumes_exposure=False,
              handles_right_censoring=False, supported_estimands=LIMITED["supported_estimands"],
              handicap="  "),
+        dict(name="integer_stride", forecast=stub("integer_stride"), **FULL,
+             supports_strided_daily=1),
     )
     for case in cases:
         fresh()
@@ -184,6 +189,33 @@ def test_run_passes_through_a_correctly_labelled_forecast() -> None:
     assert out.adapter == "a" and out.horizon == 7 and out.n_emitted == 7
 
 
+@pytest.mark.parametrize(
+    "frequency,origin",
+    [
+        ("H", "2024-03-01T22:00:00"),
+        ("D", "2024-03-01"),
+        ("W", "2024-02-28"),
+        ("M", "2024-02-29"),
+        ("MS", "2024-03-01"),
+        ("Y", "2023-12-31"),
+        ("YS", "2024-01-01"),
+    ],
+)
+def test_run_allows_explicitly_supported_frequency_families(frequency, origin) -> None:
+    fresh()
+    registry.register(
+        "a",
+        stub("a"),
+        **FULL,
+        supported_frequency_families=frozenset({"H", "D", "W", "M", "Y"}),
+    )
+    out = registry.run(
+        "a", Panel("/tmp/unused", "id", "date", "qty", frequency=frequency), origin, 2
+    )
+    assert out.frequency == frequency and out.origin == origin
+    fresh()
+
+
 def test_run_refuses_noncanonical_span_before_adapter_execution() -> None:
     fresh()
     called = False
@@ -214,6 +246,20 @@ def test_run_refuses_an_adapter_that_changes_the_panel_cadence() -> None:
         assert "frequency" in str(exc) and "'W'" in str(exc) and "'D'" in str(exc)
         return
     raise AssertionError("accepted daily output for a weekly panel")
+
+
+def test_run_requires_explicit_capability_for_a_nonunit_daily_stride() -> None:
+    panel = Panel("/tmp/unused", "id", "date", "qty", frequency="7D")
+    fresh()
+    registry.register("exact_daily", stub("exact_daily"), **FULL)
+    with pytest.raises(registry.RegistryError, match="supports_strided_daily=False"):
+        registry.run("exact_daily", panel, "2024-01-01", 2)
+    fresh()
+    registry.register(
+        "strided_daily", stub("strided_daily"), **FULL, supports_strided_daily=True
+    )
+    assert registry.run("strided_daily", panel, "2024-01-01", 2).frequency == "7D"
+    fresh()
 
 
 def test_run_refuses_an_adapter_that_changes_the_requested_forecast_span() -> None:

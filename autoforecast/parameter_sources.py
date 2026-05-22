@@ -6,7 +6,6 @@ finite JSON record which the generic runner can verify without learning campaign
 
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import json
 import os
@@ -26,11 +25,19 @@ from spec.resolved import ResolvedBuild, ResolveError
 from autoforecast._exact_json import ExactJSONError, load_exact_json, loads_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast._numeric import is_finite_real
+from autoforecast.adapter_contracts import descriptor
 from autoforecast.experiments import (
     ExperimentError,
     load_completed_attempt,
     load_study_selection,
     require_heldout_evaluation_approval,
+)
+from autoforecast.frequency import (
+    FrequencyError,
+    frequency_is_supported,
+    parse_frequency,
+    parse_origin,
+    period_points,
 )
 from autoforecast.hpo import HPOError, HPOStudySpec, load_hpo_study
 from autoforecast.model_catalog import Candidate
@@ -41,7 +48,6 @@ from autoforecast.model_execution import (
     validate_revision_parameter_groups,
 )
 from autoforecast.model_names import REVISION_VARIANTS
-from autoforecast.panel import PanelError, period_days
 from autoforecast.precision_policy import effective_precision
 from autoforecast.tuning import (
     PARAMETER_EXECUTION_COMPATIBILITY,
@@ -724,13 +730,15 @@ def _selected_source_commit(
     training_controls = _exact_record(
         bundle / "metadata" / "training-controls.json", "source training controls"
     )
+    resolved_fields = {
+        "schema", "model_id", "adapter", "origin", "horizon", "settings", "runtime"
+    }
     if (
         set(run_definition) != {"schema", "run_id", "task", "started_at_utc"}
         or run_definition.get("schema") != "mlops.run-definition.v1"
         or run_definition.get("run_id") != bundle_parts[-1]
         or run_definition.get("task") != "forecast"
-        or set(resolved)
-        != {"schema", "model_id", "adapter", "origin", "horizon", "settings", "runtime"}
+        or set(resolved) not in (resolved_fields, resolved_fields | {"frequency"})
         or resolved.get("schema") != "autoforecast.resolved-run.v1"
         or resolved.get("model_id") != candidate.id
         or resolved.get("adapter") != candidate.adapter
@@ -921,17 +929,25 @@ def _selected_source_commit(
     ):
         raise ParameterSourceError("selected source forecast/model evidence is incomplete")
     try:
-        step_days = period_days(cast(str, forecast["frequency"]))
-        origin = dt.date.fromisoformat(cast(str, resolved["origin"]))
+        cadence = parse_frequency(cast(str, forecast["frequency"]))
+        resolved_cadence = parse_frequency(cast(str, resolved.get("frequency", "D")))
+        origin = parse_origin(cast(str, resolved["origin"]), cadence)
         target_start, target_end = (
-            dt.date.fromisoformat(item)
+            parse_origin(item, cadence)
             for item in cast(list[str], study.data["validation_target_date_range"])
         )
-    except (PanelError, TypeError, ValueError) as error:
+        expected = period_points(origin, cadence, cast(int, resolved["horizon"]))
+    except (FrequencyError, TypeError, ValueError) as error:
         raise ParameterSourceError("selected source temporal evidence is invalid") from error
     if (
-        origin + dt.timedelta(days=step_days) != target_start
-        or origin + dt.timedelta(days=step_days * cast(int, resolved["horizon"])) != target_end
+        resolved_cadence.code != cadence.code
+        or not frequency_is_supported(
+            cadence,
+            descriptor(candidate.adapter).supported_frequency_families,
+            supports_strided_daily=descriptor(candidate.adapter).supports_strided_daily,
+        )
+        or expected[0] != target_start
+        or expected[-1] != target_end
         or cast(dict[str, object], plan["effective_parameters"])["data.horizon"]
         != resolved["horizon"]
     ):

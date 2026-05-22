@@ -16,6 +16,8 @@ dependencies = []
 autoforecast = "autoforecast.cli:main"
 
 [project.optional-dependencies]
+timeseries = ["PyYAML==6.0.3", "pyspark==4.2.0", "pyarrow==24.0.0", "numpy==2.5.3", "pandas==2.3.3", "psutil==7.2.2"]
+# Compatibility name for existing installations; daily is the default cadence, not a restriction.
 daily = ["PyYAML==6.0.3", "pyspark==4.2.0", "pyarrow==24.0.0", "numpy==2.5.3", "pandas==2.3.3", "psutil==7.2.2"]
 plots = ["matplotlib==3.11.1"]
 # Optional dataset acquisition and frame libraries.

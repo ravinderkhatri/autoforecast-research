@@ -108,6 +108,30 @@ def _id(value: object, label: str) -> str:
     return value
 
 
+def _canonical_time_text(value: object, label: str) -> str:
+    """Accept a canonical date or timezone-naive exact-hour timestamp without choosing cadence."""
+    if type(value) is not str:
+        raise TrainWorkflowError(f"{label} must be a canonical ISO date or exact-hour timestamp")
+    try:
+        if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+            parsed: dt.date | dt.datetime = dt.date.fromisoformat(value)
+            canonical = parsed.isoformat()
+        elif re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00", value):
+            parsed = dt.datetime.fromisoformat(value)
+            canonical = parsed.isoformat(timespec="seconds")
+        else:
+            raise ValueError
+    except ValueError as exc:
+        raise TrainWorkflowError(
+            f"{label} must be a canonical ISO date or exact-hour timestamp"
+        ) from exc
+    if canonical != value:
+        raise TrainWorkflowError(
+            f"{label} must be a canonical ISO date or exact-hour timestamp"
+        )
+    return value
+
+
 def load_run_request(path: str | pathlib.Path) -> RunRequest:
     """Load the deliberately small request YAML; it has no arbitrary executor kwargs."""
     source = pathlib.Path(path)
@@ -156,13 +180,7 @@ def load_run_request(path: str | pathlib.Path) -> RunRequest:
             raise TrainWorkflowError("run.models must not contain duplicates")
     else:
         model_ids = "all"
-    origin = run["origin"]
-    try:
-        origin_day = dt.date.fromisoformat(origin)
-    except (TypeError, ValueError) as exc:
-        raise TrainWorkflowError("run.origin must be an ISO date") from exc
-    if origin_day.isoformat() != origin:
-        raise TrainWorkflowError("run.origin must be canonical ISO YYYY-MM-DD")
+    origin = _canonical_time_text(run["origin"], "run.origin")
     for field in ("dataset_contract", "model_catalog"):
         if type(run[field]) is not str or not run[field].strip():
             raise TrainWorkflowError(f"run.{field} must be a non-blank path string")
@@ -248,14 +266,9 @@ def load_run_request(path: str | pathlib.Path) -> RunRequest:
             name, when, known_at = item
             if not isinstance(name, str) or not name or not isinstance(when, str):
                 raise TrainWorkflowError("calendar event name and date must be non-empty strings")
-            try:
-                dt.date.fromisoformat(when)
-                if known_at is not None:
-                    if not isinstance(known_at, str):
-                        raise ValueError
-                    dt.date.fromisoformat(known_at)
-            except ValueError as exc:
-                raise TrainWorkflowError("calendar event dates must be ISO dates or null") from exc
+            _canonical_time_text(when, "calendar event time")
+            if known_at is not None:
+                _canonical_time_text(known_at, "calendar event known_at")
             parsed.append((name, when, known_at))
         events = tuple(parsed)
     return RunRequest(

@@ -11,6 +11,7 @@ helper to itself would prove nothing.
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import pathlib
 import sys
@@ -45,6 +46,7 @@ def spark() -> SparkSession:
                 "nothing. Set JAVA_HOME to a Java 17 installation.")
         _SPARK = (SparkSession.builder.master("local[*]").appName("test_score_spark")
                   .config("spark.sql.shuffle.partitions", "8")
+                  .config("spark.sql.session.timeZone", "Asia/Kolkata")
                   .config("spark.ui.enabled", "false")
                   .config("spark.ui.showConsoleProgress", "false")
                   .getOrCreate())
@@ -174,12 +176,17 @@ def test_duplicate_forecast_keys_cannot_replace_a_hard_cell_at_the_same_row_coun
     raise AssertionError("two copies of one easy cell replaced a missing hard key")
 
 
-def _synthetic_panel(rows: list[tuple[object, str, object]]) -> Panel:
+def _synthetic_panel(
+    rows: list[tuple[object, str, object]],
+    *,
+    frequency: str = "D",
+) -> Panel:
     out = pathlib.Path(tempfile.mkdtemp()) / "panel"
+    key_cast = "cast(date as timestamp_ntz)" if frequency == "H" else "to_date(date)"
     spark().createDataFrame(rows, "id string, date string, qty double") \
-        .selectExpr("id", "to_date(date) as date", "qty") \
+        .selectExpr("id", f"{key_cast} as date", "qty") \
         .write.mode("overwrite").parquet(str(out))
-    return Panel(str(out), "id", "date", "qty").validate()
+    return Panel(str(out), "id", "date", "qty", frequency=frequency).validate()
 
 
 def _synthetic_forecast(
@@ -189,12 +196,16 @@ def _synthetic_forecast(
     horizon: int = 1,
     n_series: int = 1,
     frequency: str = "D",
+    origin: str | None = None,
 ) -> Forecast:
     out = pathlib.Path(tempfile.mkdtemp()) / "forecast"
+    key_cast = "cast(date as timestamp_ntz)" if frequency == "H" else "to_date(date)"
     spark().createDataFrame(rows, schema) \
-        .selectExpr("series_id", "to_date(date) as date", "yhat") \
+        .selectExpr("series_id", f"{key_cast} as date", "yhat") \
         .write.mode("overwrite").parquet(str(out))
-    return Forecast("synthetic", str(out), "2020-01-01", horizon, n_series,
+    if origin is None:
+        origin = "2020-01-01T00:00:00" if frequency == "H" else "2020-01-01"
+    return Forecast("synthetic", str(out), origin, horizon, n_series,
                     {"emitted": len(rows)}, frequency=frequency)
 
 
@@ -220,6 +231,96 @@ def test_scorer_uses_the_declared_period_grid_and_refuses_frequency_mismatch() -
         )
 
 
+def test_hourly_scorer_preserves_two_hours_on_one_day() -> None:
+    assert spark().conf.get("spark.sql.session.timeZone") == "Asia/Kolkata"
+    p = _synthetic_panel([
+        ("known", "2020-01-01 23:00:00", 3.0),
+        ("known", "2020-01-02 00:00:00", 8.0),
+    ], frequency="H")
+    fc = _synthetic_forecast([
+        ("known", "2020-01-01 23:00:00", 2.0),
+        ("known", "2020-01-02 00:00:00", 5.0),
+    ], horizon=2, frequency="H", origin="2020-01-01T22:00:00")
+    result = score_forecast(p, fc, spark(), missing_actual="no_data")
+    assert result.n_scored == 2
+    assert result.sum_abs_error == 4.0
+
+
+@pytest.mark.parametrize(
+    "frequency,origin,actuals,forecasts",
+    [
+        ("M", "2024-01-31", [("known", "2024-02-29", 3.0),
+                              ("known", "2024-03-31", 5.0)],
+         [("known", "2024-02-29", 2.0), ("known", "2024-03-31", 7.0)]),
+        ("MS", "2024-01-01", [("known", "2024-02-01", 3.0),
+                                ("known", "2024-03-01", 5.0)],
+         [("known", "2024-02-01", 2.0), ("known", "2024-03-01", 7.0)]),
+        ("Y", "2023-12-31", [("known", "2024-12-31", 3.0),
+                               ("known", "2025-12-31", 5.0)],
+         [("known", "2024-12-31", 2.0), ("known", "2025-12-31", 7.0)]),
+        ("YS", "2024-01-01", [("known", "2025-01-01", 3.0),
+                                ("known", "2026-01-01", 5.0)],
+         [("known", "2025-01-01", 2.0), ("known", "2026-01-01", 7.0)]),
+    ],
+)
+def test_calendar_scorer_uses_exact_anchored_period_keys(
+    frequency, origin, actuals, forecasts,
+) -> None:
+    p = _synthetic_panel(actuals, frequency=frequency)
+    fc = _synthetic_forecast(
+        forecasts, horizon=2, frequency=frequency, origin=origin,
+    )
+    result = score_forecast(p, fc, spark(), missing_actual="no_data")
+    assert result.n_scored == 2 and result.sum_abs_error == 3.0
+
+
+def test_month_end_aliases_compare_by_canonical_semantics() -> None:
+    p = _synthetic_panel([("known", "2024-02-29", 3.0)], frequency="M")
+    fc = _synthetic_forecast(
+        [("known", "2024-02-29", 2.0)], frequency="ME", origin="2024-01-31",
+    )
+    result = score_forecast(p, fc, spark(), missing_actual="no_data")
+    assert result.n_scored == 1 and result.sum_abs_error == 1.0
+
+
+def test_scorer_rejects_hourly_date_type_and_nonmidnight_daily_key() -> None:
+    hourly_panel = _synthetic_panel([
+        ("known", "2020-01-01 23:00:00", 3.0),
+    ], frequency="H")
+    date_out = pathlib.Path(tempfile.mkdtemp()) / "date-forecast"
+    spark().createDataFrame(
+        [("known", dt.date(2020, 1, 1), 2.0)],
+        "series_id string, date date, yhat double",
+    ).write.mode("overwrite").parquet(str(date_out))
+    date_fc = Forecast(
+        "synthetic", str(date_out), "2020-01-01T22:00:00", 1, 1, {"emitted": 1},
+        frequency="H",
+    )
+    with pytest.raises(ScoreError, match="timestamp_ntz physical type"):
+        score_forecast(hourly_panel, date_fc, spark(), missing_actual="no_data")
+
+    daily_panel = _synthetic_panel([("known", "2020-01-02", 3.0)])
+    timestamp_out = pathlib.Path(tempfile.mkdtemp()) / "timestamp-forecast"
+    spark().createDataFrame(
+        [("known", dt.datetime(2020, 1, 2, 1), 2.0)],
+        "series_id string, date timestamp, yhat double",
+    ).write.mode("overwrite").parquet(str(timestamp_out))
+    timestamp_fc = Forecast(
+        "synthetic", str(timestamp_out), "2020-01-01", 1, 1, {"emitted": 1}, frequency="D",
+    )
+    with pytest.raises(ScoreError, match="lossy non-midnight"):
+        score_forecast(daily_panel, timestamp_fc, spark(), missing_actual="no_data")
+
+
+def test_scorer_rejects_calendar_key_off_the_declared_grid() -> None:
+    p = _synthetic_panel([("known", "2024-02-29", 3.0)], frequency="M")
+    fc = _synthetic_forecast(
+        [("known", "2024-02-28", 2.0)], frequency="M", origin="2024-01-31",
+    )
+    with pytest.raises(ScoreError, match="off-anchor|outside"):
+        score_forecast(p, fc, spark(), missing_actual="no_data")
+
+
 @pytest.mark.parametrize("origin,horizon", [("20200101", 1), ("2020-01-01", True)])
 def test_scorer_refuses_noncanonical_span_before_spark_io(origin, horizon) -> None:
     p = Panel("/not-read", "id", "date", "qty")
@@ -228,10 +329,15 @@ def test_scorer_refuses_noncanonical_span_before_spark_io(origin, horizon) -> No
         score_forecast(p, fc, object(), missing_actual="no_data")
 
 
-def _synthetic_grid(rows: list[tuple[object, str]]) -> str:
+def _synthetic_grid(
+    rows: list[tuple[object, str]],
+    *,
+    frequency: str = "D",
+) -> str:
     out = pathlib.Path(tempfile.mkdtemp()) / "grid"
+    key_cast = "cast(date as timestamp_ntz)" if frequency == "H" else "to_date(date)"
     spark().createDataFrame(rows, "series_id string, date string") \
-        .selectExpr("series_id", "to_date(date) as date") \
+        .selectExpr("series_id", f"{key_cast} as date") \
         .write.mode("overwrite").parquet(str(out))
     return str(out)
 
@@ -377,6 +483,26 @@ def test_canonical_grid_can_prove_a_known_series_sparse_zero() -> None:
     grid = _synthetic_grid([("known", "2020-01-02")])
     result = score_forecast(
         p, fc, spark(), missing_actual="sparse_zero", eligible_grid=grid)
+    assert result.n_scored == 1
+    assert result.n_zero_filled == 1
+    assert result.mae == 2.0
+
+
+def test_hourly_canonical_grid_proves_the_exact_missing_hour() -> None:
+    p = _synthetic_panel([
+        ("known", "2020-01-01 21:00:00", 3.0),
+    ], frequency="H")
+    fc = _synthetic_forecast(
+        [("known", "2020-01-01 23:00:00", 2.0)],
+        frequency="H",
+        origin="2020-01-01T22:00:00",
+    )
+    eligible = _synthetic_grid(
+        [("known", "2020-01-01 23:00:00")], frequency="H",
+    )
+    result = score_forecast(
+        p, fc, spark(), missing_actual="sparse_zero", eligible_grid=eligible,
+    )
     assert result.n_scored == 1
     assert result.n_zero_filled == 1
     assert result.mae == 2.0

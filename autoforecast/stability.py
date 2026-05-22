@@ -24,7 +24,6 @@ the cells where a proportional swing is least disruptive.
 
 from __future__ import annotations
 
-import datetime as dt
 import pathlib
 import re
 from dataclasses import dataclass
@@ -35,7 +34,8 @@ from pyspark.sql.types import NumericType
 
 from autoforecast import grid
 from autoforecast._numeric import is_finite_real
-from autoforecast.panel import Forecast, ForecastError, period_days
+from autoforecast.frequency import parse_frequency, parse_origin, period_points
+from autoforecast.panel import Forecast, ForecastError
 
 __all__ = ["Stability", "StabilityError", "compare", "measure"]
 
@@ -153,17 +153,14 @@ def measure(
             "stability forecasts have different frequency declarations: "
             f"{earlier.frequency!r} versus {later.frequency!r}")
     try:
-        early_origin = dt.date.fromisoformat(earlier.origin)
-        late_origin = dt.date.fromisoformat(later.origin)
+        cadence = parse_frequency(earlier.frequency)
+        early_origin = parse_origin(earlier.origin, cadence)
+        late_origin = parse_origin(later.origin, cadence)
     except (TypeError, ValueError) as exc:
         raise StabilityError(
-            f"forecast origins must be ISO YYYY-MM-DD, got {earlier.origin!r} and "
+            f"forecast origins must be canonical for {earlier.frequency!r}, got "
+            f"{earlier.origin!r} and "
             f"{later.origin!r}") from exc
-    if (earlier.origin != early_origin.isoformat()
-            or later.origin != late_origin.isoformat()):
-        raise StabilityError(
-            f"forecast origins must be canonical ISO dates, got {earlier.origin!r} and "
-            f"{later.origin!r}")
     if late_origin <= early_origin:
         raise StabilityError(
             f"the 'later' forecast has origin {later.origin}, not after {earlier.origin}. "
@@ -173,7 +170,9 @@ def measure(
             r"[0-9a-f]{64}", expected_overlap_hash):
         raise StabilityError("expected_overlap_hash must be a lowercase SHA-256 digest")
     try:
-        actual_overlap_hash = grid.content_hash(expected_overlap, spark)
+        actual_overlap_hash = grid.content_hash(
+            expected_overlap, spark, frequency=earlier.frequency
+        )
     except Exception as exc:
         raise StabilityError(f"invalid expected-overlap artifact {expected_overlap}: {exc}") \
             from exc
@@ -184,25 +183,35 @@ def measure(
 
     a = _validated_forecast_frame(earlier, spark, "earlier", "_before")
     b = _validated_forecast_frame(later, spark, "later", "_after")
-    expected = (spark.read.parquet(str(expected_overlap))
-                .select(F.col("series_id").cast("string").alias("series_id"),
-                        F.to_date("date").alias("date")))
+    raw_expected = spark.read.parquet(str(expected_overlap))
+    if cadence.key_kind == "timestamp" and (
+        raw_expected.schema["date"].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise StabilityError("hourly expected overlap date must have timestamp_ntz physical type")
+    expected_key, valid_expected_key = grid.canonical_key("date", cadence)
+    expected = raw_expected.select(
+        F.col("series_id").cast("string").alias("series_id"),
+        expected_key.alias("date"),
+        valid_expected_key.alias("_valid_date"),
+    )
+    if expected.filter(
+        F.col("series_id").isNull()
+        | (F.trim("series_id") == F.lit(""))
+        | ~F.col("_valid_date")
+    ).limit(1).count():
+        raise StabilityError("expected overlap contains an invalid series or time key")
+    expected = expected.drop("_valid_date")
 
-    stride = period_days(earlier.frequency)
-    early_dates = {
-        early_origin + dt.timedelta(days=stride * step)
-        for step in range(1, earlier.horizon + 1)
-    }
-    late_dates = {
-        late_origin + dt.timedelta(days=stride * step)
-        for step in range(1, later.horizon + 1)
-    }
+    early_dates = set(period_points(early_origin, cadence, earlier.horizon))
+    late_dates = set(period_points(late_origin, cadence, later.horizon))
     overlap_dates = early_dates & late_dates
     if not overlap_dates:
         raise StabilityError(
             f"{earlier.adapter}: origins {earlier.origin} and {later.origin} have no mathematical "
             "horizon overlap")
-    if expected.filter(~F.col("date").isin(*sorted(overlap_dates))).limit(1).count():
+    if expected.filter(
+        ~grid.period_membership("date", sorted(overlap_dates), cadence)
+    ).limit(1).count():
         raise StabilityError(
             "expected overlap contains a date outside the exact shared period grid "
             f"{min(overlap_dates)}..{max(overlap_dates)}")
@@ -269,17 +278,29 @@ def _validated_forecast_frame(
             f"{label} forecast yhat must have a numeric schema, got "
             f"{raw.schema['yhat'].dataType.simpleString()}")
 
+    cadence = parse_frequency(forecast.frequency)
+    if cadence.key_kind == "timestamp" and (
+        raw.schema["date"].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise StabilityError(
+            f"{label} hourly forecast date must have timestamp_ntz physical type"
+        )
+    time_key, valid_time_key = grid.canonical_key("date", cadence)
     frame = raw.select(
         F.col("series_id").cast("string").alias("series_id"),
-        F.to_date("date").alias("date"),
+        time_key.alias("date"),
+        valid_time_key.alias("_valid_date"),
         F.col("yhat").cast("double").alias(value_column),
     )
     bad_key = frame.filter(
         F.col("series_id").isNull()
         | (F.trim("series_id") == F.lit(""))
-        | F.col("date").isNull()).limit(1).count()
+        | ~F.col("_valid_date")).limit(1).count()
     if bad_key:
-        raise StabilityError(f"{label} forecast contains a null/blank series id or invalid date")
+        raise StabilityError(
+            f"{label} forecast contains a null/blank series id or invalid time key"
+        )
+    frame = frame.drop("_valid_date")
     value = F.col(value_column)
     if frame.filter(
             value.isNull() | F.isnan(value)
@@ -288,17 +309,18 @@ def _validated_forecast_frame(
         raise StabilityError(f"{label} forecast contains a null, non-finite, or negative yhat")
 
     try:
-        origin = dt.date.fromisoformat(forecast.origin)
+        allowed_dates = period_points(
+            forecast.origin, cadence, forecast.horizon
+        )
     except (TypeError, ValueError) as exc:
         raise StabilityError(
-            f"{label} forecast origin must be ISO YYYY-MM-DD, got {forecast.origin!r}") from exc
-    stride = period_days(forecast.frequency)
-    allowed_dates = tuple(
-        origin + dt.timedelta(days=stride * step)
-        for step in range(1, forecast.horizon + 1)
-    )
+            f"{label} forecast origin must be canonical for {forecast.frequency!r}, got "
+            f"{forecast.origin!r}"
+        ) from exc
     lo, hi = allowed_dates[0], allowed_dates[-1]
-    if frame.filter(~F.col("date").isin(*allowed_dates)).limit(1).count():
+    if frame.filter(
+        ~grid.period_membership("date", allowed_dates, cadence)
+    ).limit(1).count():
         raise StabilityError(
             f"{label} forecast contains a date outside requested period grid {lo}..{hi}")
     if (frame.groupBy("series_id", "date").count()

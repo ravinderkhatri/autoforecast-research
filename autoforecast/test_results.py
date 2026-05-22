@@ -60,7 +60,24 @@ def _reader_boundary(tmp_path, monkeypatch, children, stages, benchmark=None):
     return digest
 
 
-def test_initialization_parent_is_not_validation_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "frequency, origin, dates",
+    [
+        ("D", "2024-01-01", (dt.date(2024, 1, 2), dt.date(2024, 1, 3))),
+        (
+            "H", "2024-03-01T21:00:00",
+            (dt.datetime(2024, 3, 1, 22), dt.datetime(2024, 3, 1, 23), dt.datetime(2024, 3, 2)),
+        ),
+        ("W", "2024-01-03", (dt.date(2024, 1, 10), dt.date(2024, 1, 17))),
+        ("M", "2024-02-29", (dt.date(2024, 3, 31), dt.date(2024, 4, 30))),
+        ("MS", "2024-02-01", (dt.date(2024, 3, 1), dt.date(2024, 4, 1))),
+        ("Y", "2023-12-31", (dt.date(2024, 12, 31), dt.date(2025, 12, 31))),
+        ("YS", "2024-01-01", (dt.date(2025, 1, 1), dt.date(2026, 1, 1))),
+    ],
+)
+def test_initialization_parent_is_not_validation_evidence(
+    tmp_path, monkeypatch, frequency, origin, dates
+):
     import pyarrow.parquet as pq
 
     from autoforecast.panel import Forecast
@@ -73,8 +90,8 @@ def test_initialization_parent_is_not_validation_evidence(tmp_path, monkeypatch)
         "variant_id": "default",
         "seed": 0,
         "initialization": "fresh_parent",
-        "origin": "2024-01-01",
-        "horizon": 1,
+        "origin": origin,
+        "horizon": len(dates),
     }
     _reader_boundary(
         tmp_path,
@@ -90,12 +107,16 @@ def test_initialization_parent_is_not_validation_evidence(tmp_path, monkeypatch)
     pq.write_table(
         pa.Table.from_pylist(
             [
-                {"series_id": "a", "date": dt.date(2024, 1, 2), "yhat": 2.0},
+                {"series_id": "a", "date": day, "yhat": 2.0 + index}
+                for index, day in enumerate(dates)
             ]
         ),
         forecast_dir / "part.parquet",
     )
-    forecast = Forecast("seasonal_naive", str(forecast_dir), child["origin"], 1, 1, {"emitted": 1})
+    forecast = Forecast(
+        "seasonal_naive", str(forecast_dir), child["origin"], len(dates), 1,
+        {"emitted": len(dates)}, frequency=frequency,
+    )
     record = parent / "forecast.json"
     record.write_text(json.dumps(forecast.as_record()))
     (parent / "child-result.json").write_text(
@@ -112,8 +133,42 @@ def test_initialization_parent_is_not_validation_evidence(tmp_path, monkeypatch)
         )
     )
     results = read_results(tmp_path)
-    assert results.rows["stage"].to_pylist() == ["initialization_parent"]
+    assert results.rows["stage"].to_pylist() == ["initialization_parent"] * len(dates)
     assert results.runs[0]["stage"] == "initialization_parent"
+    assert results.rows["target_date"].to_pylist() == list(dates)
+    assert results.rows["prediction"].to_pylist() == [2.0 + i for i in range(len(dates))]
+    assert results.metadata["frequency"] == results.runs[0]["frequency"] == frequency
+    expected_type = pa.timestamp("us") if frequency == "H" else pa.date32()
+    assert results.rows.schema.field("target_date").type == expected_type
+    export_results(results, tmp_path / "export")
+    assert pq.read_table(tmp_path / "export/predictions.parquet").equals(results.rows)
+
+    # Authenticated forecast bytes must also agree with the benchmark's cadence.
+    import autoforecast.results as reader
+
+    benchmark_path = tmp_path / "benchmark.json"
+    frozen = {
+        "benchmark_id": "benchmark", "recipe": {"target_unit": "units"},
+        "key_types": {}, "cohort_series_count": 1,
+        "artifacts": {role: "a" * 64 for role in ("selection", "final_training", "final_score")},
+    }
+    (tmp_path / "dataset.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "dataset": {"id": "fixture", "panel": {
+            "series_col": "series_id", "time_col": "date", "target_col": "units",
+            "frequency": "W" if frequency == "D" else "D",
+        }},
+    }))
+    (tmp_path / "source-keys").mkdir()
+    pq.write_table(pa.table({"series_id": ["a"]}), tmp_path / "source-keys/part.parquet")
+    monkeypatch.setattr(reader, "verify_benchmark", lambda *args: (benchmark_path, frozen))
+    _reader_boundary(
+        tmp_path, monkeypatch, [child],
+        [{"id": "parent", "status": "completed", "attempts": 1}],
+        {"id": "benchmark", "path": str(benchmark_path), "sha256": "a" * 64, "evaluations": {}},
+    )
+    with pytest.raises(ValueError, match="forecast frequency differs"):
+        read_results(tmp_path)
 
 
 def test_failed_final_fit_retains_locked_identity(tmp_path, monkeypatch):
@@ -329,7 +384,24 @@ def test_result_export_identity_roundtrip_and_publication_retry_idempotent(tmp_p
         export_results(replace(result, metadata={"changed": True}), tmp_path / "export")
 
 
-def test_plot_matches_exported_values_and_preserves_missing_predictions(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "frequency, origin, dates",
+    [
+        ("D", "2024-01-01", [dt.date(2024, 1, day) for day in (2, 3, 4)]),
+        (
+            "H", "2024-03-01T22:00:00",
+            [dt.datetime(2024, 3, 1, 23), dt.datetime(2024, 3, 2), dt.datetime(2024, 3, 2, 1)],
+        ),
+        ("W", "2024-01-03", [dt.date(2024, 1, day) for day in (10, 17, 24)]),
+        ("M", "2024-01-31", [dt.date(2024, 2, 29), dt.date(2024, 3, 31), dt.date(2024, 4, 30)]),
+        ("MS", "2024-01-01", [dt.date(2024, month, 1) for month in (2, 3, 4)]),
+        ("Y", "2023-12-31", [dt.date(year, 12, 31) for year in (2024, 2025, 2026)]),
+        ("YS", "2024-01-01", [dt.date(year, 1, 1) for year in (2025, 2026, 2027)]),
+    ],
+)
+def test_plot_matches_exported_values_and_preserves_missing_predictions(
+    tmp_path, monkeypatch, frequency, origin, dates
+):
     import math
 
     import matplotlib.axes
@@ -342,7 +414,21 @@ def test_plot_matches_exported_values_and_preserves_missing_predictions(tmp_path
         return original(self, dates, values, **kwargs)
 
     monkeypatch.setattr(matplotlib.axes.Axes, "plot", capture)
-    comparison_plot(_results(), series_id="a", output=tmp_path / "comparison.png")
+    results = _results()
+    schema = ROW_SCHEMA
+    if frequency == "H":
+        schema = schema.set(
+            schema.get_field_index("target_date"), pa.field("target_date", pa.timestamp("us"))
+        )
+    rows = [{**row, "origin": origin, "target_date": dates[0]} for row in results.rows.to_pylist()]
+    results = replace(
+        results,
+        rows=pa.Table.from_pylist(rows, schema=schema),
+        runs=tuple({**run, "frequency": frequency} for run in results.runs),
+        metadata={**results.metadata, "frequency": frequency},
+    )
+    comparison_plot(results, series_id="a", output=tmp_path / "comparison.png")
+    assert all(observed_dates == dates for observed_dates, _, _ in observed)
     assert sorted(values[0] for _, values, _ in observed) == [2.0, 9.0]
     assert all(
         len(values) == 3 and all(math.isnan(v) for v in values[1:]) for _, values, _ in observed

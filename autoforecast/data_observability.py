@@ -9,7 +9,6 @@ a data check. It intentionally has no pandas path.
 
 from __future__ import annotations
 
-import datetime as dt
 import html
 import json
 import os
@@ -17,8 +16,11 @@ import pathlib
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from spec.forecast_spec import STATE_CODES
 
+from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin
+from autoforecast.grid import canonical_key, time_literal
 from autoforecast.model_api import CheckReport, CheckResult, CheckStatus, DataFacts, RunIncident
 from autoforecast.panel import Panel, PanelError
 from autoforecast.profiling import ProfileError, profile
@@ -40,13 +42,14 @@ class DataCheckError(ValueError):
     """A report destination or requested inspection boundary is unsafe."""
 
 
-def _as_of(value: str) -> str:
-    if not isinstance(value, str):
-        raise DataCheckError("as_of must be an ISO date string")
+def _as_of(value: str, frequency: str) -> str:
     try:
-        return dt.date.fromisoformat(value).isoformat()
-    except ValueError as exc:
-        raise DataCheckError(f"as_of must be an ISO date, got {value!r}") from exc
+        cadence = parse_frequency(frequency)
+        return canonical_origin(parse_origin(value, cadence), cadence)
+    except (TypeError, ValueError) as exc:
+        raise DataCheckError(
+            f"as_of must be canonical for frequency {frequency!r}, got {value!r}"
+        ) from exc
 
 
 def run_incident_from_error(error: Exception) -> RunIncident:
@@ -128,7 +131,9 @@ def _definition_passes() -> list[CheckResult]:
 
 def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckReport | RunIncident:
     """Run universal data checks through an explicit date, returning facts or a run incident."""
-    cutoff = _as_of(as_of)
+    cutoff = _as_of(as_of, panel.frequency)
+    cadence = parse_frequency(panel.frequency)
+    cutoff_point = parse_origin(cutoff, cadence)
     if not pathlib.Path(panel.path).exists():
         return RunIncident(
             id="data_not_found",
@@ -146,14 +151,22 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         return CheckReport("data", facts, (_definition_failure(exc),))
 
     raw = spark.read.parquet(panel.path)
-    frame = raw.filter(F.to_date(F.col(panel.time_col)) <= F.lit(cutoff).cast("date"))
+    time_key, valid_time = canonical_key(panel.time_col, cadence)
+    if cadence.key_kind == "timestamp" and (
+        raw.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
+    ):
+        valid_time = valid_time & F.lit(False)
+    prepared = raw.withColumn("_time_key", time_key).withColumn(
+        "_valid_time_key", valid_time
+    )
+    frame = prepared.filter(F.col("_time_key") <= time_literal(cutoff_point, cadence))
     schema = {field.name: field.dataType.simpleString() for field in raw.schema.fields}
     aggregate = frame.agg(
         F.count(F.lit(1)).alias("n_rows"),
         F.countDistinct(panel.series_col).alias("n_series"),
-        F.countDistinct(panel.time_col).alias("n_dates"),
-        F.min(F.to_date(F.col(panel.time_col))).alias("first_date"),
-        F.max(F.to_date(F.col(panel.time_col))).alias("last_date"),
+        F.countDistinct("_time_key").alias("n_dates"),
+        F.min("_time_key").alias("first_date"),
+        F.max("_time_key").alias("last_date"),
         F.sum(F.col(panel.series_col).isNull().cast("long")).alias("null_series"),
         F.sum(F.col(panel.target_col).isNull().cast("long")).alias("null_target"),
     ).collect()[0]
@@ -204,7 +217,7 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         )
     )
     duplicate_row = (
-        frame.groupBy(panel.series_col, panel.time_col)
+        frame.groupBy(panel.series_col, "_time_key")
         .count()
         .filter(F.col("count") > 1)
         .agg(F.sum(F.col("count") - 1).alias("duplicates"))
@@ -349,55 +362,101 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
             )
         )
 
-    missing_daily: int | None = None
-    if panel.frequency == "D":
-        per_series = frame.groupBy(panel.series_col).agg(
-            F.min(F.to_date(F.col(panel.time_col))).alias("first"),
-            F.max(F.to_date(F.col(panel.time_col))).alias("last"),
-            F.countDistinct(panel.time_col).alias("observed"),
+    # A malformed key has no reliable position relative to ``as_of``. Check it on the source
+    # before the bounded comparison, just as the required-value check already does for null time
+    # keys; otherwise Spark's null filtering would make malformed keys disappear silently.
+    invalid_time_keys = prepared.filter(
+        ~F.coalesce(F.col("_valid_time_key"), F.lit(False))
+    ).count()
+    ordered = (
+        frame.filter(F.col("_valid_time_key"))
+        .select(panel.series_col, "_time_key")
+        .distinct()
+        .withColumn(
+            "_previous",
+            F.lag("_time_key").over(Window.partitionBy(panel.series_col).orderBy("_time_key")),
         )
-        missing_row = per_series.agg(
-            F.sum(F.datediff(F.col("last"), F.col("first")) + 1 - F.col("observed")).alias(
-                "missing"
+    )
+    if cadence.unit == "H":
+        phase_errors = ordered.filter(
+            F.col("_previous").isNotNull()
+            & (
+                F.pmod(
+                    F.unix_timestamp("_time_key") - F.unix_timestamp("_previous"),
+                    F.lit(3600 * cadence.multiplier),
+                )
+                != 0
             )
-        ).collect()[0]
-        missing_daily = int(missing_row["missing"] or 0)
-        checks.append(
-            CheckResult(
-                "time_grain",
-                "Dates match the dataset frequency",
-                "warning" if missing_daily else "passed",
-                (
-                    f"{missing_daily:,} daily dates are missing within observed series ranges."
-                    if missing_daily
-                    else "Dates match the declared daily frequency."
-                ),
-                numerator=missing_daily,
-            )
-        )
+        ).count()
+    elif cadence.unit in {"D", "W"}:
+        stride = cadence.multiplier if cadence.unit == "D" else 7
+        phase_errors = ordered.filter(
+            F.col("_previous").isNotNull()
+            & (F.pmod(F.datediff("_time_key", "_previous"), F.lit(stride)) != 0)
+        ).count()
+    elif cadence.unit == "M":
+        phase_errors = 0
     else:
-        checks.append(
-            CheckResult(
-                "time_grain",
-                "Dates match the dataset frequency",
-                "not_checked",
-                f"Date-gap checking is not yet available for {panel.frequency!r} data.",
-            )
+        phase_errors = 0
+    off_grid = invalid_time_keys + phase_errors
+
+    per_series = ordered.groupBy(panel.series_col).agg(
+        F.min("_time_key").alias("first"),
+        F.max("_time_key").alias("last"),
+        F.count(F.lit(1)).alias("observed"),
+    )
+    if cadence.unit == "H":
+        expected = (
+            (F.unix_timestamp("last") - F.unix_timestamp("first"))
+            / F.lit(3600 * cadence.multiplier)
+            + 1
         )
+    elif cadence.unit in {"D", "W"}:
+        stride = cadence.multiplier if cadence.unit == "D" else 7
+        expected = F.datediff("last", "first") / F.lit(stride) + 1
+    elif cadence.unit == "M":
+        expected = F.round(F.months_between("last", "first")) + 1
+    else:
+        expected = F.year("last") - F.year("first") + 1
+    missing_row = per_series.agg(
+        F.sum(expected.cast("long") - F.col("observed")).alias("missing")
+    ).collect()[0]
+    missing_timestamps = max(0, int(missing_row["missing"] or 0))
+    missing_daily = missing_timestamps if panel.frequency == "D" else None
+    checks.append(
+        CheckResult(
+            "time_grain",
+            "Times match the dataset frequency",
+            "failed" if off_grid else ("warning" if missing_timestamps else "passed"),
+            (
+                f"{off_grid:,} time keys are off the declared {panel.frequency!r} cadence."
+                if off_grid
+                else (
+                    f"{missing_timestamps:,} periods are missing within observed series ranges."
+                    if missing_timestamps
+                    else f"Time keys match the declared {panel.frequency!r} frequency."
+                )
+            ),
+            numerator=off_grid or missing_timestamps,
+        )
+    )
     coverage = tuple(dict.fromkeys((*panel.known_future, *panel.static, *panel.static_reals)))
-    try:
-        panel_profile = profile(
-            panel.path,
-            spark,
-            series_col=panel.series_col,
-            time_col=panel.time_col,
-            target_col=panel.target_col,
-            as_of=cutoff,
-            exposure_col=panel.exposure_col,
-            coverage_cols=coverage,
-        )
-    except ProfileError as exc:
-        return run_incident_from_error(exc)
+    panel_profile = None
+    if not off_grid:
+        try:
+            panel_profile = profile(
+                panel.path,
+                spark,
+                series_col=panel.series_col,
+                time_col=panel.time_col,
+                target_col=panel.target_col,
+                as_of=cutoff,
+                frequency=panel.frequency,
+                exposure_col=panel.exposure_col,
+                coverage_cols=coverage,
+            )
+        except ProfileError as exc:
+            return run_incident_from_error(exc)
     facts = DataFacts(
         as_of=cutoff,
         data_fingerprint=fingerprint,
@@ -411,6 +470,7 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         inconsistent_static_series=static_violations,
         profile=panel_profile,
         spark_schema=schema,
+        missing_timestamps=(None if panel.frequency == "D" else missing_timestamps),
     )
     return CheckReport("data", facts, tuple(checks))
 
@@ -548,7 +608,7 @@ h1{{font-size:28px}}
 <article class='card'><div class='value'>{facts.n_series:,}</div>
 <div class='label'>Series checked</div></article>
 <article class='card'><div class='value'>{facts.n_dates:,}</div>
-<div class='label'>Dates checked</div></article>
+<div class='label'>Time keys checked</div></article>
 </section>
 <section class='section'><h2>Checks</h2><p>Every check is shown with its result and measurement.</p>
 <div class='table-wrap'><table><thead><tr><th>Check</th><th>Status</th>
@@ -578,7 +638,7 @@ def _check_measurement(check: CheckResult) -> str:
         "valid_target_values": "invalid forecast values",
         "target_policy": "values outside the declared rule",
         "availability_status": "invalid availability values",
-        "time_grain": "missing daily dates",
+        "time_grain": "missing or off-grid periods",
     }
     label = labels.get(check.id, "affected values")
     if check.denominator is None:
@@ -601,7 +661,7 @@ def _history_range(profile: dict[str, object]) -> str:
     minimum = profile.get("min_eligible_history")
     maximum = profile.get("max_eligible_history")
     if type(minimum) is int and type(maximum) is int:
-        return f"{minimum:,}–{maximum:,} days"
+        return f"{minimum:,}–{maximum:,} observations"
     return "—"
 
 

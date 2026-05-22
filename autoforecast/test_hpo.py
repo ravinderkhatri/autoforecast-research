@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import pathlib
@@ -282,6 +283,16 @@ def test_hpo_config_refuses_test_as_an_objective() -> None:
         )
         with pytest.raises(ValueError, match="test is forbidden"):
             load_hpo_study(study, project_root=root)
+
+
+def test_hpo_ranges_preserve_exact_hour_keys_and_reject_mixed_key_types() -> None:
+    assert hpo_module._date_range(  # noqa: SLF001
+        ["2024-03-01T22:00:00", "2024-03-02T01:00:00"], "hourly range"
+    ) == (dt.datetime(2024, 3, 1, 22), dt.datetime(2024, 3, 2, 1))
+    with pytest.raises(HPOError, match="same temporal key type"):
+        hpo_module._date_range(  # noqa: SLF001
+            ["2024-03-01", "2024-03-02T01:00:00"], "mixed range"
+        )
 
 
 def test_hpo_config_refuses_training_or_test_overlap_with_validation_targets() -> None:

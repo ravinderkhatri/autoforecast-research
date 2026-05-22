@@ -1509,6 +1509,118 @@ def test_request_is_strict_temporal_and_requires_fresh(tmp_path: pathlib.Path) -
         subject.load_forecast_campaign_request(path)
 
 
+def test_campaign_request_preserves_exact_hour_temporal_identity(tmp_path: pathlib.Path) -> None:
+    path = _request(tmp_path, models=["seasonal_naive"], arms=["fresh"])
+    value = yaml.safe_load(path.read_text())
+    temporal = value["forecast_campaign"]["temporal"]
+    temporal.update(
+        {
+            "training_start": "2024-03-01T20:00:00",
+            "initialization_origin": "2024-03-01T21:00:00",
+            "validation_origins": ["2024-03-01T22:00:00", "2024-03-02T00:00:00"],
+            "final_train_cutoff": "2024-03-02T03:00:00",
+        }
+    )
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    request = subject.load_forecast_campaign_request(path)
+    assert request.validation_origins == (
+        dt.datetime(2024, 3, 1, 22),
+        dt.datetime(2024, 3, 2, 0),
+    )
+    assert request.final_train_cutoff.isoformat() == "2024-03-02T03:00:00"
+
+
+@pytest.mark.parametrize(
+    "frequency,start,end,span",
+    [
+        ("H", "2024-03-01T22:00:00", "2024-03-02T01:00:00", 3),
+        ("W", "2024-01-03", "2024-01-24", 3),
+        ("M", "2024-01-31", "2024-04-30", 3),
+        ("Y", "2023-12-31", "2027-12-31", 4),
+    ],
+)
+def test_campaign_window_spans_use_declared_periods(frequency, start, end, span):
+    cadence = subject.parse_frequency(frequency)
+    assert subject._period_span(  # noqa: SLF001
+        subject.parse_origin(start, cadence),
+        subject.parse_origin(end, cadence),
+        cadence,
+        "test window",
+    ) == span
+
+
+@pytest.mark.parametrize("frequency", ["W", "7D"])
+def test_campaign_rejects_a_daily_only_adapter_before_unsupported_cadence_execution(
+    frequency: str,
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _request(tmp_path, models=["croston"], arms=["fresh"])
+    value = yaml.safe_load(path.read_text())
+    value["forecast_campaign"]["temporal"].update(
+        {
+            "training_start": "2024-01-03",
+            "initialization_origin": "2024-01-10",
+            "validation_origins": ["2024-01-17", "2024-01-24"],
+            "validation_horizon": 1,
+            "final_train_cutoff": "2024-01-31",
+            "final_test_horizon": 1,
+        }
+    )
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    unsupported = SimpleNamespace(
+        panel=lambda _path: SimpleNamespace(frequency=frequency, price_col=None)
+    )
+    monkeypatch.setattr(subject, "load_dataset_contract", lambda _path: unsupported)
+    with pytest.raises(
+        subject.ForecastCampaignError, match=f"do not support {frequency} cadence"
+    ):
+        _compile(path, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "frequency,start",
+    [
+        ("H", dt.datetime(2024, 1, 1)),
+        ("W", dt.date(2024, 1, 1)),
+        ("M", dt.date(2024, 1, 31)),
+        ("MS", dt.date(2024, 1, 1)),
+        ("Y", dt.date(2024, 12, 31)),
+        ("YS", dt.date(2024, 1, 1)),
+    ],
+)
+def test_compile_propagates_supported_dataset_cadence(
+    frequency, start, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _request(tmp_path, models=["seasonal_naive"], arms=["fresh"])
+    cadence = subject.parse_frequency(frequency)
+    points = [subject.advance(start, cadence, index) for index in range(7)]
+    value = yaml.safe_load(path.read_text())
+    value["forecast_campaign"]["temporal"].update(
+        {
+            "training_start": points[0].isoformat(),
+            "initialization_origin": points[1].isoformat(),
+            "validation_origins": [points[2].isoformat(), points[4].isoformat()],
+            "validation_horizon": 1,
+            "final_train_cutoff": points[5].isoformat(),
+            "final_test_horizon": 1,
+        }
+    )
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    contract = SimpleNamespace(panel=lambda _path: SimpleNamespace(frequency=frequency))
+    monkeypatch.setattr(subject, "load_dataset_contract", lambda _path: contract)
+    monkeypatch.setattr(subject, "_git_source_identity", lambda _path: {})
+
+    compiled = _compile(path, tmp_path)
+    resolved = json.loads(compiled.resolved_path.read_text())
+    temporal = resolved["temporal"]
+    assert temporal["frequency"] == frequency
+    assert "step_days" not in temporal
+    assert {child["origin"] for child in resolved["children"]} == {
+        points[2].isoformat(),
+        points[4].isoformat(),
+    }
+
+
 def test_request_refuses_ambiguous_yaml_zero_memory_and_symlink_source(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -3152,7 +3264,7 @@ def test_tft_campaign_locks_and_verifies_selected_updates(tmp_path: pathlib.Path
         for candidate in discover_candidates(ROOT / "configs/models")
     }
     profiles = subject._parameter_profiles(
-        smoke, catalog, {"sha256": "a" * 64}, step_days=1,
+        smoke, catalog, {"sha256": "a" * 64}, frequency="D",
         dataset_contract_sha256="b" * 64, features=None,
     )
     assert len(profiles) == 2
@@ -3615,6 +3727,48 @@ def test_training_materializer_truncates_a_panel_without_known_future_rows(
     table = pads.dataset(destination, format="parquet").to_table()
     assert max(table["date"].to_pylist()) == dt.date(2024, 1, 5)
     assert table.num_rows == 10
+
+
+def test_hourly_training_materializer_excludes_later_same_day_rows(
+    tmp_path: pathlib.Path,
+) -> None:
+    contract = tmp_path / "hourly.yaml"
+    contract.write_text(
+        """schema_version: 1
+dataset:
+  id: hourly
+  panel:
+    series_col: series_id
+    time_col: date
+    target_col: target
+    frequency: H
+    season_length: 24
+""",
+        encoding="utf-8",
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {"series_id": "a", "date": dt.datetime(2024, 3, 1, hour), "target": float(hour)}
+                for hour in (21, 22, 23)
+            ]
+        ),
+        source / "part.parquet",
+    )
+    destination = tmp_path / "training"
+    subject._materialize_training_panel(  # noqa: SLF001
+        source,
+        destination,
+        contract_path=contract,
+        origin="2024-03-01T22:00:00",
+        horizon=2,
+        training_start=None,
+        expected_source_sha256=subject.directory_digest(source, suffixes=(".parquet",)),
+    )
+    points = pads.dataset(destination, format="parquet").to_table()["date"].to_pylist()
+    assert points == [dt.datetime(2024, 3, 1, 21), dt.datetime(2024, 3, 1, 22)]
 
 
 def test_training_materializer_keeps_known_future_features_but_masks_labels(

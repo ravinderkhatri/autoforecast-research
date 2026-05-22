@@ -5,6 +5,7 @@ from __future__ import annotations
 import pathlib
 from typing import Literal
 
+import pytest
 import yaml
 
 from autoforecast.model_api import (
@@ -177,6 +178,27 @@ run:
             assert message in str(error)
         else:
             raise AssertionError("run request accepted a coerced path or noncanonical origin")
+
+
+def test_run_request_preserves_an_exact_hour_origin(tmp_path: pathlib.Path) -> None:
+    request_path = tmp_path / "run.yaml"
+    request_path.write_text(
+        """schema_version: 1
+run:
+  name: hourly-run
+  dataset_contract: configs/datasets/hourly.yaml
+  model_catalog: configs/models
+  models: all
+  origin: '2024-03-01T22:00:00'
+  horizon: 3
+  tracking:
+    mlflow: {enabled: false}
+"""
+    )
+    assert load_run_request(request_path).origin == "2024-03-01T22:00:00"
+    request_path.write_text(request_path.read_text().replace("22:00:00", "22:30:00"))
+    with pytest.raises(ValueError, match="exact-hour"):
+        load_run_request(request_path)
 
 
 def test_sft_request_makes_evaluation_semantics_explicit(tmp_path: pathlib.Path) -> None:

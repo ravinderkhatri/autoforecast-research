@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast.adapter_contracts import DESCRIPTORS, descriptor
 from autoforecast.adapters import adapter_capabilities, known_adapter_names
+from autoforecast.frequency import FrequencyError, frequency_is_supported
 from autoforecast.model_catalog import Candidate, CatalogError, SelectionPolicy, resolve_candidates
 from autoforecast.panel import Panel, PanelError
 from autoforecast.profiling import Profile
@@ -99,6 +100,8 @@ class ModelInputContract:
 
     frequency: str
     history_rule: str
+    supported_frequency_families: tuple[str, ...] = ("D",)
+    supports_strided_daily: bool = False
 
     def minimum_history(self, *, season_length: int, horizon: int) -> int:
         """Return the adapter's implemented per-series observation floor."""
@@ -121,9 +124,24 @@ class ModelInputContract:
             return 28 + horizon
         raise ValueError(f"unknown history rule {self.history_rule!r}")
 
+    def supports(self, frequency: str) -> bool:
+        """Whether the adapter declares the cadence family and any non-unit daily stride."""
+        return frequency_is_supported(
+            frequency,
+            self.supported_frequency_families,
+            supports_strided_daily=self.supports_strided_daily,
+        )
 
-_CONTRACTS = {name: ModelInputContract(descriptor(name).frequency, descriptor(name).history)
-              for name in DESCRIPTORS}
+
+_CONTRACTS = {
+    name: ModelInputContract(
+        descriptor(name).frequency,
+        descriptor(name).history,
+        descriptor(name).supported_frequency_families,
+        descriptor(name).supports_strided_daily,
+    )
+    for name in DESCRIPTORS
+}
 
 
 def get_model_input_contract(adapter: str) -> ModelInputContract:
@@ -176,8 +194,15 @@ def validate_model_compatibility(
         panel.validate()
     except PanelError as exc:
         reasons.append(str(exc))
-    if panel.frequency != contract.frequency:
-        reasons.append(f"requires frequency={contract.frequency!r}, got {panel.frequency!r}")
+    try:
+        frequency_supported = contract.supports(panel.frequency)
+    except FrequencyError:
+        frequency_supported = False
+    if not frequency_supported:
+        reasons.append(
+            f"requires frequency family in {contract.supported_frequency_families!r}, "
+            f"got {panel.frequency!r}"
+        )
     supported_estimands = cast(frozenset[str], adapter_capabilities(adapter)["supported_estimands"])
     if panel.target_estimand not in supported_estimands:
         reasons.append(f"does not support target_estimand={panel.target_estimand!r}")

@@ -270,6 +270,41 @@ def test_read_forecast_grid(tmp_path, fault):
         np.testing.assert_array_equal(read_forecast_grid(**arguments, filter_actuals=True), [[1], [2]])
 
 
+def test_read_forecast_grid_preserves_distinct_hourly_keys_on_one_date(tmp_path):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "hourly-forecast.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": ["a", "a"],
+                "date": pa.array(
+                    [dt.datetime(2024, 3, 1, 23), dt.datetime(2024, 3, 2, 0)],
+                    type=pa.timestamp("us"),
+                ),
+                "value": [1.0, 2.0],
+            }
+        ),
+        path,
+    )
+
+    result = read_forecast_grid(
+        str(path),
+        ("a",),
+        "2024-03-01T22:00:00",
+        2,
+        series_col="id",
+        time_col="date",
+        value_col="value",
+        frequency="H",
+    )
+
+    np.testing.assert_array_equal(result, [[1.0, 2.0]])
+
+
 def test_read_forecast_grid_refuses_boolean_values_before_numeric_coercion(tmp_path):
     """Boolean actuals are a corrupt count schema, not the numeric values zero and one."""
     import datetime as dt

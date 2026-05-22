@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -19,6 +20,7 @@ def convert(tmp_path, text, **kwargs):
         source, tmp_path / "data/observations.parquet",
         source_keys=kwargs.get("source_keys", ["shop", "sku"]),
         time_col=kwargs.get("time_col", "day"), target_col=kwargs.get("target_col", "units"),
+        frequency=kwargs.get("frequency", "D"),
     )
 
 
@@ -34,6 +36,35 @@ def test_csv_preserves_keys_zeros_dates_and_source_identity(tmp_path):
     assert list(path.parent.iterdir()) == [path]
     assert record["row_count"] == record["series_count"] == 2
     assert record["excluded_columns"] == ["note"]
+    assert record["schema"] == "autoforecast.csv-import.v1" and "frequency" not in record
+
+
+def test_hourly_csv_preserves_distinct_hours_on_the_same_day(tmp_path):
+    path = convert(
+        tmp_path,
+        "shop,sku,day,units\na,1,2024-03-01T22:00:00,1\na,1,2024-03-01T23:00:00,2\n",
+        frequency="H",
+    )
+    table = pq.read_table(path)
+    assert table.schema.field("day").type == pa.timestamp("us")
+    assert [row["day"] for row in table.to_pylist()] == [
+        dt.datetime(2024, 3, 1, 22),
+        dt.datetime(2024, 3, 1, 23),
+    ]
+    record = json.loads(pq.read_metadata(path).metadata[b"autoforecast.csv_import"])
+    assert record["schema"] == "autoforecast.csv-import.v2"
+    assert record["frequency"] == "H"
+    assert record["first_date"] == "2024-03-01T22:00:00"
+
+
+@pytest.mark.parametrize("value", ["2024-03-01", "2024-03-01T22:30:00", "2024-03-01T22:00:00Z"])
+def test_hourly_csv_refuses_lossy_or_timezone_aware_keys(tmp_path, value):
+    with pytest.raises(ValueError, match="invalid H time key"):
+        convert(
+            tmp_path,
+            f"shop,sku,day,units\na,1,{value},1\n",
+            frequency="H",
+        )
 
 
 @pytest.mark.parametrize("row,match", [
@@ -92,6 +123,36 @@ def test_csv_cli_maps_non_retail_column_names(tmp_path):
     assert result.returncode == 0, result.stderr
     assert pq.read_table(output).to_pylist() == [
         {"meter": "0007", "date": dt.date(2024, 1, 1), "kwh": 12.5},
+    ]
+
+
+def test_csv_cli_frequency_flag_preserves_hourly_timestamps(tmp_path):
+    source = tmp_path / "meter.csv"
+    source.write_text("meter,date,kwh\n0007,2024-03-01T22:00:00,12.5\n")
+    output = tmp_path / "meter.parquet"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "autoforecast.cli",
+            "import-csv",
+            str(source),
+            str(output),
+            "--id-columns",
+            "meter",
+            "--date-column",
+            "date",
+            "--target-column",
+            "kwh",
+            "--frequency",
+            "H",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert pq.read_table(output).to_pylist() == [
+        {"meter": "0007", "date": dt.datetime(2024, 3, 1, 22), "kwh": 12.5},
     ]
 
 

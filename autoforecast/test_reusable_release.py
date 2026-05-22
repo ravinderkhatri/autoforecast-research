@@ -103,6 +103,33 @@ def test_freeze_internal_and_trailing_gaps(tmp_path, spark):
         _freeze(project, recipe, sources, spark)
 
 
+def test_freeze_rejects_duplicate_source_observations(tmp_path, spark):
+    project, recipe, sources = _inputs(tmp_path)
+    table = pq.read_table(project / "data")
+    duplicate = table.slice(0, 1)
+    pq.write_table(pa.concat_tables([table, duplicate]), project / "data/observations.parquet")
+
+    with pytest.raises(benchmark.BenchmarkError, match="duplicate source observations"):
+        _freeze(project, recipe, sources, spark)
+
+
+def test_freeze_rejects_a_weekly_source_row_off_the_declared_phase(tmp_path, spark):
+    project = tmp_path / "project"
+    create_example(project, frequency="W")
+    recipe = json.loads((project / "recipe.json").read_text())
+    sources = {role: project / "data" for role in ("selection", "final_training", "final_score")}
+    table = pq.read_table(project / "data")
+    row = table.slice(0, 1).to_pylist()[0]
+    row["day"] += dt.timedelta(days=1)
+    pq.write_table(
+        pa.concat_tables([table, pa.Table.from_pylist([row], schema=table.schema)]),
+        project / "data/observations.parquet",
+    )
+
+    with pytest.raises(benchmark.BenchmarkError, match="off the declared W grid"):
+        _freeze(project, recipe, sources, spark)
+
+
 def test_freeze_conflicting_overlap_and_explicit_revision(tmp_path, spark):
     project, recipe, sources = _inputs(tmp_path)
     rows = pq.read_table(project / "data").to_pylist()
@@ -216,6 +243,42 @@ def test_fixed_grid_rejects_population_changes(frozen, tmp_path, spark, defect):
                 output_dir=tmp_path / "score",
                 fixed_contract=fixed,
             )
+
+
+def test_fixed_grid_accepts_the_explicit_month_end_alias(tmp_path, spark):
+    from autoforecast.adapters.naive import seasonal_naive
+
+    project = tmp_path / "project"
+    create_example(project, frequency="M")
+    contract = yaml.safe_load((project / "dataset.yaml").read_text())
+    contract["dataset"]["panel"]["frequency"] = "ME"
+    (project / "dataset.yaml").write_text(yaml.safe_dump(contract, sort_keys=False))
+    recipe = json.loads((project / "recipe.json").read_text())
+    sources = {role: project / "data" for role in ("selection", "final_training", "final_score")}
+    benchmark_path = _freeze(project, recipe, sources, spark)
+    origin = recipe["validation_origins"][0]
+    fixed = benchmark.evaluation_contract(
+        benchmark_path, stage="validation", origin=origin, horizon=7, metric="rmse"
+    )
+    panel = load_dataset_contract(benchmark_path.parent / "dataset.yaml").panel(
+        benchmark_path.parent / "selection"
+    )
+    forecast = seasonal_naive(
+        panel, origin, 7, spark=spark, out_dir=tmp_path / "month-end-forecast"
+    )
+
+    result = compare_run_forecasts(
+        panel,
+        {"seasonal_naive": forecast},
+        spark,
+        missing_actual="no_data",
+        metric="rmse",
+        output_dir=tmp_path / "score",
+        fixed_contract=fixed,
+    )
+
+    record = json.loads(result.read_text())
+    assert record["candidates"][0]["status"] == "scored"
 
 
 @pytest.mark.parametrize("existing", ["active", "default", "context"])

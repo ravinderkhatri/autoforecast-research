@@ -7,19 +7,36 @@ import datetime as dt
 import json
 import pathlib
 
+from autoforecast.frequency import advance, parse_frequency
 
-def create_example(project: pathlib.Path) -> None:
-    """Write a deterministic, non-client daily example without any repository resources."""
+
+def create_example(project: pathlib.Path, *, frequency: str = "D") -> None:
+    """Write a deterministic, non-client example without any repository resources."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     import yaml
 
+    cadence = parse_frequency(frequency)
+    starts = {
+        "H": dt.datetime(2024, 1, 1),
+        "D": dt.date(2024, 1, 1),
+        "W": dt.date(2024, 1, 1),
+        "M": dt.date(2024, 1, 31),
+        "MS": dt.date(2024, 1, 1),
+        "Y": dt.date(2024, 12, 31),
+        "YS": dt.date(2024, 1, 1),
+    }
+    if cadence.code not in starts:
+        raise ValueError("example frequency must be H, D, W, M, MS, Y, or YS")
+    start = starts[cadence.code]
+    points = [advance(start, cadence, index) for index in range(42)]
+    example_id = "daily-example" if cadence.code == "D" else f"{cadence.code.lower()}-example"
     project.mkdir(parents=True, exist_ok=False)
     rows = [
         {
             "shop": shop,
             "sku": sku,
-            "day": dt.date(2024, 1, 1) + dt.timedelta(days=i),
+            "day": points[i],
             "units": float(2 + i % 7 + sku),
         }
         for shop, sku in (("a|b", 1), ("a", 2))
@@ -38,12 +55,12 @@ def create_example(project: pathlib.Path) -> None:
         {
             "schema_version": 1,
             "dataset": {
-                "id": "daily-example",
+                "id": example_id,
                 "panel": {
                     "series_col": "shop",
                     "time_col": "day",
                     "target_col": "units",
-                    "frequency": "D",
+                    "frequency": cadence.code,
                     "target_estimand": "sales_given_availability",
                     "season_length": 7,
                 },
@@ -53,16 +70,18 @@ def create_example(project: pathlib.Path) -> None:
     recipe = {
         "schema_version": 1,
         "source_keys": ["shop", "sku"],
-        "training_start": "2024-01-01",
-        "validation_origins": ["2024-01-21", "2024-01-28"],
+        "training_start": points[0].isoformat(),
+        "validation_origins": [points[20].isoformat(), points[27].isoformat()],
         "validation_horizon": 7,
-        "final_train_cutoff": "2024-02-04",
+        "final_train_cutoff": points[34].isoformat(),
         "final_test_horizon": 7,
         "history_policy": "fixed",
         "new_series_policy": "error",
         "target_unit": "units",
         "feature_availability": {},
     }
+    if cadence.code != "D":
+        recipe["frequency"] = cadence.code
     (project / "recipe.json").write_text(json.dumps(recipe, indent=2) + "\n")
     for name in ("seasonal_naive", "last_value"):
         write(
@@ -92,12 +111,12 @@ def create_example(project: pathlib.Path) -> None:
         {
             "schema_version": 5,
             "forecast_campaign": {
-                "name": "daily-example",
+                "name": example_id,
                 "purpose": "forecast_campaign",
                 "dataset": {
                     "contract": "dataset.yaml",
                     **{
-                        role: {"source_uri": f"local://daily-example-{role}"}
+                        role: {"source_uri": f"local://{example_id}-{role}"}
                         for role in ("selection", "final_training", "final_score")
                     },
                 },
@@ -253,17 +272,23 @@ def run_campaign(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="AutoForecast: local daily observed-target benchmarks"
+        description="AutoForecast: local observed-target time-series benchmarks"
     )
     commands = parser.add_subparsers(dest="command", required=True)
     example = commands.add_parser("init-example", help="create a tiny two-baseline project")
     example.add_argument("project", type=pathlib.Path)
-    convert = commands.add_parser("import-csv", help="map CSV observations to typed daily Parquet")
+    example.add_argument(
+        "--frequency",
+        choices=("H", "D", "W", "M", "ME", "MS", "Y", "YE", "YS"),
+        default="D",
+    )
+    convert = commands.add_parser("import-csv", help="map CSV observations to typed Parquet")
     convert.add_argument("source", type=pathlib.Path)
     convert.add_argument("output", type=pathlib.Path)
     convert.add_argument("--id-columns", nargs="+", required=True)
     convert.add_argument("--date-column", required=True)
     convert.add_argument("--target-column", required=True)
+    convert.add_argument("--frequency", default="D")
     freeze = commands.add_parser("freeze", help="validate data and freeze a benchmark")
     freeze.add_argument("--project-root", type=pathlib.Path, required=True)
     freeze.add_argument("--recipe", type=pathlib.Path, default=pathlib.Path("recipe.json"))
@@ -284,9 +309,10 @@ def main() -> int:
             print(import_csv(
                 args.source, args.output, source_keys=args.id_columns,
                 time_col=args.date_column, target_col=args.target_column,
+                frequency=args.frequency,
             ))
         elif args.command == "init-example":
-            create_example(args.project.resolve())
+            create_example(args.project.resolve(), frequency=args.frequency)
             print(args.project.resolve())
         else:
             project = args.project_root.resolve(strict=True)

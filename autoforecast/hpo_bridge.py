@@ -7,7 +7,6 @@ test targets during selection.
 
 from __future__ import annotations
 
-import datetime as dt
 import pathlib
 import shutil
 from dataclasses import dataclass, field
@@ -17,7 +16,15 @@ from mlops import ProvenanceError, load_completed_run_bundle, validate_data_refe
 
 from autoforecast._exact_json import ExactJSONError, load_exact_json
 from autoforecast._numeric import is_finite_real
+from autoforecast.adapter_contracts import descriptor
 from autoforecast.data_admission import DatasetContractError, load_dataset_contract
+from autoforecast.frequency import (
+    FrequencyError,
+    frequency_is_supported,
+    parse_frequency,
+    parse_origin,
+    period_points,
+)
 from autoforecast.hpo import HPOError, HPOStudySpec, TrialOutcome, TrialRequest
 from autoforecast.model_catalog import Candidate
 from autoforecast.model_execution import (
@@ -25,7 +32,7 @@ from autoforecast.model_execution import (
     resolve_revision_rolling_config,
     validate_revision_parameter_groups,
 )
-from autoforecast.panel import PanelError, period_days
+from autoforecast.panel import PanelError
 from autoforecast.train_workflow import RunRequest, load_run_request
 from provenance.lineage import directory_digest
 
@@ -227,17 +234,26 @@ class ForecastTrialBridge:
         target_range = study.data["validation_target_date_range"]
         if not isinstance(target_range, list):  # validated by load_hpo_study
             raise HPOError("study validation target range is invalid")
-        start, end = (dt.date.fromisoformat(item) for item in target_range)
-        origin = dt.date.fromisoformat(request.origin)
         try:
             contract = load_dataset_contract(self.project_root / request.dataset_contract)
-            step_days = period_days(str(contract.panel_roles.get("frequency", "D")))
-        except (DatasetContractError, PanelError) as error:
+            cadence = parse_frequency(str(contract.panel_roles.get("frequency", "D")))
+            definition = descriptor(study.tuning.adapter)
+            if not frequency_is_supported(
+                cadence,
+                definition.supported_frequency_families,
+                supports_strided_daily=definition.supports_strided_daily,
+            ):
+                raise HPOError(
+                    f"adapter {study.tuning.adapter!r} does not support {cadence.code} cadence"
+                )
+            start, end = (parse_origin(item, cadence) for item in target_range)
+            origin = parse_origin(request.origin, cadence)
+            expected = period_points(origin, cadence, request.horizon)
+        except HPOError:
+            raise
+        except (DatasetContractError, FrequencyError, PanelError, ValueError) as error:
             raise HPOError(f"builtin HPO dataset cadence is invalid: {error}") from error
-        if (
-            origin + dt.timedelta(days=step_days) != start
-            or origin + dt.timedelta(days=step_days * request.horizon) != end
-        ):
+        if expected[0] != start or expected[-1] != end:
             raise HPOError(
                 "run request origin/horizon must exactly produce study.validation_target_date_range"
             )

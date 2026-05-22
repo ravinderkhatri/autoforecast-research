@@ -8,6 +8,7 @@ and every expected value is read back out of the same Parquet the adapter read.
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import pathlib
 import sys
@@ -20,7 +21,9 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
+from autoforecast.adapters.last_value import fit_predict as last_value
 from autoforecast.adapters.naive import NAME, seasonal_naive
+from autoforecast.frequency import advance, parse_origin, period_points
 from autoforecast.panel import Forecast, Panel
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
@@ -231,7 +234,7 @@ def test_a_non_positive_horizon_is_refused() -> None:
         raise AssertionError(f"accepted horizon={bad}")
 
 
-def test_daily_adapter_refuses_invalid_span_before_spark_io() -> None:
+def test_adapter_refuses_invalid_span_before_spark_io() -> None:
     class ReadSentinel:
         @property
         def read(self):
@@ -242,7 +245,8 @@ def test_daily_adapter_refuses_invalid_span_before_spark_io() -> None:
 
     daily = _panel_contract()
     cases = (
-        (_panel_contract(frequency="W"), ORIGIN, HORIZON, "daily"),
+        (_panel_contract(frequency="M"), ORIGIN, HORIZON, "canonical"),
+        (_panel_contract(frequency="H"), ORIGIN, HORIZON, "canonical"),
         (daily, "20160424", HORIZON, "canonical"),
         (daily, ORIGIN, True, "positive integer"),
         (daily, ORIGIN, 1.0, "positive integer"),
@@ -254,6 +258,82 @@ def test_daily_adapter_refuses_invalid_span_before_spark_io() -> None:
             seasonal_naive(
                 described, origin, horizon, spark=ReadSentinel(), out_dir="/not-written"
             )
+
+
+@pytest.mark.parametrize(
+    "frequency,origin",
+    [
+        ("H", "2024-03-01T22:00:00"),
+        ("D", "2024-03-01"),
+        ("W", "2024-02-28"),
+        ("M", "2024-02-29"),
+        ("MS", "2024-03-01"),
+        ("Y", "2023-12-31"),
+        ("YS", "2024-01-01"),
+    ],
+)
+def test_baseline_repeats_period_values_without_truncating_cadence_keys(
+    tmp_path, frequency: str, origin: str
+) -> None:
+    cadence_origin = parse_origin(origin, frequency)
+    previous = advance(cadence_origin, frequency, -1)
+    source = tmp_path / f"panel-{frequency}"
+    key_type = "timestamp_ntz" if frequency == "H" else "date"
+    spark().createDataFrame(
+        [("a", previous, 10.0), ("a", cadence_origin, 20.0)],
+        f"id string, date {key_type}, qty double",
+    ).write.parquet(str(source))
+    described = Panel(
+        source, "id", "date", "qty", season_length=2, frequency=frequency
+    ).validate()
+
+    forecast = seasonal_naive(
+        described,
+        origin,
+        3,
+        spark=spark(),
+        out_dir=tmp_path / f"forecast-{frequency}",
+    )
+    rows = spark().read.parquet(forecast.path).orderBy("date").collect()
+
+    assert [row["date"] for row in rows] == list(period_points(origin, frequency, 3))
+    assert [row["yhat"] for row in rows] == [10.0, 20.0, 10.0]
+    assert forecast.frequency == frequency
+
+    last = last_value(
+        described,
+        origin,
+        3,
+        spark=spark(),
+        out_dir=tmp_path / f"last-{frequency}",
+    )
+    last_rows = spark().read.parquet(last.path).orderBy("date").collect()
+    assert [row["date"] for row in last_rows] == list(period_points(origin, frequency, 3))
+    assert [row["yhat"] for row in last_rows] == [20.0, 20.0, 20.0]
+    assert last.adapter == "last_value" and last.frequency == frequency
+
+
+@pytest.mark.parametrize(
+    "frequency,origin,bad_key",
+    [
+        ("H", "2024-03-01T22:00:00", dt.datetime(2024, 3, 1, 21, 30)),
+        ("D", "2024-03-01", dt.datetime(2024, 3, 1, 12)),
+        ("M", "2024-02-29", dt.datetime(2024, 2, 28)),
+    ],
+)
+def test_baseline_rejects_lossy_or_off_grid_panel_keys(
+    tmp_path, frequency: str, origin: str, bad_key
+) -> None:
+    source = tmp_path / f"bad-{frequency}"
+    spark().createDataFrame(
+        [("a", bad_key, 1.0)], "id string, date timestamp, qty double"
+    ).write.parquet(str(source))
+    described = Panel(source, "id", "date", "qty", season_length=1, frequency=frequency)
+
+    with pytest.raises(ValueError, match="malformed|lossy|off-anchor"):
+        seasonal_naive(
+            described, origin, 1, spark=spark(), out_dir=tmp_path / f"out-{frequency}"
+        )
 
 
 def test_write_failure_releases_cached_labelled_frame(tmp_path, monkeypatch) -> None:

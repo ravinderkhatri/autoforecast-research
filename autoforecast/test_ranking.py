@@ -693,6 +693,51 @@ def test_zero_policy_preserves_and_validates_the_declared_period_grid() -> None:
     assert {row["date"] for row in spark().read.parquet(finalized.path).collect()} == set(days)
 
 
+def test_zero_policy_keeps_two_hourly_keys_on_one_day_distinct() -> None:
+    root = pathlib.Path(tempfile.mkdtemp())
+    origin = "2024-03-01T22:00:00"
+    hours = ("2024-03-01T23:00:00", "2024-03-02T00:00:00")
+    grid_path = root / "hourly-grid"
+    (
+        spark().createDataFrame(
+            [("series", hour) for hour in hours], "series_id string, raw_date string"
+        )
+        .selectExpr("series_id", "cast(raw_date as timestamp_ntz) as date")
+        .write.parquet(str(grid_path))
+    )
+    source_path = root / "hourly-source"
+    (
+        spark().createDataFrame(
+            [("series", hours[0], 4.0)],
+            "series_id string, raw_date string, yhat double",
+        )
+        .selectExpr("series_id", "cast(raw_date as timestamp_ntz) as date", "yhat")
+        .write.parquet(str(source_path))
+    )
+    source = Forecast(
+        "candidate",
+        source_path,
+        origin,
+        2,
+        1,
+        {"emitted": 1, "declined_fixture": 1},
+        frequency="H",
+    )
+
+    finalized, _ = ranking.finalize_forecast_on_grid(
+        source,
+        grid_path,
+        grid.content_hash(grid_path, spark(), frequency="H"),
+        spark(),
+        root / "hourly-final",
+        missing_forecast_policy="zero",
+    )
+    rows = spark().read.parquet(finalized.path).orderBy("date").collect()
+
+    assert [row["date"].isoformat() for row in rows] == list(hours)
+    assert [row["yhat"] for row in rows] == [4.0, 0.0]
+
+
 def test_common_cells_refuses_equal_horizons_with_different_frequencies() -> None:
     forecasts = [
         Forecast("a", "/not-read-a", "2020-01-01", 2, 1, {"emitted": 2}),

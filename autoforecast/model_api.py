@@ -74,9 +74,10 @@ class DataFacts:
     inconsistent_static_series: dict[str, int]
     profile: Profile | None
     spark_schema: dict[str, str]
+    missing_timestamps: int | None = None
 
     def as_record(self) -> dict[str, object]:
-        return {
+        record = {
             "as_of": self.as_of,
             "data_fingerprint": self.data_fingerprint,
             "data_range": list(self.data_range),
@@ -90,6 +91,9 @@ class DataFacts:
             "profile": None if self.profile is None else self.profile.as_record(),
             "spark_schema": self.spark_schema,
         }
+        if self.missing_timestamps is not None:
+            record["missing_timestamps"] = self.missing_timestamps
+        return record
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,7 @@ class ResolvedRun:
     origin: str
     horizon: int
     settings: tuple[tuple[str, object], ...] = ()
+    frequency: str = "D"
 
     def setting(self, name: str, default: object) -> object:
         return dict(self.settings).get(name, default)
@@ -170,6 +175,8 @@ class ResolvedRun:
             "horizon": self.horizon,
             "settings": list(self.settings),
         }
+        if self.frequency != "D":
+            payload["frequency"] = self.frequency
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(raw.encode()).hexdigest()
 

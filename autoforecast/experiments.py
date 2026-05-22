@@ -31,6 +31,7 @@ from mlops._safe_files import (
 )
 
 from autoforecast._exact_json import ExactJSONError, load_exact_json, loads_exact_json
+from autoforecast.frequency import FrequencyError, TimePoint, parse_origin
 
 __all__ = [
     "ExperimentError",
@@ -113,19 +114,25 @@ def _traverses_symlink(root: pathlib.Path, path: pathlib.Path) -> bool:
     return root.is_symlink()
 
 
-def _validate_date_range(value: object, label: str) -> None:
+def _validate_date_range(value: object, label: str) -> tuple[TimePoint, TimePoint]:
     if (
         not isinstance(value, list | tuple)
         or len(value) != 2
         or not all(isinstance(item, str) for item in value)
     ):
-        raise ExperimentError(f"{label} must be a two-date ISO-8601 range")
+        raise ExperimentError(f"{label} must be a two-point ISO-8601 date/time range")
     try:
-        start, end = (datetime.fromisoformat(item).date() for item in value)
-    except ValueError as exc:
-        raise ExperimentError(f"{label} must be a two-date ISO-8601 range") from exc
+        start, end = (
+            parse_origin(item, "H" if "T" in item else "D")
+            for item in value
+        )
+    except FrequencyError as exc:
+        raise ExperimentError(f"{label} must be a two-point ISO-8601 date/time range") from exc
+    if type(start) is not type(end):
+        raise ExperimentError(f"{label} endpoints must use the same temporal key type")
     if start > end:
         raise ExperimentError(f"{label} start must not be after its end")
+    return start, end
 
 
 def _validate_metadata(metadata: Mapping[str, Any]) -> None:
@@ -142,23 +149,20 @@ def _validate_metadata(metadata: Mapping[str, Any]) -> None:
     data_fingerprint = data.get("fingerprint")
     if not isinstance(data_fingerprint, str) or _FINGERPRINT.fullmatch(data_fingerprint) is None:
         raise ExperimentError("data.fingerprint must be a complete lowercase SHA-256")
-    for name in (
-        "observed_date_range",
-        "training_date_range",
-        "validation_date_range",
-        "test_date_range",
-        "validation_target_date_range",
-        "test_target_date_range",
-    ):
-        _validate_date_range(data.get(name), f"data.{name}")
-    validation_target = data["validation_target_date_range"]
-    test_target = data["test_target_date_range"]
-    assert isinstance(validation_target, list | tuple)
-    assert isinstance(test_target, list | tuple)
-    if (
-        datetime.fromisoformat(validation_target[1]).date()
-        >= datetime.fromisoformat(test_target[0]).date()
-    ):
+    ranges = {
+        name: _validate_date_range(data.get(name), f"data.{name}")
+        for name in (
+            "observed_date_range",
+            "training_date_range",
+            "validation_date_range",
+            "test_date_range",
+            "validation_target_date_range",
+            "test_target_date_range",
+        )
+    }
+    if len({type(point) for bounds in ranges.values() for point in bounds}) != 1:
+        raise ExperimentError("all attempt data ranges must use the same temporal key type")
+    if ranges["validation_target_date_range"][1] >= ranges["test_target_date_range"][0]:
         raise ExperimentError(
             "data.test_target_date_range must start strictly after validation_target_date_range"
         )

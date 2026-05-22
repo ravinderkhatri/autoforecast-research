@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from autoforecast.adapters import known_adapter_names
 from autoforecast.data_observability import CheckReport, inspect_panel
+from autoforecast.frequency import canonical_origin, period_points
 from autoforecast.model_readiness import (
     approve_run,
     create_resolved_run,
@@ -100,6 +101,95 @@ def test_create_resolved_run_refuses_noncanonical_origin_identity() -> None:
             origin="20240101",
             horizon=4,
         )
+
+
+@pytest.mark.parametrize(
+    "frequency,anchor",
+    [
+        ("H", "2024-03-01T20:00:00"),
+        ("D", "2024-03-01"),
+        ("W", "2024-02-23"),
+        ("M", "2023-12-31"),
+        ("MS", "2024-01-01"),
+        ("Y", "2021-12-31"),
+        ("YS", "2022-01-01"),
+    ],
+)
+def test_last_value_readiness_uses_complete_period_windows_for_every_cadence(
+    tmp_path, frequency: str, anchor: str
+) -> None:
+    spark = _spark()
+    points = period_points(anchor, frequency, 3)
+    source = tmp_path / f"readiness-{frequency}"
+    key_type = "timestamp_ntz" if frequency == "H" else "date"
+    spark.createDataFrame(
+        [("a", point, float(index)) for index, point in enumerate(points, 1)],
+        f"item string, date {key_type}, sales double",
+    ).write.parquet(str(source))
+    panel = Panel(source, "item", "date", "sales", frequency=frequency)
+    origin = canonical_origin(points[-1], frequency)
+    data_checks = inspect_panel(panel, spark, as_of=origin)
+    assert isinstance(data_checks, CheckReport) and data_checks.accepted
+    run = create_resolved_run(
+        model_id=f"last-{frequency}",
+        adapter="last_value",
+        origin=origin,
+        horizon=1,
+        frequency=frequency,
+    )
+
+    prepared = prepare_model_check_input(panel, spark, data_checks.facts, run)
+    report = run_model_checks(prepared)
+
+    assert prepared.series_with_complete_window == 1
+    frequency_check = next(item for item in report.checks if item.id == "model_frequency")
+    assert frequency_check.status == "passed"
+
+
+@pytest.mark.parametrize(
+    "frequency,anchor",
+    [
+        ("H", "2024-03-01T20:00:00"),
+        ("D", "2024-03-01"),
+        ("W", "2024-02-23"),
+        ("M", "2023-12-31"),
+        ("MS", "2024-01-01"),
+        ("Y", "2021-12-31"),
+        ("YS", "2022-01-01"),
+    ],
+)
+def test_seasonal_readiness_rejects_a_missing_required_period_for_every_cadence(
+    tmp_path, frequency: str, anchor: str
+) -> None:
+    spark = _spark()
+    points = period_points(anchor, frequency, 3)
+    source = tmp_path / f"readiness-gap-{frequency}"
+    key_type = "timestamp_ntz" if frequency == "H" else "date"
+    spark.createDataFrame(
+        [("a", points[0], 1.0), ("a", points[2], 3.0)],
+        f"item string, date {key_type}, sales double",
+    ).write.parquet(str(source))
+    panel = Panel(
+        source, "item", "date", "sales", season_length=3, frequency=frequency
+    )
+    origin = canonical_origin(points[-1], frequency)
+    data_checks = inspect_panel(panel, spark, as_of=origin)
+    assert isinstance(data_checks, CheckReport) and data_checks.accepted
+    assert next(item for item in data_checks.checks if item.id == "time_grain").status == "warning"
+    run = create_resolved_run(
+        model_id=f"seasonal-{frequency}",
+        adapter="seasonal_naive",
+        origin=origin,
+        horizon=1,
+        frequency=frequency,
+    )
+
+    prepared = prepare_model_check_input(panel, spark, data_checks.facts, run)
+    report = run_model_checks(prepared)
+
+    assert prepared.series_with_complete_window == 0
+    assert next(item for item in report.checks if item.id == "model_recent_window").status == "failed"
+    assert not approve_run(data_checks, report, prepared).approved
 
 
 if __name__ == "__main__":

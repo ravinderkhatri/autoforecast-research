@@ -5,13 +5,15 @@ help resolve model requirements from the caller's data without future labels."""
 
 from __future__ import annotations
 
-import datetime as dt
 import pathlib
 from dataclasses import dataclass, field
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from spec.forecast_spec import ELIGIBLE_STATES
+
+from autoforecast.frequency import parse_frequency, parse_origin
+from autoforecast.grid import canonical_key, time_literal
 
 __all__ = ["Profile", "ProfileError", "profile"]
 
@@ -128,6 +130,7 @@ def profile(
     time_col: str,
     target_col: str,
     as_of: str,
+    frequency: str = "D",
     exposure_col: str | None = None,
     coverage_cols: tuple[str, ...] = (),
 ) -> Profile:
@@ -154,28 +157,36 @@ def profile(
         ProfileError: the cutoff is not an ISO date, the panel has no rows on or before it, or a
             named column is absent.
     """
-    if not isinstance(as_of, str):
-        raise ProfileError("as_of must be an ISO date string (YYYY-MM-DD)")
     try:
-        cutoff = dt.date.fromisoformat(as_of)
-    except ValueError:
-        raise ProfileError(f"as_of must be an ISO date string (YYYY-MM-DD), got {as_of!r}") \
-            from None
-    # Canonicalise the recorded boundary even if ``date.fromisoformat`` learns to accept another
-    # spelling in a future Python release.
-    as_of = cutoff.isoformat()
+        cadence = parse_frequency(frequency)
+        cutoff = parse_origin(as_of, cadence)
+    except (TypeError, ValueError):
+        raise ProfileError(
+            f"as_of must be a canonical ISO date/time for frequency {frequency!r}, got {as_of!r}"
+        ) from None
 
     df = spark.read.parquet(str(panel_path))
     needed = [c for c in (series_col, time_col, target_col, exposure_col, *coverage_cols) if c]
     missing = [c for c in needed if c not in df.columns]
     if missing:
         raise ProfileError(f"columns absent from the panel: {missing}")
+    if cadence.key_kind == "timestamp" and (
+        df.schema[time_col].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ProfileError(
+            f"hourly {time_col!r} must have Spark timestamp_ntz type, got "
+            f"{df.schema[time_col].dataType.simpleString()}"
+        )
 
-    # Compare calendar dates, not timestamps at midnight: every observation ON ``as_of`` belongs
-    # to the information set, including a timestamp later that day. This filter must precede both
-    # aggregate scans below; bounding only the zero-rate scan would still let future scale data
-    # decide whether normalisation is load-bearing.
-    df = df.filter(F.to_date(F.col(time_col)) <= F.lit(as_of).cast("date"))
+    time_key, valid_time = canonical_key(time_col, cadence)
+    bounded = df.withColumn("__af_profile_time", time_key).withColumn(
+        "__af_profile_valid_time", valid_time
+    )
+    if bounded.filter(~F.col("__af_profile_valid_time")).limit(1).count():
+        raise ProfileError(
+            f"{time_col!r} contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    df = bounded.filter(F.col("__af_profile_time") <= time_literal(cutoff, cadence))
 
     eligible = (F.col(exposure_col).isin(*sorted(ELIGIBLE_STATES)) if exposure_col
                 else F.lit(True))

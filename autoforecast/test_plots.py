@@ -128,7 +128,7 @@ def test_diagnostic_plot_refuses_when_nothing_has_enough_history() -> None:
     raise AssertionError("drew a figure with no series")
 
 
-def test_diagnostic_plot_requests_the_full_declared_forecast_span(monkeypatch, tmp_path) -> None:
+def test_diagnostic_plot_requests_the_full_declared_forecast_period_count(monkeypatch, tmp_path) -> None:
     import autoforecast.plots as plots
 
     seen: list[int] = []
@@ -151,7 +151,7 @@ def test_diagnostic_plot_requests_the_full_declared_forecast_span(monkeypatch, t
         tmp_path / "weekly.png",
         n_series=1,
     )
-    assert seen == [14]
+    assert seen == [2]
 
 
 def test_diagnostic_plot_refuses_panel_forecast_cadence_mismatch(monkeypatch, tmp_path) -> None:
