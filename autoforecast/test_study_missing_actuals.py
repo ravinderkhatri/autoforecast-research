@@ -16,7 +16,7 @@ import yaml
 from autoforecast import benchmark
 from autoforecast.data_admission import load_dataset_contract
 from autoforecast.panel import Forecast
-from autoforecast.score_spark import ScoreError
+from autoforecast.score_spark import MissingActualError, ScoreError
 from autoforecast.study_scoring import _score_study_snapshot, score_study
 from autoforecast.study_validation import StudyValidation
 
@@ -99,11 +99,13 @@ def test_study_rejects_imputation_policy_before_reading_data(tmp_path, policy):
 @pytest.mark.parametrize("missing,expected", [("complete", 13.165465835840768),
                                                ("absent", 2.4), ("null", 2.4)])
 def test_spark_and_checkpoint_scores_preserve_missingness_and_fixed_weights(
-    tmp_path, spark, missing, expected,
+    tmp_path, spark, monkeypatch, missing, expected,
 ):
     policy = None if missing == "complete" else "mask"
     manifest = prepare(tmp_path, spark, policy=policy, missing=missing)
     contract, panel, forecast = scoring_inputs(manifest, tmp_path)
+    assert contract["metric_policy"]["version"] == "single-level-wrmsse.v2"
+    assert contract["metric_policy"]["empty_series"] == "error"
     result = score_study(panel, forecast, spark, contract=contract, output_dir=tmp_path / "score")
     assert result["wrmsse"] == pytest.approx(expected)
     assert result["coverage"] == {
@@ -133,9 +135,21 @@ def test_spark_and_checkpoint_scores_preserve_missingness_and_fixed_weights(
             dataclasses.replace(window, contract_json=json.dumps(strict)).score(predictions)
         snapshots = {key: Path(contract[key]["path"])
                      for key in ("actuals", "grid", "coverage")}
-        with pytest.raises(ScoreError, match="requires complete actuals"):
+        with pytest.raises(MissingActualError, match="requires complete actuals"):
             _score_study_snapshot(panel, forecast, spark, contract=strict, snapshots=snapshots,
                                   output_dir=tmp_path / "strict-score")
+        from autoforecast import study_scoring
+        from autoforecast.run_evaluation import compare_run_forecasts
+
+        def missing_score(*args, **kwargs):
+            raise MissingActualError("requires complete actuals")
+
+        monkeypatch.setattr(study_scoring, "score_study", missing_score)
+        comparison = tmp_path / "strict-comparison"
+        with pytest.raises(MissingActualError, match="requires complete actuals"):
+            compare_run_forecasts(panel, {"fixture": forecast}, spark, missing_actual="no_data",
+                                  metric="wrmsse", output_dir=comparison, fixed_contract=contract)
+        assert not list(comparison.glob("*.json")) and not list(comparison.glob("*.html"))
 
 
 def test_mask_refuses_an_entirely_missing_series_without_redistributing_weight(tmp_path, spark):
@@ -174,3 +188,20 @@ def test_checkpoint_scores_observed_zero_and_requires_complete_forecasts(policy)
     for prediction in (np.array([[2.0, np.nan], [4.0, 4.0]]), np.ones((2, 1))):
         with pytest.raises(ValueError, match="finite nonnegative grid"):
             window.score(prediction)
+
+
+@pytest.mark.parametrize("metric", ["rmse", "mae", "wape", "wrmsse"])
+@pytest.mark.parametrize("policy", ["error", "mask"])
+def test_metric_definition_versions_and_missing_data_contract(metric, policy):
+    weighted = metric == "wrmsse"
+    assert benchmark._metric_definition({"metric": metric, "actual_missing": policy}) == {
+        "metric": metric,
+        "version": "single-level-wrmsse.v2" if weighted else "cell-errors.v2",
+        "label": ("masked WRMSSE" if policy == "mask" else "WRMSSE") if weighted else metric,
+        "actual_missing": policy,
+        "aggregation": "all_frozen_series" if weighted else "available_cells",
+        "empty_series": "error" if weighted else "unavailable",
+        "empty_aggregate": "unavailable",
+        "undefined_scale": "unavailable",
+        "weight_redistribution": "forbidden",
+    }

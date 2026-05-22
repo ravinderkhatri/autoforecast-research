@@ -114,7 +114,9 @@ def test_scoring_references_refuse_invalid_values_and_populations(tmp_path, spar
         benchmark._prepare_scoring_references(path, key_map, ["id"], recipe, spark)
 
 
-@pytest.mark.parametrize("case", ["absent", "type", "null", "nonzero", "no_grid", "no_output"])
+@pytest.mark.parametrize("case", [
+    "absent", "type", "null", "nonzero", "no_grid", "no_output", "sparse_zero",
+])
 def test_original_missing_flags_are_validated_before_scoring(tmp_path, spark, case):
     day = dt.date(2024, 1, 2)
     flag = "missing"
@@ -125,6 +127,8 @@ def test_original_missing_flags_are_validated_before_scoring(tmp_path, spark, ca
         row[flag] = 1 if case == "type" else None if case == "null" else True
     if case == "nonzero":
         row["y"] = 7.
+    elif case == "sparse_zero":
+        row["y"] = None
     source = tmp_path / "actuals.parquet"
     pq.write_table(pa.Table.from_pylist([row], schema=pa.schema(fields)), source)
     prediction = tmp_path / "predictions.parquet"
@@ -134,9 +138,12 @@ def test_original_missing_flags_are_validated_before_scoring(tmp_path, spark, ca
     panel = Panel(str(source), "id", "date", "y", target_estimand="observed_nonnegative")
     forecast = Forecast("test", str(prediction), "2024-01-01", 1, 1, {"emitted": 1},
                         target_estimand="observed_nonnegative")
-    with pytest.raises(ScoreError):
+    message = "study scoring never fills missing actuals" if case == "sparse_zero" else None
+    with pytest.raises(ScoreError, match=message):
         score_forecast(
-            panel, forecast, spark, missing_actual="no_data", original_missing_column=flag,
+            panel, forecast, spark,
+            missing_actual="sparse_zero" if case == "sparse_zero" else "no_data",
+            original_missing_column=flag,
             eligible_grid=None if case == "no_grid" else str(grid),
             series_scores_path=None if case == "no_output" else str(tmp_path / "scores"),
         )

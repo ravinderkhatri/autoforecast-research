@@ -367,18 +367,19 @@ def test_all_missing_heldout_score_is_unavailable(tmp_path, spark):
     assert _test_score_value(result, "rmse", "test", result["evaluation_contract"]) is None
 
 
-def test_complete_flat_wrmsse_matches_hand_calculation(tmp_path, spark):
+@pytest.mark.parametrize("policy", ["error", "mask"])
+def test_complete_flat_wrmsse_matches_hand_calculation(tmp_path, spark, policy):
     import math
 
     from autoforecast.panel import Forecast
     from autoforecast.run_evaluation import compare_run_forecasts
 
-    contract, sources, recipe = inputs(tmp_path)
+    contract, sources, recipe = inputs(tmp_path, actual_missing=policy)
     source = sources["selection"]
     table = pq.read_table(source)
-    rows = [row for row in table.to_pylist() if row["date"].day not in (6, 7)]
+    rows = [row for row in table.to_pylist() if row["date"].day not in (6, 7, 8, 9)]
     rows.extend({"id": key, "date": dt.date(2024, 1, day), "y": value}
-                for key, value in (("A", 5.0), ("B", 6.0)) for day in (6, 7))
+                for key, value in (("A", 5.0), ("B", 6.0)) for day in (6, 7, 8, 9))
     pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), source)
     recipe["metric"] = "wrmsse"
     path = benchmark.freeze_benchmark(
@@ -404,6 +405,8 @@ def test_complete_flat_wrmsse_matches_hand_calculation(tmp_path, spark):
     score = json.loads(output.read_text())["candidates"][0]["score"]
     rendered = output.with_suffix(".html").read_text()
     assert "Scored cells" in rendered and "Series by level" not in rendered
+    label = "masked WRMSSE" if policy == "mask" else "WRMSSE"
+    assert f"<th>{label}</th>" in rendered
     assert score["wrmsse"] == pytest.approx((14 * math.sqrt(1 / 2.5) + 9 * math.sqrt(2 / 4)) / 23)
 
 
@@ -419,6 +422,12 @@ def test_study_compilation_preserves_identity_roles_and_safe_training_slices(tmp
 
     project = tmp_path / "project"
     create_example(project)
+    part = next((project / "data").glob("*.parquet"))
+    source_table = pq.read_table(part)
+    source_rows = source_table.to_pylist()
+    source_rows[0]["units"] = None
+    source_rows[1]["units"] = 0.0
+    pq.write_table(pa.Table.from_pylist(source_rows, schema=source_table.schema), part)
     recipe = json.loads((project / "recipe.json").read_text())
     path = benchmark.freeze_benchmark(
         contract_path=project / "dataset.yaml",
@@ -456,6 +465,11 @@ def test_study_compilation_preserves_identity_roles_and_safe_training_slices(tmp
     )
     assert benchmark.MISSING_COLUMN not in pq.read_table(destination).column_names
     assert benchmark.MISSING_COLUMN not in spark.read.parquet(str(destination)).columns
+    exported = pq.read_table(destination).to_pylist()
+    for original in source_rows[:2]:
+        actual = next(row for row in exported
+                      if all(row[key] == original[key] for key in ("shop", "sku", "day")))
+        assert actual["units"] == original["units"]
     assert max(pq.read_table(destination)["day"].to_pylist()).isoformat() == recipe["validation_origins"][0]
     assert hashlib.sha256(path.read_bytes()).hexdigest() == resolved["benchmark"]["sha256"]
     # Fixed manual parameters work; HPO cannot add an inner window after study freeze.
