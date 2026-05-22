@@ -36,6 +36,47 @@ export FORECAST_SPARK_MEMORY=1g
 The `timeseries` extra includes the local data/runtime dependencies. The two built-in baselines
 need neither a GPU nor a model download. Additional model libraries are optional.
 
+### Choose your installation size
+
+Run these commands from the cloned repository. The base package has no required third-party
+dependencies; runnable forecasting needs the `timeseries` extra. Add only the model runtimes
+you plan to use:
+
+| Installation | Command |
+|---|---|
+| Package only, without optional libraries | `python -m pip install .` |
+| Lightweight baseline forecasting | `python -m pip install '.[timeseries]'` |
+| Baselines with result plots | `python -m pip install '.[timeseries,plots]'` |
+| AutoETS, AutoTheta and Croston | `python -m pip install '.[timeseries,classical]'` |
+| Global LightGBM model | `python -m pip install '.[timeseries,shallow]'` |
+| MFT, SFT, HMFNet and PACT | `python -m pip install '.[timeseries,custom-torch]'` |
+| TFT, TFT-Q and TFT-HNB | `python -m pip install '.[timeseries,tft]'` |
+| AutoGluon model collection | `python -m pip install '.[timeseries,autogluon-zoo]'` |
+
+For the broad model installation, including plotting and the model catalog:
+
+```bash
+python -m pip install '.[timeseries,plots,catalog,classical,shallow,custom-torch,tft,autogluon-zoo,timesfm]'
+```
+
+For a standalone TimesFM 2.5 environment:
+
+```bash
+python3.12 -m venv ../autoforecast-timesfm2-env
+../autoforecast-timesfm2-env/bin/python -m pip install '.[timeseries,timesfm]'
+```
+
+HPO and tracking are separate choices. Add `hpo-optuna` or `hpo-ray` for the selected tuning
+backend, and `mlflow-tracking` when using MLflow. For example:
+
+```bash
+python -m pip install '.[timeseries,custom-torch,hpo-optuna,mlflow-tracking]'
+```
+
+Installing a runtime does not select a model or download its pretrained weights. Choose the
+model in the experiment configuration; its data, frequency, device and weight requirements
+still apply. The TimesFM extra installs a pinned source revision and require Git.
+
 ## Run the example
 
 Create an experiment outside this checkout:
