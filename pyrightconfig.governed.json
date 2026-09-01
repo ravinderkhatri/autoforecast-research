@@ -4,6 +4,7 @@
     "autoforecast/adapter_contracts.py",
     "autoforecast/benchmark.py",
     "autoforecast/study.py",
+    "autoforecast/study_horizon_metrics.py",
     "scripts/study_example.py",
     "autoforecast/cli.py",
     "autoforecast/project.py",

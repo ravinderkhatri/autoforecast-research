@@ -25,6 +25,10 @@ from autoforecast.frequency import TimePoint, advance, parse_frequency, parse_or
 from autoforecast.grid import time_literal
 from autoforecast.panel import Forecast, Panel
 from autoforecast.project import project_root
+from autoforecast.study_horizon_metrics import (
+    ForecastAccuracyBreakdown,
+    validate_forecast_accuracy_breakdown,
+)
 from autoforecast.study_scoring import score_study
 from provenance.lineage import directory_digest, snapshot_parquet_directory
 
@@ -221,16 +225,22 @@ class Study:
 
     def evaluate_forecasts(
         self, *, validation_forecasts: Forecast, testing_forecasts: Forecast, model_id: str,
+        forecast_accuracy_breakdown: ForecastAccuracyBreakdown = "per_step",
     ) -> dict:
         """Evaluate validation and test forecasts against the frozen study.
 
         Save forecast snapshots, scores, coverage and input identities in a separate
         run directory. Return the uniquely identified result, including its saved path.
 
+        ``forecast_accuracy_breakdown`` selects per-step leads (default), cumulative
+        prefixes, both, or none. Leads follow each forecast's frequency and horizon.
+        The full-horizon overall score is always calculated independently.
+
         Forecast Parquet uses ``series_id``, ``date`` and ``yhat``. IDs must match
         ``series_mapping``; dates use the study cadence. All frozen cells are required.
         This checks predictions and records input identities, not external training code.
         """
+        validate_forecast_accuracy_breakdown(forecast_accuracy_breakdown)
         if not isinstance(model_id, str) or not model_id.strip():
             raise ValueError("model_id must be a non-blank string")
         record = self._record(data=True)
@@ -290,6 +300,7 @@ class Study:
                 score = score_study(
                     dataclasses.replace(self.panel, path=fixed["actuals"]["path"]),
                     forecast, self._spark, contract=fixed, output_dir=output / stage / "scores",
+                    forecast_accuracy_breakdown=forecast_accuracy_breakdown,
                 )
                 scoring = output / stage / "score.json"
                 payload = (json.dumps(score, sort_keys=True, allow_nan=False) + "\n").encode()
@@ -301,6 +312,12 @@ class Study:
                 )
             self._record(data=True)
             for stage_name, stage in stages.items():
+                breakdown = stage["score"].get("forecast_accuracy_breakdown")
+                if breakdown is not None:
+                    evidence = breakdown["series_sums"]
+                    if (directory_digest(evidence["path"], suffixes=(".parquet",))
+                            != evidence["sha256"]):
+                        raise BenchmarkError("retained study horizon metric evidence changed")
                 for name in ("forecast", "scoring"):
                     if (hashlib.sha256(pathlib.Path(stage[name]).read_bytes()).hexdigest()
                             != stage[name + "_sha256"]):

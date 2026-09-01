@@ -170,7 +170,9 @@ def test_study_interface_scores_match_direct_scorer_and_retain_run_identities(fr
             direct = score_study(dataclasses.replace(study.panel, path=fixed["actuals"]["path"]),
                                  forecast, spark, contract=fixed, output_dir=tmp_path / f"{stage}-direct")
             expected = {k: v for k, v in direct.items() if k != "series_scores"}
-            assert {k: v for k, v in result["score"].items() if k != "series_scores"} == expected
+            assert {k: v for k, v in result["score"].items()
+                    if k not in {"series_scores", "forecast_accuracy_breakdown"}} == expected
+            assert result["score"]["forecast_accuracy_breakdown"]["mode"] == "per_step"
             assert result["score"]["coverage"] == {
                 "expected": 4, "originally_missing": 2,
                 "zero_filled": 0,
@@ -428,7 +430,7 @@ def test_study_interface_snapshot_rejects_changes_during_copy(frozen, spark, mon
             part.write_bytes(payload)
 
 
-@pytest.mark.parametrize("artifact", ["forecasts", "forecast.json", "scoring", "series-scores"])
+@pytest.mark.parametrize("artifact", ["forecasts", "forecast.json", "scoring", "series-scores", "horizon-cell-sums"])
 def test_study_interface_rejects_retained_forecast_changes_after_scoring(frozen, spark, tmp_path, monkeypatch, artifact):
     _, manifest, _ = frozen
     compare = study_api.score_study
@@ -444,7 +446,7 @@ def test_study_interface_rejects_retained_forecast_changes_after_scoring(frozen,
             elif artifact == "scoring":
                 target = validation / "score.json"
             else:
-                target = next((validation / "scores/series-scores").rglob("*.parquet"))
+                target = next((validation / "scores" / artifact).rglob("*.parquet"))
             target.write_bytes(target.read_bytes() + b"\n")
         return result
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:

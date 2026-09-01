@@ -58,6 +58,7 @@ def score_forecast(
     eligible_grid: str | None = None,
     original_missing_column: str | None = None,
     series_scores_path: str | None = None,
+    horizon_sums_path: str | None = None,
 ) -> Score:
     """Score a forecast against the panel's actuals, on eligible cells only.
 
@@ -92,6 +93,8 @@ def score_forecast(
             normally materialised by `autoforecast.grid.build`. Required to classify an absent
             panel row as `sparse_zero`. When supplied it is also the eligibility source: emitted
             keys outside the grid are ineligible, never zero-filled.
+        horizon_sums_path: Optional Parquet output of the same sufficient statistics
+            grouped by series and forecast time, for study horizon diagnostics.
 
     Returns:
         A `Score` at `grain="cell"`, carrying the raw sums so it reduces across partitions.
@@ -297,12 +300,17 @@ def score_forecast(
         raise ScoreError(
             f"{forecast.adapter}: finite cells overflowed the aggregate error/volume; the "
             "requested score is not representable as float64")
-    if series_scores_path is not None:
-        joined.groupBy("series_id").agg(
+    for destination, keys in (
+        (series_scores_path, ["series_id"]),
+        (horizon_sums_path, ["series_id", "date"]),
+    ):
+        if destination is None:
+            continue
+        joined.groupBy(*keys).agg(
             F.count("*").alias("expected"),
             F.count(F.when(F.col("_actual_present").isNull(), 1)).alias("originally_missing"),
             *_aggregations(panel, missing_actual, grid is not None),
-        ).write.parquet(series_scores_path)
+        ).write.parquet(destination)
     return Score(
         n_scored=n,
         n_dropped_ineligible=int(agg["n_ineligible"]),

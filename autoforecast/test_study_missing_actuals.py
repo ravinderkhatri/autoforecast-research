@@ -141,7 +141,7 @@ def test_spark_and_checkpoint_scores_preserve_missingness_and_fixed_weights(
                      for key in ("actuals", "grid", "coverage")}
         with pytest.raises(MissingActualError, match="requires complete actuals"):
             _score_study_snapshot(panel, forecast, spark, contract=strict, snapshots=snapshots,
-                                  output_dir=tmp_path / "strict-score")
+                                  output_dir=tmp_path / "strict-score", forecast_accuracy_breakdown="both")
         from autoforecast import study_scoring
         from autoforecast.run_evaluation import compare_run_forecasts
 
@@ -161,7 +161,8 @@ def test_mask_refuses_an_entirely_missing_series_without_redistributing_weight(t
     manifest = prepare(tmp_path, spark, policy="mask", missing="all", series_b=private_id)
     contract, panel, forecast = scoring_inputs(manifest, tmp_path)
     with pytest.raises(MissingActualError, match="every retained series") as error:
-        score_study(panel, forecast, spark, contract=contract, output_dir=tmp_path / "score")
+        score_study(panel, forecast, spark, contract=contract, output_dir=tmp_path / "score",
+                    forecast_accuracy_breakdown="both")
     assert private_id not in str(error.value)
 
 
