@@ -361,7 +361,7 @@ with experiment_project("/absolute/path/to/my-experiment"):
         # Fit your existing model on training, then refit on refit.
         # Keep testing_actuals outside all fitting and model selection.
         # Produce two Forecast objects as shown in the runnable example below.
-        result = study.run_validation(
+        result = study.evaluate_forecasts(
             validation_forecasts=validation_forecasts,
             testing_forecasts=testing_forecasts,
             model_id="my-model",

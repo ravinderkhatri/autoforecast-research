@@ -219,10 +219,13 @@ class Study:
             return None
         return self._frame("scoring_references")
 
-    def run_validation(
+    def evaluate_forecasts(
         self, *, validation_forecasts: Forecast, testing_forecasts: Forecast, model_id: str,
     ) -> dict:
-        """Check both stage forecasts and retain a separate, uniquely identified result.
+        """Evaluate validation and test forecasts against the frozen study.
+
+        Save forecast snapshots, scores, coverage and input identities in a separate
+        run directory. Return the uniquely identified result, including its saved path.
 
         Forecast Parquet uses ``series_id``, ``date`` and ``yhat``. IDs must match
         ``series_mapping``; dates use the study cadence. All frozen cells are required.

@@ -159,7 +159,7 @@ def test_study_interface_scores_match_direct_scorer_and_retain_run_identities(fr
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         validation = example_forecast(study, spark, tmp_path / "val", "validation")
         testing = example_forecast(study, spark, tmp_path / "test", "test")
-        results = [study.run_validation(validation_forecasts=validation, testing_forecasts=testing,
+        results = [study.evaluate_forecasts(validation_forecasts=validation, testing_forecasts=testing,
                                         model_id="external-model") for _ in range(2)]
         assert results[0]["run_id"] != results[1]["run_id"]
         for stage, forecast in (("validation", validation), ("test", testing)):
@@ -262,7 +262,7 @@ def test_study_interface_rejects_incorrect_forecast_contract(frozen, spark, tmp_
         runs = manifest.parent.parent.parent / "study-runs"
         before = set(runs.iterdir()) if runs.exists() else set()
         with pytest.raises(ValueError):
-            study.run_validation(validation_forecasts=forecast, testing_forecasts=testing, model_id="bad")
+            study.evaluate_forecasts(validation_forecasts=forecast, testing_forecasts=testing, model_id="bad")
         assert set(runs.iterdir()) == before
 
 
@@ -292,7 +292,7 @@ def test_study_interface_keeps_undefined_wrmsse_and_frozen_weights(tmp_path, spa
     )
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         assert study.scoring_references.count() == 4
-        result = study.run_validation(
+        result = study.evaluate_forecasts(
             validation_forecasts=example_forecast(study, spark, tmp_path / "validation", "validation"),
             testing_forecasts=example_forecast(study, spark, tmp_path / "testing", "test"),
             model_id="weights",
@@ -315,7 +315,7 @@ def test_study_interface_refuses_an_empty_wrmsse_series(tmp_path, spark):
     )
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
         with pytest.raises(MissingActualError, match="every retained series"):
-            study.run_validation(
+            study.evaluate_forecasts(
                 validation_forecasts=example_forecast(study, spark, tmp_path / "validation", "validation"),
                 testing_forecasts=example_forecast(study, spark, tmp_path / "testing", "test"),
                 model_id="empty-series",
@@ -360,9 +360,9 @@ def test_study_interface_rejects_invalid_model_names_and_swapped_valid_stages(fr
         testing = example_forecast(study, spark, tmp_path / "testing", "test").validate()
         for model_id in (None, "", "  "):
             with pytest.raises(ValueError, match="^model_id must be a non-blank string"):
-                study.run_validation(validation_forecasts=None, testing_forecasts=None, model_id=model_id)
+                study.evaluate_forecasts(validation_forecasts=None, testing_forecasts=None, model_id=model_id)
         with pytest.raises(ValueError, match="wrong evaluation boundary"):
-            study.run_validation(validation_forecasts=testing, testing_forecasts=validation, model_id="swap")
+            study.evaluate_forecasts(validation_forecasts=testing, testing_forecasts=validation, model_id="swap")
 
 
 @pytest.mark.parametrize("changed_stage", ["validation", "test"])
@@ -383,7 +383,7 @@ def test_study_interface_reauthenticates_between_scores(frozen, spark, tmp_path,
         before = set(runs.iterdir()) if runs.exists() else set()
         try:
             with pytest.raises(benchmark.BenchmarkError, match="changed"):
-                study.run_validation(validation_forecasts=validation, testing_forecasts=testing, model_id="change")
+                study.evaluate_forecasts(validation_forecasts=validation, testing_forecasts=testing, model_id="change")
             assert set(runs.iterdir()) == before
         finally:
             manifest.write_bytes(raw)
@@ -454,7 +454,7 @@ def test_study_interface_rejects_retained_forecast_changes_after_scoring(frozen,
         runs = manifest.parent.parent.parent / "study-runs"
         before = set(runs.iterdir()) if runs.exists() else set()
         with pytest.raises(benchmark.BenchmarkError, match="retained study .* changed"):
-            study.run_validation(validation_forecasts=validation, testing_forecasts=testing, model_id="change")
+            study.evaluate_forecasts(validation_forecasts=validation, testing_forecasts=testing, model_id="change")
         assert set(runs.iterdir()) == before
 
 
@@ -558,7 +558,7 @@ def test_study_interface_captures_both_forecasts_before_either_score(frozen, spa
                 observed.append(testing.path)
             return result
         monkeypatch.setattr(study_api, "score_study", changed)
-        result = study.run_validation(validation_forecasts=validation, testing_forecasts=testing, model_id="capture")
+        result = study.evaluate_forecasts(validation_forecasts=validation, testing_forecasts=testing, model_id="capture")
         assert observed
         assert directory_digest(testing.path, suffixes=(".parquet",)) != expected
         assert result["test"]["forecast_artifact_sha256"] == expected

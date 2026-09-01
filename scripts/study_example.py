@@ -102,7 +102,7 @@ def run_example(project: pathlib.Path, spark: SparkSession) -> dict:
             study, spark, project / "validation-predictions", "validation",
         )
         testing = example_forecast(study, spark, project / "test-predictions", "test")
-        result = study.run_validation(
+        result = study.evaluate_forecasts(
             validation_forecasts=validation, testing_forecasts=testing, model_id="constant-example",
         )
     print(json.dumps({stage: result[stage]["score"] for stage in ("validation", "test")}, indent=2))
