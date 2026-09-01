@@ -1,0 +1,41 @@
+schema_version: 2
+model:
+  id: timesfm_v8
+  adapter: timesfm_v8
+  family: foundation_count_hybrid
+  runtime: timesfm3
+  status: candidate
+  tags: [autoforecast, development, timesfm3, v8]
+hyperparameters:
+  model.context_days:
+    default: 371
+    valid: {kind: categorical, values: [371]}
+    search: {kind: categorical, values: [371]}
+  model.group_size:
+    default: 4
+    valid: {kind: categorical, values: [4]}
+    search: {kind: categorical, values: [4]}
+  model.max_variates:
+    default: 32
+    valid: {kind: categorical, values: [32, 64]}
+    search: {kind: categorical, values: [32]}
+  model.head_width:
+    default: 64
+    valid: {kind: categorical, values: [64]}
+    search: {kind: categorical, values: [64]}
+  training.learning_rate:
+    default: 0.0003
+    valid: {kind: categorical, values: [0.0003]}
+    search: {kind: categorical, values: [0.0003]}
+  training.mean_loss_weight:
+    default: 0.0
+    valid: {kind: categorical, values: [0.0, 0.2]}
+    search: {kind: categorical, values: [0.0]}
+  training.train_windows:
+    default: 1
+    valid: {kind: categorical, values: [1, 52]}
+    search: {kind: categorical, values: [1]}
+  training.train_stride:
+    default: 28
+    valid: {kind: categorical, values: [28]}
+    search: {kind: categorical, values: [28]}

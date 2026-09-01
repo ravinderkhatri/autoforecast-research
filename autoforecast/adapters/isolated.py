@@ -472,11 +472,11 @@ def run(adapter: str, panel: Panel, origin: str, horizon: int, *,
                         "isolated private request changed while the worker consumed it"
                     )
         if (
-            adapter in {"tft_q", "tft_hnb", }
+            adapter in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}
             and not private_response_path.exists()
         ):
             checkpoint_value = kwargs.get("checkpoint_out")
-            version = {"tft_q": "v6", "tft_hnb": "v6", }[
+            version = {"tft_q": "v6", "tft_hnb": "v6", "timesfm_hnb": "hnb", "timesfm_v8": "v8"}[
                 adapter
             ]
             checkpoint = (

@@ -257,7 +257,8 @@ def test_preflight_selects_data_compatible_catalog_candidates_before_fitting() -
             _profile(1024, 1024),
             horizon=28,
         )
-        assert len(preflight.eligible) == 14
+        assert len(preflight.eligible) == 16
+        assert "timesfm_hnb" in {candidate.id for candidate in preflight.eligible}
 
 
 if __name__ == "__main__":

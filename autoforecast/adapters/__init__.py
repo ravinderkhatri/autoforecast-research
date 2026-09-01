@@ -110,6 +110,18 @@ def validate_execution_controls(
     """Reject common controls that an adapter cannot execute before allocating resources."""
     if name not in _ISOLATED_MODULE:
         raise ValueError(f"unknown adapter {name!r}; known={list(known_adapter_names())}")
+    if name in {"timesfm_hnb", "timesfm_v8"}:
+        if precision != "32-true" or device not in (None, "auto", "cpu", "cuda", "mps"):
+            raise ValueError("TimesFM-HNB requires 32-true precision and a supported source device")
+        if gradient_microbatch_size not in {None, batch_size}:
+            raise ValueError(
+                "TimesFM-HNB has no gradient accumulation; microbatch must equal batch_size"
+            )
+        if has_generic_events:
+            raise ValueError(
+                "TimesFM-HNB consumes numeric event fields through declared known_future roles"
+            )
+        return
     if name in {"tft", "tft_q", "tft_hnb"} and precision == "16-mixed" and device == "cpu":
         raise ValueError(f"{name} float16 mixed precision needs CUDA or MPS hardware")
     if name not in {
@@ -270,6 +282,17 @@ def register_defaults(*, quiet: bool = False,
         registry.register("tft_q", tft_q.fit_predict_quantile, **_registration("tft_q"))
         registry.register("tft_hnb", tft_q.fit_predict_hnb, **_registration("tft_hnb"))
 
+    def _timesfm_hnb():
+        from autoforecast.adapters import timesfm_hnb
+
+        registry.register(
+            timesfm_hnb.NAME, timesfm_hnb.fit_predict, **_registration(timesfm_hnb.NAME)
+        )
+
+    def _timesfm_v8():
+        from autoforecast.adapters import timesfm_v8
+        registry.register(timesfm_v8.NAME, timesfm_v8.fit_predict, **_registration(timesfm_v8.NAME))
+
     def _zoo():
         # AutoGluon genuinely cannot honour the contract: no cell-level loss exclusion, no
         # censored observations, and it FILLS missing values. It may compete; registration
@@ -328,7 +351,8 @@ def register_defaults(*, quiet: bool = False,
 
     loaders = (
         ("naive", _naive), ("classical", _classical), ("shallow", _shallow),
-        ("tft", _tft), ("tft_q", _tft_q), ("zoo", _zoo), ("foundation", _foundation),
+        ("tft", _tft), ("tft_q", _tft_q), ("timesfm_hnb", _timesfm_hnb),
+        ("timesfm_v8", _timesfm_v8), ("zoo", _zoo), ("foundation", _foundation),
         ("mft", _mft),
     )
     legacy_modules = {name for name, _ in loaders}

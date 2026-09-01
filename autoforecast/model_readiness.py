@@ -108,6 +108,10 @@ def _positive_setting(run: ResolvedRun, name: str, default: int) -> int:
 
 
 _REGISTRATIONS = {
+    "timesfm_hnb": ModelRegistration("timesfm_hnb", _one, sales_only=True,
+                                     rejects_soft_availability=True),
+    "timesfm_v8": ModelRegistration("timesfm_v8", _one, sales_only=True,
+                                     rejects_soft_availability=True),
     "seasonal_naive": ModelRegistration("seasonal_naive", _season, True),
     "croston": ModelRegistration("croston", _two),
     "auto_ets": ModelRegistration("auto_ets", _classical_season),

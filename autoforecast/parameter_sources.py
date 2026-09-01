@@ -398,6 +398,17 @@ def _execution_plan_matches(
         or not 0 <= cast(int, effective["training.seed"]) <= 2**32 - 1
     ):
         return False
+    if candidate.adapter in {"timesfm_hnb", "timesfm_v8"}:
+        expected_kwargs = {
+            **{name: expected[f"model.{name}"] for name in (
+                "context_days", "group_size", "max_variates", "head_width")},
+            "learning_rate": expected["training.learning_rate"],
+            "mean_loss_weight": expected["training.mean_loss_weight"],
+            "train_windows": expected["training.train_windows"],
+            "train_stride": expected["training.train_stride"],
+            "max_epochs": effective["training.epochs"], "seed": effective["training.seed"],
+        }
+        return readiness == {} and _same_exact(adapter_kwargs, expected_kwargs)
     if candidate.adapter == "tft":
         expected_kwargs = {
             "max_epochs": effective["training.epochs"],

@@ -11,7 +11,7 @@ MODEL_NAMES = {
     "pact": "PACT",
     "tft_q": "TFT-Q",
     "tft_hnb": "TFT-HNB",
-
+    "timesfm_hnb": "TimesFM-HNB",
 }
 
 # These values belong to existing recipe/checkpoint formats, not public catalog IDs.

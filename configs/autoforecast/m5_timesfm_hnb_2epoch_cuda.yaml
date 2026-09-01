@@ -1,0 +1,86 @@
+# Full population, features and 52-window schedule. Two selection epochs only.
+# Fresh refit uses exactly the selected optimizer update count.
+schema_version: 6
+forecast_campaign:
+  name: m5-timesfm-hnb-2epoch-cuda
+  purpose: single_model_benchmark
+  dataset:
+    contract: configs/datasets/m5_timesfm_all_features.yaml
+    selection:
+      source_uri: local://m5-public-selection-v1-timesfm-all-features-v1
+      sha256: 026854dd6a2b61e302ce86b328087eaf9322641f01861c0e521033352347d459
+    final_training:
+      source_uri: local://m5-final-training-v1-timesfm-all-features-v1
+      sha256: d8b89d2c0c310cfc9a40d4997c1fda3bdea45ae1fe54a798936c58d8e61cebcc
+    final_score:
+      source_uri: kaggle://m5/organizer-private-replay-v1-timesfm-all-features-v1
+      sha256: 629a8f62b673a2c21187cfad3c8203cc6537aec339b2d63797a330f90d42afa2
+  models:
+    catalog: configs/models
+    candidates:
+    - model_id: timesfm_hnb
+      parameters:
+        mode: manual
+        values:
+          model.context_days: 371
+          model.group_size: 4
+          model.max_variates: 64
+          model.head_width: 64
+          training.learning_rate: 0.0003
+          training.mean_loss_weight: 0.2
+          training.train_windows: 52
+          training.train_stride: 28
+  temporal:
+    training_start: null
+    initialization_origin: null
+    validation_origins:
+    - '2016-04-24'
+    validation_horizon: 28
+    final_train_cutoff: '2016-05-22'
+    final_test_horizon: 28
+  seeds:
+  - 0
+  initialization_arms:
+  - fresh
+  selection:
+    metric: wrmsse
+    missing_actual: no_data
+    direction: minimize
+    tie_break:
+    - mean_score
+    - score_stddev
+    - model_id
+    - variant_id
+    - initialization
+  final_evidence_role: archived_private_replay_not_blind
+  budgets:
+    initialization:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 1
+      early_stopping_absolute_min_delta: 1.0e-06
+      early_stopping_relative_min_delta: 0.0
+    validation:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 1
+      early_stopping_absolute_min_delta: 1.0e-06
+      early_stopping_relative_min_delta: 0.0
+    final_fit:
+      maximum_epochs: 2
+      patience: 10
+      timeout_seconds: 259200
+      max_attempts: 1
+      early_stopping_absolute_min_delta: 1.0e-06
+      early_stopping_relative_min_delta: 0.0
+  compute:
+    precision: 32-true
+    device: cuda
+    batch_size: 32
+    gradient_microbatch_size: null
+    memory_gib: 16
+    min_free_disk_gib: 30
+  tracking:
+    mlflow: false

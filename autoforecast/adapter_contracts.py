@@ -61,6 +61,14 @@ DESCRIPTORS = {
         "tft_q", "fit_predict_hnb", "tft", "tft_q", "typed", ("autolog", "lightning"),
         supports_shared_studies=True,
     ),
+    "timesfm_hnb": AdapterDescriptor(
+        "timesfm_hnb", "fit_predict", "timesfm3", "one", "typed", ("reporter", "none"),
+        supports_shared_studies=True,
+    ),
+    "timesfm_v8": AdapterDescriptor(
+        "timesfm_v8", "fit_predict", "timesfm3", "one", "typed", ("reporter", "none"),
+        supports_shared_studies=True,
+    ),
     "autogluon_zoo": AdapterDescriptor(
         "zoo", "fit_predict", "autogluon_zoo", "one", consumes_exposure=False,
         supports_shared_studies=True,

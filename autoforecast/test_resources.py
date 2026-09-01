@@ -401,16 +401,31 @@ def test_the_configuration_scales_with_the_machine() -> None:
     assert large.series_per_partition >= small.series_per_partition
 
 
-def test_forecast_scoring_preserves_the_native_resource_profile(
+def test_timesfm_wrmsse_scoring_limits_concurrent_wide_panel_scans(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clear_env()
     for gb in (16, 64):
         host = machine(gb, 10)
-        for metric in ("wrmsse", "rmse"):
-            assert forecast_scoring_profile(metric, ("hmfnet",), host) == (
-                spark_profile(host, python_udfs=False)
-            )
+        for adapter in ("timesfm_hnb", "timesfm_v8"):
+            profile = forecast_scoring_profile("wrmsse", (adapter,), host)
+            assert profile.cores == 2
+            assert profile.driver_memory == "9g"
+            assert profile.shuffle_partitions == 32
+        assert forecast_scoring_profile(
+            "wrmsse", ("hmfnet", "timesfm_hnb"), host
+        ).cores == 2
+        assert forecast_scoring_profile("rmse", ("timesfm_hnb",), host) == spark_profile(
+            host, python_udfs=False
+        )
+        assert forecast_scoring_profile("wrmsse", ("hmfnet",), host) == (
+            spark_profile(host, python_udfs=False)
+        )
+    monkeypatch.setenv("FORECAST_SPARK_CORES", "10")
+    monkeypatch.setenv("FORECAST_SPARK_MEMORY", "2g")
+    monkeypatch.setenv("FORECAST_SHUFFLE_PARTITIONS", "160")
+    bounded = forecast_scoring_profile("wrmsse", ("timesfm_hnb",), machine(16, 10))
+    assert (bounded.cores, bounded.driver_memory, bounded.shuffle_partitions) == (2, "9g", 32)
 
 
 def test_machine_profile_refuses_impossible_or_mistyped_physical_resources() -> None:

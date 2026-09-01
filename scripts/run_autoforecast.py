@@ -100,8 +100,19 @@ def _root() -> pathlib.Path:
 def _preflight_spark_profiles(
     selected: tuple[Candidate, ...],
 ) -> tuple[resources.SparkProfile, resources.SparkProfile]:
-    """Split parent and worker resource budgets."""
-    return resources.isolated_spark_profiles()
+    """Give TimesFM's wide M5 data check a bounded heap before its Arrow-only worker."""
+    preflight, worker = resources.isolated_spark_profiles()
+    if any(item.adapter in {"timesfm_hnb", "timesfm_v8"} for item in selected):
+        machine = resources.detect()
+        preflight_machine = resources.MachineProfile(
+            min(machine.total_ram_bytes, 8 * 1024**3),
+            preflight.cores,
+            f"TimesFM preflight on {machine.source}",
+        )
+        preflight = resources.spark_profile(
+            preflight_machine, python_udfs=False, honor_env=False
+        )
+    return preflight, worker
 
 
 def _shutdown_owned_preflight_runtime(
@@ -496,7 +507,7 @@ def _worker_kwargs(
         raise TrainWorkflowError("execution plan adapter inputs are not a mapping")
     kwargs: dict[str, object] = {**serialized, "out_dir": str(out)}
     if evaluation_contract_path is not None and context.input.run.adapter in {
-        "sft", "hmfnet", "pact", "tft_q", "tft_hnb",
+        "sft", "hmfnet", "pact", "tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8",
     }:
         if training_mode != "fixed_validation" or evaluation_contract_sha256 is None:
             raise TrainWorkflowError("native study selection requires a fixed validation contract")
@@ -571,7 +582,7 @@ def _worker_kwargs(
             )
     elif context.input.run.adapter == "shallow_global":
         kwargs["checkpoint_dir"] = str(context.attempt_dir / "model")
-    elif context.input.run.adapter in {"tft", "tft_q", "tft_hnb", }:
+    elif context.input.run.adapter in {"tft", "tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}:
         kwargs.update(
             {
                 "checkpoint_out": str(
@@ -586,7 +597,7 @@ def _worker_kwargs(
             kwargs["device"] = training_controls["device"]
         if training_controls.get("precision") == "16-mixed":
             kwargs["precision"] = "16-mixed"
-        if context.input.run.adapter in {"tft_q", "tft_hnb", }:
+        if context.input.run.adapter in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}:
             kwargs.update(
                 {
                     "device": training_controls["device"] or (
@@ -1260,7 +1271,7 @@ def run_request(
                     f"model {candidate.id!r} does not support shared studies"
                 )
             if candidate.adapter in {
-                "sft", "hmfnet", "pact", "tft_q", "tft_hnb",
+                "sft", "hmfnet", "pact", "tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8",
             } and (training_mode != "fixed_validation" or evaluation_data_path is None):
                 raise TrainWorkflowError(
                     "native study selection requires fixed_validation and separate evaluation data"
@@ -1344,7 +1355,9 @@ def run_request(
         if not runtime_checks[candidate.id].available
     }
 
-    # Shut down the preflight JVM before starting the isolated adapter.
+    # The preflight JVM is shut down before the isolated adapter starts. TimesFM's
+    # wide calendar panel needs more than the generic 2 GiB parent heap on M5;
+    # the bounded profile leaves room for the Python process and the OS.
     preflight_profile, worker_profile = _preflight_spark_profiles(tuple(selected))
     authenticate_configuration()
     preflight_progress = PipelineProgress(

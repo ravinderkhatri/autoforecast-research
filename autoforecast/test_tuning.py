@@ -526,7 +526,8 @@ def test_every_registered_adapter_declares_whether_outer_loop_hpo_is_honest() ->
         "tft",
         "tft_q",
         "tft_hnb",
-
+        "timesfm_hnb",
+        "timesfm_v8",
     }
     for candidate in candidates:
         eligibility = tuning_support(candidate.adapter)

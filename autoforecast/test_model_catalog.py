@@ -44,8 +44,8 @@ def test_checked_in_catalog_resolves_all_registered_candidates() -> None:
         ROOT / "configs/autoforecast/selection/development_top_k.yaml"
     )
     selected = catalog.resolve_candidates(candidates, policy)
-    assert len(candidates) == 14
-    assert len(selected) == 14
+    assert len(candidates) == 16
+    assert len(selected) == 16
     assert {candidate.id for candidate in candidates} == {
         "seasonal_naive",
         "croston",
@@ -57,6 +57,8 @@ def test_checked_in_catalog_resolves_all_registered_candidates() -> None:
         "tft_hnb",
         "autogluon_zoo",
         "timesfm_standalone",
+        "timesfm_hnb",
+        "timesfm_v8",
         "mft",
         "sft",
         "hmfnet",
@@ -73,6 +75,8 @@ def test_checked_in_catalog_resolves_all_registered_candidates() -> None:
         "tft_hnb",
         "autogluon_zoo",
         "timesfm_standalone",
+        "timesfm_hnb",
+        "timesfm_v8",
         "mft",
         "sft",
         "hmfnet",

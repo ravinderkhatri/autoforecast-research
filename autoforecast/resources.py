@@ -449,12 +449,20 @@ def spark_profile(machine: MachineProfile | None = None, *, python_udfs: bool = 
 def forecast_scoring_profile(
     metric: str, adapters: tuple[str, ...], machine: MachineProfile | None = None
 ) -> SparkProfile:
-    """Use the ordinary native scoring profile."""
-    return (
-        spark_profile(python_udfs=False)
-        if machine is None
-        else spark_profile(machine, python_udfs=False)
+    """Bound TimesFM M5 WRMSSE scans; leave other forecast scoring profiles unchanged."""
+    if metric != "wrmsse" or not set(adapters) & {"timesfm_hnb", "timesfm_v8"}:
+        return (
+            spark_profile(python_udfs=False)
+            if machine is None
+            else spark_profile(machine, python_udfs=False)
+        )
+    machine = machine or detect()
+    bounded = MachineProfile(
+        min(machine.total_ram_bytes, 16 * _GB),
+        min(machine.cores, 2),
+        f"TimesFM M5 scoring on {machine.source}",
     )
+    return spark_profile(bounded, python_udfs=False, honor_env=False)
 
 
 def isolated_spark_profiles(

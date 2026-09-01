@@ -212,13 +212,30 @@ def test_owned_preflight_shutdown_terminates_the_gateway_before_worker_training(
 
 
 @pytest.mark.parametrize("memory_gib", [16, 64])
-def test_preflight_preserves_the_isolated_parent_and_worker_budgets(
+def test_timesfm_preflight_heap_handles_wide_m5_without_expanding_worker_budget(
     monkeypatch: pytest.MonkeyPatch, memory_gib: int
 ) -> None:
     machine = runner.resources.MachineProfile(memory_gib * 1024**3, 10, "test")
     monkeypatch.setattr(runner.resources, "detect", lambda: machine)
-    expected = runner.resources.isolated_spark_profiles()
-    assert runner._preflight_spark_profiles((SimpleNamespace(adapter="hmfnet"),)) == expected
+    old_preflight, old_worker = runner.resources.isolated_spark_profiles()
+    if memory_gib == 16:
+        assert old_preflight.driver_memory == "2g"
+    for adapter in ("timesfm_hnb", "timesfm_v8"):
+        preflight, worker = runner._preflight_spark_profiles(
+            (SimpleNamespace(adapter=adapter),)
+        )
+        assert preflight.driver_memory == "4g"
+        assert preflight.cores == old_preflight.cores
+        assert worker == old_worker
+    ordinary, worker = runner._preflight_spark_profiles(
+        (SimpleNamespace(adapter="hmfnet"),)
+    )
+    assert ordinary == old_preflight and worker == old_worker
+    mixed, worker = runner._preflight_spark_profiles(
+        (SimpleNamespace(adapter="timesfm_hnb"), SimpleNamespace(adapter="tft_q"))
+    )
+    assert mixed.driver_memory == "4g"
+    assert worker == old_worker
 
 
 def test_parameter_resolution_provenance_uses_private_validated_bytes(
@@ -417,6 +434,54 @@ def test_post_training_evaluation_refuses_to_open_score_data_without_all_provena
             forecasts={"seasonal_naive": forecast},
             run_path=tmp_path / "run",
         )
+
+
+@pytest.mark.parametrize("adapter", ["timesfm_hnb", "timesfm_v8"])
+def test_timesfm_post_training_score_starts_bounded_spark_runtime(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, adapter: str
+) -> None:
+    chosen: dict[str, str] = {}
+
+    class FakeBuilder:
+        def master(self, value: str) -> FakeBuilder:
+            chosen["master"] = value
+            return self
+
+        def appName(self, _value: str) -> FakeBuilder:
+            return self
+
+        def config(self, key: str, value: str) -> FakeBuilder:
+            chosen[key] = value
+            return self
+
+        def getOrCreate(self) -> SimpleNamespace:
+            return SimpleNamespace(stop=lambda: None)
+
+    monkeypatch.setattr(
+        runner.resources, "detect",
+        lambda: runner.resources.MachineProfile(16 * 1024**3, 10, "test"),
+    )
+    monkeypatch.setattr(runner.SparkSession, "builder", FakeBuilder())
+    monkeypatch.setattr(runner, "directory_digest", lambda *_a, **_kw: "a" * 64)
+    def fail_score(*_args: object, **_kwargs: object) -> pathlib.Path:
+        raise runner.EvaluationError("probe complete")
+
+    monkeypatch.setattr(runner, "compare_run_forecasts", fail_score)
+    forecast = Forecast(
+        adapter, str(tmp_path / "forecast"), "2016-05-22", 28, 1, {"emitted": 28}
+    )
+    assert not runner._evaluate_completed_forecasts(
+        request=_request(),
+        training_panel=Panel(str(tmp_path / "training"), "id", "date", "qty"),
+        score_panel=Panel(str(tmp_path / "score"), "id", "date", "qty"),
+        score_data_snapshot_id="m5_private_score_v1",
+        score_data_reference="derived://m5-private-score-v1",
+        forecasts={adapter: forecast},
+        run_path=tmp_path / "run",
+    )
+    assert chosen["master"] == "local[2]"
+    assert chosen["spark.driver.memory"] == "9g"
+    assert chosen["spark.sql.shuffle.partitions"] == "32"
 
 
 def test_post_training_evaluation_fails_when_the_metric_refuses_any_candidate(
@@ -703,7 +768,7 @@ selection_lock:
 
 
 @pytest.mark.parametrize("adapter", [
-    "sft", "hmfnet", "pact", "tft_q", "tft_hnb",
+    "sft", "hmfnet", "pact", "tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8",
 ])
 @pytest.mark.parametrize("metric,policy", [("wrmsse", "zero"), ("rmse", "zero"), ("rmse", "mask")])
 def test_shared_study_refuses_an_adapter_without_declared_support_before_runtime(

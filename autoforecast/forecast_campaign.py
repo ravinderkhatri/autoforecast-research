@@ -112,12 +112,13 @@ _SHA_CHARS = frozenset("0123456789abcdef")
 _ARMS = ("fresh", "full_state_continuation", "weights_only_finetune")
 _FIXED_BUDGET_ADAPTERS = frozenset(
     {"sft", "hmfnet", "pact",
-     "tft_q", "tft_hnb", }
+     "tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}
 )
 _ROLLING_BUDGET_ADAPTERS = _FIXED_BUDGET_ADAPTERS - {
     "tft_q",
     "tft_hnb",
-
+    "timesfm_hnb",
+    "timesfm_v8",
 }
 _TIE_BREAK = (
     "mean_score",
@@ -1443,6 +1444,14 @@ def compile_forecast_campaign(
             "MFT weights-only continuation requires compute.precision: 32-true; "
             "use a fresh-only campaign for mixed precision"
         )
+    if any(candidates[mid].adapter in {"timesfm_hnb", "timesfm_v8"} for mid in request.model_ids):
+        if (len(request.seeds) != 1 or len(request.validation_origins) != 1
+                or any(b.relative_min_delta != 0 for b in (
+                    request.initialization_budget, request.validation_budget,
+                    request.final_fit_budget))):
+            raise ForecastCampaignError(
+                "TimesFM-HNB needs one seed/origin and zero relative min-delta"
+            )
     if any(candidates[model_id].adapter in {"tft_q", "tft_hnb"} for model_id in request.model_ids):
         if len(request.seeds) != 1 or len(request.validation_origins) != 1:
             raise ForecastCampaignError(
@@ -1490,9 +1499,9 @@ def compile_forecast_campaign(
     for model_id in dict.fromkeys(request.model_ids):
         candidate = candidates[model_id]
         if (request.purpose == "capacity_diagnostic"
-                and candidate.adapter in {"tft_q", "tft_hnb", }):
+                and candidate.adapter in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}):
             raise ForecastCampaignError(
-                "TFT-Q/TFT-HNB capacity diagnostics require a validation window "
+                "TFT-Q/TFT-HNB/TimesFM-HNB capacity diagnostics require a validation window "
                 "and are unsupported"
             )
         if hierarchy_wrmsse and candidate.adapter in _ROLLING_BUDGET_ADAPTERS:
@@ -3816,7 +3825,7 @@ def _revision_training_record(result: dict[str, object]) -> dict[str, object] | 
     selected = training.get("selected_updates")
     recorded_ceiling = (
         training.get("maximum_epochs")
-        if result.get("adapter") in {"tft_q", "tft_hnb", }
+        if result.get("adapter") in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}
         else training.get("epochs_per_phase")
     )
     config = training.get("config")
@@ -3826,7 +3835,7 @@ def _revision_training_record(result: dict[str, object]) -> dict[str, object] | 
         type(ceiling) is not int
         or type(recorded_ceiling) is not int
         or recorded_ceiling != ceiling
-        or (result.get("adapter") not in {"tft_q", "tft_hnb", } and (
+        or (result.get("adapter") not in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"} and (
             type(config) is not dict or type(config.get("epochs")) is not int
             or config.get("epochs") != ceiling
         ))
@@ -3881,7 +3890,7 @@ def _selected_update_budget(
         or not is_finite_real(relative_delta) or relative_delta < 0
     ):
         raise ForecastCampaignError("revision selection budget controls are invalid")
-    if result.get("adapter") in {"tft_q", "tft_hnb", }:
+    if result.get("adapter") in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}:
         import torch
 
         if expected_loss_kind is None:
@@ -3894,15 +3903,18 @@ def _selected_update_budget(
         record_sha = result.get("forecast_record_sha256")
         record = (
             _load_hashed_json(
-                _path_without_links(record_path, "TFT-Q/TFT-HNB forecast record"),
+                _path_without_links(record_path, "TFT-Q/TFT-HNB/TimesFM-HNB forecast record"),
                 cast(str, record_sha),
-                "TFT-Q/TFT-HNB forecast record",
+                "TFT-Q/TFT-HNB/TimesFM-HNB forecast record",
             )
             if type(record_path) is str and _is_sha256(record_sha)
             else None
         )
         series_count = record.get("n_series") if type(record) is dict else None
-        examples = series_count
+        v7 = result.get("adapter") in {"timesfm_hnb", "timesfm_v8"}
+        if v7:
+            from forecast.models.timesfm_v8 import EPOCH_DEFINITION
+        examples = training.get("n_training_examples") if v7 else series_count
         study_selection = contract.get("study_evaluation") is not None
         metric_policy = (
             contract["study_evaluation"].get("metric_policy")
@@ -3910,45 +3922,40 @@ def _selected_update_budget(
         )
         study_metric = metric_policy.get("metric") if type(metric_policy) is dict else None
         if (
-            type(batch_size) is not int
-            or batch_size < 1
-            or type(series_count) is not int
-            or (series_count < 1)
-            or (training.get("n_series") != series_count)
-            or (type(examples) is not int)
-            or (examples < 1)
-            or (steps != (examples + batch_size - 1) // batch_size)
-            or (len(validation) > ceiling)
-            or (type(training.get("early_stopping_patience")) is not int)
-            or (training.get("early_stopping_patience") != patience)
-            or (not is_finite_real(training.get("early_stopping_min_delta")))
-            or (training.get("early_stopping_min_delta") != absolute_delta)
-            or (relative_delta != 0)
-            or (
-                not study_selection
-                and expected_metric is not None
-                and (expected_metric != "wrmsse")
-            )
-            or (expected_loss_kind not in {"quantile", "v3_hurdle_nb"})
-            or (
-                study_selection
-                and (
-                    study_metric not in {"rmse", "mae", "wape", "wrmsse"}
-                    or training.get("selection_metric") != study_metric
-                    or (expected_metric is not None and study_metric != expected_metric)
-                )
-            )
-            or (not _same_exact(training.get("validation"), training.get("epoch_log")))
+            type(batch_size) is not int or batch_size < 1
+            or type(series_count) is not int or series_count < 1
+            or training.get("n_series") != series_count
+            or type(examples) is not int or examples < 1
+            or (v7 and examples > series_count)
+            or steps != (examples + batch_size - 1) // batch_size
+            or len(validation) > ceiling
+            or type(training.get("early_stopping_patience")) is not int
+            or training.get("early_stopping_patience") != patience
+            or not is_finite_real(training.get("early_stopping_min_delta"))
+            or training.get("early_stopping_min_delta") != absolute_delta
+            or relative_delta != 0
+            or (not study_selection and not v7
+                and expected_metric is not None and expected_metric != "wrmsse")
+            or (not v7 and expected_loss_kind not in {"quantile", "v3_hurdle_nb"})
+            or (not study_selection and v7
+                and training.get("selection_metric") not in {"count_nll", "count_nll_mean"})
+            or (study_selection and (
+                study_metric not in {"rmse", "mae", "wape", "wrmsse"}
+                or training.get("selection_metric") != study_metric
+                or (expected_metric is not None and study_metric != expected_metric)
+            ))
+            or (v7 and training.get("epoch_definition") != EPOCH_DEFINITION)
+            or not _same_exact(training.get("validation"), training.get("epoch_log"))
         ):
             raise ForecastCampaignError(
-                "TFT-Q/TFT-HNB selection controls disagree with the budget"
+                "TFT-Q/TFT-HNB/TimesFM-HNB selection controls disagree with the budget"
             )
         selected_epoch = training.get("selected_epoch")
         epochs: list[int] = []
         updates: list[int] = []
         scores: list[torch.Tensor] = []
         loss_dtype = (
-            torch.float32 if not study_selection and expected_loss_kind == "quantile"
+            torch.float32 if not study_selection and not v7 and expected_loss_kind == "quantile"
             else torch.float64
         )
         score_key = "study_score" if study_selection else "val_loss"
@@ -3968,12 +3975,12 @@ def _selected_update_budget(
                 ))
             ):
                 raise ForecastCampaignError(
-                    "TFT-Q/TFT-HNB selection validation history is invalid"
+                    "TFT-Q/TFT-HNB/TimesFM-HNB selection validation history is invalid"
                 )
             typed_loss = torch.tensor(row[score_key], dtype=loss_dtype)
             if not bool(torch.isfinite(typed_loss)) or float(typed_loss) != row[score_key]:
                 raise ForecastCampaignError(
-                    "TFT-Q/TFT-HNB validation loss is not representable"
+                    "TFT-Q/TFT-HNB/TimesFM-HNB validation loss is not representable"
                 )
             epochs.append(row["epoch"])
             updates.append(row["updates"])
@@ -3992,7 +3999,7 @@ def _selected_update_budget(
                 stopped_early = index == len(scores) - 1
                 if not stopped_early:
                     raise ForecastCampaignError(
-                        "TFT-Q/TFT-HNB selection continued after early stopping"
+                        "TFT-Q/TFT-HNB/TimesFM-HNB selection continued after early stopping"
                     )
         witnessed = (
             training.get("validation_origin") == origin
@@ -4130,11 +4137,11 @@ def _verify_fixed_refit_budget(
         )
         or training.get("validation") != []
         or (
-            result.get("adapter") in {"tft_q", "tft_hnb", }
+            result.get("adapter") in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}
             and training.get("validation_origin") is not None
         )
         or (
-            result.get("adapter") not in {"tft_q", "tft_hnb", }
+            result.get("adapter") not in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}
             and (
                 contract.get("validation_origin") is not None
                 or type(validation_origins) not in (list, tuple)
@@ -4148,68 +4155,62 @@ def _verify_fixed_refit_budget(
         _verify_rolling_refit_journal(
             result, expected, batch_size=batch_size, resolved=resolved
         )
-    elif result.get("adapter") in {"tft_q", "tft_hnb", }:
+    elif result.get("adapter") in {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}:
         record_path = result.get("forecast_record_path")
         record_sha = result.get("forecast_record_sha256")
         record = (
             _load_hashed_json(
-                _path_without_links(record_path, "TFT-Q/TFT-HNB final forecast record"),
-                cast(str, record_sha), "TFT-Q/TFT-HNB final forecast record",
+                _path_without_links(record_path, "TFT-Q/TFT-HNB/TimesFM-HNB final forecast record"),
+                cast(str, record_sha), "TFT-Q/TFT-HNB/TimesFM-HNB final forecast record",
             )
             if type(record_path) is str and _is_sha256(record_sha) else None
         )
         count = record.get("n_series") if type(record) is dict else None
-        examples = count
+        v7 = result.get("adapter") in {"timesfm_hnb", "timesfm_v8"}
+        if v7:
+            from forecast.models.timesfm_v8 import EPOCH_DEFINITION
+        examples = training.get("n_training_examples") if v7 else count
         steps = training.get("steps_per_epoch")
         epoch_log = training.get("epoch_log")
         if (
-            type(batch_size) is not int
-            or batch_size < 1
-            or type(count) is not int
-            or (count < 1)
-            or (type(examples) is not int)
-            or (examples < 1)
-            or (type(steps) is not int)
-            or (steps < 1)
-            or (type(epoch_log) is not list)
+            type(batch_size) is not int or batch_size < 1
+            or type(count) is not int or count < 1
+            or type(examples) is not int or examples < 1
+            or (v7 and examples > count)
+            or type(steps) is not int or steps < 1
+            or type(epoch_log) is not list
         ):
             raise ForecastCampaignError(
-                "TFT-Q/TFT-HNB final refit epoch telemetry is missing"
+                "TFT-Q/TFT-HNB/TimesFM-HNB final refit epoch telemetry is missing"
             )
         epochs = math.ceil(expected / steps)
         if (
             training.get("n_series") != count
+            or (v7 and training.get("epoch_definition") != EPOCH_DEFINITION)
             or steps != (examples + batch_size - 1) // batch_size
-            or expected < steps
-            or (len(epoch_log) != epochs)
-            or (training.get("selected_epoch") != epochs)
+            or (not v7 and expected < steps)
+            or len(epoch_log) != epochs
+            or training.get("selected_epoch") != epochs
             or any(
-                (
-                    type(row) is not dict
-                    or set(row)
-                    != {
-                        "epoch",
-                        "updates",
-                        "train_loss",
-                        "val_loss",
-                        "val_loss_dtype",
-                        "elapsed_seconds",
-                    }
-                    or row.get("epoch") != index
-                    or (row.get("updates") != min(index * steps, expected))
-                    or (type(row.get("train_loss")) is not float)
-                    or (not is_finite_real(row.get("train_loss")))
-                    or (row.get("val_loss") is not None)
-                    or (row.get("val_loss_dtype") is not None)
-                    or (type(row.get("elapsed_seconds")) is not float)
-                    or (not is_finite_real(row.get("elapsed_seconds")))
-                    or (cast(float, row["elapsed_seconds"]) < 0)
-                    for index, row in enumerate(epoch_log, start=1)
-                )
+                type(row) is not dict
+                or set(row) != {
+                    "epoch", "updates", "train_loss", "val_loss", "val_loss_dtype",
+                    "elapsed_seconds",
+                }
+                or row.get("epoch") != index
+                or row.get("updates") != min(index * steps, expected)
+                or type(row.get("train_loss")) is not float
+                or not is_finite_real(row.get("train_loss"))
+                or row.get("val_loss") is not None
+                or row.get("val_loss_dtype") is not None
+                or type(row.get("elapsed_seconds")) is not float
+                or not is_finite_real(row.get("elapsed_seconds"))
+                or cast(float, row["elapsed_seconds"]) < 0
+                for index, row in enumerate(epoch_log, start=1)
             )
         ):
             raise ForecastCampaignError(
-                "TFT-Q/TFT-HNB final refit epoch telemetry differs "
+                "TFT-Q/TFT-HNB/TimesFM-HNB final refit epoch telemetry differs "
                 "from selected updates"
             )
 
@@ -4354,6 +4355,69 @@ def _verify_revision_checkpoint_binding(
             raise ForecastCampaignError(
                 "rolling checkpoint recipe differs from governed parameters"
             )
+        return
+    if child["adapter"] in {"timesfm_hnb", "timesfm_v8"}:
+        from forecast.models.timesfm_v8 import EPOCH_DEFINITION
+
+        from autoforecast.adapters.timesfm_hnb import SCHEMA
+        if child["adapter"] == "timesfm_v8":
+            from autoforecast.adapters.timesfm_v8 import SCHEMA
+        from autoforecast.timesfm_hnb_source import MODEL_ID, MODEL_REVISION, SOURCE_REVISION
+
+        panel = load_dataset_contract(
+            _root() / cast(str, cast(dict[str, object], resolved["source"])["dataset_contract"])
+        ).panel(training_path)
+        contract = training.get("training_contract")
+        identity = saved.get("run_identity")
+        source = identity.get("source") if type(identity) is dict else None
+        if type(contract) is not dict or type(source) is not dict:
+            raise ForecastCampaignError("TimesFM-HNB checkpoint recipe is incomplete")
+        expected = {
+            "panel": asdict(panel), "panel_sha256": training_digest,
+            "plan_sha256": None if panel.plan is None else directory_digest(
+                panel.plan.path, suffixes=(".parquet",)),
+            "origin": child["origin"], "horizon": child["horizon"],
+            **{name: effective.get(f"model.{name}") for name in (
+                "context_days", "group_size", "max_variates", "head_width")},
+            "learning_rate": effective.get("training.learning_rate"),
+            "mean_loss_weight": effective.get("training.mean_loss_weight"),
+            "train_windows": effective.get("training.train_windows"),
+            "train_stride": effective.get("training.train_stride"),
+            "weight_decay": 0.0001, "embedding_dim": 8, "gradient_clip": 1.0,
+            "seed": child["seed"], "batch_size": compute["batch_size"],
+            "maximum_epochs": budget["maximum_epochs"], "patience": budget["patience"],
+            "min_delta": budget["early_stopping_absolute_min_delta"],
+            "source_device": compute["device"] or "cpu", "head_device": "cpu",
+            "precision": "32-true", "training_mode": mode,
+            "fixed_update_budget": contract.get("fixed_update_budget"), "source": source,
+            "epoch_definition": EPOCH_DEFINITION,
+            **({"study_evaluation": expected_study} if expected_study is not None else {}),
+        }
+        if (saved.get("schema") != SCHEMA or not _same_exact(identity, expected)
+                or contract.get("mode") != mode or training.get("precision") != "32-true"
+                or training.get("epoch_definition") != EPOCH_DEFINITION
+                or source.get("model_id") != MODEL_ID
+                or source.get("model_revision") != MODEL_REVISION
+                or source.get("source_revision") != SOURCE_REVISION
+                or source.get("device") != expected["source_device"]
+                or not _is_sha256(source.get("weights_sha256"))
+                or not _is_sha256(source.get("config_sha256"))):
+            raise ForecastCampaignError(
+                "TimesFM-HNB checkpoint recipe differs from governed parameters"
+            )
+        expected_metric_name = metric if expected_study is not None else (
+            "count_nll_mean" if expected["mean_loss_weight"] else "count_nll"
+        )
+        if training.get("selection_metric") != expected_metric_name:
+            raise ForecastCampaignError("TimesFM checkpoint loss differs from governed parameters")
+        if child["adapter"] == "timesfm_v8":
+            from autoforecast.timesfm_v8_source import LORA_RECIPE, state_digest
+            state = saved.get("source_lora_state")
+            trained_source = saved.get("trained_source_identity")
+            if (source.get("adaptation") != LORA_RECIPE or type(state) is not dict or not state
+                    or type(trained_source) is not dict
+                    or trained_source != {**source, "adapter_sha256": state_digest(state)}):
+                raise ForecastCampaignError("V8 LoRA state differs from its governed recipe")
         return
     if child["adapter"] not in {"tft_q", "tft_hnb"}:
         return
@@ -5156,7 +5220,7 @@ def _locked_selected_update_budget(
         return None
     if len(adapters) != 1 or (
         resolved.get("purpose") == "single_model_benchmark" and len(matches) != 1
-    ) or (bool(adapters & {"tft_q", "tft_hnb", }) and len(matches) != 1):
+    ) or (bool(adapters & {"tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"}) and len(matches) != 1):
         raise ForecastCampaignError("fixed-budget selection has no unique child budget")
     selection = resolved.get("selection")
     expected_metric = selection.get("metric") if type(selection) is dict else None

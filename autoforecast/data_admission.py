@@ -96,11 +96,16 @@ def _load_dataset_contract_bytes(raw: bytes, source: pathlib.Path) -> DatasetCon
     if unknown or "path" in roles:
         raise DatasetContractError(f"dataset.panel has unknown or forbidden fields: {unknown}")
     normalised: dict[str, Any] = dict(roles)
-    for name in ("known_future", "static", "static_reals", "past_only"):
+    for name in ("known_future", "static", "static_reals", "past_only", "shared_known_future"):
         if name in normalised:
             if type(normalised[name]) is not list:
                 raise DatasetContractError(f"dataset.panel.{name} must be a YAML list")
             normalised[name] = tuple(normalised[name])
+    if "covariate_families" in normalised:
+        families = normalised["covariate_families"]
+        if type(families) is not list or any(type(family) is not list for family in families):
+            raise DatasetContractError("dataset.panel.covariate_families must be a list of lists")
+        normalised["covariate_families"] = tuple(tuple(family) for family in families)
     try:
         Panel.from_record({"path": ".", **normalised}).validate_column_names()
     except PanelError as exc:

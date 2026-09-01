@@ -138,7 +138,7 @@ def test_study_compiles_for_shared_scorer_and_enforces_declared_adapter_support(
     original_discover = campaign.discover_candidates
     original_descriptor = campaign.descriptor
     with experiment_project(project):
-        for adapter in ("sft", "hmfnet", "pact", "tft_q", "tft_hnb", ):
+        for adapter in ("sft", "hmfnet", "pact", "tft_q", "tft_hnb", "timesfm_hnb", "timesfm_v8"):
             assert original_descriptor(adapter).supports_shared_studies
             monkeypatch.setattr(
                 campaign, "descriptor", lambda name: dataclasses.replace(

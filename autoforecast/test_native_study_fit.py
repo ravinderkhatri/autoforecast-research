@@ -155,13 +155,16 @@ def lightning_study(tmp_path_factory, spark):
 @pytest.mark.parametrize("adapter_name,device,precision", [
     ("tft_q", "cpu", "32-true"), ("tft_hnb", "cpu", "32-true"),
     ("tft_q", "mps", "16-mixed"), ("tft_hnb", "mps", "16-mixed"),
-
+    ("timesfm_hnb", "cpu", "32-true"), ("timesfm_v8", "cpu", "32-true"),
 ])
 def test_lightning_study_selection_refit_and_saved_score(
     lightning_study, tmp_path, spark, monkeypatch, adapter_name, device, precision,
 ):
-    from autoforecast.adapters import tft_q
+    from autoforecast.adapters import tft_q, timesfm_hnb, timesfm_v8
     from autoforecast.forecast_campaign import _selected_update_budget, _verify_fixed_refit_budget
+    from autoforecast.test_timesfm_hnb import FakeSource
+    from autoforecast.test_timesfm_v8 import TinyLoRA
+    from autoforecast.timesfm_hnb_source import file_sha256
 
     if device == "mps" and not torch.backends.mps.is_available():
         pytest.skip("MPS is not available")
@@ -170,12 +173,19 @@ def test_lightning_study_selection_refit_and_saved_score(
     origin, horizon = recipe["validation_origins"][0], recipe["validation_horizon"]
     contract_path = path.parent / "dataset.yaml"
     dataset = load_dataset_contract(contract_path)
-    fit = tft_q.fit_predict_quantile if adapter_name == "tft_q" else tft_q.fit_predict_hnb
-    options = dict(
-        hidden_size=8, hidden_continuous_size=4, attention_head_size=2, dropout=0.1,
-        learning_rate=0.001, max_encoder_length=30, min_encoder_length=7,
-        lag_short_days=2, lag_long_days=14,
-    )
+    if adapter_name.startswith("tft"):
+        fit = tft_q.fit_predict_quantile if adapter_name == "tft_q" else tft_q.fit_predict_hnb
+        options = dict(
+            hidden_size=8, hidden_continuous_size=4, attention_head_size=2, dropout=0.1,
+            learning_rate=0.001, max_encoder_length=30, min_encoder_length=7,
+            lag_short_days=2, lag_long_days=14,
+        )
+    else:
+        monkeypatch.setattr(timesfm_hnb, "TimesFM3Source", FakeSource)
+        from autoforecast import timesfm_v8_source
+        monkeypatch.setattr(timesfm_v8_source, "LoRASource", TinyLoRA)
+        fit = timesfm_hnb.fit_predict if adapter_name == "timesfm_hnb" else timesfm_v8.fit_predict
+        options = dict(context_days=12, group_size=2, head_width=8)
     options.update(
         max_epochs=2, batch_size=2, early_stopping_patience=10,
         early_stopping_min_delta=1e-6, device=device, seed=0, precision=precision,
@@ -185,7 +195,7 @@ def test_lightning_study_selection_refit_and_saved_score(
     )
     evaluation_path = tmp_path / "evaluation.json"
     evaluation_path.write_text(json.dumps(fixed))
-    evaluation_sha = hashlib.sha256((evaluation_path).read_bytes()).hexdigest()
+    evaluation_sha = file_sha256(evaluation_path)
 
     def input_panel(role, boundary):
         target = tmp_path / (role + "-input")
@@ -237,9 +247,9 @@ def test_lightning_study_selection_refit_and_saved_score(
         record_path.write_text(json.dumps(forecast.as_record()))
         return {
             "adapter": adapter_name, "origin": forecast.origin,
-            "checkpoint": {"path": str(checkpoint), "sha256": hashlib.sha256((checkpoint).read_bytes()).hexdigest()},
+            "checkpoint": {"path": str(checkpoint), "sha256": file_sha256(checkpoint)},
             "forecast_record_path": str(record_path),
-            "forecast_record_sha256": hashlib.sha256((record_path).read_bytes()).hexdigest(),
+            "forecast_record_sha256": file_sha256(record_path),
             "budget": {"maximum_epochs": 2, "patience": 10,
                        "early_stopping_absolute_min_delta": 1e-6,
                        "early_stopping_relative_min_delta": 0.0},
@@ -256,7 +266,7 @@ def test_lightning_study_selection_refit_and_saved_score(
         altered["training"]["epoch_log"][0][field] = value
         checkpoint = tmp_path / (field + ".pt")
         torch.save(altered, checkpoint)
-        bad = {**result, "checkpoint": {"path": str(checkpoint), "sha256": hashlib.sha256((checkpoint).read_bytes()).hexdigest()}}
+        bad = {**result, "checkpoint": {"path": str(checkpoint), "sha256": file_sha256(checkpoint)}}
         with pytest.raises(RuntimeError, match="selection (controls|validation history)"):
             _selected_update_budget(bad, "rmse", 2, expected_loss_kind=loss_kind)
     assert fit(**selection_args) == forecast  # Authenticated completed-artifact adoption.
@@ -271,3 +281,12 @@ def test_lightning_study_selection_refit_and_saved_score(
     _verify_fixed_refit_budget(
         campaign_result(final, tmp_path / "refit.pt", "refit"), updates, batch_size=2,
     )
+    if adapter_name.startswith("timesfm"):
+        replay = timesfm_hnb.predict_from_checkpoint(
+            dataset.panel(tmp_path / "final_training-input"), recipe["final_train_cutoff"],
+            horizon, checkpoint=tmp_path / "refit.pt", checkpoint_sha256=file_sha256(tmp_path / "refit.pt"),
+            out_dir=tmp_path / "replay", _adapter=adapter_name,
+        )
+        np.testing.assert_array_equal(
+            pq.read_table(final.path)["yhat"].to_numpy(), pq.read_table(replay.path)["yhat"].to_numpy(),
+        )

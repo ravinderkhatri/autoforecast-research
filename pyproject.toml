@@ -31,7 +31,8 @@ autoforecast = "autoforecast.cli:main"
 
 [project.optional-dependencies]
 # Convenience extra combines the existing model families without duplicating their requirements.
-all-models = ["autoforecast[shallow,custom-torch,tft,autogluon-zoo,timesfm]"]
+# Standalone TimesFM 2.5 needs a second environment because it conflicts with TimesFM 3.
+all-models = ["autoforecast[shallow,custom-torch,tft,autogluon-zoo,timesfm3]"]
 # Existing workflow extra names remain compatible aliases; their libraries are now standard.
 timeseries = ["PyYAML==6.0.3", "pyspark==4.2.0", "pyarrow==24.0.0", "numpy==2.5.3", "pandas==2.3.3", "psutil==7.2.2"]
 plots = ["matplotlib==3.11.1"]
@@ -58,6 +59,12 @@ autogluon-zoo = ["autogluon.timeseries>=1.4,<2"]
 # PyPI's 1.x package does not expose the repository's governed TimesFM 2.5 API. Pin the official
 # source snapshot rather than silently installing an incompatible provider.
 timesfm = ["timesfm[torch] @ git+https://github.com/google-research/timesfm.git@2f1625c208cf99bd4c9f6650d54796d8f88486f8"]
+timesfm3 = [
+  "peft==0.19.1",
+    "timesfm @ git+https://github.com/google-research/timesfm.git@331c6d33cb1ac2611de3056d0ac7164aab6301eb",
+    "lightning==2.6.6",
+    "torch==2.10.0",
+]
 
 [dependency-groups]
 ci = [
@@ -66,6 +73,14 @@ ci = [
     "pyright==1.1.413",
     "build>=1.3,<2",
     "setuptools>=77",
+]
+
+[tool.uv]
+# The two source snapshots have the same distribution name. Separate environments preserve
+# the governed TimesFM 2.5 runtime while TimesFM-HNB uses the official 3.0 implementation.
+conflicts = [
+    [{extra = "timesfm"}, {extra = "timesfm3"}],
+    [{extra = "timesfm"}, {extra = "all-models"}],
 ]
 
 [tool.setuptools.packages.find]

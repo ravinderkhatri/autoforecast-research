@@ -21,6 +21,10 @@ class TuningSupport:
 
 
 _SUPPORT = {
+    "timesfm_hnb": TuningSupport(
+        True, "typed TimesFM-HNB development recipe with singleton frozen domains"
+    ),
+    "timesfm_v8": TuningSupport(True, "typed V8 development recipe with singleton frozen domains"),
     "mft": TuningSupport(True, "typed architecture and optimizer settings"),
     "sft": TuningSupport(True, "typed SFT revision architecture and optimizer settings"),
     "hmfnet": TuningSupport(True, "typed HMFNet revision architecture and optimizer settings"),

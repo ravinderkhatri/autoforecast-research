@@ -577,6 +577,28 @@ def _tft_q_plan(
     )
 
 
+def _timesfm_hnb_plan(candidate, *, horizon, epochs, seed, parameter_overrides):
+    """Resolve the TimesFM-HNB development recipe without exposing source identity as a knob."""
+    model, training = _declared_parameters(
+        candidate, parameter_overrides,
+        expected_model={"context_days", "group_size", "max_variates", "head_width"},
+        expected_training={"learning_rate", "mean_loss_weight", "train_windows", "train_stride"},
+    )
+    kwargs: dict[str, int | float] = {name: _integer(value, name) for name, value in model.items()}
+    if (not 1 <= kwargs["group_size"] <= kwargs["max_variates"] <= 64
+            or not 1 <= kwargs["context_days"] <= 15360):
+        raise ExecutionPlanError("TimesFM-HNB context/group/channel budget exceeded")
+    kwargs.update(learning_rate=_fraction(training["learning_rate"], "learning_rate"),
+                  mean_loss_weight=_fraction(training["mean_loss_weight"], "mean_loss_weight"),
+                  train_windows=_integer(training["train_windows"], "train_windows"),
+                  train_stride=_integer(training["train_stride"], "train_stride"),
+                  max_epochs=epochs, seed=seed)
+    effective = {**{f"model.{k}": v for k, v in model.items()},
+                 **{f"training.{k}": v for k, v in training.items()},
+                 "data.horizon": horizon, "training.epochs": epochs, "training.seed": seed}
+    return ExecutionPlan(_frozen({}), _frozen(kwargs), _frozen(effective))
+
+
 def resolve_execution_plan(
     candidate: Candidate,
     panel: Panel,
@@ -632,6 +654,9 @@ def resolve_execution_plan(
             seed=seed,
             parameter_overrides=parameter_overrides,
         )
+    if candidate.adapter in {"timesfm_hnb", "timesfm_v8"}:
+        return _timesfm_hnb_plan(candidate, horizon=horizon, epochs=epochs, seed=seed,
+                               parameter_overrides=parameter_overrides)
     if candidate.adapter in {"tft_q", "tft_hnb"}:
         return _tft_q_plan(
             candidate,

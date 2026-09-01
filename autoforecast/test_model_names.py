@@ -12,8 +12,8 @@ def test_model_names_preserve_recipe_wire_identifiers():
         "mft_corrected": "v1_corrected", "sft": "v2", "hmfnet": "v3", "pact": "v5",
     }
     assert {REVISION_MODELS[v] for v in REVISION_VARIANTS.values()} == set(REVISION_VARIANTS)
-    assert [model_name(v) for v in ("v2", "v3", "v5", "tft_hnb", )] == [
-        "SFT", "HMFNet", "PACT", "TFT-HNB",
+    assert [model_name(v) for v in ("v2", "v3", "v5", "tft_hnb", "timesfm_hnb")] == [
+        "SFT", "HMFNet", "PACT", "TFT-HNB", "TimesFM-HNB",
     ]
     assert model_name("custom_model") == "custom_model"
 

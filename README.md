@@ -54,6 +54,7 @@ the cloned repository:
 | Add MFT, SFT, HMFNet and PACT | `python -m pip install '.[custom-torch]'` |
 | Add TFT, TFT-Q and TFT-HNB | `python -m pip install '.[tft]'` |
 | Add the AutoGluon model collection | `python -m pip install '.[autogluon-zoo]'` |
+| Add TimesFM-HNB and TimesFM-V8 | `python -m pip install '.[timesfm3]'` |
 
 On macOS, the LightGBM-based options (`shallow` and `autogluon-zoo`) also need OpenMP:
 run `brew install libomp`, as described in the
@@ -65,8 +66,10 @@ Install all compatible model families together:
 python -m pip install '.[all-models]'
 ```
 
-The `all-models` extra combines `shallow`, `custom-torch`, `tft`, `autogluon-zoo`, and `timesfm`.
-For a standalone TimesFM 2.5 environment:
+The `all-models` extra combines `shallow`, `custom-torch`, `tft`, `autogluon-zoo`, and `timesfm3`.
+Full catalog coverage also needs a second environment for standalone TimesFM 2.5. It and the
+TimesFM 3 runtime use different versions of the same Python distribution and cannot be
+installed together. From the same checkout, create that separate environment:
 
 ```bash
 python3.12 -m venv ../autoforecast-timesfm2-env
@@ -75,10 +78,11 @@ python3.12 -m venv ../autoforecast-timesfm2-env
 
 Installing a runtime does not select a model or download its pretrained weights. Choose the
 model in the experiment configuration; its data, frequency, device and weight requirements
-still apply. The TimesFM extra installs a pinned source revision and require Git.
+still apply. The TimesFM extras install pinned source revisions and require Git.
 
 These are standard [Python packaging extras](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/#dependencies-optional-dependencies),
-not custom installer flags. With uv, use `uv sync --extra all-models`.
+not custom installer flags. With uv, use `uv sync --extra all-models`; do not use
+`--all-extras`, which would request both incompatible TimesFM versions.
 
 ## Run the example
 
@@ -321,7 +325,7 @@ Weights and scales are supplied by the caller and frozen with the study. The sco
 observed cells. If any retained series has no scoreable actuals or an undefined scale, WRMSSE
 is unavailable. Weights are never redistributed.
 
-The `sft`, `hmfnet`, `pact`, `tft_q`, and `tft_hnb`
+The `sft`, `hmfnet`, `pact`, `tft_q`, `tft_hnb`, `timesfm_hnb`, and `timesfm_v8`
 adapters select checkpoints with the study metric, including its original missing-value mask
 and any supplied weights and scales. Training loss remains model-specific. Final refit uses
 the selected update budget without test labels. These native adapters retain their daily-data,
@@ -541,9 +545,10 @@ refused. Use a fresh output directory for each rescoring operation.
 ## Models and M5
 
 The maintained model catalog is in `configs/models/`. Additional model extras include
-`shallow`, `custom-torch`, `tft`, `autogluon-zoo`, and `timesfm`. Install only the runtime for your selected model.
+`shallow`, `custom-torch`, `tft`, `autogluon-zoo`, `timesfm`, and `timesfm3`. The two TimesFM
+extras require separate environments. Install only the runtime for your selected model.
 
-The custom model families include MFT, SFT, HMFNet, PACT, TFT-Q, and TFT-HNB.
+The custom model families include MFT, SFT, HMFNet, PACT, TFT-Q, TFT-HNB, and TimesFM-HNB.
 Each adapter declares its input, horizon, device, and parameter requirements. A model being
 listed does not mean it supports every dataset or device. The installed release check exercises
 the two built-in baselines across all five frequency families. Optional models explicitly declare

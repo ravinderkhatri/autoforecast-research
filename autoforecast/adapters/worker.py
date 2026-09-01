@@ -31,7 +31,8 @@ _ARROW_ONLY_ADAPTERS = frozenset(
         "pact",
         "tft_q",
         "tft_hnb",
-
+        "timesfm_hnb",
+        "timesfm_v8",
     }
 )
 
@@ -166,7 +167,9 @@ def main(request_name: str, response_name: str) -> int:
         raise RuntimeError(check.summary)
     register_defaults(only=(module,))
     spark = None
-    if adapter not in _ARROW_ONLY_ADAPTERS:
+    if adapter not in _ARROW_ONLY_ADAPTERS or (
+        adapter in {"timesfm_hnb", "timesfm_v8"} and panel.plan is not None
+    ):
         local_spark_config = resources.configure_local_spark_runtime()
         builder = SparkSession.builder.master(f"local[{profile.cores}]").appName(
             f"forecast-{adapter}")

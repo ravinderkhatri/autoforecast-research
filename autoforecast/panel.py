@@ -134,8 +134,12 @@ class Panel:
             `exposure_col`: a zero-sale stockout is likelihood-unobserved (its lower bound is
             vacuous) but must remain visible to the encoder as shelf state.
         known_future: Columns known for the whole horizon at forecast time (price, planned promo).
+        shared_known_future: Known-future fields identical across series on each date; TimesFM-HNB/V8
+            store them once and send one channel per group.
+        covariate_families: Disjoint sets of optional numeric fields removed together during
+            TimesFM-HNB/V8 training (for example all calendar fields belong to one feed).
         past_only: Optional historical numeric covariates. Values after a forecast origin are
-            unavailable even when present in the source Parquet.
+            unavailable even when present in the source Parquet; TimesFM-HNB consumes this role.
         price_col: Which column is the PRICE, if this client has one. Declared rather than
             detected: an adapter that sniffs for a known name silently drops the commercial branch
             on a dataset that calls it something else -- for example `price` or `sell_price` --
@@ -213,6 +217,8 @@ class Panel:
     target_estimand: str = "sales_given_availability"
     negative_target_policy: str = "refuse"
     past_only: tuple[str, ...] = ()
+    shared_known_future: tuple[str, ...] = ()
+    covariate_families: tuple[tuple[str, ...], ...] = ()
 
     def __post_init__(self) -> None:
         """Normalise path and every valid cadence spelling to their semantic identities."""
@@ -251,11 +257,17 @@ class Panel:
         if unknown:
             raise PanelError(f"panel record has unknown field(s) {unknown}")
         restored = dict(record)
-        for name in ("known_future", "static", "static_reals", "past_only"):
+        for name in ("known_future", "static", "static_reals", "past_only", "shared_known_future"):
             value = restored.get(name, ())
             if type(value) not in (list, tuple):
                 raise PanelError(f"panel record {name} must be a JSON array")
             restored[name] = tuple(value)
+        families = restored.get("covariate_families", ())
+        if not isinstance(families, list | tuple) or any(
+            not isinstance(family, list | tuple) for family in families
+        ):
+            raise PanelError("covariate_families must be an array of column arrays")
+        restored["covariate_families"] = tuple(tuple(family) for family in families)
         plan = restored.get("plan")
         if type(plan) is dict:
             try:
@@ -307,6 +319,8 @@ class Panel:
         """Validate mapped identifiers without opening data or starting a runtime."""
         try:
             names = list(self.role_columns)
+            names.extend(self.shared_known_future)
+            names.extend(name for family in self.covariate_families for name in family)
             validate_column_names(names)
         except (TypeError, KeyError, AttributeError, ValueError) as exc:
             raise PanelError(f"invalid panel column mapping: {exc}") from exc
@@ -397,6 +411,7 @@ class Panel:
         for role, columns in (
             ("known_future", self.known_future),
             ("past_only", self.past_only),
+            ("shared_known_future", self.shared_known_future),
             ("static", self.static),
             ("static_reals", self.static_reals),
         ):
@@ -407,6 +422,23 @@ class Panel:
                     raise PanelError(
                         f"{role}[{index}] must name a non-empty column, got {column!r}"
                     )
+
+        if len(set(self.shared_known_future)) != len(self.shared_known_future) or not set(
+            self.shared_known_future
+        ) <= set(self.known_future):
+            raise PanelError("shared_known_future must be a unique subset of known_future")
+        if not isinstance(self.covariate_families, tuple) or any(
+            not isinstance(family, tuple) or not family
+            or any(not isinstance(name, str) or not name.strip() for name in family)
+            for family in self.covariate_families
+        ):
+            raise PanelError("covariate_families must contain nonempty column tuples")
+        family_fields = [name for family in self.covariate_families for name in family]
+        covariates = {*self.past_only, *self.known_future}
+        if self.oos_col:
+            covariates.add(self.oos_col)
+        if len(set(family_fields)) != len(family_fields) or not set(family_fields) <= covariates:
+            raise PanelError("covariate_families must be disjoint subsets of declared covariates")
 
         if self.target_col in self.known_future:
             raise PanelError(

@@ -10,7 +10,8 @@ TRAINABLE_TORCH_ADAPTERS = frozenset({
     "tft",
     "tft_q",
     "tft_hnb",
-
+    "timesfm_hnb",
+    "timesfm_v8",
 })
 
 
