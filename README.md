@@ -365,11 +365,40 @@ with experiment_project("/absolute/path/to/my-experiment"):
             validation_forecasts=validation_forecasts,
             testing_forecasts=testing_forecasts,
             model_id="my-model",
+            forecast_accuracy_breakdown="per_step",  # Default: accuracy at each forecast step.
         )
         print(result["validation"]["score"])
         print(result["test"]["score"])
         print(result["result_path"])
 ```
+
+`forecast_accuracy_breakdown` controls accuracy diagnostics for each stage:
+
+| Setting | Metrics reported alongside the full-horizon overall score |
+|---|---|
+| `"per_step"` (default) | Each forecast step separately: H1, H2, ..., Hn |
+| `"cumulative"` | Each prefix: H1–H1, H1–H2, ..., H1–Hn |
+| `"both"` | Both separately labelled breakdowns |
+| `"none"` | Overall metrics only |
+
+Hn follows each forecast's horizon and declared frequency. For hourly data H3 is three hours
+ahead; for weekly data it is three weeks ahead. All supported study frequencies use the same
+calendar rules as the forecasts. Validation and test horizons can differ.
+
+Read `result["test"]["score"]["forecast_accuracy_breakdown"]["per_step"]` for the default
+test breakdown. Each row identifies its lead range, target-time range, metrics and coverage.
+The breakdown reports MAE, RMSE, WAPE and bias, plus WRMSSE for studies configured with its
+frozen weights and scales. Cumulative scores use the underlying cell errors through that lead;
+they do not average per-step scores or score summed demand. The final cumulative score equals
+the overall score. The overall metric definitions and missing-actual policy stay fixed.
+
+Strict studies require complete actuals. With explicit masking, a diagnostic WRMSSE is
+unavailable when any retained series has no observed actual in that lead range; its status,
+reason and coverage are returned. Undefined scales also yield unavailable WRMSSE. Weights are
+never redistributed. The existing full-horizon error for an entirely unobserved series remains.
+All requested breakdowns and their supporting statistics are saved with the evaluation result.
+Each row's status and unavailable reason describe the study's selected metric. Other metrics
+can be unavailable independently; for example, WAPE is unavailable when actual volume is zero.
 
 For a standalone registry, pass `registry_root=...` to `load_study`. Pass `spark=spark` when
 the caller's session is not active. An absent ID in an existing registry raises

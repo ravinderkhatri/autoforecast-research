@@ -22,6 +22,11 @@ from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.panel import Forecast, ForecastError, Panel
 from autoforecast.ranking import SelectionError, _exact_grid_restrictions
 from autoforecast.score_spark import MissingActualError, ScoreError, score_forecast
+from autoforecast.study_horizon_metrics import (
+    ForecastAccuracyBreakdown,
+    score_horizon_metrics,
+    validate_forecast_accuracy_breakdown,
+)
 from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
 
@@ -42,8 +47,10 @@ def verify_study_evaluation(contract: dict) -> tuple[pathlib.Path, dict]:
 def score_study(
     panel: Panel, forecast: Forecast, spark: SparkSession, *, contract: dict,
     output_dir: pathlib.Path,
+    forecast_accuracy_breakdown: ForecastAccuracyBreakdown = "none",
 ) -> dict:
     """Score the full frozen grid and retain per-series coverage and unavailable scores."""
+    validate_forecast_accuracy_breakdown(forecast_accuracy_breakdown)
     contract = copy.deepcopy(contract)
     forecast = Forecast.from_record(forecast.as_record())
     try:
@@ -87,6 +94,7 @@ def score_study(
         score = _score_study_snapshot(
             private_panel, private_forecast, spark, contract=contract,
             snapshots=snapshots, output_dir=output_dir,
+            forecast_accuracy_breakdown=forecast_accuracy_breakdown,
         )
     if (directory_digest(panel.path, suffixes=(".parquet",)) != actuals["sha256"]
             or directory_digest(forecast.path, suffixes=(".parquet",)) != forecast_sha):
@@ -98,6 +106,7 @@ def score_study(
 def _score_study_snapshot(
     panel: Panel, forecast: Forecast, spark: SparkSession, *, contract: dict,
     snapshots: dict[str, pathlib.Path], output_dir: pathlib.Path,
+    forecast_accuracy_breakdown: ForecastAccuracyBreakdown = "none",
 ) -> dict:
     """Consume only the verified copies owned by this scoring operation."""
     try:
@@ -112,10 +121,12 @@ def _score_study_snapshot(
     policy = contract["metric_policy"]
 
     raw_path = output_dir / "cell-sums"
+    horizon_path = output_dir / "horizon-cell-sums"
     result = score_forecast(
         panel, forecast, spark, missing_actual="no_data",
         eligible_grid=str(snapshots["grid"]), original_missing_column=MISSING_COLUMN,
         series_scores_path=str(raw_path),
+        horizon_sums_path=(str(horizon_path) if forecast_accuracy_breakdown != "none" else None),
     )
     sums = spark.read.parquet(str(raw_path))
     coverage = sums.select(
@@ -152,6 +163,7 @@ def _score_study_snapshot(
         "coverage": contract["coverage"]["counts"],
         "metric_definition": policy,
     }
+    references = None
     if policy["metric"] == "wrmsse":
         if per_series.filter(F.col("scored") == 0).limit(1).count():
             raise MissingActualError(
@@ -184,4 +196,9 @@ def _score_study_snapshot(
     score["series_scores"] = {
         "path": str(series_path), "sha256": directory_digest(series_path, suffixes=(".parquet",)),
     }
+    if forecast_accuracy_breakdown != "none":
+        score["forecast_accuracy_breakdown"] = score_horizon_metrics(
+            horizon_path, forecast, spark, mode=forecast_accuracy_breakdown,
+            policy=policy, references=references,
+        )
     return score
