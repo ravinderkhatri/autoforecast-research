@@ -17,9 +17,9 @@ from provenance.lineage import directory_digest
 ForecastAccuracyBreakdown = Literal["per_step", "cumulative", "both", "none"]
 
 
-def validate_forecast_accuracy_breakdown(value: ForecastAccuracyBreakdown) -> None:
+def validate_forecast_accuracy_breakdown(value: object) -> None:
     """Reject unknown modes before allocating an evaluation run or reading inputs."""
-    if value not in ("per_step", "cumulative", "both", "none"):
+    if type(value) is not str or value not in ("per_step", "cumulative", "both", "none"):
         raise ValueError(
             "forecast_accuracy_breakdown must be per_step, cumulative, both, or none"
         )

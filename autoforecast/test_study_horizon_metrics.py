@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -33,7 +34,7 @@ def build_study(root, spark, *, frequency="D", metric="wrmsse", missing=None, sc
     rows = []
     for series in ("A", "B"):
         for index, point in enumerate(points):
-            value = (10.0 - (2 - index) * (2 if series == "A" else math.sqrt(scale_b))
+            value = (10.0 - (2 - index) * (2 if series == "A" else math.sqrt(9.0 if scale_b is None else scale_b))
                      if index < 3 else 0.0 if zero_actuals else 10.0)
             if index == 4 and (missing == "both" or (missing == "B" and series == "B")):
                 value = None
@@ -102,6 +103,18 @@ def evaluate(manifest, forecast, spark, output, mode="both"):
                        forecast_accuracy_breakdown=mode)
 
 
+def assert_breakdown_schema(report, modes, *, wrmsse=True):
+    assert set(report) == {
+        "schema", "mode", "frequency", "origin", "horizon", "metric_definition", "series_sums",
+    } | modes
+    keys = {
+        "start_lead", "end_lead", "start_time", "end_time", "mae", "rmse", "wape",
+        "bias", "coverage", "status", "unavailable_reason",
+    } | ({"wrmsse"} if wrmsse else set())
+    for mode in modes:
+        assert all(set(row) == keys for row in report[mode])
+
+
 @pytest.mark.parametrize("frequency", ["H", "D", "W", "M", "MS", "Y", "YS", "2D", "ME", "YE"])
 def test_horizon_metrics_use_forecast_periods_and_square_errors_before_aggregation(
     tmp_path, spark, frequency,
@@ -112,6 +125,7 @@ def test_horizon_metrics_use_forecast_periods_and_square_errors_before_aggregati
     assert breakdown["schema"] == "autoforecast.forecast-accuracy-breakdown.v1"
     assert breakdown["frequency"] == parse_frequency(frequency).code
     assert breakdown["horizon"] == 3 and breakdown["origin"] == forecasts[0].origin
+    assert_breakdown_schema(breakdown, {"per_step", "cumulative"})
     each, cumulative = breakdown["per_step"], breakdown["cumulative"]
     if frequency in {"M", "ME"}:
         assert each[1]["end_time"] == "2024-02-29"
@@ -153,6 +167,7 @@ def test_public_default_modes_saved_results_and_different_stage_lengths(tmp_path
             report = default[stage]["score"]["forecast_accuracy_breakdown"]
             assert report["mode"] == "per_step" and "cumulative" not in report
             assert len(report["per_step"]) == length
+            assert_breakdown_schema(report, {"per_step"})
         for mode in ("none", "cumulative", "both"):
             result = study.evaluate_forecasts(
                 validation_forecasts=forecasts[0], testing_forecasts=forecasts[1],
@@ -168,9 +183,24 @@ def test_public_default_modes_saved_results_and_different_stage_lengths(tmp_path
                     report = score["forecast_accuracy_breakdown"]
                     assert report["mode"] == mode and "cumulative" in report
                     assert ("per_step" in report) == (mode == "both")
+                    assert_breakdown_schema(report, {"per_step", "cumulative"}
+                                            if mode == "both" else {"cumulative"})
 
 
-@pytest.mark.parametrize("mode", ["individual", "wrong", None, True, {}, []])
+class EqualBothList(list):
+    def __eq__(self, other):
+        return other == "both"
+
+
+class EqualBothStr(str):
+    def __eq__(self, other):
+        return other == "both"
+
+
+@pytest.mark.parametrize("mode", [
+    "individual", "wrong", None, True, {}, [], np.array("both"),
+    EqualBothList(), EqualBothStr("wrong"),
+])
 def test_invalid_breakdown_mode_fails_before_input_access_or_output(tmp_path, mode):
     with pytest.raises(ValueError, match="forecast_accuracy_breakdown"):
         object.__new__(Study).evaluate_forecasts(
@@ -202,8 +232,9 @@ def test_masked_lead_wrmsse_is_unavailable_without_reweighting(tmp_path, spark, 
     assert report["cumulative"][-1]["wrmsse"] == pytest.approx(score["wrmsse"])
 
 
-def test_undefined_scale_is_unavailable_at_each_lead(tmp_path, spark):
-    manifest, forecasts, _ = build_study(tmp_path, spark, scale_b=0.0)
+@pytest.mark.parametrize("scale", [None, 0.0])
+def test_undefined_scale_is_unavailable_at_each_lead(tmp_path, spark, scale):
+    manifest, forecasts, _ = build_study(tmp_path, spark, scale_b=scale)
     score = evaluate(manifest, forecasts[0], spark, tmp_path / "score")
     assert score["wrmsse"] is None
     for mode in ("per_step", "cumulative"):
@@ -216,6 +247,8 @@ def test_undefined_scale_is_unavailable_at_each_lead(tmp_path, spark):
 def test_breakdown_supports_existing_cell_metrics_without_wrmsse_references(tmp_path, spark, metric):
     manifest, forecasts, _ = build_study(tmp_path, spark, metric=metric)
     score = evaluate(manifest, forecasts[0], spark, tmp_path / "score")
+    assert_breakdown_schema(score["forecast_accuracy_breakdown"], {"per_step", "cumulative"},
+                            wrmsse=False)
     for mode in ("per_step", "cumulative"):
         for row in score["forecast_accuracy_breakdown"][mode]:
             assert "wrmsse" not in row and row["status"] == "scored"
