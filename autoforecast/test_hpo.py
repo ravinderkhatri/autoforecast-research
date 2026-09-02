@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import hashlib
 import json
@@ -17,6 +18,7 @@ import autoforecast.hpo as hpo_module
 from autoforecast.experiment_report import render_benchmark_report
 from autoforecast.experiments import (
     ExperimentError,
+    load_study_selection,
     require_heldout_evaluation_approval,
     seal_study_selection,
 )
@@ -508,3 +510,72 @@ def test_mlflow_selection_sync_failure_is_durable_and_retryable(
     assert retried["error_type"] is None
     assert retried["attempted_run_ids"] == ["run-1"]
     assert retried["synchronized_run_ids"] == ["run-1"]
+
+
+@pytest.mark.parametrize("evaluator_name", ["builtin", "external:fit_predict"])
+def test_nonexternal_hpo_rejects_unvalidated_external_evidence(tmp_path, evaluator_name):
+    study = load_hpo_study(_write_study(tmp_path, evaluator=evaluator_name), project_root=tmp_path)
+    def evaluator(request):
+        request.attempt.write_bytes("model/model.bin", b"model")
+        request.attempt.write_bytes("evaluation/external-run.json", b"not-json")
+        return TrialOutcome(1.0)
+    with pytest.raises(HPOError, match="epoch metrics"):
+        run_hpo_study(study, tmp_path / "artifacts", evaluator)
+    assert not list((tmp_path / "artifacts").rglob("selection.json"))
+
+
+@pytest.mark.parametrize("defect", [None, "missing", "empty", "malformed", "schema", "context", "model", "forecast", "test"])
+def test_external_hpo_requires_exact_external_evidence(tmp_path, defect):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from provenance.lineage import directory_digest
+
+    study = load_hpo_study(_write_study(tmp_path), project_root=tmp_path)
+    context = {"input": "frozen"}
+    fingerprint = hashlib.sha256((json.dumps(context, sort_keys=True) + "\n").encode()).hexdigest()
+    study = dataclasses.replace(study, tuning=dataclasses.replace(study.tuning, adapter="external"),
+                                evaluator="external:fit_predict", comparability_fingerprint=fingerprint)
+    def evaluator(request):
+        request.attempt.write_bytes("model/model.bin", b"model")
+        forecasts = request.attempt.path / "forecasts"
+        forecasts.mkdir()
+        pq.write_table(pa.table({"series_id": ["A"], "date": [dt.date(2024, 2, 11)], "yhat": [1.0]}), forecasts / "part.parquet")
+        record = {"schema": "autoforecast.external-trial.v1", "test_metrics": "not_evaluated",
+                  "context": context, "model_sha256": directory_digest(request.attempt.path / "model"),
+                  "forecast_sha256": directory_digest(forecasts, suffixes=(".parquet",))}
+        if defect == "missing":
+            return TrialOutcome(1.0)
+        if defect in {"empty", "malformed"}:
+            request.attempt.write_bytes("evaluation/external-run.json", b"" if defect == "empty" else b"not-json")
+        else:
+            if defect == "schema":
+                record["schema"] = "wrong"
+            elif defect == "context":
+                record["context"] = {"input": "changed"}
+            elif defect in {"model", "forecast"}:
+                record[defect + "_sha256"] = "0" * 64
+            elif defect == "test":
+                record["test_metrics"] = "evaluated"
+            request.attempt.write_json("evaluation/external-run.json", record)
+        return TrialOutcome(1.0)
+    if defect:
+        with pytest.raises(HPOError, match="external trial evidence"):
+            run_hpo_study(study, tmp_path / "artifacts", evaluator)
+        assert not list((tmp_path / "artifacts").rglob("selection.json"))
+    else:
+        run_hpo_study(study, tmp_path / "artifacts", evaluator)
+        assert (tmp_path / "artifacts/studies/hpo-smoke/selection.json").is_file()
+
+
+def test_hpo_preserves_declared_multiple_winners_and_rejects_policy_edit(tmp_path):
+    spec = load_hpo_study(_write_study(tmp_path), project_root=tmp_path)
+    spec = dataclasses.replace(spec, top_k=2)
+    run_hpo_study(spec, tmp_path / "artifacts", smoke_evaluator)
+    root = tmp_path / "artifacts/studies/hpo-smoke"
+    selection = load_study_selection(root)
+    assert len(selection["selected"]) == 2
+    selection.update(top_k=1, selected=selection["candidates"][:1])
+    (root / "selection.json").write_text(json.dumps(selection))
+    with pytest.raises(ExperimentError, match="top_k"):
+        load_study_selection(root)

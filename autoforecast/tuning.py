@@ -28,6 +28,7 @@ __all__ = [
     "TuningSpec",
     "load_tuning_spec",
     "loads_tuning_spec",
+    "loads_external_tuning_spec",
     "materialize_manual_parameters",
     "materialize_runtime_parameters",
     "materialize_trial_parameters",
@@ -508,6 +509,22 @@ def loads_tuning_spec(
     raw: bytes, *, source_path: str | pathlib.Path = "<retained-model-profile>"
 ) -> TuningSpec:
     """Parse already-authenticated model-profile bytes without reopening a mutable path."""
+    return _loads_tuning_spec(raw, source_path=source_path, external=False)
+
+
+def loads_external_tuning_spec(
+    raw: bytes, *, source_path: str | pathlib.Path = "<external-model-profile>",
+) -> TuningSpec:
+    """Validate an explicit external profile; execution requires a Python callback.
+
+    This shares domain/constraint validation with built-in models without admitting
+    unknown adapters to the built-in execution path.
+    """
+    return _loads_tuning_spec(raw, source_path=source_path, external=True)
+
+
+def _loads_tuning_spec(raw: bytes, *, source_path: str | pathlib.Path,
+                       external: bool) -> TuningSpec:
     source = pathlib.Path(source_path)
     try:
         value = loads_exact_yaml(raw)
@@ -537,17 +554,23 @@ def loads_tuning_spec(
         raise TuningError(f"{source}: model.adapter is invalid")
     if not isinstance(adapter, str):
         raise TuningError(f"{source}: model.adapter is invalid")
-    try:
-        support = tuning_support(adapter)
-    except ValueError as error:
-        raise TuningError(f"{source}: model.adapter is not HPO-registered: {adapter!r}") from error
     raw_parameters = root.get("hyperparameters")
-    if raw_parameters is None and not support.supported:
-        raise TuningError(f"{model_id} is intentionally not tuneable: {support.reason}")
+    if external:
+        if adapter != "external" or set(model) != {"id", "adapter"}:
+            raise TuningError("external model requires exactly id and adapter: external")
+        if "implementation" in root:
+            raise TuningError("external implementation must be supplied through Python")
+    else:
+        try:
+            support = tuning_support(adapter)
+        except ValueError as error:
+            raise TuningError(
+                f"{source}: model.adapter is not HPO-registered: {adapter!r}"
+            ) from error
+        if not support.supported:
+            raise TuningError(f"{model_id} is intentionally not tuneable: {support.reason}")
     if raw_parameters is None:
         raise TuningError(f"{model_id} has no declared tuneable execution settings")
-    if not support.supported:
-        raise TuningError(f"{model_id} is intentionally not tuneable: {support.reason}")
     raw_parameters = _mapping(raw_parameters, f"{source}: hyperparameters")
     if not raw_parameters:
         raise TuningError(f"{source}: hyperparameters must not be empty")

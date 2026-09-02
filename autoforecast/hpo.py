@@ -44,6 +44,7 @@ from autoforecast.tuning import (
     ray_param_space,
     suggest_optuna_parameters,
 )
+from provenance.lineage import directory_digest
 
 __all__ = [
     "HPOError",
@@ -401,6 +402,7 @@ def _trial_metadata(study: HPOStudySpec, parameters: dict[str, object]) -> dict[
             "config_sha256": study.source_sha256,
             "objective": study.objective,
             "direction": study.direction,
+            "top_k": study.top_k,
             "backend": study.backend,
         },
         "hyperparameters": parameters,
@@ -408,14 +410,36 @@ def _trial_metadata(study: HPOStudySpec, parameters: dict[str, object]) -> dict[
     }
 
 
-def _require_trial_evidence(attempt: LocalAttempt) -> None:
+def _require_trial_evidence(
+    attempt: LocalAttempt, *, external_fingerprint: str | None = None,
+) -> None:
     # Classical/boosted adapters do not have an epoch loop. They must still leave the governed
-    # runner record; neural adapters additionally retain their epoch metrics when available.
+    # runner record (or external callback evidence); neural adapters additionally retain
+    # their epoch metrics when available.
     has_epochs = attempt.metrics_path.is_file() and bool(
         attempt.metrics_path.read_text(encoding="utf-8").strip()
     )
     governed = attempt.path / "evaluation" / "governed-run.json"
-    if not has_epochs and not governed.is_file():
+    if external_fingerprint is not None:
+        try:
+            record = load_exact_json(attempt.path / "evaluation" / "external-run.json")
+            if (type(record) is not dict
+                    or record.get("schema") != "autoforecast.external-trial.v1"
+                    or record.get("test_metrics") != "not_evaluated"
+                    or type(record.get("context")) is not dict):
+                raise HPOError("invalid external trial evidence")
+            context_bytes = (json.dumps(
+                record["context"], sort_keys=True, allow_nan=False,
+            ) + "\n").encode()
+            if (hashlib.sha256(context_bytes).hexdigest() != external_fingerprint
+                    or record.get("model_sha256") != directory_digest(attempt.path / "model")
+                    or record.get("forecast_sha256") != directory_digest(
+                        attempt.path / "forecasts", suffixes=(".parquet",),
+                    )):
+                raise HPOError("external trial evidence differs from frozen inputs or artifacts")
+        except (OSError, ValueError) as error:
+            raise HPOError("external trial evidence is missing, invalid or changed") from error
+    elif not has_epochs and not governed.is_file():
         raise HPOError(
             "completed HPO trial needs epoch metrics or an evaluation/governed-run.json record"
         )
@@ -441,6 +465,11 @@ def _evaluate(
         trial_id=trial_id,
         attempt_id=f"attempt-{uuid.uuid4().hex}",
         metadata=_trial_metadata(study, parameters),
+    )
+    external_fingerprint = (
+        study.comparability_fingerprint
+        if (study.tuning.adapter, study.evaluator) == ("external", "external:fit_predict")
+        else None
     )
     live: MLflowTrainingRun | None = None
     tracking_record: dict[str, object] | None = None
@@ -502,7 +531,7 @@ def _evaluate(
             # The evaluator is model code and must not be able to substitute a remote run ID.
             # Exclusive publication after it returns makes any forged pre-write fail the trial.
             attempt.write_json("tracking/mlflow.json", tracking_record)
-        _require_trial_evidence(attempt)
+        _require_trial_evidence(attempt, external_fingerprint=external_fingerprint)
         attempt.write_json(
             "evaluation/validation.json",
             {

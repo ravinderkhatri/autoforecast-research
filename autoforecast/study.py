@@ -8,6 +8,7 @@ import json
 import pathlib
 import shutil
 import tempfile
+from collections.abc import Callable, Mapping
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -30,6 +31,7 @@ from autoforecast.study_horizon_metrics import (
     validate_forecast_accuracy_breakdown,
 )
 from autoforecast.study_scoring import score_study
+from autoforecast.study_tuning import FitPredictRequest, FitPredictResult, TuningResult, tune_study
 from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 
@@ -222,6 +224,23 @@ class Study:
         if "scoring_references" not in self._record()["artifacts"]:
             return None
         return self._frame("scoring_references")
+
+    def tune(
+        self, *, fit_predict: Callable[[FitPredictRequest], FitPredictResult],
+        config: str | pathlib.Path, implementation: Mapping[str, object],
+        tuning_origin: str | None = None,
+    ) -> TuningResult:
+        """Tune a Python model on a frozen inner window using sequential Optuna.
+
+        Config contains an external model profile and explicit HPO budget/seed.
+        Implementation records name, version, source_sha256 and dependency versions.
+        The callback fits and saves predictions/model files; AutoForecast scores them.
+        The sole tuning window is the default; choose tuning_origin when several exist.
+        Outer validation/test targets never select parameters. Callback code is trusted
+        caller code, not sandboxed or attested. No final refit is performed here.
+        """
+        return tune_study(self, fit_predict=fit_predict, config=config,
+                          implementation=implementation, tuning_origin=tuning_origin)
 
     def evaluate_forecasts(
         self, *, validation_forecasts: Forecast, testing_forecasts: Forecast, model_id: str,
