@@ -124,9 +124,11 @@ def open_study(manifest, spark):
 
 def test_custom_model_tunes_scores_reloads_and_keeps_outer_labels_out(frozen, spark, tmp_path):
     seen = []
+    input_paths = []
     profile = config(tmp_path, budget=4)
     identity = implementation()
     def fit(request):
+        input_paths.append(pathlib.Path(request.panel.path))
         history = request.training_data.collect()
         assert len(history) == 6
         assert {row["units"] for row in history} == {1.0, 2.0, 3.0}
@@ -141,6 +143,7 @@ def test_custom_model_tunes_scores_reloads_and_keeps_outer_labels_out(frozen, sp
         return result
     with open_study(frozen, spark) as study:
         result = study.tune(fit_predict=fit, config=profile, implementation=identity)
+    assert input_paths and all(not path.exists() for path in input_paths)
     assert len(seen) == 4 and set(seen) == {0.0, 10.0}
     assert result.parameters == {"model.level": 0.0, "training.offset": 0}
     assert result.tuning_score == pytest.approx(math.sqrt((4**2 + 5**2) / 2))
@@ -197,8 +200,10 @@ def test_bad_callback_cannot_publish_selection(frozen, spark, tmp_path, defect):
     shutil.copytree(frozen.parent, local / frozen.parent.name)
     manifest = local / frozen.parent.name / "benchmark.json"
     scratch = []
+    input_paths = []
     def bad(request):
         scratch.append(request.output_dir)
+        input_paths.append(pathlib.Path(request.panel.path))
         result = predict(request)
         if defect in {"adapter", "horizon", "frequency"}:
             value = {"adapter": "wrong-model", "horizon": 1, "frequency": "W"}[defect]
@@ -246,6 +251,7 @@ def test_bad_callback_cannot_publish_selection(frozen, spark, tmp_path, defect):
     completions = list(roots[0].glob("trials/*/attempts/*/completion.json"))
     assert len(completions) == 1
     assert json.loads(completions[0].read_text())["status"] == "failed"
+    assert input_paths and all(not path.exists() for path in input_paths)
     assert scratch and all(not path.exists() for path in scratch)
     assert spark.range(1).count() == 1
 
@@ -402,3 +408,20 @@ def test_profile_bytes_are_frozen_before_callback(frozen, spark, tmp_path):
         result = study.tune(fit_predict=fit, config=profile, implementation=implementation())
     assert (result.model_artifacts.parent / "metadata/external-profile.yaml").read_bytes() == original
     assert result.provenance["profile_sha256"] == hashlib.sha256(original).hexdigest()
+
+
+def test_tuning_input_snapshots_are_cleaned_when_preparation_fails(frozen, spark, tmp_path, monkeypatch):
+    from pyspark.sql.readwriter import DataFrameWriter
+
+    created = []
+    def fail_write(self, path, *args, **kwargs):
+        directory = pathlib.Path(path)
+        directory.mkdir(parents=True)
+        (directory / "partial-write").write_bytes(b"partial")
+        created.append(directory)
+        raise RuntimeError("training preparation failed")
+    monkeypatch.setattr(DataFrameWriter, "parquet", fail_write)
+    with open_study(frozen, spark) as study, pytest.raises(RuntimeError, match="preparation failed"):
+        study.tune(fit_predict=predict, config=config(tmp_path, budget=1), implementation=implementation())
+    assert created and all(not path.parent.exists() for path in created)
+    assert spark.range(1).count() == 1

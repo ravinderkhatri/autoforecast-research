@@ -301,54 +301,55 @@ def tune_study(
     dates = tuple(period_points(origin, cadence, horizon))
     identifier = "tune-" + uuid.uuid4().hex
     root = study._path.parent.parent.parent / "study-tuning"
-    inputs = root / "inputs" / identifier
-    inputs.mkdir(parents=True)
-    training = inputs / "training"
-    mapping = inputs / "series-mapping"
-    # Materialize the slice: a lazy filter alone still points at future target rows.
-    study.training_data.filter(F.col(panel.time_col) <= time_literal(
-        parse_origin(origin, cadence), cadence,
-    )).write.parquet(str(training))
-    study.series_mapping.write.parquet(str(mapping))
-    study._record(data=True)
-    panel = dataclasses.replace(panel, path=str(training))
-    context = {
-        "schema": "autoforecast.external-tuning.v1", "study": fixed["study"],
-        "study_id": record["study_id"], "evaluation_contract": fixed,
-        "model_id": tuning.model_id, "implementation": implementation_record,
-        "profile_sha256": tuning.source_sha256, "metric": recipe["metric"],
-        "origin": origin, "horizon": horizon, "frequency": panel.frequency,
-        "seed": seed, "max_trials": budget, "backend": "optuna",
-        "training_sha256": directory_digest(training, suffixes=(".parquet",)),
-        "mapping_sha256": directory_digest(mapping, suffixes=(".parquet",)),
-    }
-    context_bytes = _json_bytes(context)
-    # Existing HPO metadata calls inner targets "validation". The recorded contract
-    # explicitly identifies them as tuning, and reserves the final test dates untouched.
-    test_dates = tuple(period_points(recipe["final_train_cutoff"], cadence,
-                                    recipe["final_test_horizon"]))
-    def iso(point):
-        return canonical_origin(point, cadence)
-    train_range = [recipe["training_start"], origin]
-    test_range = [iso(test_dates[0]), iso(test_dates[-1])]
-    # The manifest binds all stage artifacts, including the reserved final test range.
-    # The physically sliced training input has its own digest in context.
-    data = {
-        "id": record["study_id"], "fingerprint": fixed["study"]["sha256"],
-        "observed_date_range": [recipe["training_start"], test_range[-1]],
-        "training_date_range": train_range, "validation_date_range": train_range,
-        "validation_target_date_range": [iso(dates[0]), iso(dates[-1])],
-        "test_date_range": test_range, "test_target_date_range": test_range,
-        "training_series": record["cohort_series_count"],
-        "validation_series": record["cohort_series_count"], "test": "reserved_not_evaluated",
-    }
-    spec = HPOStudySpec(
-        id=identifier, backend="optuna", direction="minimize", objective="validation/objective",
-        max_trials=budget, top_k=1, seed=seed,
-        comparability_fingerprint=hashlib.sha256(context_bytes).hexdigest(),
-        data=data, evaluator="external:fit_predict", tuning=tuning,
-        source_path=pathlib.Path(config), source_sha256=tuning.source_sha256,
-    )
-    bridge = _ExternalTrialBridge(study._spark, fit_predict, panel, mapping, context_bytes, raw)
-    run_hpo_study(spec, root, bridge)
-    return load_tuning_result(root / "studies" / identifier)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".inputs-", dir=root) as temporary:
+        inputs = pathlib.Path(temporary)
+        training = inputs / "training"
+        mapping = inputs / "series-mapping"
+        # Materialize the slice: a lazy filter alone still points at future target rows.
+        study.training_data.filter(F.col(panel.time_col) <= time_literal(
+            parse_origin(origin, cadence), cadence,
+        )).write.parquet(str(training))
+        study.series_mapping.write.parquet(str(mapping))
+        study._record(data=True)
+        panel = dataclasses.replace(panel, path=str(training))
+        context = {
+            "schema": "autoforecast.external-tuning.v1", "study": fixed["study"],
+            "study_id": record["study_id"], "evaluation_contract": fixed,
+            "model_id": tuning.model_id, "implementation": implementation_record,
+            "profile_sha256": tuning.source_sha256, "metric": recipe["metric"],
+            "origin": origin, "horizon": horizon, "frequency": panel.frequency,
+            "seed": seed, "max_trials": budget, "backend": "optuna",
+            "training_sha256": directory_digest(training, suffixes=(".parquet",)),
+            "mapping_sha256": directory_digest(mapping, suffixes=(".parquet",)),
+        }
+        context_bytes = _json_bytes(context)
+        # Existing HPO metadata calls inner targets "validation". The recorded contract
+        # explicitly identifies them as tuning, and reserves the final test dates untouched.
+        test_dates = tuple(period_points(recipe["final_train_cutoff"], cadence,
+                                        recipe["final_test_horizon"]))
+        def iso(point):
+            return canonical_origin(point, cadence)
+        train_range = [recipe["training_start"], origin]
+        test_range = [iso(test_dates[0]), iso(test_dates[-1])]
+        # The manifest binds all stage artifacts, including the reserved final test range.
+        # The physically sliced training input has its own digest in context.
+        data = {
+            "id": record["study_id"], "fingerprint": fixed["study"]["sha256"],
+            "observed_date_range": [recipe["training_start"], test_range[-1]],
+            "training_date_range": train_range, "validation_date_range": train_range,
+            "validation_target_date_range": [iso(dates[0]), iso(dates[-1])],
+            "test_date_range": test_range, "test_target_date_range": test_range,
+            "training_series": record["cohort_series_count"],
+            "validation_series": record["cohort_series_count"], "test": "reserved_not_evaluated",
+        }
+        spec = HPOStudySpec(
+            id=identifier, backend="optuna", direction="minimize", objective="validation/objective",
+            max_trials=budget, top_k=1, seed=seed,
+            comparability_fingerprint=hashlib.sha256(context_bytes).hexdigest(),
+            data=data, evaluator="external:fit_predict", tuning=tuning,
+            source_path=pathlib.Path(config), source_sha256=tuning.source_sha256,
+        )
+        bridge = _ExternalTrialBridge(study._spark, fit_predict, panel, mapping, context_bytes, raw)
+        run_hpo_study(spec, root, bridge)
+        return load_tuning_result(root / "studies" / identifier)

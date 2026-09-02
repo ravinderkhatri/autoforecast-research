@@ -624,6 +624,10 @@ and returned artifacts are checked for changes. Run data identity uses the full 
 manifest; the sliced training input has a separate digest. Missing predictions fail; missing actuals use
 the frozen study policy. No values are imputed by tuning.
 
+Working training/mapping copies are removed when tuning finishes or fails; callbacks must not
+retain their dataframes or input paths for later use. The original frozen study remains the
+data source for another run.
+
 Each completed trial retains forecasts, scores, model files and provenance under the existing
 HPO attempt manifests. The result exposes `trial_id`, `model_id`, `parameters`, `tuning_score`,
 `forecasts`, `model_artifacts`, `model_format`, `trial_history`, `provenance` and `path`.
