@@ -1366,6 +1366,15 @@ def parameter_resolution_from_selection(
         raise ParameterSourceError(f"selected HPO attempt is invalid: {error}") from error
     model = metadata.get("model")
     selected_study = metadata.get("study")
+    expected_study: dict[str, object] = {
+        "config_sha256": study.source_sha256,
+        "objective": study.objective,
+        "direction": study.direction,
+        "backend": study.backend,
+    }
+    # New HPO attempts bind the winner count; older sealed attempts omit this field.
+    if isinstance(selected_study, dict) and "top_k" in selected_study:
+        expected_study["top_k"] = study.top_k
     parameters = metadata.get("hyperparameters")
     expected_data = {"name": study.data["id"], **study.data}
     if (
@@ -1382,13 +1391,7 @@ def parameter_resolution_from_selection(
             "adapter": candidate.adapter,
             "config_sha256": candidate.source_sha256,
         }
-        or selected_study
-        != {
-            "config_sha256": study.source_sha256,
-            "objective": study.objective,
-            "direction": study.direction,
-            "backend": study.backend,
-        }
+        or selected_study != expected_study
         or metadata.get("data") != expected_data
         or metadata.get("parameter_execution_compatibility") != PARAMETER_EXECUTION_COMPATIBILITY
         or type(parameters) is not dict

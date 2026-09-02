@@ -14,7 +14,7 @@ from mlops.provenance import capture_runtime_identity, capture_source_identity
 from mlops.run_bundle import open_run_bundle
 
 from autoforecast.experiments import open_local_attempt, seal_study_selection
-from autoforecast.hpo import load_hpo_study
+from autoforecast.hpo import _trial_metadata, load_hpo_study
 from autoforecast.model_catalog import discover_candidates
 from autoforecast.parameter_sources import (
     PARAMETER_EXECUTION_COMPATIBILITY,
@@ -172,6 +172,7 @@ def _project(
     malformed_evidence: str | None = None,
     training_series: int = 2,
     zero_filled_count: object = 0,
+    legacy_study_metadata: bool = False,
 ):
     project = tmp_path / "project"
     model_path = project / "configs/models/neural/tft/model.yaml"
@@ -268,33 +269,17 @@ study:
         "model.dropout": 0.2,
         "training.learning_rate": 0.001,
     }
-    data = {
-        "name": "example-data",
-        **study.data,
-    }
+    metadata = _trial_metadata(study, parameters)
+    metadata["purpose"] = purpose
+    metadata["parameter_execution_compatibility"] = compatibility
+    if legacy_study_metadata:
+        metadata["study"].pop("top_k")
     attempt = open_local_attempt(
         root,
         study_id=study.id,
         trial_id="trial-0000",
         attempt_id="attempt-one",
-        metadata={
-            "purpose": purpose,
-            "parameter_execution_compatibility": compatibility,
-            "comparability_fingerprint": study.comparability_fingerprint,
-            "model": {
-                "id": candidate.id,
-                "adapter": candidate.adapter,
-                "config_sha256": candidate.source_sha256,
-            },
-            "study": {
-                "config_sha256": study.source_sha256,
-                "objective": study.objective,
-                "direction": study.direction,
-                "backend": study.backend,
-            },
-            "hyperparameters": parameters,
-            "data": data,
-        },
+        metadata=metadata,
     )
     attempt.write_json(
         "evaluation/validation.json",
@@ -787,10 +772,13 @@ def test_retained_capsule_rechecks_data_references(
         _validate_retained_attempt_data_references(attempt)
 
 
+@pytest.mark.parametrize("legacy_study_metadata", [False, True])
 def test_reused_hpo_selection_replays_manifest_model_study_and_source_identity(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, legacy_study_metadata: bool,
 ) -> None:
-    project, candidate, study, selection, _attempt = _project(tmp_path)
+    project, candidate, study, selection, _attempt = _project(
+        tmp_path, legacy_study_metadata=legacy_study_metadata,
+    )
     record = parameter_resolution_from_selection(
         candidate,
         study,
@@ -1168,4 +1156,13 @@ def test_reused_selection_requires_runtime_and_lockfile_provenance(
             selection,
             kind="reuse_selection",
             project_root=project,
+        )
+
+
+def test_reused_hpo_selection_rejects_a_different_declared_winner_count(tmp_path):
+    project, candidate, study, selection, _attempt = _project(tmp_path)
+    with pytest.raises(ParameterSourceError, match="metadata is incompatible"):
+        parameter_resolution_from_selection(
+            candidate, dataclasses.replace(study, top_k=2), selection,
+            kind="reuse_selection", project_root=project,
         )
