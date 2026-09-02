@@ -1159,10 +1159,54 @@ def test_reused_selection_requires_runtime_and_lockfile_provenance(
         )
 
 
-def test_reused_hpo_selection_rejects_a_different_declared_winner_count(tmp_path):
-    project, candidate, study, selection, _attempt = _project(tmp_path)
+@pytest.mark.parametrize("legacy_study_metadata", [False, True])
+def test_reused_hpo_selection_rejects_a_different_declared_winner_count(
+    tmp_path, legacy_study_metadata,
+):
+    project, candidate, study, selection, _attempt = _project(
+        tmp_path, legacy_study_metadata=legacy_study_metadata,
+    )
     with pytest.raises(ParameterSourceError, match="metadata is incompatible"):
         parameter_resolution_from_selection(
             candidate, dataclasses.replace(study, top_k=2), selection,
             kind="reuse_selection", project_root=project,
+        )
+
+
+def test_legacy_selection_top_k_must_match_supplied_study(tmp_path):
+    project, candidate, study, selection, _attempt = _project(
+        tmp_path, legacy_study_metadata=True,
+    )
+    selection.unlink()
+    parameters = {
+        "model.hidden_size": 16,
+        "model.attention_head_size": 2,
+        "model.dropout": 0.1,
+        "training.learning_rate": 0.002,
+    }
+    metadata = _trial_metadata(study, parameters)
+    metadata["study"].pop("top_k")
+    second = open_local_attempt(
+        tmp_path / "hpo", study_id=study.id, trial_id="trial-0001",
+        attempt_id="attempt-two", metadata=metadata,
+    )
+    second.write_json("evaluation/validation.json", {
+        "schema": "autoforecast.hpo-validation.v1",
+        "objective": "validation/objective", "value": 0.75,
+        "metrics": {"validation/mae": 0.75}, "test_metrics": "not_evaluated",
+    })
+    second.finalize(status="completed", summary={
+        "selection_metric": study.objective, "validation_objective": 0.75,
+        "test_metrics": "not_evaluated",
+    })
+    selection = seal_study_selection(
+        selection.parent, top_k=1, direction="minimize", required_trial_count=2,
+    )
+    record = json.loads(selection.read_text())
+    record["top_k"] = 2
+    record["selected"] = record["candidates"][:2]
+    selection.write_text(json.dumps(record))
+    with pytest.raises(ParameterSourceError, match="metadata is incompatible"):
+        parameter_resolution_from_selection(
+            candidate, study, selection, kind="reuse_selection", project_root=project,
         )

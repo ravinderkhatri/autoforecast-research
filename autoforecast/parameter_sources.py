@@ -1392,6 +1392,7 @@ def parameter_resolution_from_selection(
             "config_sha256": candidate.source_sha256,
         }
         or selected_study != expected_study
+        or sealed.get("top_k") != study.top_k
         or metadata.get("data") != expected_data
         or metadata.get("parameter_execution_compatibility") != PARAMETER_EXECUTION_COMPATIBILITY
         or type(parameters) is not dict
