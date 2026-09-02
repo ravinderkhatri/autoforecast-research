@@ -620,7 +620,8 @@ seed; the callback must apply it. Model dependencies belong to the caller's envi
 The callback receives no target actuals or Study object. It is trusted Python running in your
 process, not a sandbox: AutoForecast cannot attest what other data that code reads. Code identity
 and dependency versions are caller declarations, recorded unchanged for traceability. Inputs
-and returned artifacts are checked for changes. Missing predictions fail; missing actuals use
+and returned artifacts are checked for changes. Run data identity uses the full frozen study
+manifest; the sliced training input has a separate digest. Missing predictions fail; missing actuals use
 the frozen study policy. No values are imputed by tuning.
 
 Each completed trial retains forecasts, scores, model files and provenance under the existing

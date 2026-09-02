@@ -2,6 +2,7 @@
 
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import math
 import pathlib
@@ -53,10 +54,12 @@ def config(root, *, budget=2, backend="optuna", seed=9):
     return path
 
 
-def freeze(root, spark, *, hourly=False, windows=True, missing=False, metric="rmse", zero_targets=False):
+def freeze(root, spark, *, hourly=False, monthly=False, windows=True, missing=False, metric="rmse", zero_targets=False):
     # Population: two series A/B, zero exclusions, four cells in the inner window.
     root.mkdir(parents=True, exist_ok=True)
     def point(day):
+        if monthly:
+            return dt.date(2024, day, 1)
         return dt.datetime(2024, 1, 1) + dt.timedelta(hours=day - 1) if hourly else dt.date(2024, 1, day)
     source = root / "source.parquet"
     pq.write_table(pa.Table.from_pylist([
@@ -65,11 +68,11 @@ def freeze(root, spark, *, hourly=False, windows=True, missing=False, metric="rm
     ]), source)
     dataset = root / "dataset.yaml"
     dataset.write_text(yaml.safe_dump({"schema_version": 1, "dataset": {"id": "external-test", "panel": {
-        "series_col": "sku", "time_col": "at", "target_col": "units", "frequency": "H" if hourly else "D",
+        "series_col": "sku", "time_col": "at", "target_col": "units", "frequency": "H" if hourly else "MS" if monthly else "D",
         "season_length": 1, "target_estimand": "observed_nonnegative",
     }}}))
     recipe = {"schema_version": 2, "source_keys": ["sku"], "training_start": point(1).isoformat(),
-              "frequency": "H" if hourly else "D", "validation_origins": [point(5).isoformat()],
+              "frequency": "H" if hourly else "MS" if monthly else "D", "validation_origins": [point(5).isoformat()],
               "validation_horizon": 2, "final_train_cutoff": point(7).isoformat(), "final_test_horizon": 2,
               "history_policy": "fixed", "new_series_policy": "error", "target_unit": "units",
               "feature_availability": {}, "metric": metric, "actual_missing": "mask" if missing else "error"}
@@ -154,11 +157,30 @@ def test_custom_model_tunes_scores_reloads_and_keeps_outer_labels_out(frozen, sp
     for entry in result.trial_history:
         attempt = result.path / entry["attempt_path"]
         metadata = json.loads((attempt / "metadata/attempt.json").read_text())
+        data = metadata["data"]
+        assert data["fingerprint"] == hashlib.sha256(frozen.read_bytes()).hexdigest()
+        assert data["observed_date_range"] == ["2024-01-01", "2024-01-09"]
+        assert data["training_date_range"] == ["2024-01-01", "2024-01-03"]
+        assert data["validation_target_date_range"] == ["2024-01-04", "2024-01-05"]
+        assert data["test_target_date_range"] == ["2024-01-08", "2024-01-09"]
+        _, bound = benchmark.verify_benchmark(frozen, data["fingerprint"])
+        for role, start, end in (("selection", "2024-01-01", "2024-01-05"),
+                                 ("final_score", "2024-01-08", "2024-01-09")):
+            rows = pq.read_table(benchmark.artifact_path(frozen, bound, role)).to_pylist()
+            assert min(r["at"] for r in rows).isoformat() == start
+            assert max(r["at"] for r in rows).isoformat() == end
         level = metadata["hyperparameters"]["model.level"]
         assert entry["validation_objective"] == pytest.approx(math.sqrt(((level-4)**2 + (level-5)**2)/2))
         assert {r["yhat"] for r in pq.read_table(attempt / "forecasts").to_pylist()} == {level}
         assert not (attempt / "evaluation/governed-run.json").exists()
-    for artifact in (result.model_artifacts / "constant.json", result.path / "selection.json"):
+    other = next(entry for entry in result.trial_history if entry["trial_id"] != result.trial_id)
+    for artifact in (
+        result.model_artifacts / "constant.json", result.path / "selection.json",
+        next(pathlib.Path(result.forecasts.path).glob("*.parquet")),
+        result.model_artifacts.parent / "metadata/external-profile.yaml",
+        result.model_artifacts.parent / "evaluation/external-run.json",
+        result.path / other["attempt_path"] / "model/constant.json",
+    ):
         original = artifact.read_bytes()
         try:
             artifact.write_bytes(original + b" ") if artifact.name != "selection.json" else artifact.write_text(
@@ -169,13 +191,28 @@ def test_custom_model_tunes_scores_reloads_and_keeps_outer_labels_out(frozen, sp
             artifact.write_bytes(original)
 
 
-@pytest.mark.parametrize("defect", ["origin", "missing", "duplicate", "series", "model", "empty-model", "linked-model", "input", "study", "return"])
+@pytest.mark.parametrize("defect", ["origin", "missing", "duplicate", "series", "model", "empty-model", "linked-model", "input", "study", "return", "adapter", "horizon", "frequency", "mapping", "escaped", "format"])
 def test_bad_callback_cannot_publish_selection(frozen, spark, tmp_path, defect):
     local = tmp_path / "registry"
     shutil.copytree(frozen.parent, local / frozen.parent.name)
     manifest = local / frozen.parent.name / "benchmark.json"
+    scratch = []
     def bad(request):
+        scratch.append(request.output_dir)
         result = predict(request)
+        if defect in {"adapter", "horizon", "frequency"}:
+            value = {"adapter": "wrong-model", "horizon": 1, "frequency": "W"}[defect]
+            return dataclasses.replace(result, forecasts=dataclasses.replace(result.forecasts, **{defect: value}))
+        if defect == "mapping":
+            # Mutate the physical mapping directory whose digest is owned by the bridge.
+            mapping = pathlib.Path(request.series_mapping.inputFiles()[0].removeprefix("file:"))
+            mapping.write_bytes(b"changed")
+        if defect == "escaped":
+            external = tmp_path / "escaped"
+            shutil.copytree(request.output_dir / "predictions", external)
+            return dataclasses.replace(result, forecasts=dataclasses.replace(result.forecasts, path=str(external)))
+        if defect == "format":
+            return dataclasses.replace(result, model_format=" ")
         if defect == "origin":
             return dataclasses.replace(result, forecasts=dataclasses.replace(result.forecasts, origin="2024-01-05"))
         if defect in {"missing", "duplicate", "series"}:
@@ -209,18 +246,22 @@ def test_bad_callback_cannot_publish_selection(frozen, spark, tmp_path, defect):
     completions = list(roots[0].glob("trials/*/attempts/*/completion.json"))
     assert len(completions) == 1
     assert json.loads(completions[0].read_text())["status"] == "failed"
+    assert scratch and all(not path.exists() for path in scratch)
+    assert spark.range(1).count() == 1
 
 
-@pytest.mark.parametrize("hourly,metric,missing", [(True, "rmse", False), (False, "wrmsse", False), (False, "wrmsse", True)])
-def test_frequency_and_frozen_metric_policy(spark, tmp_path, hourly, metric, missing):
-    manifest = freeze(tmp_path / "study", spark, hourly=hourly, metric=metric, missing=missing)
+@pytest.mark.parametrize("hourly,monthly,metric,missing", [(True, False, "rmse", False), (False, False, "wrmsse", False), (False, False, "wrmsse", True), (False, True, "mae", False)])
+def test_frequency_and_frozen_metric_policy(spark, tmp_path, hourly, monthly, metric, missing):
+    manifest = freeze(tmp_path / "study", spark, hourly=hourly, monthly=monthly, metric=metric, missing=missing)
     with open_study(manifest, spark) as study:
         result = study.tune(fit_predict=predict, config=config(tmp_path, budget=1), implementation=implementation())
     level = result.parameters["model.level"]
     full = math.sqrt(((level-4)**2 + (level-5)**2)/2)
     expected = 0.8 * full + 0.2 * abs(level-4) if missing else full
+    if metric == "mae":
+        expected = (abs(level-4) + abs(level-5))/2
     assert result.tuning_score == pytest.approx(expected)
-    assert result.forecasts.frequency == ("H" if hourly else "D")
+    assert result.forecasts.frequency == ("H" if hourly else "MS" if monthly else "D")
     score = json.loads((result.model_artifacts.parent / "evaluation/score.json").read_text())
     assert score["coverage"]["zero_filled"] == 0
     assert score["coverage"]["scored"] == (3 if missing else 4)
@@ -234,14 +275,14 @@ def test_missing_or_ambiguous_window_fails_before_callback(spark, tmp_path, wind
                    implementation=implementation(), tuning_origin=origin)
 
 
-@pytest.mark.parametrize("option,value,error", [("backend", "ray", "sequential optuna"), ("budget", True, "positive integer"), ("budget", 0, "positive integer"), ("seed", -1, "seed"), ("seed", True, "seed")])
+@pytest.mark.parametrize("option,value,error", [("backend", "ray", "sequential optuna"), ("budget", True, "positive integer"), ("budget", 0, "positive integer"), ("seed", -1, "seed"), ("seed", 2**32, "seed"), ("seed", True, "seed")])
 def test_invalid_search_settings_fail_before_study_access(tmp_path, option, value, error):
     from autoforecast.study import Study
     with pytest.raises(TuningError, match=error):
         Study.tune(object(), fit_predict=predict, config=config(tmp_path, **{option: value}), implementation=implementation())
 
 
-@pytest.mark.parametrize("field,value", [("name", ""), ("version", 1), ("source_sha256", "bad"), ("dependencies", {"pkg": 1})])
+@pytest.mark.parametrize("field,value", [("name", ""), ("version", 1), ("source_sha256", "bad"), ("dependencies", {"pkg": 1}), ("dependencies", {"": "1"}), ("dependencies", {"pkg": " "})])
 def test_invalid_implementation_fails_before_data_access(tmp_path, field, value):
     from autoforecast.study import Study
     identity = {**implementation(), field: value}
@@ -337,3 +378,27 @@ def test_external_configuration_is_explicit_and_inert(tmp_path, defect):
         profile = link
     with pytest.raises(TuningError):
         Study.tune(object(), fit_predict=predict, config=profile, implementation=implementation())
+
+
+@pytest.mark.parametrize("defect", ["missing", "extra"])
+def test_implementation_key_set_is_exact(tmp_path, defect):
+    from autoforecast.study import Study
+    identity = implementation()
+    if defect == "missing":
+        identity.pop("dependencies")
+    else:
+        identity["module"] = "some_module:run"
+    with pytest.raises(ValueError, match="requires"):
+        Study.tune(object(), fit_predict=predict, config=tmp_path / "absent", implementation=identity)
+
+
+def test_profile_bytes_are_frozen_before_callback(frozen, spark, tmp_path):
+    profile = config(tmp_path, budget=1)
+    original = profile.read_bytes()
+    def fit(request):
+        profile.write_bytes(b"changed after capture")
+        return predict(request)
+    with open_study(frozen, spark) as study:
+        result = study.tune(fit_predict=fit, config=profile, implementation=implementation())
+    assert (result.model_artifacts.parent / "metadata/external-profile.yaml").read_bytes() == original
+    assert result.provenance["profile_sha256"] == hashlib.sha256(original).hexdigest()

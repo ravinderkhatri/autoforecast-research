@@ -331,8 +331,10 @@ def tune_study(
         return canonical_origin(point, cadence)
     train_range = [recipe["training_start"], origin]
     test_range = [iso(test_dates[0]), iso(test_dates[-1])]
+    # The manifest binds all stage artifacts, including the reserved final test range.
+    # The physically sliced training input has its own digest in context.
     data = {
-        "id": record["study_id"], "fingerprint": record["artifacts"]["selection"],
+        "id": record["study_id"], "fingerprint": fixed["study"]["sha256"],
         "observed_date_range": [recipe["training_start"], test_range[-1]],
         "training_date_range": train_range, "validation_date_range": train_range,
         "validation_target_date_range": [iso(dates[0]), iso(dates[-1])],
