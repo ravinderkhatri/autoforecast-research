@@ -410,14 +410,16 @@ def _trial_metadata(study: HPOStudySpec, parameters: dict[str, object]) -> dict[
 
 def _require_trial_evidence(attempt: LocalAttempt) -> None:
     # Classical/boosted adapters do not have an epoch loop. They must still leave the governed
-    # runner record; neural adapters additionally retain their epoch metrics when available.
+    # runner record (or external callback evidence); neural adapters additionally retain
+    # their epoch metrics when available.
     has_epochs = attempt.metrics_path.is_file() and bool(
         attempt.metrics_path.read_text(encoding="utf-8").strip()
     )
     governed = attempt.path / "evaluation" / "governed-run.json"
-    if not has_epochs and not governed.is_file():
+    external = attempt.path / "evaluation" / "external-run.json"
+    if not has_epochs and not governed.is_file() and not external.is_file():
         raise HPOError(
-            "completed HPO trial needs epoch metrics or an evaluation/governed-run.json record"
+            "completed HPO trial needs epoch metrics or a governed-run/external-run record"
         )
     artifact_directories = (attempt.path / "model", attempt.path / "checkpoints")
     saved_artifacts = (path for directory in artifact_directories for path in directory.rglob("*"))

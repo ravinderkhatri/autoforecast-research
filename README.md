@@ -540,6 +540,102 @@ requests without an explicit precision use `16-mixed`; checkpoint continuation r
 Use a current example as a starting point. Older request and resolved-artifact formats are
 rejected rather than translated.
 
+### Tune a model supplied by Python
+
+Keep your custom model in your application and pass its fitting function to `Study.tune`.
+No built-in adapter registration or remote service is required. AutoForecast searches settings,
+checks forecasts, scores the frozen **inner tuning window**, and saves the selection. Your
+function fits the model, generates forecasts and saves its model files.
+
+The study must already declare `tuning_windows`. With one window it is selected automatically;
+with several, pass its exact `tuning_origin`. A study without an inner window must be frozen
+again with the intended window. Outer validation and test targets never select parameters.
+The initial external-model route supports sequential Optuna; built-in Ray execution is unchanged.
+
+An external tuning configuration reuses the existing parameter domains and constraints:
+
+```yaml
+schema_version: 2
+model:
+  id: custom-prophet
+  adapter: external
+hpo:
+  backend: optuna
+  max_trials: 20
+  seed: 7
+hyperparameters:
+  model.changepoint_prior_scale:
+    default: 0.05
+    valid: {kind: float, low: 0.001, high: 0.5, log: true}
+    search: {kind: float, low: 0.01, high: 0.1, log: true}
+```
+
+Pass an ordinary Python function; configuration files never load executable code:
+
+```python
+from autoforecast.study_tuning import FitPredictResult, load_tuning_result
+
+def fit_predict(request):
+    # Implement these model-specific operations in your application.
+    model = fit_my_model(
+        request.training_data,
+        model_parameters=request.model_parameters,
+        training_parameters=request.training_parameters,
+        seed=request.seed,
+    )
+    # Return the existing Forecast type, with adapter=request.model_id and
+    # origin=request.origin. Save the complete series/date grid under output_dir.
+    forecasts = predict_and_save(
+        model, request.series_mapping, request.forecast_dates,
+        output_dir=request.output_dir / "forecasts",
+        model_id=request.model_id, origin=request.origin,
+        frequency=request.panel.frequency,
+    )
+    save_my_model(model, request.output_dir / "model")
+    return FitPredictResult(forecasts=forecasts, model_format="my-model-format-v1")
+
+selection = study.tune(
+    fit_predict=fit_predict,
+    config="prophet_tuning.yaml",
+    implementation={
+        "name": "my-project.custom-prophet",
+        "version": "1.0.0",
+        "source_sha256": source_sha256,  # SHA-256 of your retained implementation source
+        "dependencies": dependency_versions,  # e.g. {"prophet": installed_version}
+    },
+)
+
+print(selection.parameters)    # Full profile names, e.g. model.changepoint_prior_scale
+print(selection.tuning_score)
+selected_again = load_tuning_result(selection.path)
+# Your application loads selected_again.model_artifacts using its own model loader.
+```
+
+The example's fitting, prediction and serialization functions belong to your application.
+`request.panel` describes the physically sliced training Parquet and its column roles.
+`request.series_mapping` contains the retained IDs and source keys. `forecast_dates` follows
+the study frequency, including hourly and calendar frequencies. Each trial receives the same
+seed; the callback must apply it. Model dependencies belong to the caller's environment.
+
+The callback receives no target actuals or Study object. It is trusted Python running in your
+process, not a sandbox: AutoForecast cannot attest what other data that code reads. Code identity
+and dependency versions are caller declarations, recorded unchanged for traceability. Inputs
+and returned artifacts are checked for changes. Missing predictions fail; missing actuals use
+the frozen study policy. No values are imputed by tuning.
+
+Each completed trial retains forecasts, scores, model files and provenance under the existing
+HPO attempt manifests. The result exposes `trial_id`, `model_id`, `parameters`, `tuning_score`,
+`forecasts`, `model_artifacts`, `model_format`, `trial_history`, `provenance` and `path`.
+Reload checks all ranked attempts and their recorded hashes; it never executes a model loader.
+Failed trials abort the search without publishing a selection. Every call creates a new run;
+resuming a partial search is not part of this interface.
+
+The winning model belongs to the inner tuning cutoff. To evaluate outer validation, fit again
+with the selected settings through that stage's cutoff. Then perform the final refit before
+creating test forecasts and calling `Study.evaluate_forecasts`. For example: tune on April 1–7
+using history through March 31, fit through April 7 to validate April 8–14, then fit through
+April 14 to test April 15–21. Keep the final test results out of parameter selection.
+
 ## Inspect results
 
 `run` prints the campaign directory. It contains stage logs, run bundles, selection information,
