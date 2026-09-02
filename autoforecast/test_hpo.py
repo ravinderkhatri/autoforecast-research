@@ -18,6 +18,7 @@ import autoforecast.hpo as hpo_module
 from autoforecast.experiment_report import render_benchmark_report
 from autoforecast.experiments import (
     ExperimentError,
+    load_study_selection,
     require_heldout_evaluation_approval,
     seal_study_selection,
 )
@@ -565,3 +566,16 @@ def test_external_hpo_requires_exact_external_evidence(tmp_path, defect):
     else:
         run_hpo_study(study, tmp_path / "artifacts", evaluator)
         assert (tmp_path / "artifacts/studies/hpo-smoke/selection.json").is_file()
+
+
+def test_hpo_preserves_declared_multiple_winners_and_rejects_policy_edit(tmp_path):
+    spec = load_hpo_study(_write_study(tmp_path), project_root=tmp_path)
+    spec = dataclasses.replace(spec, top_k=2)
+    run_hpo_study(spec, tmp_path / "artifacts", smoke_evaluator)
+    root = tmp_path / "artifacts/studies/hpo-smoke"
+    selection = load_study_selection(root)
+    assert len(selection["selected"]) == 2
+    selection.update(top_k=1, selected=selection["candidates"][:1])
+    (root / "selection.json").write_text(json.dumps(selection))
+    with pytest.raises(ExperimentError, match="top_k"):
+        load_study_selection(root)

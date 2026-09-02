@@ -15,7 +15,7 @@ import yaml
 from pyspark.sql import SparkSession
 
 from autoforecast import benchmark
-from autoforecast.experiments import ExperimentError
+from autoforecast.experiments import ExperimentError, require_heldout_evaluation_approval
 from autoforecast.hpo import HPOError
 from autoforecast.panel import Forecast, ForecastError
 from autoforecast.score_spark import ScoreError
@@ -176,6 +176,21 @@ def test_custom_model_tunes_scores_reloads_and_keeps_outer_labels_out(frozen, sp
         assert entry["validation_objective"] == pytest.approx(math.sqrt(((level-4)**2 + (level-5)**2)/2))
         assert {r["yhat"] for r in pq.read_table(attempt / "forecasts").to_pylist()} == {level}
         assert not (attempt / "evaluation/governed-run.json").exists()
+    selection_path = result.path / "selection.json"
+    original_selection = selection_path.read_bytes()
+    try:
+        changed = json.loads(original_selection)
+        changed.update(top_k=2, selected=changed["candidates"][:2])
+        selection_path.write_text(json.dumps(changed))
+        with pytest.raises(ExperimentError, match="top_k"):
+            load_tuning_result(result.path)
+        extra = changed["selected"][1]
+        with pytest.raises(ExperimentError, match="top_k"):
+            require_heldout_evaluation_approval(
+                result.path, trial_id=extra["trial_id"], attempt_id=extra["attempt_id"],
+            )
+    finally:
+        selection_path.write_bytes(original_selection)
     other = next(entry for entry in result.trial_history if entry["trial_id"] != result.trial_id)
     for artifact in (
         result.model_artifacts / "constant.json", result.path / "selection.json",
@@ -337,7 +352,7 @@ def test_external_constraints_and_parameter_names_are_enforced(tmp_path):
         loads_external_tuning_spec(yaml.safe_dump(record).encode())
 
 
-@pytest.mark.parametrize("value", [False, 1, [], ""])
+@pytest.mark.parametrize("value", [False, 1, [], "", " ", "\t", "\r\n", "\u00a0"])
 def test_invalid_origin_rejected_before_study_access(tmp_path, value):
     from autoforecast.study import Study
     with pytest.raises(ValueError, match="tuning_origin"):
@@ -425,3 +440,22 @@ def test_tuning_input_snapshots_are_cleaned_when_preparation_fails(frozen, spark
         study.tune(fit_predict=predict, config=config(tmp_path, budget=1), implementation=implementation())
     assert created and all(not path.parent.exists() for path in created)
     assert spark.range(1).count() == 1
+
+
+def test_tuning_root_symlink_rejected_before_writing_inputs(spark, tmp_path, monkeypatch):
+    from pyspark.sql.readwriter import DataFrameWriter
+    manifest = freeze(tmp_path / "study", spark)
+    target = tmp_path / "redirected"
+    target.mkdir()
+    (tmp_path / "study/.autoforecast/study-tuning").symlink_to(target, target_is_directory=True)
+    writes = []
+    original = DataFrameWriter.parquet
+    def observe_write(self, path, *args, **kwargs):
+        writes.append(path)
+        return original(self, path, *args, **kwargs)
+    monkeypatch.setattr(DataFrameWriter, "parquet", observe_write)
+    with open_study(manifest, spark) as study:
+        with pytest.raises((HPOError, LineageError), match="symlink"):
+            study.tune(fit_predict=predict, config=config(tmp_path), implementation=implementation())
+    assert writes == []
+    assert list(target.iterdir()) == []

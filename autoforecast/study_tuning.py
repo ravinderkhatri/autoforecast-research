@@ -273,7 +273,7 @@ def tune_study(
     tuning_origin: str | None = None,
 ) -> TuningResult:
     """Tune one caller-supplied implementation on one explicitly frozen inner window."""
-    if tuning_origin is not None and (type(tuning_origin) is not str or not tuning_origin):
+    if tuning_origin is not None and (type(tuning_origin) is not str or not tuning_origin.strip()):
         raise ValueError("tuning_origin must be a nonblank frozen origin string")
     if not callable(fit_predict):
         raise TypeError("fit_predict must be a Python callable")
@@ -301,8 +301,10 @@ def tune_study(
     dates = tuple(period_points(origin, cadence, horizon))
     identifier = "tune-" + uuid.uuid4().hex
     root = study._path.parent.parent.parent / "study-tuning"
-    root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".inputs-", dir=root) as temporary:
+    if root.is_symlink():
+        raise HPOError("HPO output root may not be a symlink")
+    # Keep working data independent of the artifact destination.
+    with tempfile.TemporaryDirectory(prefix="autoforecast-inputs-") as temporary:
         inputs = pathlib.Path(temporary)
         training = inputs / "training"
         mapping = inputs / "series-mapping"

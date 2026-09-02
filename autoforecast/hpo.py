@@ -402,6 +402,7 @@ def _trial_metadata(study: HPOStudySpec, parameters: dict[str, object]) -> dict[
             "config_sha256": study.source_sha256,
             "objective": study.objective,
             "direction": study.direction,
+            "top_k": study.top_k,
             "backend": study.backend,
         },
         "hyperparameters": parameters,

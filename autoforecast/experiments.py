@@ -559,6 +559,7 @@ def load_completed_attempt(path: pathlib.Path) -> tuple[dict[str, Any], dict[str
 def _selection_candidates(
     study_root: pathlib.Path,
     *,
+    top_k: int,
     direction: str,
     required_trial_count: int | None,
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -594,6 +595,9 @@ def _selection_candidates(
         study = metadata.get("study")
         if type(study) is not dict or study.get("direction") != direction:
             raise ExperimentError(f"candidate direction does not match its study: {attempt_path}")
+        # Older attempts did not bind top_k. New HPO runs retain it immutably.
+        if "top_k" in study and (type(study["top_k"]) is not int or study["top_k"] != top_k):
+            raise ExperimentError(f"selection top_k differs from its study: {attempt_path}")
         trial_id = metadata.get("trial_id")
         attempt_id = metadata.get("attempt_id")
         if not isinstance(trial_id, str) or not isinstance(attempt_id, str):
@@ -690,7 +694,7 @@ def seal_study_selection(
     ):
         raise ExperimentError("required_trial_count must be a positive integer when supplied")
     fingerprint, candidates = _selection_candidates(
-        root, direction=direction, required_trial_count=required_trial_count
+        root, top_k=top_k, direction=direction, required_trial_count=required_trial_count
     )
     if top_k > len(candidates):
         raise ExperimentError(f"top_k={top_k} exceeds {len(candidates)} completed trials")
@@ -755,6 +759,7 @@ def load_study_selection(study_root: str | pathlib.Path) -> dict[str, Any]:
         raise ExperimentError("selection timestamp is invalid")
     fingerprint, ranked = _selection_candidates(
         root,
+        top_k=top_k,
         direction=record["direction"],
         required_trial_count=None,
     )
