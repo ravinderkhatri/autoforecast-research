@@ -17,7 +17,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from autoforecast._exact_json import load_exact_json
-from autoforecast._exact_yaml import loads_exact_yaml
+from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast.benchmark import evaluation_contract, verify_benchmark
 from autoforecast.experiments import load_completed_attempt, load_study_selection
 from autoforecast.frequency import (
@@ -126,7 +126,10 @@ def _config(path: pathlib.Path) -> tuple[bytes, TuningSpec, int, int]:
     if path.is_symlink() or not path.is_file():
         raise TuningError("external tuning config must be a regular file")
     raw = path.read_bytes()
-    value = loads_exact_yaml(raw)
+    try:
+        value = loads_exact_yaml(raw)
+    except ExactYAMLError as error:
+        raise TuningError(f"invalid YAML in external tuning config: {error}") from error
     if type(value) is not dict or "hpo" not in value:
         raise TuningError("external tuning config requires an hpo mapping")
     options = value.pop("hpo")
@@ -139,7 +142,11 @@ def _config(path: pathlib.Path) -> tuple[bytes, TuningSpec, int, int]:
         raise TuningError("hpo.max_trials must be a positive integer")
     if type(seed) is not int or not 0 <= seed < 2**32:
         raise TuningError("hpo.seed must be an integer in [0, 2**32 - 1]")
-    spec = loads_external_tuning_spec(_json_bytes(value), source_path=path)
+    try:
+        profile = _json_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise TuningError("external profile requires finite JSON-compatible values") from error
+    spec = loads_external_tuning_spec(profile, source_path=path)
     spec = dataclasses.replace(spec, source_sha256=hashlib.sha256(raw).hexdigest())
     return raw, spec, budget, seed
 
@@ -218,9 +225,11 @@ class _ExternalTrialBridge:
                 seed=context["seed"], output_dir=work,
             ))
             self._verify_inputs(context)
-            if type(result) is not FitPredictResult or type(result.model_format) is not str \
-                    or not result.model_format.strip():
-                raise HPOError("fit_predict must return FitPredictResult with a model_format")
+            if (type(result) is not FitPredictResult or type(result.forecasts) is not Forecast
+                    or type(result.model_format) is not str or not result.model_format.strip()):
+                raise HPOError(
+                    "fit_predict must return FitPredictResult with a Forecast and model_format"
+                )
             forecast = Forecast.from_record(result.forecasts.as_record())
             if (forecast.origin, forecast.horizon, forecast.frequency, forecast.adapter) != (
                 origin, horizon, frequency, context["model_id"],

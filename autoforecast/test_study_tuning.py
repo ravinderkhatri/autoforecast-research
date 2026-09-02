@@ -209,7 +209,7 @@ def test_custom_model_tunes_scores_reloads_and_keeps_outer_labels_out(frozen, sp
             artifact.write_bytes(original)
 
 
-@pytest.mark.parametrize("defect", ["origin", "missing", "duplicate", "series", "model", "empty-model", "linked-model", "input", "study", "return", "adapter", "horizon", "frequency", "mapping", "escaped", "format"])
+@pytest.mark.parametrize("defect", ["origin", "missing", "duplicate", "series", "model", "empty-model", "linked-model", "input", "study", "return", "adapter", "horizon", "frequency", "mapping", "escaped", "format", "forecast-return"])
 def test_bad_callback_cannot_publish_selection(frozen, spark, tmp_path, defect):
     local = tmp_path / "registry"
     shutil.copytree(frozen.parent, local / frozen.parent.name)
@@ -231,6 +231,8 @@ def test_bad_callback_cannot_publish_selection(frozen, spark, tmp_path, defect):
             external = tmp_path / "escaped"
             shutil.copytree(request.output_dir / "predictions", external)
             return dataclasses.replace(result, forecasts=dataclasses.replace(result.forecasts, path=str(external)))
+        if defect == "forecast-return":
+            return dataclasses.replace(result, forecasts=None)
         if defect == "format":
             return dataclasses.replace(result, model_format=" ")
         if defect == "origin":
@@ -459,3 +461,22 @@ def test_tuning_root_symlink_rejected_before_writing_inputs(spark, tmp_path, mon
             study.tune(fit_predict=predict, config=config(tmp_path), implementation=implementation())
     assert writes == []
     assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("defect", ["duplicate", "nonfinite", "date", "key"])
+def test_malformed_external_profile_raises_tuning_error_before_study_access(tmp_path, defect):
+    from autoforecast.study import Study
+    profile = config(tmp_path)
+    if defect == "duplicate":
+        profile.write_text(profile.read_text() + "hpo: {}\n")
+    else:
+        record = yaml.safe_load(profile.read_text())
+        if defect == "nonfinite":
+            record["hyperparameters"]["model.level"]["default"] = float("nan")
+        elif defect == "date":
+            record["model"]["id"] = dt.date(2024, 1, 1)
+        else:
+            record[7] = "unexpected key"
+        profile.write_text(yaml.safe_dump(record))
+    with pytest.raises(TuningError):
+        Study.tune(object(), fit_predict=predict, config=profile, implementation=implementation())
