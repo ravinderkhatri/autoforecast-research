@@ -168,9 +168,11 @@ numeric scale. Fixed mode ignores the search range.
 
 The function receives `request.training_data`, `request.forecast_dates`, and parameter
 dictionaries. Here, `request.model_parameters["level"]` is `4.0`.
-It must apply `request.seed`, return a `FitPredictResult` containing a complete `Forecast`,
-and save its model under `request.output_dir / "model"`. Optional diagnostics belong in
-`request.output_dir / "artifacts"`. That workspace is temporary; `run.path` is the retained result.
+Predict every supplied series/date pair and apply `request.seed`. Save forecast Parquet
+(columns `series_id`, `date`, `yhat`) beneath `request.output_dir`, for example in its
+`forecasts` subfolder. Return a `FitPredictResult` containing a `Forecast` that points to it.
+Save model files under `request.output_dir / "model"` and optional diagnostics under
+`request.output_dir / "artifacts"`. This workspace is temporary; `run.path` is the retained result.
 All Spark workers must also be able to access temporary working paths.
 Your application still owns data access, business rules, and publishing.
 
@@ -288,6 +290,7 @@ For a completed campaign, export both phases:
 
 ```python
 from pathlib import Path
+from autoforecast.results import read_workflow_results, export_results
 
 # campaign is the dictionary returned by study.run_campaign(...).
 assert campaign["state"]["status"] == "completed"

@@ -51,8 +51,8 @@
 <text x="834" y="883" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">1. Fit with the supplied history and parameters.</text>
 <text x="834" y="919" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">2. Predict the supplied forecast_dates.</text>
 <text x="834" y="955" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">3. Save native model files under model/.</text>
-<text x="834" y="991" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">4. Save forecasts; optional diagnostics go in artifacts/.</text>
-<text x="834" y="1040" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Other temporary scratch files are discarded.</text>
+<text x="834" y="991" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">4. Save forecast Parquet beneath request.output_dir.</text>
+<text x="834" y="1040" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Diagnostics go in artifacts/; other scratch is discarded.</text>
 <rect x="56" y="1108" width="1488" height="222" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
 <rect x="78" y="1130" width="40" height="36" rx="9" fill="#EAF0FD"/>
 <text x="89" y="1155" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">5</text>

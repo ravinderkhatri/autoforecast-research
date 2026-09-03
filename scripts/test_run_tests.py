@@ -76,6 +76,9 @@ def test_ci_shards_execute_every_discovered_module_once(tmp_path, runner_project
             "    from pathlib import Path\n"
             "    assert os.environ['PYSPARK_PYTHON'] == sys.executable\n"
             "    assert os.environ['RAY_DEFAULT_OBJECT_STORE_MAX_MEMORY_BYTES'] == '134217728'\n"
+            "    assert os.environ['FORECAST_SPARK_CORES'] == '2'\n"
+            "    assert os.environ['FORECAST_SPARK_MEMORY'] == '1g'\n"
+            "    assert os.environ['SPARK_LOCAL_IP'] == '127.0.0.1'\n"
             "    assert not hasattr(builtins, 'previous_module')\n"
             "    builtins.previous_module = True\n"
             "    with Path('executed.txt').open('a') as stream:\n"
@@ -161,6 +164,77 @@ def test_runner_reports_first_failure_without_running_later_work(
     assert not (tmp_path / "later.txt").exists()
 
 
+@pytest.mark.parametrize("index,count", [(0, 1), (1, 2)])
+def test_runner_propagates_later_failure_in_default_and_ci_shards(
+    tmp_path, runner_project, index, count,
+):
+    runner, checks = runner_project
+    for number in range(3 * count):
+        body = "def test_ok(): pass\n"
+        if number == index + count:
+            body = "def test_failure(): assert False\n"
+        elif number == index + 2 * count:
+            body = (
+                "def test_later():\n    from pathlib import Path\n    Path('later.txt').touch()\n"
+            )
+        (checks / f"test_{number}.py").write_text(body)
+    result = subprocess.run(
+        [sys.executable, str(runner), "--shard-index", str(index), "--shard-count", str(count)],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"FAILED checks/test_{index + count}.py" in result.stdout
+    assert "Modules: 2; failed: 1" in result.stdout
+    assert not (tmp_path / "later.txt").exists()
+
+
+def test_ci_keeps_required_checks_and_acceptance_variants():
+    jobs = workflow_jobs()
+    matrix = jobs["installed-wheel"]["strategy"]["matrix"]
+    cases = set(itertools.product(matrix["python"], matrix["frequency"], matrix["input"]))
+    cases.update((row["python"], row["frequency"], row["input"]) for row in matrix["include"])
+    assert cases == {
+        (python, frequency, source)
+        for python in ("3.12", "3.13")
+        for frequency in (("H", "D", "W", "M", "MS", "Y", "YS") if python == "3.12" else ("D",))
+        for source in ("csv", "parquet")
+    }
+    assert set(jobs["installed-models"]["strategy"]["matrix"]["extra"]) == {"timesfm", "all-models"}
+    preflight = jobs["preflight"]["steps"]
+    checkout = next(
+        step for step in preflight if step.get("uses", "").startswith("actions/checkout@")
+    )
+    assert checkout["with"]["fetch-depth"] == 0
+    for step in preflight:
+        assert step.get("if") is None and not step.get("continue-on-error", False)
+    required = {
+        ("preflight", "Install checked CI tools"): (
+            "uv lock --check", "uv export --frozen", '--constraint "$RUNNER_TEMP/constraints.txt"',
+            '--build-constraints "$RUNNER_TEMP/constraints.txt"', "--group ci PyYAML",
+        ),
+        ("preflight", "Lint and publication checks"): (
+            "ruff check .", "python -m scripts.verify_public_release",
+            "python -m pytest -q -rs -x scripts/test_run_tests.py "
+            "scripts/test_distribution.py scripts/test_public_release.py",
+        ),
+        ("regressions", "Type check"): ("pyright --project pyrightconfig.governed.json",),
+        ("regressions", "Installed native model and HPO acceptance"): (
+            "for metric in mae wape; do", "python -m scripts.verify_native_study_release",
+            '--metric "$metric"', "--model-profile", "--implementation-config",
+        ),
+        ("regressions", "Export checked lock and install CPU test runtimes"): (
+            "uv lock --check", "uv export --frozen", "python -m build --wheel",
+            "python -m scripts.verify_public_release --wheel", "uv pip install --system",
+            '--constraint "$RUNNER_TEMP/constraints.txt"',
+            '--build-constraints "$RUNNER_TEMP/constraints.txt"',
+            "uv pip check --system",
+        ),
+    }
+    for (job, name), commands in required.items():
+        step = next(step for step in jobs[job]["steps"] if step.get("name") == name)
+        assert all(command in step["run"] for command in commands), name
+
+
 def test_ci_orders_stages_and_requires_every_result():
     jobs = workflow_jobs()
     assert jobs["regressions"]["needs"] == "preflight"
@@ -187,7 +261,8 @@ def test_ci_orders_stages_and_requires_every_result():
     step = gate["steps"][0]
     assert step.get("if") is None
     assert not step.get("continue-on-error", False)
-    assert step.get("shell", "bash") == "bash"
+    assert step["shell"] == "bash"
+    assert step.get("env", {}) == {}
     for values in itertools.product(("success", "failure", "cancelled", "skipped"), repeat=4):
         result = subprocess.run(
             ["bash", "-c", step["run"]],

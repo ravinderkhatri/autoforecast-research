@@ -274,5 +274,6 @@ jobs:
       MODEL_RESULT: ${{ needs.installed-models.result }}
     steps:
       - name: Require every validation stage
+        shell: bash
         run: |
           test "$PREFLIGHT_RESULT $REGRESSION_RESULT $WHEEL_RESULT $MODEL_RESULT" = "success success success success"

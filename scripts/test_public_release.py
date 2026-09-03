@@ -17,6 +17,13 @@ from autoforecast.project import installed_library_identity
 from scripts.verify_public_release import README_IMAGES, ROOT_FILES, tracked_inventory, verify_wheel
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+APPROVED_README_IMAGES = {
+    "assets/autoforecast-overview.svg",
+    "assets/01-cross-validation.svg",
+    "assets/02-workflow-function.svg",
+    "assets/03-parallel-execution.svg",
+    "assets/04-run-outputs.svg",
+}
 
 
 def command(root, *args):
@@ -128,13 +135,13 @@ def test_public_inventory_accepts_root_readme(clean_wheel, tmp_path):
 
 def test_readme_diagrams_are_present_valid_and_approved():
     images = set(re.findall(r"!\[[^\]]*\]\(([^)]+)\)", (ROOT / "README.md").read_text()))
-    assert images == README_IMAGES
+    assert images == README_IMAGES == APPROVED_README_IMAGES
     for name in images:
         assert pathlib.PurePosixPath(name).suffix == ".svg"
         assert ET.parse(ROOT / name).getroot().tag == "{http://www.w3.org/2000/svg}svg"
 
 
-@pytest.mark.parametrize("name", sorted(README_IMAGES))
+@pytest.mark.parametrize("name", sorted(APPROVED_README_IMAGES))
 def test_public_inventory_accepts_only_approved_readme_diagrams(clean_wheel, tmp_path, name):
     original, _ = clean_wheel
     root = tmp_path / "repo"
@@ -145,6 +152,20 @@ def test_public_inventory_accepts_only_approved_readme_diagrams(clean_wheel, tmp
     command(root, "git", "add", name)
     names, _ = tracked_inventory(root)
     assert name in names
+    original_svg = path.read_text()
+    path.write_text("<svg>\nGenerated-" + "by: invalid marker\n</svg>\n")
+    with pytest.raises(ValueError, match="public file"):
+        tracked_inventory(root)
+    path.unlink()
+    target = root / "untracked-image-source.svg"
+    target.write_text(original_svg)
+    path.symlink_to(target)
+    command(root, "git", "add", name)
+    with pytest.raises(ValueError, match="public inventory"):
+        tracked_inventory(root)
+    path.unlink()
+    path.write_text(original_svg)
+    command(root, "git", "add", name)
     sibling = path.with_name("unapproved-diagram.svg")
     sibling.write_text(path.read_text())
     command(root, "git", "add", str(sibling.relative_to(root)))
