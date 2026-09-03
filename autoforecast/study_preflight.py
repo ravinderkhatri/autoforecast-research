@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from pyarrow.compute import field
+from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from autoforecast import grid
@@ -68,6 +69,25 @@ def _rows(path: pathlib.Path, columns: list[str] | None = None):
     source = ds.dataset(path, format="parquet")
     for batch in source.to_batches(columns=columns, batch_size=8192):
         yield from batch.to_pylist()
+
+
+def _source_key_error(frame: DataFrame, record: dict, series_col: str) -> str | None:
+    """Use registration's canonical encoding to verify every stored key representation."""
+    keys = record["recipe"]["source_keys"]
+    if any(
+        key not in frame.columns
+        or frame.schema[key].dataType.simpleString() != record["key_types"][key]
+        for key in keys
+    ):
+        return "source key storage types differ from registration"
+    invalid = F.col(series_col).isNull() | (
+        F.col(series_col) != F.to_json(F.struct(*[F.col(key) for key in keys]))
+    )
+    for key in keys:
+        invalid = invalid | F.col(key).isNull()
+    if frame.filter(invalid).limit(1).count():
+        return "source key mapping differs from canonical series IDs"
+    return None
 
 
 def preflight_study(study: Study, options: dict) -> PreflightResult:
@@ -149,6 +169,22 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         or any(type(sid) is not str or not sid for sid in ids)
     ):
         raise BenchmarkError("source mapping canonical IDs differ from the frozen cohort")
+    mapping_frame = study._spark.read.parquet(
+        str(artifact_path(study._path, record, "source-keys"))
+    )
+    key_error = _source_key_error(mapping_frame, record, panel.series_col)
+    if key_error:
+        raise BenchmarkError(key_error)
+    keys = recipe["source_keys"]
+    declared_starts = {
+        tuple(item["keys"][key] for key in keys): parse_origin(item["start"], frequency)
+        for item in recipe["series_starts"]["values"]
+    }
+    if any(
+        row[START_COLUMN] != declared_starts.get(tuple(row[key] for key in keys), history_start)
+        for row in mappings
+    ):
+        raise BenchmarkError("source mapping history starts differ from registration")
     id_set = set(ids)
     starts = {row[panel.series_col]: row[START_COLUMN] for row in mappings}
     windows = study_windows(recipe)
@@ -190,16 +226,38 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         ) or (frequency != "H" and not pa.types.is_date(schema.field(panel.time_col).type)):
             raise BenchmarkError(f"{role}: invalid time storage type")
         role_path = artifact_path(study._path, record, role)
+        frame = study._spark.read.parquet(str(role_path))
+        key_error = _source_key_error(frame, record, panel.series_col)
+        if key_error:
+            report["issues"].append(
+                {
+                    "code": "source_key_mapping",
+                    "severity": "error",
+                    "stage": role,
+                    "series_id": None,
+                    "origin": None,
+                    "dates": [],
+                    "explanation": key_error,
+                }
+            )
         duplicate = (
-            study._spark.read.parquet(str(role_path))
-            .groupBy(panel.series_col, panel.time_col)
+            frame.groupBy(panel.series_col, panel.time_col)
             .count()
             .filter(F.col("count") != 1)
-            .limit(1)
             .collect()
         )
-        if duplicate:
-            raise BenchmarkError(f"{role}: duplicate series/date {duplicate[0].asDict()}")
+        for row in duplicate:
+            report["issues"].append(
+                {
+                    "code": "duplicate_series_date",
+                    "severity": "error",
+                    "stage": role,
+                    "series_id": row[panel.series_col],
+                    "origin": None,
+                    "dates": [str(row[panel.time_col])],
+                    "explanation": "duplicate series/date in frozen prepared data",
+                }
+            )
         test_points = points[next(key for key in by_key if key.startswith("test/"))]
         lower = test_points[0] if role == "final_score" else history_start
         upper = (
@@ -237,6 +295,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             [panel.series_col, panel.time_col, panel.target_col, MISSING_COLUMN],
         ):
             sid, point, value = row[panel.series_col], row[panel.time_col], row[panel.target_col]
+            present.add(sid)
             if sid not in id_set:
                 report["issues"].append(
                     {
@@ -249,14 +308,13 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                         "explanation": "ID is absent from the frozen canonical cohort",
                     }
                 )
-                raise BenchmarkError(f"{role}: unexpected canonical ID {sid!r}")
+                continue
             text = canonical_origin(point, frequency)
             if parse_origin(text, frequency) != point:
                 raise BenchmarkError(f"{role}: invalid or duplicate series/date {sid!r} {text}")
-            if not lower <= point <= written_upper:
+            if not max(lower, starts[sid]) <= point <= written_upper:
                 raise BenchmarkError(f"{role}: date outside its frozen range: {sid!r} {text}")
             _inclusive_period_count(history_start, point, cadence, label=f"{role} date {text}")
-            present.add(sid)
             missing = row[MISSING_COLUMN]
             if (
                 type(missing) is not bool
@@ -284,9 +342,50 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             "expected_count": len(ids),
             "actual_count": len(present),
             "missing_ids": sorted(id_set - present),
-            "extra_ids": sorted(present - id_set),
-            "actual_ids_sha256": digest(sorted(present)),
+            "extra_ids": sorted(present - id_set, key=str),
+            "actual_ids_sha256": digest(sorted(present, key=str)),
         }
+        for sid in ids:
+            first = max(lower, starts[sid])
+            expected_count = (
+                _inclusive_period_count(first, upper, cadence, label=role) if first <= upper else 0
+            )
+            if counts[sid]["required_observations"] != expected_count:
+                report["issues"].append(
+                    {
+                        "code": "missing_or_extra_prepared_rows",
+                        "severity": "error",
+                        "stage": role,
+                        "series_id": sid,
+                        "origin": None,
+                        "dates": [],
+                        "explanation": (
+                            f"frozen prepared rows: expected={expected_count}, "
+                            f"actual={counts[sid]['required_observations']}; "
+                            "missing demand must retain its row and missing marker"
+                        ),
+                    }
+                )
+        totals = {
+            name: sum(row[name] for row in counts.values()) for name in record["counts"][role]
+        }
+        if totals != record["counts"][role]:
+            report["issues"].append(
+                {
+                    "code": "prepared_counts_mismatch",
+                    "severity": "error",
+                    "stage": role,
+                    "series_id": None,
+                    "origin": None,
+                    "dates": [],
+                    "explanation": "prepared row and missingness counts differ from frozen counts",
+                }
+            )
+    if report["issues"]:
+        raise BenchmarkError(
+            "frozen prepared data integrity failed: "
+            + ", ".join(sorted({issue["code"] for issue in report["issues"]}))
+        )
     for key, (_stage, _origin, _horizon) in by_key.items():
         grid_path = study._path.parent / record["grids"][key]["path"]
         expected = {(sid, point) for sid in ids for point in points[key]}
@@ -298,6 +397,24 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             seen_grid.add(cell)
         if seen_grid != expected:
             raise BenchmarkError(f"{key}: forecast grid is missing required series/date cells")
+        coverage_path = study._path.parent / record["coverage"][key]["path"]
+        coverage = list(_rows(coverage_path))
+        expected_coverage = []
+        for sid in ids:
+            missing = sum(actuals[key].get((sid, point), (None, True))[1] for point in points[key])
+            excluded = missing if recipe["actual_missing"] == "mask" else 0
+            expected_coverage.append(
+                {
+                    "series_id": sid,
+                    "expected": len(points[key]),
+                    "originally_missing": missing,
+                    "zero_filled": 0,
+                    "excluded": excluded,
+                    "scored": len(points[key]) - excluded,
+                }
+            )
+        if sorted(coverage, key=lambda row: str(row["series_id"])) != expected_coverage:
+            raise BenchmarkError(f"{key}: frozen coverage differs from actual rows and masks")
     references = {}
     if "scoring_references" in record["artifacts"]:
         for row in _rows(artifact_path(study._path, record, "scoring_references")):

@@ -720,7 +720,9 @@ overall reporting. Returned models remain in the caller’s serialization format
 
 Saved-settings execution performs two fresh fits and no parameter search. It allows different
 data and dates, checks parameter names/types/domains/constraints and the declared implementation,
-and records the source trial. It reuses settings, not the earlier model’s learned state.
+and records the source search, trial, attempt and parameter digest. Both fits keep the saved
+seed, including when a current reporting configuration is supplied. It reuses settings, not
+the earlier model’s learned state.
 To retune later, pass `config=previous_run.search_config` and omit `selected_config`.
 `Study.tune` also exposes `selection.search_config`. Explicit old origin dates remain explicit;
 use `selection.origins: all` for a search profile intended for different registered schedules.
@@ -734,6 +736,7 @@ need their immediate predecessor’s bundle, not the original study’s data. Us
 `load_selected_configuration(path)` from `autoforecast.study_tuning` to inspect it without
 loading any model code. Use `load_forecast_workflow(path)` from `autoforecast.study_workflow`
 to verify and reload a workflow. `Study.tune` also accepts `output_dir` and exposes `winner_config`.
+Output directories cannot sit inside frozen input data or an existing retained run.
 
 Failures retain a sealed failed run and validation report; they cannot reload as successful
 workflows. `status="partial"` means only some original cells were scored;

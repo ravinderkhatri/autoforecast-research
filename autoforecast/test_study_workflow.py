@@ -1,9 +1,11 @@
 """Public workflow contracts: windows, selection, availability and future reuse."""
 
 import datetime as dt
+import hashlib
 import json
 import math
 import pathlib
+import shutil
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -24,6 +26,7 @@ from autoforecast.test_study_tuning import (
 from autoforecast.test_study_tuning import (
     spark as _spark,
 )
+from provenance.lineage import directory_digest
 
 
 @pytest.fixture(scope="module")
@@ -250,7 +253,13 @@ def test_workflow_counts_and_saved_configuration_future_reuse(
     assert result.provenance["work_estimate"]["total_callback_fits"] == expected_calls
     assert result.status == "completed"
     assert seen[-1][0] == "2024-01-09"
-    assert seen[-1][1]["level"] == result.parameters["model.level"]
+    expected_parameters = (
+        {"level": result.parameters["model.level"]},
+        {"offset": result.parameters["training.offset"]},
+    )
+    assert seen[-1][1:] == expected_parameters
+    if selection_stage == "tuning":
+        assert seen[-2] == ("2024-01-07", *expected_parameters)
     assert result.testing["model_artifacts"] != result.validation["model_artifacts"]
     assert load_forecast_workflow(result.path).parameters == result.parameters
     assert result.search_config.read_bytes() == cfg.read_bytes()
@@ -418,6 +427,8 @@ def test_schedule_rejects_conflicts_and_impossible_history(complete):
         {"horizon": 0, "stride": 2},
         {"horizon": 2, "stride": True},
         {"horizon": 2, "stride": 2, "count": -1},
+        {"horizon": 2, "stride": 2, "count": 0},
+        {"horizon": 2, "stride": 0, "count": 1},
     ):
         with pytest.raises(benchmark.BenchmarkError):
             benchmark.resolve_tuning_schedule(recipe, schedule)
@@ -644,6 +655,11 @@ def test_available_policy_never_masks_missing_forecasts(incomplete, spark, tmp_p
         ("validation_score", "duplicate"),
         ("final_training", "duplicate"),
         ("final_training", "wrong_date"),
+        *[
+            (role, defect)
+            for role in ("selection", "final_training", "validation_score", "final_score")
+            for defect in ("missing_row", "missing_id")
+        ],
     ],
 )
 def test_preflight_checks_exact_ids_and_duplicates_before_any_fit(
@@ -666,6 +682,10 @@ def test_preflight_checks_exact_ids_and_duplicates_before_any_fit(
         rows.append(rows[0])
     elif defect == "wrong_date":
         rows[0]["at"] = dt.date(2023, 12, 31)
+    elif defect == "missing_row":
+        rows = rows[1:]
+    elif defect == "missing_id":
+        rows = [row for row in rows if row["__af_series_id"] != rows[0]["__af_series_id"]]
     else:
         old = rows[0]["__af_series_id"]
         for row in rows:
@@ -685,7 +705,9 @@ def test_preflight_checks_exact_ids_and_duplicates_before_any_fit(
     copied.rename(final)
     cfg = profile(tmp_path, selection={"origins": "all"}, series_policy="use_available")
     with open_study(final / "benchmark.json", spark) as study:
-        with pytest.raises(StudyPreflightError, match="unexpected|duplicate|date") as caught:
+        with pytest.raises(
+            StudyPreflightError, match="unexpected|duplicate|date|missing"
+        ) as caught:
             study.tune(
                 fit_predict=lambda _: pytest.fail(
                     "corrupt downstream input must block before fitting"
@@ -802,3 +824,417 @@ def test_policy_rejects_invalid_configuration_before_callback(complete, spark, t
             config=cfg,
             implementation=implementation(),
         )
+
+
+def _publish_changed_record(copied: pathlib.Path, record: dict) -> pathlib.Path:
+    identity = benchmark.digest(benchmark._identity(record))
+    record["study_id"] = record["benchmark_id"] = identity
+    (copied / "benchmark.json").write_text(json.dumps(record))
+    final = copied.parent / identity
+    copied.rename(final)
+    return final / "benchmark.json"
+
+
+def _copy_and_corrupt_coverage(manifest: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
+    copied = root / "registry/original"
+    shutil.copytree(manifest.parent, copied)
+    record = json.loads((copied / "benchmark.json").read_text())
+    key = next(key for key in record["coverage"] if key.startswith("tuning/"))
+    path = copied / record["coverage"][key]["path"]
+    table = pq.read_table(path)
+    rows = table.to_pylist()
+    rows[0]["series_id"] = rows[1]["series_id"]
+    shutil.rmtree(path)
+    path.mkdir(parents=True)
+    pq.write_table(type(table).from_pylist(rows, schema=table.schema), path / "part.parquet")
+    record["coverage"][key]["sha256"] = directory_digest(path, suffixes=(".parquet",))
+    record["coverage_identities"][key]["content_sha256"] = benchmark._parquet_hash(path)
+    return _publish_changed_record(copied, record)
+
+
+def test_preflight_rejects_coverage_mask_mismatch_before_callback(complete, spark, tmp_path):
+    manifest = _copy_and_corrupt_coverage(complete, tmp_path / "coverage-mask")
+    cfg_root = tmp_path / "coverage-config"
+    cfg_root.mkdir()
+    cfg = profile(cfg_root, selection={"origins": ["2024-01-03"]})
+    calls = []
+
+    def fit(request):
+        calls.append(request.origin)
+        return predict(request)
+
+    with open_study(manifest, spark) as study:
+        with pytest.raises(StudyPreflightError, match="coverage|mask"):
+            study.tune(
+                fit_predict=fit,
+                config=cfg,
+                implementation=implementation(),
+            )
+    assert calls == []
+
+
+def test_saved_configuration_keeps_saved_seed_with_current_policy_config(complete, spark, tmp_path):
+    source_root = tmp_path / "source-config"
+    source_root.mkdir()
+    source = profile(source_root, selection={"stage": "validation"})
+    with open_study(complete, spark) as study:
+        selected = study.tune(
+            fit_predict=predict,
+            config=source,
+            implementation=implementation(),
+            output_dir=tmp_path / "source-search",
+        )
+    saved = load_selected_configuration(selected.winner_config)
+
+    current_root = tmp_path / "current-config"
+    current_root.mkdir()
+    current = profile(current_root, selection={"stage": "validation"})
+    value = yaml.safe_load(current.read_text())
+    value["hpo"]["seed"] = 123
+    value["hyperparameters"]["model.level"]["search"] = {
+        "kind": "categorical",
+        "values": [0.0],
+    }
+    current.write_text(yaml.safe_dump(value))
+    seeds = []
+
+    def fit(request):
+        seeds.append(request.seed)
+        return predict(request)
+
+    with open_study(complete, spark) as study:
+        study.run_forecast_workflow(
+            fit_predict=fit,
+            config=current,
+            selected_config=selected.winner_config,
+            implementation=implementation(),
+            output_dir=tmp_path / "future-run",
+        )
+    assert seeds == [saved["seed"], saved["seed"]]
+
+
+def test_winner_retains_unique_source_and_parameter_digest(complete, spark, tmp_path):
+    cfg_root = tmp_path / "winner-config"
+    cfg_root.mkdir()
+    cfg = profile(cfg_root, selection={"stage": "validation"})
+    with open_study(complete, spark) as study:
+        selected = study.tune(
+            fit_predict=predict,
+            config=cfg,
+            implementation=implementation(),
+            output_dir=tmp_path / "winner-search",
+        )
+    saved = load_selected_configuration(selected.winner_config)
+    chosen = json.loads((selected.path / "selection.json").read_text())["selected"][0]
+    assert saved["parameter_sha256"] == benchmark.digest(saved["parameters"])
+    assert saved["source"]["search_id"] == selected.path.name
+    assert saved["source"]["attempt_id"] == chosen["attempt_id"]
+
+
+def _copy_manifest(manifest: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
+    target = root / manifest.parent.name
+    shutil.copytree(manifest.parent, target)
+    return target / "benchmark.json"
+
+
+def test_custom_output_cannot_overlap_frozen_study_artifacts(complete, spark, tmp_path):
+    manifest = _copy_manifest(complete, tmp_path / "copied-registry")
+    record = benchmark.read_benchmark_manifest(manifest)[1]
+    output = benchmark.artifact_path(manifest, record, "selection")
+    cfg_root = tmp_path / "overlap-config"
+    cfg_root.mkdir()
+    cfg = profile(cfg_root, selection={"origins": ["2024-01-03"]})
+    value = yaml.safe_load(cfg.read_text())
+    value["hpo"]["max_trials"] = 1
+    cfg.write_text(yaml.safe_dump(value))
+    calls = []
+
+    def fit(request):
+        calls.append(request.origin)
+        return predict(request)
+
+    try:
+        with open_study(manifest, spark) as study:
+            study.tune(
+                fit_predict=fit,
+                config=cfg,
+                implementation=implementation(),
+                output_dir=output,
+            )
+    except Exception:
+        pass
+    assert calls == []
+    benchmark.verify_benchmark(manifest)
+
+
+def test_workflow_output_cannot_invalidate_selected_configuration_source(complete, spark, tmp_path):
+    cfg_root = tmp_path / "overlap-source-config"
+    cfg_root.mkdir()
+    cfg = profile(cfg_root, selection={"stage": "validation"})
+    with open_study(complete, spark) as study:
+        selected = study.tune(
+            fit_predict=predict,
+            config=cfg,
+            implementation=implementation(),
+            output_dir=tmp_path / "overlap-source-search",
+        )
+    source_attempt = selected.winner_config.parent.parent
+    calls = []
+
+    def fit(request):
+        calls.append(request.origin)
+        return predict(request)
+
+    try:
+        with open_study(complete, spark) as study:
+            study.run_forecast_workflow(
+                fit_predict=fit,
+                selected_config=selected.winner_config,
+                implementation=implementation(),
+                output_dir=source_attempt,
+            )
+    except Exception:
+        pass
+    assert calls == []
+    assert load_selected_configuration(selected.winner_config)["parameters"] == selected.parameters
+
+
+def test_preflight_report_names_every_integrity_failure(complete, spark, tmp_path):
+    copied = tmp_path / "report-registry/original"
+    shutil.copytree(complete.parent, copied)
+    record = json.loads((copied / "benchmark.json").read_text())
+    defects = []
+    for role, defect in (("final_training", "unexpected"), ("final_score", "duplicate")):
+        relative = record["role_paths"][role]
+        path = copied / relative
+        if relative in defects:
+            continue
+        table = pq.read_table(path)
+        rows = table.to_pylist()
+        if defect == "unexpected":
+            old = rows[0]["__af_series_id"]
+            for row in rows:
+                if row["__af_series_id"] == old:
+                    row["__af_series_id"] = '{"sku":"unexpected"}'
+        else:
+            rows.append(rows[0])
+        shutil.rmtree(path)
+        path.mkdir()
+        pq.write_table(type(table).from_pylist(rows, schema=table.schema), path / "part.parquet")
+        for name, target_path in record["role_paths"].items():
+            if target_path == relative:
+                record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
+                record["logical_snapshots"][name] = benchmark._parquet_hash(path)
+        defects.append(relative)
+    manifest = _publish_changed_record(copied, record)
+    cfg_root = tmp_path / "report-config"
+    cfg_root.mkdir()
+    cfg = profile(cfg_root, selection={"origins": "all"}, series_policy="use_available")
+    with open_study(manifest, spark) as study, pytest.raises(StudyPreflightError) as caught:
+        study.preflight(config=cfg)
+    report = json.loads(caught.value.report_path.read_text())
+    observed = {(issue["code"], issue["stage"]) for issue in report["issues"]}
+    assert ("unexpected_id", "final_training") in observed
+    assert ("duplicate_series_date", "final_score") in observed
+    assert report["roles"]["final_training"]["missing_ids"]
+    assert report["roles"]["final_score"]["actual_count"] == report["original_count"]
+
+
+def test_validation_selection_succeeds_without_inner_windows(spark, tmp_path):
+    from autoforecast.test_study_tuning import freeze
+
+    manifest = freeze(tmp_path / "no-inner-study", spark, windows=False)
+    cfg = config(tmp_path, budget=1)
+    value = yaml.safe_load(cfg.read_text())
+    value["selection"] = {"stage": "validation"}
+    cfg.write_text(yaml.safe_dump(value))
+    calls = []
+
+    def fit(request):
+        calls.append(request.origin)
+        return predict(request)
+
+    with open_study(manifest, spark) as study:
+        result = study.tune(
+            fit_predict=fit,
+            config=cfg,
+            implementation=implementation(),
+        )
+    assert calls == ["2024-01-05"]
+    assert result.windows[0]["boundary"].startswith("validation/")
+
+
+def test_exact_reuse_rejects_changed_config_and_study(complete, spark, tmp_path):
+    cfg_root = tmp_path / "exact-reuse-config"
+    cfg_root.mkdir()
+    cfg = profile(cfg_root, selection={"stage": "validation"})
+    with open_study(complete, spark) as study:
+        selected = study.tune(
+            fit_predict=predict,
+            config=cfg,
+            implementation=implementation(),
+            output_dir=tmp_path / "exact-reuse-source",
+        )
+    changed_root = tmp_path / "changed-config"
+    changed_root.mkdir()
+    changed = profile(changed_root, selection={"stage": "validation"})
+    value = yaml.safe_load(changed.read_text())
+    value["hpo"]["seed"] = 10
+    changed.write_text(yaml.safe_dump(value))
+    with open_study(complete, spark) as study, pytest.raises(Exception, match="differs"):
+        study.tune(
+            fit_predict=lambda _: pytest.fail("changed config must not fit"),
+            config=changed,
+            implementation=implementation(),
+            reuse_tuning=selected.path,
+        )
+    other = register(tmp_path / "exact-reuse-other", spark, shift=31, count=1)
+    with open_study(other, spark) as study, pytest.raises(Exception, match="differs"):
+        study.tune(
+            fit_predict=lambda _: pytest.fail("changed study must not fit"),
+            config=cfg,
+            implementation=implementation(),
+            reuse_tuning=selected.path,
+        )
+
+
+def _reseal_attempt(attempt: pathlib.Path) -> str:
+    from autoforecast.experiments import _file_identity, _json_bytes
+
+    manifest_path = attempt / "artifact_manifest.json"
+    completion_path = attempt / "completion.json"
+    completion = json.loads(completion_path.read_text())
+    terminal = {
+        key: value for key, value in completion.items() if key != "artifact_manifest_sha256"
+    }
+    artifacts = []
+    for path in sorted(
+        path
+        for path in attempt.rglob("*")
+        if path.is_file() and path not in {manifest_path, completion_path}
+    ):
+        sha, size = _file_identity(path)
+        artifacts.append(
+            {
+                "path": path.relative_to(attempt).as_posix(),
+                "sha256": sha,
+                "bytes": size,
+            }
+        )
+    manifest = {
+        "schema": json.loads(manifest_path.read_text())["schema"],
+        "artifacts": artifacts,
+        "terminal_payload_sha256": hashlib.sha256(_json_bytes(terminal)).hexdigest(),
+    }
+    manifest_path.write_bytes(_json_bytes(manifest))
+    completion["artifact_manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    completion_path.write_bytes(_json_bytes(completion))
+    return completion["artifact_manifest_sha256"]
+
+
+@pytest.mark.parametrize("wrong_score", [False, True])
+def test_legacy_v1_reload_rejects_score_objective_mismatch(complete, spark, tmp_path, wrong_score):
+    cfg_root = tmp_path / "legacy-config"
+    cfg_root.mkdir()
+    cfg = profile(cfg_root, selection={"stage": "validation"})
+    with open_study(complete, spark) as study:
+        selected = study.tune(
+            fit_predict=predict,
+            config=cfg,
+            implementation=implementation(),
+            output_dir=tmp_path / "legacy-search",
+        )
+    selection_path = selected.path / "selection.json"
+    selection = json.loads(selection_path.read_text())
+    chosen = selection["selected"][0]
+    attempt = selected.path / chosen["attempt_path"]
+    evidence_path = attempt / "evaluation/external-run.json"
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["schema"] == "autoforecast.external-trial.v1"
+    evidence.pop("windows")
+    evidence.pop("aggregation")
+    evidence_path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+    score_path = attempt / "evaluation/score.json"
+    score = json.loads(score_path.read_text())
+    if wrong_score:
+        score[evidence["context"]["metric"]] = 999.0
+    score_path.write_text(json.dumps(score, indent=2, sort_keys=True) + "\n")
+    manifest_sha = _reseal_attempt(attempt)
+    for group in (selection["candidates"], selection["selected"]):
+        for item in group:
+            if item["attempt_path"] == chosen["attempt_path"]:
+                item["artifact_manifest_sha256"] = manifest_sha
+    selection_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
+    if wrong_score:
+        with pytest.raises(HPOError, match="score|objective|selection"):
+            load_tuning_result(selected.path)
+    else:
+        assert load_tuning_result(selected.path).tuning_score == selected.tuning_score
+
+
+def test_workflow_reload_binds_selected_settings_to_both_fits(complete, spark, tmp_path):
+    cfg = profile(tmp_path, selection={"stage": "validation"})
+    with open_study(complete, spark) as study:
+        result = study.run_forecast_workflow(
+            fit_predict=predict,
+            config=cfg,
+            implementation=implementation(),
+            output_dir=tmp_path / "original",
+        )
+    assert load_forecast_workflow(result.path).parameters == result.parameters
+    for field in ("parameters", "validation", "testing", "seed", "implementation", "source"):
+        root = tmp_path / field
+        shutil.copytree(result.path, root)
+        path = root / "result.json"
+        record = json.loads(path.read_text())
+        if field == "parameters":
+            record[field]["model.level"] = 999.0
+        elif field in ("validation", "testing"):
+            record[field]["parameter_sha256"] = "0" * 64
+        elif field == "source":
+            record["provenance"]["configuration_source"]["trial_id"] = "wrong-trial"
+        elif field == "implementation":
+            record["provenance"][field]["version"] = "changed"
+        else:
+            record["provenance"][field] += 1
+        path.write_text(json.dumps(record))
+        _reseal_attempt(root)
+        with pytest.raises(HPOError, match="configuration"):
+            load_forecast_workflow(root)
+        with pytest.raises(HPOError, match="configuration"):
+            load_selected_configuration(root / "metadata/winner-config.json")
+
+
+@pytest.mark.parametrize(
+    "role,field",
+    [
+        ("source-keys", "sku"),
+        ("final_training", "sku"),
+        ("source-keys", benchmark.START_COLUMN),
+    ],
+)
+def test_preflight_checks_source_key_and_start_mapping(complete, spark, tmp_path, role, field):
+    copied = tmp_path / "registry/original"
+    shutil.copytree(complete.parent, copied)
+    record = json.loads((copied / "benchmark.json").read_text())
+    relative = record["role_paths"][role]
+    path = copied / relative
+    table = pq.read_table(path)
+    rows = table.to_pylist()
+    rows[0][field] = "wrong-key" if field == "sku" else dt.date(2024, 1, 2)
+    shutil.rmtree(path)
+    path.mkdir()
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path / "part.parquet")
+    for name, target in record["role_paths"].items():
+        if target == relative:
+            record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
+            record["logical_snapshots"][name] = benchmark._parquet_hash(path)
+    manifest = _publish_changed_record(copied, record)
+    cfg = profile(tmp_path, selection={"stage": "validation"})
+    with open_study(manifest, spark) as study:
+        with pytest.raises(StudyPreflightError, match="mapping|source.key|canonical"):
+            study.tune(
+                fit_predict=lambda _: pytest.fail("invalid mapping must not reach a callback"),
+                config=cfg,
+                implementation=implementation(),
+            )

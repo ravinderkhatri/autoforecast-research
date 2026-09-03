@@ -322,8 +322,6 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
             or [w["boundary"] for w in windows]
             != [w["evaluation_contract"]["boundary"] for w in context["windows"]]
             or any(w["parameter_sha256"] != digest(metadata["hyperparameters"]) for w in windows)
-            or math.fsum(w["score"][context["metric"]] for w in windows) / len(windows)
-            != chosen["validation_objective"]
         ):
             raise HPOError("window scores, parameters or aggregate differ from selection")
     else:
@@ -342,6 +340,12 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
                 },
             ),
         )
+    scores = [window["score"].get(context["metric"]) for window in windows]
+    if (
+        any(type(value) not in (int, float) or not math.isfinite(value) for value in scores)
+        or math.fsum(scores) / len(scores) != chosen["validation_objective"]
+    ):
+        raise HPOError("saved window scores differ from the selected objective")
     winner = attempt / "metadata/winner-config.json"
     if winner.exists():
         saved = cast(dict, load_exact_json(winner))
@@ -560,21 +564,28 @@ class _ExternalTrialBridge:
             inputs.verify()
         request.attempt.write_bytes("metadata/external-profile.yaml", self.profile_bytes)
         request.attempt.write_bytes("metadata/preflight.json", self.report_bytes)
+        parameters = {
+            **{"model." + k: v for k, v in request.model_parameters.items()},
+            **{"training." + k: v for k, v in request.training_parameters.items()},
+        }
         request.attempt.write_json(
             "metadata/winner-config.json",
             {
                 "schema": "autoforecast.selected-configuration.v1",
                 "model_id": context["model_id"],
-                "parameters": {
-                    **{"model." + k: v for k, v in request.model_parameters.items()},
-                    **{"training." + k: v for k, v in request.training_parameters.items()},
-                },
+                "parameters": parameters,
+                "parameter_sha256": digest(parameters),
                 "profile_sha256": context["profile_sha256"],
                 "implementation": context["implementation"],
                 "profile": loads_exact_yaml(self.profile_bytes),
                 "profile_text": self.profile_bytes.decode("utf-8"),
                 "seed": context["seed"],
-                "source": {"study": context["study"], "trial_id": request.trial_id},
+                "source": {
+                    "study": context["study"],
+                    "search_id": request.study.id,
+                    "trial_id": request.trial_id,
+                    "attempt_id": request.attempt.attempt_id,
+                },
             },
         )
         if len(records) == 1:
@@ -616,6 +627,25 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
     root = _platform_absolute(root)
     if any(path.is_symlink() for path in (root, *root.parents)):
         raise HPOError("HPO output root may not traverse a symlink")
+    # Run artifacts must never become children of inputs or already sealed evidence.
+    record = study._record()
+    protected = [
+        study._path.parent,
+        *(pathlib.Path(source["path"]) for source in record["sources"].values()),
+    ]
+    if any(root.is_relative_to(path.resolve()) for path in protected) or any(
+        any(
+            (parent / marker).exists()
+            for marker in (
+                "benchmark.json",
+                "artifact_manifest.json",
+                "metadata/run.json",
+                "metadata/attempt.json",
+            )
+        )
+        for parent in (root, *root.parents)
+    ):
+        raise HPOError("output root overlaps frozen inputs or retained run artifacts")
     return root
 
 
@@ -749,6 +779,25 @@ def tune_study(
         return load_tuning_result(root / "studies" / identifier)
 
 
+def _validate_workflow_configuration(record: dict, saved: dict) -> None:
+    """Require the summary and both fits to refer to the retained winner settings."""
+    parameters_sha = digest(record["parameters"])
+    provenance = record["provenance"]
+    if (
+        parameters_sha != saved["parameter_sha256"]
+        or parameters_sha != digest(saved["parameters"])
+        or any(
+            record[stage]["parameter_sha256"] != parameters_sha
+            for stage in ("validation", "testing")
+        )
+        or provenance["implementation"] != saved["implementation"]
+        or type(provenance["seed"]) is not int
+        or provenance["seed"] != saved["seed"]
+        or provenance["configuration_source"] != saved["source"]
+    ):
+        raise HPOError("workflow configuration differs from its winner or fitted stages")
+
+
 def load_selected_configuration(path: str | pathlib.Path) -> dict:
     """Load the inert winner settings from a sealed trial without requiring its old data.
 
@@ -766,6 +815,7 @@ def load_selected_configuration(path: str | pathlib.Path) -> dict:
         if completion["status"] != "completed" or completion["task"] != "forecast-workflow":
             raise HPOError("selected configuration requires a successful workflow")
         result = cast(dict, load_exact_json(attempt / "result.json"))
+        _validate_workflow_configuration(result, cast(dict, load_exact_json(source)))
         metadata = {
             "hyperparameters": result["parameters"],
             "model": {"id": cast(dict, load_exact_json(source))["model_id"]},
@@ -782,8 +832,16 @@ def load_selected_configuration(path: str | pathlib.Path) -> dict:
         or saved.get("schema") != "autoforecast.selected-configuration.v1"
         or saved.get("parameters") != metadata["hyperparameters"]
         or saved.get("model_id") != metadata["model"]["id"]
+        or saved.get("parameter_sha256") != digest(saved.get("parameters"))
     ):
         raise HPOError("selected configuration differs from its sealed trial")
+    if "study_id" in metadata and saved["source"] != {
+        "study": saved["source"]["study"],
+        "search_id": metadata["study_id"],
+        "trial_id": metadata["trial_id"],
+        "attempt_id": metadata["attempt_id"],
+    }:
+        raise HPOError("saved configuration source differs from its sealed trial")
     raw_profile = saved["profile_text"].encode("utf-8")
     if (
         hashlib.sha256(raw_profile).hexdigest() != saved["profile_sha256"]

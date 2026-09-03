@@ -28,6 +28,7 @@ from autoforecast.study_tuning import (
     _output_root,
     _prepare_window,
     _resolve_options,
+    _validate_workflow_configuration,
     _window_result,
     load_selected_configuration,
     load_tuning_result,
@@ -64,6 +65,9 @@ def load_forecast_workflow(path: str | pathlib.Path) -> ForecastWorkflowResult:
     record = cast(dict, load_exact_json(root / "result.json"))
     if record["schema"] != "autoforecast.forecast-workflow.v1":
         raise HPOError("unsupported forecast workflow result")
+    _validate_workflow_configuration(
+        record, cast(dict, load_exact_json(root / "metadata/winner-config.json"))
+    )
     stages = {stage: _window_result(root, record[stage]) for stage in ("validation", "testing")}
     return ForecastWorkflowResult(
         root,
@@ -131,6 +135,7 @@ def run_forecast_workflow(
         if spec.model_id != saved["model_id"]:
             raise HPOError("saved configuration uses a different model identity")
         materialize_runtime_parameters(spec, saved["parameters"])
+        seed = saved["seed"]
         controls = {**controls, "selection": {"stage": "validation"}}
     options = _resolve_options(study, controls, tuning_origin)
     if saved is not None:
