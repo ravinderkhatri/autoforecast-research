@@ -544,12 +544,13 @@ rejected rather than translated.
 
 Keep your custom model in your application and pass its fitting function to `Study.tune`.
 No built-in adapter registration or remote service is required. AutoForecast searches settings,
-checks forecasts, scores the frozen **inner tuning window**, and saves the selection. Your
+checks forecasts, scores the selected frozen windows, and saves the selection. Your
 function fits the model, generates forecasts and saves its model files.
 
-The study must already declare `tuning_windows`. With one window it is selected automatically;
-with several, pass its exact `tuning_origin`. A study without an inner window must be frozen
-again with the intended window. Outer validation and test targets never select parameters.
+With one registered inner window it is selected automatically. With several, choose
+`tuning_origin`, `selection.origins: [origin, ...]`, or `selection.origins: all`.
+Alternatively, `selection.stage: validation` searches on the existing outer validation boundary
+and does not require inner windows. Final testing never selects parameters.
 The initial external-model route supports sequential Optuna; built-in Ray execution is unchanged.
 
 An external tuning configuration reuses the existing parameter domains and constraints:
@@ -632,14 +633,117 @@ Each completed trial retains forecasts, scores, model files and provenance under
 HPO attempt manifests. The result exposes `trial_id`, `model_id`, `parameters`, `tuning_score`,
 `forecasts`, `model_artifacts`, `model_format`, `trial_history`, `provenance` and `path`.
 Reload checks all ranked attempts and their recorded hashes; it never executes a model loader.
-Failed trials abort the search without publishing a selection. Every call creates a new run;
-resuming a partial search is not part of this interface.
+Failed trials abort the search without publishing a selection. Calls create new runs unless
+`reuse_tuning=selection.path` explicitly reopens a completed search. Reuse checks the study,
+profile and implementation identities and performs no new trials. Resuming an incomplete
+search is not part of this interface. With multiple windows, `forecasts` and `model_artifacts`
+are `None`; use `selection.windows` for each boundary’s separate artifacts.
 
-The winning model belongs to the inner tuning cutoff. To evaluate outer validation, fit again
-with the selected settings through that stage's cutoff. Then perform the final refit before
-creating test forecasts and calling `Study.evaluate_forecasts`. For example: tune on April 1–7
-using history through March 31, fit through April 7 to validate April 8–14, then fit through
-April 14 to test April 15–21. Keep the final test results out of parameter selection.
+### Several windows, configurable metrics and preflight
+
+Add these settings to the external profile above:
+
+```yaml
+selection:
+  stage: tuning             # or validation
+  origins: all              # omit when stage is validation
+  metric: mae               # mae, rmse, wape, or wrmsse; defaults to study metric
+  aggregation: mean
+reporting:
+  metrics: [mae, rmse, wape, bias, wrmsse]
+  forecast_accuracy_breakdown: both  # none, per_step, cumulative, both
+series_policy: error        # default; also exclude_unavailable or use_available
+minimum_history: 1          # usable observations required by your model
+```
+
+Every trial fits a fresh model at every chosen window using identical sampled settings and
+seed. Its objective is the equal-weight mean of those window scores. A mean of three RMSEs
+or WRMSSEs is **not** a score pooled over all forecast dates. Every required window must succeed.
+Bias is a diagnostic, not a selection objective. Requested WRMSSE requires registered weights
+and scales, even when MAE selects the winner. Optional undefined diagnostics retain a reason;
+an undefined selection objective blocks the search.
+
+When registering a **new** study, `tuning_schedule: {horizon: 14, stride: 14}` generates three
+inner windows ending at the outer training cutoff. Add `count: 5` for five windows. These
+numbers count frequency periods (hours, days, weeks or calendar periods). An explicit
+`tuning_windows` list conflicts with the schedule; existing frozen studies never expand.
+To register optional WRMSSE references for a study whose primary metric is MAE, supply
+`scoring_references` at registration. Tuning does not invent or replace references.
+
+`study.preflight(config=...)` checks all registered stages and saves a report. Tuning and the
+full workflow call it automatically before the first fit. The original registered IDs are
+the population; every required prediction must cover its entire resolved date grid.
+
+| Series policy | What the run does |
+| --- | --- |
+| `error` | Retains the original cohort; stops on insufficient history or actuals forbidden by the frozen policy. An explicitly registered actuals mask remains valid. |
+| `exclude_unavailable` | Removes one union of unavailable series across all stages, freezes a derived study and normalizes its retained weights once. |
+| `use_available` | Freezes trainable IDs and actual masks per window; reports original and available populations separately. |
+
+Availability policies never excuse corrupt data, changed hashes, unexpected IDs or missing
+predictions. Supply the same combined history requirement and effective study when comparing
+models. Availability determined using later stages is labelled retrospective.
+In `use_available`, WRMSSE uses only dates with actuals for **every** series in the fixed
+weighted cohort. For A/B with B missing day 2, WRMSSE uses days 1 and 3 for both; MAE can use
+all five observed cells. An unfittable weighted member or no common dates makes WRMSSE
+unavailable. No API here fills missing values or fabricates pre-start history.
+
+### Full workflow and reuse on future data
+
+```python
+run = study.run_forecast_workflow(
+    fit_predict=fit_predict,
+    config="prophet_tuning.yaml",
+    implementation=implementation_identity,
+    output_dir="/my/experiment-results",  # optional; defaults beside the study registry
+)
+print(run.parameters)
+print(run.validation["score"])
+print(run.testing["score"])
+print(run.selected_config)                # winning settings: skip HPO
+print(run.search_config)                  # search settings: run HPO again
+
+# Later: new data and new dates, same winning model settings, no HPO.
+next_run = next_study.run_forecast_workflow(
+    fit_predict=fit_predict,
+    selected_config=run.selected_config,
+    implementation=implementation_identity,
+    output_dir="/my/next-experiment",
+)
+```
+
+Inner selection with T trials and N windows performs N×T callback fits, one outer validation
+fit and one final refit. Outer-validation selection performs T+1 fits: its selected validation
+model/forecasts are reused, then the final model is fitted separately. The work estimate is
+logged before tuning. Horizon reports use schema `autoforecast.forecast-accuracy-breakdown.v2`; each metric has its
+own status and reason, while the row status describes the primary metric. Previously saved
+reports remain readable. The full workflow defaults to per-step reporting; tune-only defaults to
+overall reporting. Returned models remain in the caller’s serialization format.
+
+Saved-settings execution performs two fresh fits and no parameter search. It allows different
+data and dates, checks parameter names/types/domains/constraints and the declared implementation,
+and records the source search, trial, attempt and parameter digest. Both fits keep the saved
+seed, including when a current reporting configuration is supplied. It reuses settings, not
+the earlier model’s learned state.
+To retune later, pass `config=previous_run.search_config` and omit `selected_config`.
+`Study.tune` also exposes `selection.search_config`. Explicit old origin dates remain explicit;
+use `selection.origins: all` for a search profile intended for different registered schedules.
+You can run HPO again whenever you choose; no automatic retuning schedule is imposed. An optional
+current `config` supplies reporting/availability settings and validates runtime parameter validity,
+without forcing a saved value into the current HPO search range.
+
+Keep `metadata/winner-config.json` inside its retained trial or workflow directory: the artifact
+manifest verifies it. The workflow copies it into each new run, so later fixed-settings runs
+need their immediate predecessor’s bundle, not the original study’s data. Use
+`load_selected_configuration(path)` from `autoforecast.study_tuning` to inspect it without
+loading any model code. Use `load_forecast_workflow(path)` from `autoforecast.study_workflow`
+to verify and reload a workflow. `Study.tune` also accepts `output_dir` and exposes `winner_config`.
+Output directories cannot sit inside frozen input data or an existing retained run.
+
+Failures retain a sealed failed run and validation report; they cannot reload as successful
+workflows. `status="partial"` means only some original cells were scored;
+`status="pending_actuals"` means testing forecasts exist but no testing actuals were scored.
+Neither status claims a complete evaluation. Final testing scores never feed back into HPO.
 
 ## Inspect results
 

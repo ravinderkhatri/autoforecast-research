@@ -20,6 +20,7 @@ from autoforecast.hpo import HPOError
 from autoforecast.panel import Forecast, ForecastError
 from autoforecast.score_spark import ScoreError
 from autoforecast.study import load_study
+from autoforecast.study_preflight import StudyPreflightError
 from autoforecast.study_tuning import FitPredictResult, load_tuning_result
 from autoforecast.tuning import TuningError, loads_external_tuning_spec, loads_tuning_spec
 from provenance.lineage import LineageError
@@ -375,11 +376,12 @@ def test_noncallable_and_closed_study_reject_before_fitting(frozen, spark, tmp_p
         study.tune(fit_predict=predict, config=config(tmp_path), implementation=implementation())
 
 
-@pytest.mark.parametrize("metric,missing,zero,error", [("wape", False, True, "finite tuning objective"), ("wrmsse", "all", False, "every retained series")])
+@pytest.mark.parametrize("metric,missing,zero,error", [("wape", False, True, "zero_actual_volume"), ("wrmsse", "all", False, "missing_series_actuals")])
 def test_unavailable_objectives_never_select_a_trial(spark, tmp_path, metric, missing, zero, error):
     manifest = freeze(tmp_path / "study", spark, metric=metric, missing=missing, zero_targets=zero)
-    with open_study(manifest, spark) as study, pytest.raises((HPOError, ScoreError), match=error):
-        study.tune(fit_predict=predict, config=config(tmp_path, budget=1), implementation=implementation())
+    with open_study(manifest, spark) as study, pytest.raises(StudyPreflightError, match=error):
+        study.tune(fit_predict=lambda _: pytest.fail("objective must fail before fitting"),
+                   config=config(tmp_path, budget=1), implementation=implementation())
     assert not list((tmp_path / "study/.autoforecast/study-tuning").rglob("selection.json"))
 
 

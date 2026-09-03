@@ -424,19 +424,25 @@ def _require_trial_evidence(
         try:
             record = load_exact_json(attempt.path / "evaluation" / "external-run.json")
             if (type(record) is not dict
-                    or record.get("schema") != "autoforecast.external-trial.v1"
+                    or record.get("schema") not in {
+                        "autoforecast.external-trial.v1", "autoforecast.external-trial.v2"
+                    }
                     or record.get("test_metrics") != "not_evaluated"
                     or type(record.get("context")) is not dict):
                 raise HPOError("invalid external trial evidence")
             context_bytes = (json.dumps(
                 record["context"], sort_keys=True, allow_nan=False,
             ) + "\n").encode()
-            if (hashlib.sha256(context_bytes).hexdigest() != external_fingerprint
-                    or record.get("model_sha256") != directory_digest(attempt.path / "model")
+            if hashlib.sha256(context_bytes).hexdigest() != external_fingerprint:
+                raise HPOError("external trial context differs from frozen inputs")
+            if record["schema"].endswith("v2"):
+                if record.get("windows_sha256") != directory_digest(attempt.path / "windows"):
+                    raise HPOError("external window artifacts changed")
+            elif (record.get("model_sha256") != directory_digest(attempt.path / "model")
                     or record.get("forecast_sha256") != directory_digest(
                         attempt.path / "forecasts", suffixes=(".parquet",),
                     )):
-                raise HPOError("external trial evidence differs from frozen inputs or artifacts")
+                raise HPOError("external trial evidence differs from frozen artifacts")
         except (OSError, ValueError) as error:
             raise HPOError("external trial evidence is missing, invalid or changed") from error
     elif not has_epochs and not governed.is_file():
@@ -444,6 +450,29 @@ def _require_trial_evidence(
             "completed HPO trial needs epoch metrics or an evaluation/governed-run.json record"
         )
     artifact_directories = (attempt.path / "model", attempt.path / "checkpoints")
+    if external_fingerprint is not None and record["schema"].endswith("v2"):
+        windows = record.get("windows")
+        if not isinstance(windows, list) or not windows:
+            raise HPOError("external multi-window trial requires window evidence")
+        directories = []
+        for window in windows:
+            relative = pathlib.PurePosixPath(window["model_path"])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise HPOError("external model path must stay within the trial")
+            model = attempt.path / relative
+            if directory_digest(model) != window["model_sha256"]:
+                raise HPOError("external window model changed")
+            if not any(p.is_file() for p in model.rglob("*")):
+                raise HPOError("each external window needs a saved model")
+            forecast = pathlib.PurePosixPath(window["forecast"]["path"])
+            if forecast.is_absolute() or ".." in forecast.parts:
+                raise HPOError("external forecast path must stay within the trial")
+            if directory_digest(attempt.path / forecast, suffixes=(".parquet",)) != (
+                window["forecast_sha256"]
+            ):
+                raise HPOError("external window forecasts changed")
+            directories.append(model)
+        artifact_directories = tuple(directories)
     saved_artifacts = (path for directory in artifact_directories for path in directory.rglob("*"))
     if not any(path.is_file() for path in saved_artifacts):
         raise HPOError("completed HPO trial needs a saved model or checkpoint")

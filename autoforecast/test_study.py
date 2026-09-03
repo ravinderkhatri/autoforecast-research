@@ -200,7 +200,9 @@ def test_study_freezes_inner_tuning_population_and_missingness(tmp_path, spark, 
     [{"origin": "2024-01-03", "horizon": 0}],
     [{"origin": "2024-01-03", "horizon": 3}],
     [{"origin": "2023-12-31", "horizon": 2}],
-    [{"origin": "2024-01-02", "horizon": 2}],  # B has not reached its declared start.
+    # Late-starting series are now registrable for explicit availability policies.
+    # test_late_history_masks_are_frozen_and_wrmsse_unavailable checks strict
+    # preflight still blocks before fitting and available mode freezes eligibility.
     [{"origin": "2024-01-03", "horizon": 1}, {"origin": "2024-01-03", "horizon": 2}],
     [{"origin": "2024-01-04", "horizon": 1}, {"origin": "2024-01-03", "horizon": 2}],
     [{"origin": "2024-01-03", "horizon": 2, "metric": "mae"}],
