@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1660" viewBox="0 0 1600 1660" role="img" aria-labelledby="title desc">
+<title id="title">Parallel execution: models, processes and machines</title>
+<desc id="desc">Ray places independent model jobs. Each model owns any parallel training inside its callback.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#245DD8"/></marker></defs>
+<rect x="0" y="0" width="1600" height="1660" rx="0" fill="#F4F7FB"/>
+<text x="56" y="45" font-family="Arial, sans-serif" font-size="16" fill="#245DD8" xml:space="preserve" font-weight="700">AUTOFORECAST / HOW IT WORKS</text>
+<text x="56" y="100" font-family="Arial, sans-serif" font-size="42" fill="#172A43" xml:space="preserve" font-weight="700">Parallel execution: models, processes and machines</text>
+<text x="56" y="142" font-family="Arial, sans-serif" font-size="21" fill="#53647A" xml:space="preserve">Ray places independent model jobs. Each model owns any parallel training inside its callback.</text>
+<rect x="56" y="180" width="1488" height="90" rx="16" fill="#EAF0FD"/>
+<text x="83" y="234" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">Validate every candidate</text>
+<text x="600" y="234" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">Compare validation scores</text>
+<text x="1110" y="234" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">Final refit / evaluation</text>
+<path d="M400,226 L566,226" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M930,226 L1074,226" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="56" y="300" width="728" height="435" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="78" y="322" width="40" height="36" rx="9" fill="#EAF0FD"/>
+<text x="89" y="347" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">1</text>
+<text x="134" y="348" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">One machine: one model job at a time</text>
+<text x="82" y="385" font-family="Courier New, monospace" font-size="20" fill="#245DD8" xml:space="preserve">execution=&quot;sequential&quot;</text>
+<rect x="90" y="430" width="192" height="85" rx="12" fill="#EAF0FD"/>
+<text x="120" y="480" font-family="Arial, sans-serif" font-size="24" fill="#245DD8" xml:space="preserve" font-weight="700">Model A</text>
+<rect x="310" y="430" width="192" height="85" rx="12" fill="#EAF0FD"/>
+<text x="340" y="480" font-family="Arial, sans-serif" font-size="24" fill="#245DD8" xml:space="preserve" font-weight="700">Model B</text>
+<rect x="530" y="430" width="192" height="85" rx="12" fill="#EAF0FD"/>
+<text x="560" y="480" font-family="Arial, sans-serif" font-size="24" fill="#245DD8" xml:space="preserve" font-weight="700">Model C</text>
+<path d="M286,472 L304,472" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M506,472 L524,472" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<text x="82" y="563" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">max_parallel_models=1</text>
+<text x="82" y="597" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Each job finishes before the next starts.</text>
+<text x="82" y="631" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Spark may start JVM or helper processes;</text>
+<text x="82" y="665" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">“sequential” means one model job, not one OS process.</text>
+<rect x="808" y="300" width="736" height="435" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="830" y="322" width="40" height="36" rx="9" fill="#EAF0FD"/>
+<text x="841" y="347" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">2</text>
+<text x="886" y="348" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">One machine: several model jobs</text>
+<text x="834" y="385" font-family="Courier New, monospace" font-size="19" fill="#245DD8" xml:space="preserve">execution=&quot;local&quot;, max_parallel_models=2</text>
+<rect x="842" y="424" width="305" height="140" rx="12" fill="#EAF0FD"/>
+<text x="866" y="464" font-family="Arial, sans-serif" font-size="24" fill="#245DD8" xml:space="preserve" font-weight="700">Process A</text>
+<text x="866" y="501" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Trial 1 → trial 2 → …</text>
+<text x="866" y="529" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Windows run in sequence</text>
+<rect x="1177" y="424" width="305" height="140" rx="12" fill="#EAF0FD"/>
+<text x="1201" y="464" font-family="Arial, sans-serif" font-size="24" fill="#245DD8" xml:space="preserve" font-weight="700">Process B</text>
+<text x="1201" y="501" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Trial 1 → trial 2 → …</text>
+<text x="1201" y="529" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Windows run in sequence</text>
+<rect x="842" y="591" width="640" height="54" rx="10" fill="#F0F3F7"/>
+<text x="864" y="626" font-family="Arial, sans-serif" font-size="20" fill="#53647A" xml:space="preserve">Model C waits until capacity is available.</text>
+<text x="834" y="698" font-family="Arial, sans-serif" font-size="19" fill="#172A43" xml:space="preserve">Separate worker process, Spark session and run folder per job.</text>
+<rect x="56" y="763" width="728" height="435" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="78" y="785" width="40" height="36" rx="9" fill="#EAF0FD"/>
+<text x="89" y="810" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">3</text>
+<text x="134" y="811" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">One model: its own parallel workers</text>
+<text x="82" y="844" font-family="Arial, sans-serif" font-size="21" fill="#087F82" xml:space="preserve" font-weight="700">The callback implements this, when supported.</text>
+<rect x="265" y="881" width="305" height="68" rx="12" fill="#E5F4EF"/>
+<text x="306" y="924" font-family="Arial, sans-serif" font-size="23" fill="#087F82" xml:space="preserve" font-weight="700">Model A callback</text>
+<path d="M343,952 L238,997" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M491,952 L598,997" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="100" y="1008" width="284" height="64" rx="12" fill="#E5F4EF"/>
+<text x="170" y="1048" font-family="Arial, sans-serif" font-size="22" fill="#087F82" xml:space="preserve" font-weight="700">Worker A1</text>
+<rect x="450" y="1008" width="284" height="64" rx="12" fill="#E5F4EF"/>
+<text x="520" y="1048" font-family="Arial, sans-serif" font-size="22" fill="#087F82" xml:space="preserve" font-weight="700">Worker A2</text>
+<text x="82" y="1120" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Declare resources for the whole job, including its workers.</text>
+<text x="82" y="1152" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">AutoForecast does not split a model’s training algorithm.</text>
+<rect x="808" y="763" width="736" height="435" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="830" y="785" width="40" height="36" rx="9" fill="#EAF0FD"/>
+<text x="841" y="810" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">4</text>
+<text x="886" y="811" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Several machines: independent model jobs</text>
+<text x="834" y="844" font-family="Courier New, monospace" font-size="20" fill="#245DD8" xml:space="preserve">execution=&quot;cluster&quot;, max_parallel_models=4</text>
+<rect x="842" y="879" width="305" height="171" rx="12" fill="#F5F7FA" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="866" y="918" font-family="Arial, sans-serif" font-size="24" fill="#172A43" xml:space="preserve" font-weight="700">Machine 1</text>
+<rect x="862" y="940" width="125" height="76" rx="10" fill="#EAF0FD"/>
+<text x="880" y="971" font-family="Arial, sans-serif" font-size="17" fill="#245DD8" xml:space="preserve">Process</text>
+<text x="913" y="1000" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">A</text>
+<rect x="1002" y="940" width="125" height="76" rx="10" fill="#EAF0FD"/>
+<text x="1020" y="971" font-family="Arial, sans-serif" font-size="17" fill="#245DD8" xml:space="preserve">Process</text>
+<text x="1053" y="1000" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">B</text>
+<rect x="1177" y="879" width="305" height="171" rx="12" fill="#F5F7FA" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="1201" y="918" font-family="Arial, sans-serif" font-size="24" fill="#172A43" xml:space="preserve" font-weight="700">Machine 2</text>
+<rect x="1197" y="940" width="125" height="76" rx="10" fill="#EAF0FD"/>
+<text x="1215" y="971" font-family="Arial, sans-serif" font-size="17" fill="#245DD8" xml:space="preserve">Process</text>
+<text x="1248" y="1000" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">C</text>
+<rect x="1337" y="940" width="125" height="76" rx="10" fill="#EAF0FD"/>
+<text x="1355" y="971" font-family="Arial, sans-serif" font-size="17" fill="#245DD8" xml:space="preserve">Process</text>
+<text x="1388" y="1000" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">D</text>
+<text x="834" y="1090" font-family="Arial, sans-serif" font-size="19" fill="#172A43" xml:space="preserve">ray_address=&quot;…&quot;; shared paths; same installed code.</text>
+<rect x="834" y="1112" width="684" height="58" rx="10" fill="#FFF0DB"/>
+<text x="854" y="1149" font-family="Arial, sans-serif" font-size="22" fill="#A15B08" xml:space="preserve" font-weight="700">Real two-machine testing remains pending.</text>
+<rect x="56" y="1226" width="1488" height="322" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="80" y="1274" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">What the scheduler controls, and what it does not</text>
+<text x="82" y="1312" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">Capacity: CPU, memory and GPU reservations; optional node labels must fit one eligible node.</text>
+<text x="82" y="1352" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">Concurrency: max_parallel_models is an upper bound, reduced when resources are unavailable.</text>
+<text x="82" y="1392" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">Final stage: all_models refits every validated candidate; validation_winner refits only the winner.</text>
+<text x="82" y="1432" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">Recovery: timeout and retry limits apply to each campaign phase; verified completed jobs are reused.</text>
+<text x="82" y="1487" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">Trials/windows stay sequential inside each job. Multi-machine training needs model-specific implementation.</text>
+<text x="56" y="1615" font-family="Arial, sans-serif" font-size="17" fill="#53647A" xml:space="preserve">Example placement assumes enough capacity. Ray does not provision machines or distribute arbitrary model code.</text>
+<text x="56" y="1640" font-family="Arial, sans-serif" font-size="15" fill="#53647A" xml:space="preserve">Campaign callbacks are importable module entry points. Campaign Spark sessions are local to their workers.</text>
+</svg>

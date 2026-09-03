@@ -509,7 +509,7 @@ def test_custom_depth_settings_build_the_requested_model_depth() -> None:
     assert len(deep.calendar.kernel_layers) == 4
     event_output = deep.calendar(
         torch.zeros(2, 7, 1),
-        present=torch.ones(2, 7, 1),
+        present=torch.ones(2, 7, 1, dtype=torch.bool),
         series_index=torch.tensor([0, 1]),
     )
     assert event_output.shape == (2, 7, 16)

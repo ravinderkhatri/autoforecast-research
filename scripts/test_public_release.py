@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import importlib.metadata
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 import zipfile
 
 import pytest
 from autoforecast.project import installed_library_identity
 
-from scripts.verify_public_release import ROOT_FILES, tracked_inventory, verify_wheel
+from scripts.verify_public_release import README_IMAGES, ROOT_FILES, tracked_inventory, verify_wheel
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -124,8 +126,35 @@ def test_public_inventory_accepts_root_readme(clean_wheel, tmp_path):
     assert "README.md" in names
 
 
+def test_readme_diagrams_are_present_valid_and_approved():
+    images = set(re.findall(r"!\[[^\]]*\]\(([^)]+)\)", (ROOT / "README.md").read_text()))
+    assert images == README_IMAGES
+    for name in images:
+        assert pathlib.PurePosixPath(name).suffix == ".svg"
+        assert ET.parse(ROOT / name).getroot().tag == "{http://www.w3.org/2000/svg}svg"
+
+
+@pytest.mark.parametrize("name", sorted(README_IMAGES))
+def test_public_inventory_accepts_only_approved_readme_diagrams(clean_wheel, tmp_path, name):
+    original, _ = clean_wheel
+    root = tmp_path / "repo"
+    shutil.copytree(original, root)
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+    command(root, "git", "add", name)
+    names, _ = tracked_inventory(root)
+    assert name in names
+    sibling = path.with_name("unapproved-diagram.svg")
+    sibling.write_text(path.read_text())
+    command(root, "git", "add", str(sibling.relative_to(root)))
+    with pytest.raises(ValueError, match="public inventory"):
+        tracked_inventory(root)
+
+
 @pytest.mark.parametrize("name", sorted(
-    {name for name in ROOT_FILES if name.lower().endswith(".md") and name != "README.md"}
+    {name for name in ROOT_FILES | README_IMAGES
+     if name.lower().endswith(".md") and pathlib.Path(name).name.lower() != "readme.md"}
     | {"plan.md", "notes.MD", "docs/plan.md"}
 ))
 def test_public_inventory_rejects_every_non_readme_markdown(clean_wheel, tmp_path, name):

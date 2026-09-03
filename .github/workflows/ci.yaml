@@ -9,8 +9,37 @@ permissions:
   contents: read
 
 jobs:
-  checks:
+  preflight:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          version: '0.11.32'
+      - name: Install checked CI tools
+        run: |
+          uv lock --check
+          uv export --frozen --no-hashes --no-emit-project --group ci \
+            --output-file "$RUNNER_TEMP/constraints.txt"
+          uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
+            --build-constraints "$RUNNER_TEMP/constraints.txt" --group ci PyYAML
+      - name: Lint and publication checks
+        run: |
+          ruff check .
+          python -m scripts.verify_public_release
+          python -m pytest -q -rs -x scripts/test_run_tests.py scripts/test_distribution.py scripts/test_public_release.py
+  regressions:
+    needs: preflight
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, native]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -46,17 +75,21 @@ jobs:
           assert torch.__version__ == '2.10.0+cpu', torch.__version__
           assert not any(d.metadata['Name'].startswith('nvidia-') for d in importlib.metadata.distributions())
           PY
-      - name: Lint
-        run: ruff check .
       - name: Type check
+        if: matrix.shard == 'native'
         run: pyright --project pyrightconfig.governed.json
       - name: Unit and workflow regressions
+        if: matrix.shard != 'native'
         env:
+          # Tiny test jobs exchange paths, not training data, through Ray's object store.
+          # Preserve enough schedulable memory for two 2 GiB model workers.
+          RAY_DEFAULT_OBJECT_STORE_MAX_MEMORY_BYTES: '134217728'
           FORECAST_SPARK_CORES: '2'
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
-        run: python scripts/run_tests.py
+        run: python scripts/run_tests.py --shard-index ${{ matrix.shard }} --shard-count 8
       - name: Installed native model and HPO acceptance
+        if: matrix.shard == 'native'
         working-directory: ${{ runner.temp }}
         env:
           FORECAST_SPARK_CORES: '2'
@@ -70,6 +103,7 @@ jobs:
               --implementation-config "$GITHUB_WORKSPACE/configs/experiments/multibranch_revisions/sft_campaign_default.json"
           done
   installed-wheel:
+    needs: regressions
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -181,6 +215,7 @@ jobs:
           SPARK_LOCAL_IP: '127.0.0.1'
         run: env -u PYTHONPATH "$RUNNER_TEMP/timeseries-env/bin/python" -m scripts.study_example "$RUNNER_TEMP/study-interface-project"
   installed-models:
+    needs: regressions
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -228,3 +263,16 @@ jobs:
           assert not any(d.metadata['Name'].startswith('nvidia-') for d in importlib.metadata.distributions())
           print("Selected model libraries and CPU backend are available; weights were not downloaded.")
           PY
+  checks:
+    if: always()
+    needs: [preflight, regressions, installed-wheel, installed-models]
+    runs-on: ubuntu-latest
+    env:
+      PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+      REGRESSION_RESULT: ${{ needs.regressions.result }}
+      WHEEL_RESULT: ${{ needs.installed-wheel.result }}
+      MODEL_RESULT: ${{ needs.installed-models.result }}
+    steps:
+      - name: Require every validation stage
+        run: |
+          test "$PREFLIGHT_RESULT $REGRESSION_RESULT $WHEEL_RESULT $MODEL_RESULT" = "success success success success"

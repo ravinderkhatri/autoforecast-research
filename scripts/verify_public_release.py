@@ -33,6 +33,13 @@ ROOT_FILES = {
     "COPYING.txt",
     "NOTICE.txt",
 }
+README_IMAGES = {
+    "assets/autoforecast-overview.svg",
+    "assets/01-cross-validation.svg",
+    "assets/02-workflow-function.svg",
+    "assets/03-parallel-execution.svg",
+    "assets/04-run-outputs.svg",
+}
 PRIVATE_PATH = re.compile(r"(^|/)(conversations?|transcripts?|sessions?|chats?)(/|[._-])", re.I)
 ATTRIBUTION = re.compile(
     r"(?im)^\s*(?:co-authored-by|generated-by|assistant-signature|ai-signature)\s*:"
@@ -47,7 +54,7 @@ def git(root: pathlib.Path, *arguments: str) -> bytes:
 
 
 def tracked_inventory(root: pathlib.Path) -> tuple[set[str], dict]:
-    """Allow maintained source, configuration, CI, README and its approved overview."""
+    """Allow maintained source, configuration, CI, README and its approved diagrams."""
     if pathlib.Path(git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve() != root:
         raise ValueError("public inventory requires the repository root")
     if git(root, "rev-parse", "--is-shallow-repository").strip() == b"true":
@@ -64,7 +71,7 @@ def tracked_inventory(root: pathlib.Path) -> tuple[set[str], dict]:
         path = pathlib.PurePosixPath(name)
         allowed = (
             name in ROOT_FILES
-            or name == "assets/autoforecast-overview.svg"
+            or name in README_IMAGES
             or (path.parts[0] in roots and path.suffix == ".py")
             or (path.parts[0] == "configs" and path.suffix in {".json", ".yaml", ".yml"})
             or (path.parent.as_posix() == ".github/workflows" and path.suffix in {".yaml", ".yml"})
