@@ -192,7 +192,7 @@ def run_forecast_workflow(
             bundle.write_json("metadata/winner-config.json", saved)
             bundle.write_bytes("metadata/search-config.yaml", saved["profile_text"].encode("utf-8"))
             provenance = {
-                "study": {"path": str(study._path), "sha256": study._sha256},
+                "study": {"path": str(study._path.resolve()), "sha256": study._sha256},
                 "implementation": identity,
                 "configuration_source": saved["source"],
                 "mode": "saved_configuration"

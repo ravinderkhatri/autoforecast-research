@@ -244,7 +244,13 @@ def test_workflow_counts_and_saved_configuration_future_reuse(
         )
         return predict(request)
 
-    with open_study(complete, spark) as study:
+    # macOS exposes /tmp as an alias of /private/tmp; caller spelling is not identity.
+    supplied = (
+        pathlib.Path(str(complete).removeprefix("/private"))
+        if str(complete).startswith("/private/tmp/")
+        else complete
+    )
+    with open_study(supplied, spark) as study:
         result = study.run_forecast_workflow(
             fit_predict=fit,
             config=cfg,
@@ -254,6 +260,7 @@ def test_workflow_counts_and_saved_configuration_future_reuse(
     assert len(seen) == expected_calls
     assert result.provenance["work_estimate"]["total_callback_fits"] == expected_calls
     assert result.status == "completed"
+    assert result.provenance["study"]["path"] == str(complete.resolve())
     assert seen[-1][0] == "2024-01-09"
     expected_parameters = (
         {"level": result.parameters["model.level"]},
