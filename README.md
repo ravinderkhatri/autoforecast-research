@@ -95,6 +95,41 @@ zero. Missing evaluation values are errors by default; explicit masking records 
 Choose the intended series population and date rules before freezing. A new dataset or changed
 rules require a new study identity.
 
+## Inspect daily WRMSSE reference issues
+
+Use the strict numeric report before registering caller-supplied or calculated references:
+
+```python
+from datetime import date
+from autoforecast.study_references import check_wrmsse_references
+
+issues = check_wrmsse_references(
+    references,
+    origins=[("tuning", date(2024, 1, 3)), ("tuning", date(2024, 1, 5))],
+)
+issues.show(truncate=False)
+```
+
+`references` is a Spark DataFrame with `keys` (the original typed key struct), `stage`,
+`origin` (ISO date string), `weight`, and `scale`. Declare every expected boundary, even
+when exclusions leave it empty. The result always has `keys`, `stage`, `origin`, `field`,
+`issue_code`, `observed_value`, and `message`; valid input produces an empty report.
+
+The codes are `INVALID_WEIGHT`, `INVALID_SCALE`, and `INVALID_TOTAL_WEIGHT`. Weights must
+be finite and nonnegative; scales must be finite and positive. The total includes only
+rows where both values are usable. Total issues have null keys; an empty usable total
+has a null observed value. Null and non-finite offending values remain visible.
+
+For calculated references, call `prepare_wrmsse_references(..., validate=False)` once,
+then pass the result to this checker. Its default `validate=True` still raises `ValueError`
+for invalid references. Use Spark `persist()` and materialize the references if repeated
+actions should reuse a calculation; release them with `unpersist()` when finished.
+The checker never changes values or removes series. Your application saves issues and
+applies its exclusion policy across the shared cohort, then checks the retained references
+again. Keep study registration and integrity checks: a clean numeric report does not
+establish identity, complete cohort coverage, or artifact integrity. Existing frozen-study
+handling of undefined scales is unchanged.
+
 ## Use your own Python model
 
 Keep model training in your application. AutoForecast calls your function with the right

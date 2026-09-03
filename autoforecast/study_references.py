@@ -5,8 +5,9 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Mapping, Sequence
 
-from pyspark.sql import DataFrame, Window
+from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
+from pyspark.sql.types import NumericType, StringType, StructType
 
 from autoforecast.preparation import _column, prepare_time_series
 
@@ -35,7 +36,7 @@ def prepare_wrmsse_references(
 
     Missing periods follow the explicit na/zero policy. Explicit null values are
     never silently converted to zeros. Invalid scales/weights raise by default;
-    validate=False returns them for an existing admission report, without dropping
+    validate=False returns them for check_wrmsse_references, without dropping
     or admitting series. Caller-owned exclusions require a separate decision.
     """
     for name, value in (("weight_window_days", weight_window_days), ("scale_lag", scale_lag)):
@@ -45,16 +46,7 @@ def prepare_wrmsse_references(
         raise ValueError("scale_start must be first_positive or history_start")
     if type(validate) is not bool:
         raise ValueError("validate must be boolean")
-    windows = list(origins.items() if isinstance(origins, Mapping) else origins)
-    if (
-        not windows
-        or any(
-            stage not in {"tuning", "validation", "test"} or type(origin) is not dt.date
-            for stage, origin in windows
-        )
-        or len(set(windows)) != len(windows)
-    ):
-        raise ValueError("origins must contain distinct stage/date pairs")
+    windows = _reference_origins(origins)
     if (
         not series_id
         or len(set([*series_id, date_col, target_col, weight_col])) != len(series_id) + 3
@@ -105,18 +97,6 @@ def prepare_wrmsse_references(
             ).alias("scale"),
         )
         refs = series.join(weights, keys, "left").join(scales, keys, "left")
-        if validate:
-            invalid = F.lit(False)
-            for name in ("weight", "scale"):
-                value = F.col(name)
-                invalid |= value.isNull() | F.isnan(value) | (F.abs(value) == float("inf"))
-                invalid |= value < 0 if name == "weight" else value <= 0
-            if refs.filter(invalid).limit(1).count():
-                raise ValueError(f"invalid weight or scale at {stage}/{origin}")
-            total_row = refs.agg(F.sum("weight")).first()
-            total = total_row[0] if total_row is not None else None
-            if total is None or not 0 < total < float("inf"):
-                raise ValueError("reference weights require a finite positive total")
         frame = refs.select(
             F.struct(
                 *[F.col(key).alias(name) for key, name in zip(keys, series_id, strict=False)]
@@ -126,6 +106,121 @@ def prepare_wrmsse_references(
             F.col("weight").cast("double"),
             F.col("scale").cast("double"),
         )
+        if validate:
+            issue = check_wrmsse_references(frame, origins=[(stage, origin)]).first()
+            if issue is not None:
+                raise ValueError(f"invalid weight or scale at {stage}/{origin}: {issue.message}")
         output = frame if output is None else output.unionByName(frame)
     assert output is not None
     return output
+
+
+def _reference_origins(
+    origins: Mapping[str, dt.date] | Sequence[tuple[str, dt.date]],
+) -> list[tuple[str, dt.date]]:
+    """Normalize the explicit, nonempty set of daily reference boundaries."""
+    message = "origins must contain distinct stage/date pairs"
+    if not isinstance(origins, Mapping | Sequence) or isinstance(origins, str | bytes):
+        raise ValueError(message)
+    entries = list(origins.items() if isinstance(origins, Mapping) else origins)
+    windows = []
+    for entry in entries:
+        if not isinstance(entry, tuple | list) or len(entry) != 2:
+            raise ValueError(message)
+        stage, origin = entry
+        if (not isinstance(stage, str) or stage not in {"tuning", "validation", "test"}
+                or type(origin) is not dt.date):
+            raise ValueError(message)
+        windows.append((stage, origin))
+    if not windows or len(set(windows)) != len(windows):
+        raise ValueError(message)
+    return windows
+
+
+def _invalid_reference_value(value: Column, *, positive: bool) -> Column:
+    """Identify missing, non-finite or out-of-range strict reference values."""
+    return (
+        value.isNull() | F.isnan(value) | (F.abs(value) == float("inf"))
+        | ((value <= 0) if positive else (value < 0))
+    )
+
+
+def check_wrmsse_references(
+    references: DataFrame,
+    *,
+    origins: Mapping[str, dt.date] | Sequence[tuple[str, dt.date]],
+) -> DataFrame:
+    """Report every numeric problem without changing or excluding references.
+
+    Input uses keys (a nonempty struct), stage/origin (strings, origin in ISO date
+    form), and numeric weight/scale columns. Origins declares every expected
+    daily boundary, including ones with no remaining rows. Malformed schemas,
+    null keys and undeclared boundaries raise ValueError.
+
+    Returns keys/stage/origin/field/issue_code/observed_value/message, with the
+    original key type and double observed values (including null, NaN and Inf).
+    A clean report has zero rows with the same schema. INVALID_WEIGHT requires
+    finite nonnegative weights; INVALID_SCALE requires finite positive scales.
+    INVALID_TOTAL_WEIGHT requires a finite positive sum over rows where BOTH
+    values are usable; its keys are null and an empty usable sum is null.
+
+    This strict numeric report does not check duplicate identities, cohort
+    coverage, frozen-study schema or artifact integrity. Keep the existing study
+    registration checks; some frozen studies allow undefined scales. Applications
+    own exclusions and must apply them consistently across their shared cohort.
+    """
+    windows = _reference_origins(origins)
+    required = {"keys", "stage", "origin", "weight", "scale"}
+    if (not isinstance(references, DataFrame)
+            or not required.issubset(references.columns)
+            or len({name.casefold() for name in references.columns}) != len(references.columns)):
+        raise ValueError("references require unambiguous keys, stage, origin, weight and scale")
+    key_type = references.schema["keys"].dataType
+    if (not isinstance(key_type, StructType) or not key_type.fields
+            or len({name.casefold() for name in key_type.names}) != len(key_type.names)
+            or any(not isinstance(references.schema[name].dataType, StringType)
+                   for name in ("stage", "origin"))
+            or any(not isinstance(references.schema[name].dataType, NumericType)
+                   for name in ("weight", "scale"))):
+        raise ValueError("reference key, stage, origin, weight or scale types are invalid")
+    frame = references.select(
+        "keys", "stage", "origin", F.col("weight").cast("double").alias("weight"),
+        F.col("scale").cast("double").alias("scale"),
+    )
+    expected = references.sparkSession.createDataFrame(
+        [(stage, origin.isoformat()) for stage, origin in windows],
+        "stage string, origin string",
+    )
+    invalid_keys = F.col("keys").isNull()
+    for key in key_type.names:
+        invalid_keys |= F.col("keys")[key].isNull()
+    if frame.filter(invalid_keys).limit(1).count():
+        raise ValueError("reference keys cannot be null")
+    if frame.join(expected, ["stage", "origin"], "left_anti").limit(1).count():
+        raise ValueError("reference stage/origin must match an expected boundary")
+
+    invalid_weight = _invalid_reference_value(F.col("weight"), positive=False)
+    invalid_scale = _invalid_reference_value(F.col("scale"), positive=True)
+    issues = frame.filter(invalid_weight).select(
+        "keys", "stage", "origin", F.lit("weight").alias("field"),
+        F.lit("INVALID_WEIGHT").alias("issue_code"), F.col("weight").alias("observed_value"),
+        F.lit("Weight must be finite and nonnegative.").alias("message"),
+    ).unionByName(frame.filter(invalid_scale).select(
+        "keys", "stage", "origin", F.lit("scale").alias("field"),
+        F.lit("INVALID_SCALE").alias("issue_code"), F.col("scale").alias("observed_value"),
+        F.lit("This strict reference check requires a finite positive scale.").alias("message"),
+    ))
+    totals = frame.filter(~invalid_weight & ~invalid_scale).groupBy("stage", "origin").agg(
+        F.sum("weight").alias("observed_value"),
+    )
+    totals = expected.join(totals, ["stage", "origin"], "left").filter(
+        _invalid_reference_value(F.col("observed_value"), positive=True),
+    )
+    return issues.unionByName(totals.select(
+        F.lit(None).cast(key_type).alias("keys"), "stage", "origin",
+        F.lit("total_weight").alias("field"), F.lit("INVALID_TOTAL_WEIGHT").alias("issue_code"),
+        "observed_value",
+        F.lit("Reference weights require a finite positive total over usable rows.").alias(
+            "message",
+        ),
+    ))
