@@ -12,6 +12,7 @@
     "autoforecast/cli.py",
     "autoforecast/project.py",
     "autoforecast/results.py",
+    "autoforecast/study_results.py",
     "autoforecast/campaign.py",
     "autoforecast/campaign_child.py",
     "autoforecast/campaign_launchd.py",
@@ -50,6 +51,9 @@
     "scripts/verify_study_release.py",
     "scripts/verify_native_study_release.py",
     "provenance/lineage.py",
-    "autoforecast/score_spark.py"
+    "autoforecast/score_spark.py",
+    "autoforecast/study_campaign.py",
+    "autoforecast/preparation.py",
+    "autoforecast/study_references.py"
   ]
 }

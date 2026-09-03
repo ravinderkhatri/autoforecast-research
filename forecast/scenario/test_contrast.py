@@ -41,6 +41,7 @@ REPRODUCTION = {
     "horizon": HORIZON,
     "window_bounds": (1, HORIZON),
     "requested_window_bounds": None,
+    "requested_window": "horizon",
 }
 
 
@@ -70,7 +71,7 @@ def test_a_post_treatment_origin_is_refused() -> None:
     try:
         contrast(model, kf, InterventionBundle("promo", (0,)), draws,
                  origin="2016-06-10", campaign_start="2016-06-01", campaign_index=camp,
-                 observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3))
+                 observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3), window="horizon")
     except ContrastError as e:
         assert "understates it silently" in str(e); return
     raise AssertionError("computed a contrast from inside the campaign")
@@ -91,10 +92,10 @@ def test_the_bundle_sets_every_column_together() -> None:
     kf[..., 1] = 1.0                                   # display on
     out = contrast(model, kf, InterventionBundle("price_display", (0, 1)), draws,
                    origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
-                   observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3))
+                   observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3), window="horizon")
     single = contrast(model, kf, InterventionBundle("price_only", (0,)), draws,
                       origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
-                      observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3))
+                      observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3), window="horizon")
     assert out.bundle == "price_display" and single.bundle == "price_only"
     assert out.effect != 0.0
 
@@ -119,7 +120,7 @@ def test_a_single_campaign_bootstrap_is_refused() -> None:
         contrast(model, kf, InterventionBundle("promo", (0,)), draws,
                  origin="2016-05-01", campaign_start="2016-06-01",
                  campaign_index=torch.zeros(CELLS, dtype=torch.long),
-                 observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3))
+                 observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3), window="horizon")
     except ContrastError as e:
         assert "reads as certainty" in str(e); return
     raise AssertionError("produced a zero-width interval from one campaign")
@@ -131,17 +132,20 @@ def test_extrapolation_beyond_the_observed_range_is_flagged_not_hidden() -> None
     kf, draws, camp = setup(planned=0.30)
     out = contrast(model, kf, InterventionBundle("promo", (0,)), draws,
                    origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
-                   observed_driver_range=(0.0, 0.05), planned_driver_range=(0.0, 0.30))
+                   observed_driver_range=(0.0, 0.05), planned_driver_range=(0.0, 0.30), window="horizon")
     assert not out.is_quotable
     assert any("extrapolating" in n for n in out.notes)
 
 
 def test_a_well_supported_contrast_is_quotable() -> None:
     kf, draws, camp = setup(planned=0.1, spread=0.04)
-    out = contrast(model, kf, InterventionBundle("promo", (0,)), draws,
+    def per_day(known, shared):
+        return (2.0 + 4.0 * known[..., 0] + shared.unsqueeze(-1)).clamp_min(0.0)
+
+    out = contrast(per_day, kf, InterventionBundle("promo", (0,)), draws,
                    origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
                    observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.15),
-                   episode_validated=True)
+                   episode_validated=True, window="custom", custom_window=(1, HORIZON))
     assert out.is_quotable, f"a well-supported contrast was marked unquotable: {out.notes}"
     assert out.n_campaigns == 8
     assert "NOT QUOTABLE" not in str(out)
@@ -154,7 +158,7 @@ def test_campaigns_that_are_all_alike_produce_a_flagged_degenerate_interval() ->
     kf, draws, camp = setup(planned=0.1, spread=0.0)
     out = contrast(model, kf, InterventionBundle("promo", (0,)), draws,
                    origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
-                   observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.1))
+                   observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.1), window="horizon")
     assert not out.is_quotable
     assert any("indistinguishable" in n for n in out.notes), out.notes
 
@@ -167,7 +171,7 @@ def test_too_few_campaigns_is_flagged_because_count_is_not_identification() -> N
     out = contrast(model, kf, InterventionBundle("promo", (0,)), draws,
                    origin="2016-05-01", campaign_start="2016-06-01",
                    campaign_index=torch.arange(15) // 5,          # 3 campaigns
-                   observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.1))
+                   observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.1), window="horizon")
     assert not out.is_quotable
     assert any("not identification" in n for n in out.notes)
 
@@ -180,7 +184,7 @@ def test_the_estimand_is_named_in_the_record_so_it_cannot_be_read_as_causal() ->
                    origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
                    observed_driver_range=(0.0, 0.5),
                    planned_driver_range=(0.0, 0.15), n_bootstrap=321, seed=17, alpha=0.2,
-                   episode_validated=True).as_record()
+                   episode_validated=True, window="horizon").as_record()
     assert rec["estimand"] == "prospective scenario contrast, NOT a causal effect"
     assert rec["origin"] == "2016-05-01" and rec["campaign_start"] == "2016-06-01"
     assert rec["n_bootstrap"] == 321 and rec["seed"] == 17 and rec["alpha"] == 0.2
@@ -292,7 +296,7 @@ def test_query_campaign_labels_alone_cannot_make_a_contrast_quotable() -> None:
     kf, draws, camp = setup(planned=0.1, spread=0.04)
     out = contrast(model, kf, InterventionBundle("promo", (0,)), draws,
                    origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
-                   observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.15))
+                   observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.15), window="horizon")
     assert not out.is_quotable and not out.episode_validated
     assert any("held-out whole-episode" in note for note in out.notes)
 
@@ -361,6 +365,7 @@ def test_contrast_record_validates_every_reproduction_control_and_window() -> No
         ("window_bounds", (1, HORIZON + 1)),
         ("window_bounds", (1, True)),
         ("requested_window_bounds", (1, HORIZON)),
+        ("requested_window", None),
         ("requested_window", "custom"),
         ("requested_window", StringAlias("horizon")),
     )
@@ -418,7 +423,7 @@ def test_contrast_numeric_controls_refuse_unrepresentable_json_integers() -> Non
             lambda invalid=invalid: contrast(
                 model, kf, InterventionBundle("promo", (0,)), draws,
                 origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
-                observed_driver_range=(0.0, invalid), planned_driver_range=(0.0, 0.3)),
+                observed_driver_range=(0.0, invalid), planned_driver_range=(0.0, 0.3), window="horizon"),
         ):
             try:
                 call()
@@ -439,7 +444,7 @@ def test_overlap_stays_exact_when_finite_endpoint_subtraction_would_overflow() -
         campaign_index=camp,
         observed_driver_range=(-1e308, 1e308),
         planned_driver_range=(-1e308, 1e308),
-    )
+     window="horizon")
     assert result.overlap == 1.0
 
 
@@ -464,7 +469,7 @@ def test_model_outputs_have_exact_cell_and_horizon_axes() -> None:
                 campaign_index=camp,
                 observed_driver_range=(0.0, 0.5),
                 planned_driver_range=(0.0, 0.3),
-            )
+             window="horizon")
         except ContrastError as exc:
             assert "[cells] or [cells, horizon]" in str(exc)
             continue
@@ -511,7 +516,7 @@ def test_model_outputs_are_aligned_floating_tensors_on_the_scenario_device() -> 
                 campaign_index=camp,
                 observed_driver_range=(0.0, 0.5),
                 planned_driver_range=(0.0, 0.3),
-            )
+             window="horizon")
         except ContrastError as error:
             assert fragment in str(error), (model_fn.__name__, error)
             continue
@@ -539,7 +544,7 @@ def test_contrast_requires_floating_rank_three_known_future() -> None:
                 campaign_index=camp,
                 observed_driver_range=(0.0, 0.5),
                 planned_driver_range=(0.0, 0.3),
-            )
+             window="horizon")
         except ContrastError as error:
             assert "floating rank-3" in str(error), error
             continue
@@ -558,7 +563,7 @@ def test_contrast_requires_floating_rank_three_known_future() -> None:
                 campaign_index=camp,
                 observed_driver_range=(0.0, 0.5),
                 planned_driver_range=(0.0, 0.3),
-            )
+             window="horizon")
         except ContrastError as error:
             assert "axes must all be non-empty" in str(error), error
             continue
@@ -571,7 +576,7 @@ def test_contrast_refuses_unaligned_references_and_driver_ranges() -> None:
     try:
         contrast(model, kf, InterventionBundle("b", (0,)), draws,
                  origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
-                 observed_driver_range=(0.5, 0.0), planned_driver_range=(0.0, 0.3))
+                 observed_driver_range=(0.5, 0.0), planned_driver_range=(0.0, 0.3), window="horizon")
     except ContrastError as exc:
         assert "ordered pair" in str(exc)
     else:
@@ -580,7 +585,7 @@ def test_contrast_refuses_unaligned_references_and_driver_ranges() -> None:
     try:
         contrast(model, kf, bad_bundle, draws,
                  origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
-                 observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3))
+                 observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3), window="horizon")
     except ContrastError as exc:
         assert "does not align" in str(exc)
     else:
@@ -619,7 +624,7 @@ def test_bundle_reference_values_have_one_exact_materialized_scenario_type() -> 
             model, kf, wrong_dtype, draws,
             origin="2016-05-01", campaign_start="2016-06-01", campaign_index=camp,
             observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3),
-        )
+         window="horizon")
     except ContrastError as error:
         assert "same floating dtype and device" in str(error)
     else:
@@ -641,7 +646,7 @@ def test_the_attribution_window_selects_the_days_it_claims() -> None:
     implicit = contrast(per_day, kf, InterventionBundle("promo", (0,)), draws,
                         origin="2016-05-01", campaign_start="2016-05-06",
                         campaign_index=camp, observed_driver_range=(0.0, 0.5),
-                        planned_driver_range=(0.0, 0.3))
+                        planned_driver_range=(0.0, 0.3), window="horizon")
     full = contrast(per_day, kf, InterventionBundle("promo", (0,)), draws,
                     origin="2016-05-01", campaign_start="2016-05-06", campaign_index=camp,
                     observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3),
@@ -651,12 +656,13 @@ def test_the_attribution_window_selects_the_days_it_claims() -> None:
     assert implicit.window_bounds == full.window_bounds == (1, HORIZON)
     implicit_record = json.loads(json.dumps(implicit.as_record()))
     explicit_record = json.loads(json.dumps(full.as_record()))
-    assert implicit_record["requested_window"] is None
+    assert implicit_record["requested_window"] == "horizon"
     assert explicit_record["requested_window"] == "horizon"
     assert implicit_record["horizon"] == explicit_record["horizon"] == HORIZON
     assert implicit_record["window_bounds"] == explicit_record["window_bounds"] == [1, HORIZON]
     assert implicit_record["requested_window_bounds"] is None
     assert explicit_record["requested_window_bounds"] is None
+    assert implicit_record == explicit_record
     assert any("BY CHOICE" in note for note in full.notes)
     windowed = contrast(per_day, kf, InterventionBundle("promo", (0,)), draws,
                         origin="2016-05-01", campaign_start="2016-05-06", campaign_index=camp,
@@ -709,6 +715,7 @@ def test_the_attribution_window_selects_the_days_it_claims() -> None:
 def test_window_arguments_cannot_be_mixed_or_silently_ignored() -> None:
     kf, draws, camp = setup(spread=0.1)
     invalid = (
+        ({"window": None}, "window must be exactly one of"),
         ({"event_support": (-1, 1)}, "only valid with window='event_support'"),
         ({"custom_window": (1, 2)}, "only valid with window='custom'"),
         ({"window": "horizon", "event_support": (-1, 1)}, "only valid"),
@@ -733,7 +740,7 @@ def test_window_arguments_cannot_be_mixed_or_silently_ignored() -> None:
                 campaign_index=camp,
                 observed_driver_range=(0.0, 0.5),
                 planned_driver_range=(0.0, 0.3),
-                **window_args,
+                **{"window": "horizon", **window_args},
             )
         except ContrastError as error:
             assert fragment in str(error), (window_args, error)
@@ -745,3 +752,13 @@ if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if name.startswith("test_"):
             fn(); print("PASS " + name)
+
+
+def test_contrast_requires_an_explicit_window():
+    import pytest
+
+    kf, draws, camp = setup()
+    with pytest.raises(TypeError, match="window"):
+        contrast(model, kf, InterventionBundle("promo", (0,)), draws,
+                 origin="2016-05-01", campaign_start="2016-05-06", campaign_index=camp,
+                 observed_driver_range=(0.0, 0.5), planned_driver_range=(0.0, 0.3))

@@ -11,7 +11,7 @@ from autoforecast.adapter_contracts import DESCRIPTORS, descriptor
 from autoforecast.adapters import adapter_capabilities, known_adapter_names
 from autoforecast.frequency import FrequencyError, frequency_is_supported
 from autoforecast.model_catalog import Candidate, CatalogError, SelectionPolicy, resolve_candidates
-from autoforecast.panel import Panel, PanelError
+from autoforecast.panel import Panel, PanelError, PlanSource
 from autoforecast.profiling import Profile
 
 if TYPE_CHECKING:
@@ -45,7 +45,10 @@ class DatasetContract:
 
     def panel(self, path: str | pathlib.Path) -> Panel:
         """Build a Panel for an explicit runtime path; never commit the data location."""
-        return Panel(path=str(path), **self.panel_roles)
+        roles = dict(self.panel_roles)
+        if type(roles.get("plan")) is dict:
+            roles["plan"] = PlanSource(**roles["plan"])
+        return Panel(path=str(path), **roles)
 
 
 def load_dataset_contract(path: str | pathlib.Path) -> DatasetContract:
@@ -106,11 +109,14 @@ def _load_dataset_contract_bytes(raw: bytes, source: pathlib.Path) -> DatasetCon
         if type(families) is not list or any(type(family) is not list for family in families):
             raise DatasetContractError("dataset.panel.covariate_families must be a list of lists")
         normalised["covariate_families"] = tuple(tuple(family) for family in families)
+    if normalised.get("plan") is not None and type(normalised["plan"]) is not dict:
+        raise DatasetContractError("dataset.panel.plan must be a YAML mapping or null")
+    contract = DatasetContract(dataset["id"], normalised, source, required_series_count)
     try:
-        Panel.from_record({"path": ".", **normalised}).validate_column_names()
-    except PanelError as exc:
+        contract.panel(".").validate_column_names()
+    except (PanelError, TypeError) as exc:
         raise DatasetContractError(str(exc)) from exc
-    return DatasetContract(dataset["id"], normalised, source, required_series_count)
+    return contract
 
 
 @dataclass(frozen=True)

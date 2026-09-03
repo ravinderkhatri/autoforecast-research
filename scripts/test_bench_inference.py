@@ -212,7 +212,7 @@ def test_uniform_fingerprint_does_not_advance_the_production_generator() -> None
 
 def test_full_stochastic_seal_covers_the_declared_stream() -> None:
     model = torch.nn.Linear(1, 1)
-    model.factor = SimpleNamespace(rank=2, theta=model.weight)
+    model.factor = SimpleNamespace(rank=2, loading_occurrence=SimpleNamespace(weight=model.weight))
     first = bench._full_stochastic_input_fingerprints(  # noqa: SLF001
         model, n_groups=2, n_cells=3, horizon=4, p_dtype=torch.float32,
         factor_seed=11, count_seed=22, n_paths=3)
@@ -248,12 +248,12 @@ def test_full_stochastic_seal_matches_the_production_stream() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.rank = 2
-            self.theta = torch.nn.Parameter(torch.zeros(self.rank))
+            self.loading_occurrence = torch.nn.Embedding(1, self.rank)
 
         def draw(self, n_groups, horizon, n_draws=1, generator=None):
             innovations = torch.randn(
                 n_draws, n_groups, horizon, self.rank,
-                dtype=self.theta.dtype, generator=generator)
+                dtype=self.loading_occurrence.weight.dtype, generator=generator)
             factor_inputs.append(innovations.detach().clone())
             return innovations
 

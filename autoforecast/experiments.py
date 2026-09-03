@@ -29,6 +29,7 @@ from mlops._safe_files import (
     read_regular_bytes,
     snapshot_tree_types,
 )
+from mlops.run_report import _discard_unsealed_guide, run_guide
 
 from autoforecast._exact_json import ExactJSONError, load_exact_json, loads_exact_json
 from autoforecast.frequency import FrequencyError, TimePoint, parse_origin
@@ -246,6 +247,8 @@ class LocalAttempt:
             raise ExperimentError("attempt status must be 'completed' or 'failed'")
         if self._finalized or (self.path / "completion.json").exists():
             raise ExperimentError("attempt already has terminal completion metadata")
+        if (self.path / "RUN.md").exists():
+            raise ExperimentError("RUN.md is reserved for the generated file guide")
         artifact_manifest = self.path / "artifact_manifest.json"
         descendants = tuple(self.path.rglob("*"))
         linked = [path for path in descendants if path.is_symlink()]
@@ -275,23 +278,38 @@ class LocalAttempt:
             "completed_at_utc": datetime.now(UTC).isoformat(),
             "summary": dict(summary),
         }
-        self.write_json(
-            "artifact_manifest.json",
-            {
-                "schema": "autoforecast.artifact-manifest.v2",
-                "artifacts": artifacts,
-                "terminal_payload_sha256": hashlib.sha256(
-                    _json_bytes(terminal_payload)
-                ).hexdigest(),
-            },
+        terminal_bytes = _json_bytes(terminal_payload)
+        guide_payload = run_guide(
+            identity={"study_id": self.study_id, "trial_id": self.trial_id,
+                      "attempt_id": self.attempt_id}, status=status,
+            files=[*(item["path"] for item in artifacts),
+                   "RUN.md", "artifact_manifest.json", "completion.json"],
         )
-        self.write_json(
-            "completion.json",
-            {
-                **terminal_payload,
-                "artifact_manifest_sha256": _sha256(artifact_manifest),
-            },
-        )
+        guide = self.write_bytes("RUN.md", guide_payload)
+        try:
+            guide_digest, guide_size = _file_identity(guide)
+            artifacts.append({"path": "RUN.md", "sha256": guide_digest, "bytes": guide_size})
+            artifacts.sort(key=lambda item: item["path"])
+            self.write_json(
+                "artifact_manifest.json",
+                {
+                    "schema": "autoforecast.artifact-manifest.v2",
+                    "artifacts": artifacts,
+                    "terminal_payload_sha256": hashlib.sha256(
+                        terminal_bytes
+                    ).hexdigest(),
+                },
+            )
+            self.write_json(
+                "completion.json",
+                {
+                    **terminal_payload,
+                    "artifact_manifest_sha256": _sha256(artifact_manifest),
+                },
+            )
+        except Exception as error:
+            _discard_unsealed_guide(self.path, guide_payload, error)
+            raise
         self._finalized = True
         return self.path / "completion.json"
 
@@ -595,8 +613,7 @@ def _selection_candidates(
         study = metadata.get("study")
         if type(study) is not dict or study.get("direction") != direction:
             raise ExperimentError(f"candidate direction does not match its study: {attempt_path}")
-        # Older attempts did not bind top_k. New HPO runs retain it immutably.
-        if "top_k" in study and (type(study["top_k"]) is not int or study["top_k"] != top_k):
+        if type(study.get("top_k")) is not int or study["top_k"] != top_k:
             raise ExperimentError(f"selection top_k differs from its study: {attempt_path}")
         trial_id = metadata.get("trial_id")
         attempt_id = metadata.get("attempt_id")

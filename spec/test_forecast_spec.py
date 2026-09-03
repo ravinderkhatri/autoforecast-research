@@ -31,7 +31,7 @@ def _bare() -> ForecastDataSpec:
 
 
 def _blocking(spec, data):
-    return [e for e in spec.validate(data) if not str(e).startswith("NOTE:")]
+    return [e for e in spec.validate(data) if e.severity == "error"]
 
 
 # ---------------------------------------------------------------- validate
@@ -83,7 +83,7 @@ def test_resolve_degrades_a_bare_client_to_something_buildable():
     bare = _bare()
     r = ForecastModelSpec().resolve(bare)
     assert _blocking(r, bare) == []
-    assert [e for e in bare.validate() if not str(e).startswith("NOTE:")] == []
+    assert [e for e in bare.validate() if not e.startswith("NOTE:")] == []
 
 
 def test_resolve_drops_the_factor_without_a_grouping_column():
@@ -196,7 +196,7 @@ def test_capability_report_and_validate_agree():
 # ---------------------------------------------------------------- data contract
 def test_data_validate_notes_a_missing_range_column_without_blocking():
     """Absent range eligibility is a capability loss, not a misconfiguration."""
-    notes = [e for e in _bare().validate() if str(e).startswith("NOTE:")]
+    notes = [e for e in _bare().validate() if e.startswith("NOTE:")]
     assert any("ranged_col" in str(n) for n in notes)
 
 
@@ -213,6 +213,20 @@ def test_the_demand_branch_may_attend_over_time_and_others_may_not():
     assert not time_axis_errors(with_branch(
         {"demand": Branch(attend_over="time", is_demand_history=True)}))
     assert time_axis_errors(with_branch({"calendar": Branch(attend_over="time")}))
+
+
+def test_findings_use_typed_equality_and_severity():
+    import pytest
+    from spec.forecast_spec import Finding
+
+    error = Finding("error", "problem")
+    note = Finding("note", "problem")
+    assert error == Finding("error", "problem")
+    assert error != note and error != "problem"
+    assert len({error, note, Finding("error", "problem")}) == 2
+    assert str(error) == "problem" and str(note) == "NOTE: problem"
+    with pytest.raises(AttributeError):
+        error.startswith("NOTE:")
 
 
 if __name__ == "__main__":

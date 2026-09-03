@@ -288,7 +288,7 @@ def test_one_step_per_step_cumulative_and_overall_agree(tmp_path, spark):
     assert report["per_step"][0]["wrmsse"] == pytest.approx(score["wrmsse"])
 
 
-def test_horizon_overflow_raises_and_removes_the_incomplete_run(tmp_path, spark):
+def test_horizon_overflow_raises_and_retains_failed_evidence(tmp_path, spark):
     manifest, forecasts, _ = build_study(tmp_path, spark, metric="wape", tiny_first_actual=True)
     baseline = evaluate(manifest, forecasts[0], spark, tmp_path / "baseline", mode="none")
     assert math.isfinite(baseline["wape"])
@@ -296,7 +296,11 @@ def test_horizon_overflow_raises_and_removes_the_incomplete_run(tmp_path, spark)
         with pytest.raises(ScoreError, match="horizon metric overflowed"):
             study.evaluate_forecasts(validation_forecasts=forecasts[0], testing_forecasts=forecasts[1],
                                      model_id="fixture")
-    assert not list((tmp_path / "study-runs").glob("run-*"))
+    from mlops.run_bundle import load_completed_run_bundle
+
+    completed = list((tmp_path / "study-runs").rglob("completion.json"))
+    assert len(completed) == 1
+    assert load_completed_run_bundle(completed[0].parent)["status"] == "failed"
 
 
 def test_diagnostic_evidence_changed_during_reduction_is_rejected(tmp_path, spark, monkeypatch):
@@ -317,7 +321,11 @@ def test_diagnostic_evidence_changed_during_reduction_is_rejected(tmp_path, spar
             study.evaluate_forecasts(validation_forecasts=forecasts[0], testing_forecasts=forecasts[1],
                                      model_id="fixture")
     assert len(calls) == 2
-    assert not list((tmp_path / "study-runs").glob("run-*"))
+    from mlops.run_bundle import load_completed_run_bundle
+
+    completed = list((tmp_path / "study-runs").rglob("completion.json"))
+    assert len(completed) == 1
+    assert load_completed_run_bundle(completed[0].parent)["status"] == "failed"
 
 
 def test_masked_empty_step_cell_metrics_are_unavailable(tmp_path, spark):

@@ -118,9 +118,8 @@ class SharedLatentFactor(nn.Module):
                 anything else, and the lead-time sums that motivate the factor need exactly that.
                 Ignored when `factor_dynamics="iid"`.
             factor_dynamics: `"ar1"` for a stationary autoregressive path, or `"iid"` for an
-                independent standard-normal draw at every horizon step. The latter deliberately
-                retains a `theta` parameter in the state dict so AR(1) and IID checkpoints have
-                compatible keys, but that parameter is fixed and ignored.
+                independent standard-normal draw at every horizon step. Only AR(1) owns a learned
+                persistence parameter; their checkpoint state keys are intentionally distinct.
 
         Raises:
             FactorError: rank or n_stores is not a positive integer, `init_phi` is outside
@@ -166,11 +165,6 @@ class SharedLatentFactor(nn.Module):
                 else math.atanh(float(init_phi) / MAX_PHI)
             )
             self.theta = nn.Parameter(torch.full((rank,), initial_theta))
-        else:
-            # Keep the historical state key so loading remains strict-compatible across dynamics.
-            # `phi` ignores this value in IID mode as well, so even an AR(1) theta loaded from an
-            # old checkpoint cannot silently reintroduce temporal dependence.
-            self.theta = nn.Parameter(torch.zeros(rank), requires_grad=False)
         self.loading_occurrence = nn.Embedding(n_stores, rank)
         self.loading_size = nn.Embedding(n_stores, rank)
         # Small, not zero: identical loadings would make every store move identically and the
@@ -183,7 +177,7 @@ class SharedLatentFactor(nn.Module):
     def phi(self) -> Tensor:
         """Persistence strictly inside (-1, 1), or exact zero for configured IID dynamics."""
         if self.factor_dynamics == "iid":
-            return torch.zeros_like(self.theta)
+            return self.loading_occurrence.weight.new_zeros(self.rank)
         return MAX_PHI * torch.tanh(self.theta)
 
     @property
@@ -198,7 +192,7 @@ class SharedLatentFactor(nn.Module):
         determined. IID is the exact phi=0 boundary, where this scale is exactly 1.
         """
         if self.factor_dynamics == "iid":
-            return torch.ones_like(self.theta)
+            return self.loading_occurrence.weight.new_ones(self.rank)
         return torch.sqrt(1.0 - self.phi * self.phi)
 
     def draw(
@@ -236,14 +230,14 @@ class SharedLatentFactor(nn.Module):
                 f"n_groups={n_groups!r}, horizon={horizon!r}, n_draws={n_draws!r}: "
                 "all must be positive integers"
             )
-        device = self.theta.device
+        device = self.loading_occurrence.weight.device
         eps = torch.randn(
             n_draws,
             n_groups,
             horizon,
             self.rank,
             device=device,
-            dtype=self.theta.dtype,
+            dtype=self.loading_occurrence.weight.dtype,
             generator=generator,
         )
         if self.factor_dynamics == "iid":

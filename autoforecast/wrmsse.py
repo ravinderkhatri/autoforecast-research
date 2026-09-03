@@ -56,9 +56,9 @@ class Wrmsse:
             published result additionally requires the same evaluation labels and evidence role.
         per_level: Level name -> weighted RMSSE at that level.
         n_series_scored: Level name -> series included in the published formula.
-        n_series_dropped: Retained in the serialized record for backward compatibility. A valid
-            score always reports zero: dropping an undefined scale changes the population and is
-            not published WRMSSE.
+        n_series_dropped: Per-level evidence that the full scoring population was retained.
+            Every value must be zero. Selection checks this evidence because dropping an
+            undefined scale changes the population and is not published WRMSSE.
     """
 
     score: float

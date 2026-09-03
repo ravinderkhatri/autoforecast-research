@@ -872,7 +872,7 @@ def _full_stochastic_input_fingerprints(
         count_shape = [n_cells, horizon, 1]
         for draw in range(n_paths):
             innovations = torch.randn(
-                factor_shape, device=device, dtype=model.factor.theta.dtype,
+                factor_shape, device=device, dtype=model.factor.loading_occurrence.weight.dtype,
                 generator=factor_generator)
             _update_tensor_fingerprint(
                 factor_digest, f"factor_innovations_{draw:04d}", innovations)

@@ -50,6 +50,8 @@ def enable_autologging(plan: TrackingPlan) -> None:
     try:
         import mlflow
     except ImportError as error:  # pragma: no cover - optional boundary
-        raise RuntimeError("MLflow tracking requires: uv sync --extra mlflow-tracking") from error
+        raise RuntimeError(
+            "MLflow tracking requires the standard AutoForecast installation with dependencies"
+        ) from error
     flavor = getattr(mlflow, "pytorch" if plan.flavor == "lightning" else plan.flavor)
     flavor.autolog(log_models=plan.log_models)

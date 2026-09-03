@@ -6046,17 +6046,16 @@ def fit_predict(
             ARCHITECTURE beats the comparators, and a capacity advantage would confound that.
         trunk_stages: Alternating group/time transformer stages. This is executable model
             topology, not an implicit code default, and is saved with the checkpoint. The
-            direct-API default preserves legacy checkpoints; governed runs receive their value
+            direct API uses this explicit default; governed runs receive their value
             from the typed model YAML.
         decoder_layers: Future decoder layers. This is executable model topology, not an
-            implicit code default, and is saved with the checkpoint. The direct-API default
-            preserves legacy checkpoints; governed runs receive their value from model YAML.
+            implicit code default, and is saved with the checkpoint. Governed runs receive their
+            value from model YAML.
         history_attention_layers: Attention-pooling blocks over demand-history time tokens.
         commercial_attention_layers: Attention-pooling blocks over price/discount/promo tokens.
         event_kernel_layers: Residual spline-basis refinements in the calendar-event kernel.
             This is not attention and runs on compact kernel weights before panel-sized event
-            features are formed.  The direct-API default preserves legacy checkpoints; governed
-            runs receive their value from model YAML.
+            features are formed. Governed runs receive their value from model YAML.
         n_draws: Factor draws per training step, for the IWAE bound. Ignored by the resolved
             rank-zero bottom-up model, whose marginal likelihood is exact and evaluated once.
         epochs: Passes over the training cells.
@@ -8418,7 +8417,7 @@ def _checkpoint_final_price_ladder_controls(run: dict) -> dict[str, object]:
         stored["point_factor_method"] == "mc" and (type(draws) is not int or draws < 1)
     ):
         raise OursError("checkpoint price-ladder point-factor draw count is malformed")
-    if stored["rng_domain_scheme"] not in (RNG_DOMAIN_SCHEME, LEGACY_RNG_DOMAIN_SCHEME):
+    if stored["rng_domain_scheme"] != RNG_DOMAIN_SCHEME:
         raise OursError("checkpoint price-ladder RNG domain scheme is unsupported")
     return {
         "bumps": bumps,
@@ -8845,10 +8844,9 @@ def evaluate_price_ladder(
             f"the price ladder seed must be an integer for reproducible common-random-number "
             f"comparisons, got {seed!r}"
         )
-    if rng_domain_scheme not in (RNG_DOMAIN_SCHEME, LEGACY_RNG_DOMAIN_SCHEME):
+    if rng_domain_scheme != RNG_DOMAIN_SCHEME:
         raise OursError(
-            f"unknown RNG domain scheme {rng_domain_scheme!r}; expected "
-            f"{RNG_DOMAIN_SCHEME!r} or {LEGACY_RNG_DOMAIN_SCHEME!r}"
+            f"unknown RNG domain scheme {rng_domain_scheme!r}; expected {RNG_DOMAIN_SCHEME!r}"
         )
     if point_factor_method not in ("gauss_hermite", "mc"):
         raise OursError(
@@ -9374,18 +9372,8 @@ def _panel_role_mismatches(panel: Panel, stored: dict | None) -> list[str]:
 def _checkpoint_point_replay(
     run: dict,
     override_draws: int | None,
-    *,
-    factorless: bool = False,
 ) -> tuple[str, int | None, str]:
-    """Resolve only point-inference facts a checkpoint actually recorded.
-
-    Checkpoints written before 2026-08-25 record neither the point integration count nor the RNG
-    domain scheme. Their source default was 1,000/direct-seed MC, but a caller could override that
-    count and the artifact did not persist the override. Silently substituting today's 128-draw
-    default therefore changes the forecast while claiming to replay it. Refuse unless the caller
-    explicitly chooses a new MC count; that opt-in is a re-evaluation of the old weights, not a
-    claim that an unrecorded historical invocation was reconstructed.
-    """
+    """Validate the current checkpoint's integration contract before replay or re-evaluation."""
     if override_draws is not None and (
         isinstance(override_draws, bool)
         or not isinstance(override_draws, int)
@@ -9394,57 +9382,30 @@ def _checkpoint_point_replay(
         raise OursError(
             f"point_factor_draws must be a positive integer when supplied, got {override_draws!r}"
         )
-    method = run.get("point_factor_method")
-    if method is None:
-        if override_draws is None and not factorless:
-            raise OursError(
-                "this checkpoint predates point replay metadata and does not record its Monte "
-                "Carlo factor-draw count. Exact historical point replay cannot be inferred; pass "
-                "point_factor_draws explicitly to request a legacy-seeded MC re-evaluation, or "
-                "refit to produce a self-describing checkpoint"
-            )
-        method = "mc"
+    required = {"point_factor_method", "point_factor_draws", "rng_domain_scheme"}
+    missing = required.difference(run)
+    if missing:
+        raise OursError(
+            f"checkpoint lacks current point replay metadata {sorted(missing)}; refit before replay"
+        )
+    method = run["point_factor_method"]
     if method not in ("gauss_hermite", "mc"):
         raise OursError(f"checkpoint records unknown point_factor_method {method!r}")
-    if method == "gauss_hermite" and override_draws is not None:
-        raise OursError(
-            "point_factor_draws has no effect on a checkpoint whose point_factor_method is "
-            "gauss_hermite; refusing an argument whose result would be silently ignored"
-        )
-
-    draws = override_draws
-    if draws is None and method == "mc":
-        draws = run.get("point_factor_draws")
-        if draws is None and factorless:
-            # The old MC entry point already evaluated a factorless model exactly once; neither
-            # draw count nor seed can change that result, so there is no missing stochastic fact.
-            draws = 1
-        elif draws is None:
+    draws = run["point_factor_draws"]
+    if method == "gauss_hermite":
+        if draws is not None:
+            raise OursError("checkpoint gauss_hermite point_factor_draws must be null")
+        if override_draws is not None:
             raise OursError(
-                "checkpoint records MC point inference but no point_factor_draws; exact replay "
-                "cannot be inferred. Pass point_factor_draws explicitly or refit"
+                "point_factor_draws has no effect on a checkpoint whose point_factor_method is "
+                "gauss_hermite; refusing an argument whose result would be silently ignored"
             )
-    if draws is not None and (isinstance(draws, bool) or not isinstance(draws, int) or draws < 1):
+    elif isinstance(draws, bool) or not isinstance(draws, int) or draws < 1:
         raise OursError(f"checkpoint point_factor_draws must be a positive integer, got {draws!r}")
-    scheme = run.get("rng_domain_scheme")
-    if scheme is None:
-        # A transitional checkpoint may record method/count but predate the RNG-map field.  The
-        # implementation at that time drew one batched ``factor.draw(S)``; the current canonical
-        # route draws S trajectories separately so ``chunk`` cannot change them.  Direct seed +
-        # count is therefore still insufficient for exact replay.  An explicit override opts in
-        # to a newly evaluated legacy-seeded result; factorless and GH routes have no missing
-        # stochastic mapping.
-        if method == "mc" and not factorless and override_draws is None:
-            raise OursError(
-                "this checkpoint records an MC point count but not the RNG trajectory-mapping "
-                "scheme. Exact historical point replay cannot be inferred; pass "
-                "point_factor_draws explicitly to request a legacy-seeded re-evaluation, or "
-                "refit to produce a self-describing checkpoint"
-            )
-        scheme = LEGACY_RNG_DOMAIN_SCHEME
-    # Validate the recorded scheme now rather than after feature assembly.
+    scheme = run["rng_domain_scheme"]
+    # Validate the stored contract even when the caller requests a different MC draw count.
     _domain_seed(0, "factor", scheme)
-    return method, draws, scheme
+    return method, override_draws if override_draws is not None else draws, scheme
 
 
 def _paths_overlap(left: pathlib.Path, right: pathlib.Path) -> bool:
@@ -11538,7 +11499,7 @@ def _predict_from_checkpoint_snapshot(
             "checkpoint serving rather than treating an untrained row as a cold-start estimate"
         )
     point_method, replay_point_draws, point_rng_scheme = _checkpoint_point_replay(
-        run, point_factor_draws, factorless=model.factor is None
+        run, point_factor_draws
     )
     vocab = run.get("vocabularies")
     if vocab is None:
@@ -11903,10 +11864,8 @@ def _predict_from_checkpoint_snapshot(
         path_request = path_count, path_factor_draws, min(sample, n)
 
     # THE CHECKPOINT'S OWN METHOD, count and RNG domain -- never this process's defaults. A fit
-    # that recorded deterministic quadrature must not be re-served by seeded Monte Carlo. Older
-    # checkpoints did use MC, but did not record whether their 1,000-draw default was overridden;
-    # `_checkpoint_point_replay` refuses that missing evidence unless the caller opts into a new
-    # explicitly counted re-evaluation.
+    # that recorded deterministic quadrature must not be re-served by seeded Monte Carlo.
+    # `_checkpoint_point_replay` rejects missing or unsupported inference metadata.
     yhat = _checkpoint_point_forecast(
         model,
         inputs,
@@ -11946,7 +11905,7 @@ def _predict_from_checkpoint_snapshot(
             path_series_ids = [series_ids[i] for i in keep]
             index = torch.tensor(keep, dtype=torch.long)
             path_inputs = _subset(inputs, index)
-            path_rng_scheme = run.get("rng_domain_scheme", LEGACY_RNG_DOMAIN_SCHEME)
+            path_rng_scheme = point_rng_scheme
             paths = draw_paths_over_factor(
                 model,
                 path_inputs,
@@ -13392,7 +13351,7 @@ def _finalize_oov_parameters(
                 )
             evidence_index = torch.tensor(rows["store"], dtype=torch.long)
             absent_index = torch.tensor(
-                missing("store"), dtype=torch.long, device=model.factor.theta.device
+                missing("store"), dtype=torch.long, device=model.factor.loading_occurrence.weight.device
             )
             for table in (model.factor.loading_occurrence, model.factor.loading_size):
                 # Compute on CPU in sorted-row order so the stored value can be independently
@@ -14792,31 +14751,23 @@ the POINT ESTIMATE -- a point estimand that changes because a caller wanted more
 
 
 RNG_DOMAIN_SCHEME = "sha256-domain-v1"
-LEGACY_RNG_DOMAIN_SCHEME = "shared-seed-v0"
-"""Versioned separation between systemic-factor and idiosyncratic-count random streams.
+"""Separation between systemic-factor and idiosyncratic-count random streams.
 
 Using the same integer to initialise both generators does not make the streams independent: they
 are deterministic transforms of the same underlying sequence. A reproduced rank-one model showed
-a -0.346 correlation and moved the occurrence rate by 0.027. New forecasts derive disjoint seeds
-for the `factor` and `count` domains. Checkpoints record the scheme. A pre-scheme factor-bearing
-MC checkpoint can replay only when its historical draw mapping is also recorded; transitional
-checkpoints without that fact refuse an exact-replay claim unless a caller explicitly requests a
-fresh draw count. Rank-zero checkpoints have no factor draw mapping to recover and retain their
-legacy count stream.
+a -0.346 correlation and moved the occurrence rate by 0.027. Forecasts derive disjoint seeds for
+`factor` and `count`. Checkpoint replay requires this explicitly recorded scheme.
 """
 
 
 def _domain_seed(seed: int | None, domain: str, scheme: str = RNG_DOMAIN_SCHEME) -> int | None:
-    """Derive a stable Torch seed for one stochastic domain, or replay the legacy shared seed."""
-    if seed is None:
-        return None
-    if scheme == LEGACY_RNG_DOMAIN_SCHEME:
-        return seed
+    """Derive a stable Torch seed for one stochastic domain under the current scheme."""
     if scheme != RNG_DOMAIN_SCHEME:
         raise OursError(
-            f"unknown RNG domain scheme {scheme!r}; expected {RNG_DOMAIN_SCHEME!r} or "
-            f"{LEGACY_RNG_DOMAIN_SCHEME!r}"
+            f"unknown RNG domain scheme {scheme!r}; expected {RNG_DOMAIN_SCHEME!r}"
         )
+    if seed is None:
+        return None
     digest = hashlib.sha256(f"{scheme}\0{seed}\0{domain}".encode()).digest()
     return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
 
@@ -14850,7 +14801,6 @@ def mean_over_factor(
     inputs: dict | None,
     *,
     factor_draws: int | None = None,
-    n_paths: int = 1000,
     chunk: int = 25,
     seed: int | None = None,
     rng_domain_scheme: str = RNG_DOMAIN_SCHEME,
@@ -14880,15 +14830,12 @@ def mean_over_factor(
         factor_draws: Realisations to average over, or None for `POINT_FACTOR_DRAWS`. It is
             deliberately NOT derived from `n_paths`: a point estimand must not move because a
             caller asked for a bigger path artifact.
-        n_paths: Accepted and ignored, kept so existing callers do not break. It used to set the
-            default draw count, which is exactly the coupling this signature removed.
         chunk: Factor realisations per head pass. Several at once is much faster than one at a time
             and costs `chunk x cells x horizon` floats, which is small without the support table
             that sampling needs. It changes batching only, never which seeded factor paths are
             drawn or their accumulation order.
-        rng_domain_scheme: Versioned factor-seed derivation. New forecasts use independent
-            factor/count domains. Checkpoint replay supplies the scheme recorded by that artifact;
-            a pre-scheme checkpoint uses the legacy direct seed.
+        rng_domain_scheme: Current independent factor/count seed mapping. Checkpoint replay
+            supplies and validates the scheme recorded by that artifact.
 
     Returns:
         `[n_cells, horizon]` expected demand.
@@ -14905,7 +14852,7 @@ def mean_over_factor(
         # There is nothing to Monte Carlo-integrate.  Calling the same deterministic marginal
         # head `factor_draws` times is both misleading and, at the advertised 1,000 draws,
         # needlessly expensive.  Keep this entry point shared with factor models but evaluate it
-        # once.  An explicitly supplied factor_draws remains a harmless compatibility option.
+        # once. The shared entry point accepts the integration budget for either model kind.
         with (
             _seeded_rng(model, _domain_seed(seed, "factor", rng_domain_scheme)),
             evaluating(model),
@@ -15827,8 +15774,8 @@ def draw_paths_over_factor(
             path. Supplying fewer is an explicit Monte Carlo approximation; the default preserves
             the advertised effective path count.
         seed: Reproducibility. A gate result that cannot be reproduced is not one.
-        rng_domain_scheme: Versioned derivation of independent factor/count streams. The legacy
-            value is accepted only so a checkpoint written before this fix can be replayed.
+        rng_domain_scheme: Current derivation of independent factor/count streams; checkpoint
+            replay requires this scheme to be explicitly recorded.
 
     Returns:
         `[n_paths, n_cells, horizon]` integer paths.

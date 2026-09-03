@@ -170,12 +170,8 @@ def test_manifest_binds_and_validates_missing_forecast_policy() -> None:
             raise AssertionError("manifest accepted an undefined or unbound fallback policy")
 
 
-def test_checked_in_legacy_manifest_keeps_its_pre_grid_hash() -> None:
-    """Historical schema vector, not a registration or permission to score retired labels.
-
-    The former construction read ignored gates/ state and failed in every clean clone. Keep
-    the exact legacy payload/hash here as inert test input; adding empty fields must not change it.
-    """
+def test_pre_grid_manifest_is_rejected_without_migrating_its_hash() -> None:
+    """Historical input stays intact and cannot substitute for a complete current manifest."""
     blob = {
         "manifest": {
             "name": "m5_phase2",
@@ -196,13 +192,39 @@ def test_checked_in_legacy_manifest_keeps_its_pre_grid_hash() -> None:
         },
         "hash": "88b9e55aed6fa5e21f1c722ccdbb10f51e5764e97fd8623d7b7a398f420cfd0f",
     }
-    raw = dict(blob["manifest"])
-    for field_name in ("origins", "scoring_grain", "clients", "acceptance_origins"):
-        raw[field_name] = tuple(raw.get(field_name, ()))
-    rebuilt = P.EvaluationManifest(**raw)
-    assert rebuilt.eligible_grid_hashes == {}
-    assert rebuilt.missing_forecast_policy == "error"
-    assert rebuilt.hash == blob["hash"]
+    _tmp()
+    P.REGISTRY.mkdir(parents=True)
+    path = P.REGISTRY / "manifest_m5_phase2.json"
+    original = json.dumps(blob)
+    path.write_text(original)
+    try:
+        P._manifest_with_hash(blob["hash"])
+    except RuntimeError as exc:
+        assert "every current manifest field" in str(exc), str(exc)
+    else:
+        raise AssertionError("a pre-grid manifest was reconstructed with current defaults")
+    assert path.read_text() == original
+
+
+def test_manifest_serializes_default_fields_and_refuses_their_omission() -> None:
+    _tmp()
+    manifest = P.EvaluationManifest(**MF)
+    path = manifest.save()
+    current = json.loads(path.read_text())
+    assert current["manifest"]["eligible_grid_hashes"] == {}
+    assert current["manifest"]["missing_forecast_policy"] == "error"
+    assert P._manifest_with_hash(manifest.hash) == manifest
+    for omitted in ("eligible_grid_hashes", "missing_forecast_policy", "campaign_of_date"):
+        record = dict(current["manifest"])
+        record.pop(omitted)
+        digest = P.content_hash(record)
+        path.write_text(json.dumps({"manifest": record, "hash": digest}))
+        try:
+            P._manifest_with_hash(digest)
+        except RuntimeError as exc:
+            assert "every current manifest field" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"manifest record filled omitted {omitted}")
 
 
 def test_manifest_rejects_no_origins():
@@ -324,16 +346,63 @@ def test_gate_numeric_contracts_refuse_unrepresentable_json_integers() -> None:
         raise AssertionError("an unrepresentable integer entered gate arithmetic")
 
 
-def test_new_extra_gate_cannot_save_only_a_threshold_without_a_measurement() -> None:
+def test_extra_gate_cannot_define_only_a_threshold_without_a_measurement() -> None:
     _tmp()
-    gate = P.RegisteredGate(**GATE, extra_criteria=(
-        P.ExtraCriterion("coverage_gap", 0.05, "lower_is_better"),))
     try:
-        gate.save()
+        P.RegisteredGate(**GATE, extra_criteria=(
+            P.ExtraCriterion("coverage_gap", 0.05, "lower_is_better"),))
     except ValueError as exc:
         assert "measurement_contract" in str(exc)
         return
     raise AssertionError("registered an extra threshold whose measurement can still be changed")
+
+
+def test_gate_save_rechecks_a_measurement_mapping_mutated_after_construction() -> None:
+    _tmp()
+    contract = {"coverage_gap": {"lead_time_days": 5}}
+    gate = P.RegisteredGate(
+        **GATE, extra_criteria=(P.ExtraCriterion("coverage_gap", 0.05, "lower_is_better"),),
+        measurement_contract=contract)
+    contract.clear()
+    try:
+        gate.save()
+    except ValueError as exc:
+        assert "measurement_contract" in str(exc), str(exc)
+    else:
+        raise AssertionError("a gate saved an extra threshold after its measurement was removed")
+    assert not (P.REGISTRY / "phase2.json").exists()
+
+
+def test_gate_records_require_current_default_fields() -> None:
+    for extras in (False, True):
+        _tmp()
+        options = {} if not extras else {
+            "extra_criteria": (P.ExtraCriterion("coverage_gap", 0.05, "lower_is_better"),),
+            "measurement_contract": {"coverage_gap": {"lead_time_days": 5}},
+        }
+        gate = P.RegisteredGate(**GATE, **options)
+        path = gate.save()
+        current = json.loads(path.read_text())
+        assert current["gate"]["measurement_contract"] == gate.measurement_contract
+        assert P.RegisteredGate.load("phase2") == gate
+        for omitted in ("measurement_contract", "extra_criteria", "per_client_policy", "relation"):
+            record = dict(current["gate"])
+            record.pop(omitted)
+            payload = json.dumps({"gate": record, "hash": P.content_hash(record)})
+            path.write_text(payload)
+            try:
+                P.RegisteredGate.load("phase2")
+            except ValueError as exc:
+                assert "every current registered gate field" in str(exc), str(exc)
+            else:
+                raise AssertionError(f"gate record filled omitted {omitted}")
+            try:
+                gate.save()
+            except ValueError as exc:
+                assert "different threshold" in str(exc), str(exc)
+            else:
+                raise AssertionError("an old gate record was overwritten with a new identity")
+            assert path.read_text() == payload
 
 
 def test_measurement_contract_must_match_metrics_and_be_canonical_json() -> None:
@@ -404,6 +473,10 @@ def test_gate_result_integer_and_boolean_evidence_is_type_exact_on_reload() -> N
         ("scored_origins", ACC + ACC),
         ("scored_origins", dict.fromkeys(ACC)),
         ("extra_scores", [("unregistered_posthoc_metric", 999.0)]),
+        ("attempt_number", None),
+        ("attempt_number", True),
+        ("attempt_number", 1.0),
+        ("attempt_number", 0),
     )
     for field, alias in aliases:
         _tmp()
@@ -411,13 +484,11 @@ def test_gate_result_integer_and_boolean_evidence_is_type_exact_on_reload() -> N
         gate.save()
         manifest = P.EvaluationManifest(**MF)
         manifest.save()
-        values = dict(
-            phase="phase2", manifest_hash=manifest.hash, gate_hash=gate.hash, metric="MASE",
-            comparator_scores=_both(1.0), candidate_score=0.5, passed=True,
-            expected_cells=1000, scored_cells=1000, scored_origins=ACC,
-        )
+        result = _gate("phase2", manifest, "MASE", _both(1.0), 0.5)
+        path = result.save()
+        values = asdict(result)
         values[field] = alias
-        P.GateResult(**values).save()
+        path.write_text(json.dumps(values | {"hash": P.content_hash(values)}))
         try:
             P.require_passed("phase2", manifest.hash)
         except RuntimeError:
@@ -433,11 +504,10 @@ def test_require_passed_rechecks_measurement_evidence_not_only_the_gate_hash() -
         **GATE, extra_criteria=(criterion,), measurement_contract=contract)
     gate.save()
     m = P.EvaluationManifest(**MF); m.save()
-    P.GateResult(
-        phase="phase2", manifest_hash=m.hash, gate_hash=gate.hash, metric="MASE",
-        comparator_scores=_both(1.0), candidate_score=0.5, passed=True,
-        expected_cells=1000, scored_cells=1000, scored_origins=ACC,
-        extra_scores={"coverage_gap": 0.01},
+    result = _gate("phase2", m, "MASE", _both(1.0), 0.5,
+                   extra_scores={"coverage_gap": 0.01}, measurement_evidence=contract)
+    replace(
+        result,
         measurement_evidence={"coverage_gap": {"lead_time_days": 7, "n_paths": 1000}},
     ).save()
     try:
@@ -940,11 +1010,8 @@ def test_a_forged_pass_is_recomputed_and_rejected():
     _tmp()
     P.RegisteredGate(**GATE).save()
     m = P.EvaluationManifest(**MF); m.save()
-    P.GateResult(phase="phase2", manifest_hash=m.hash,
-                 gate_hash=P.RegisteredGate.load("phase2").hash,
-                 metric="MASE",
-                 comparator_scores=_both(1.0), candidate_score=99.0, passed=True,
-                 expected_cells=1000, scored_cells=1000, scored_origins=ACC).save()
+    result = _gate("phase2", m, "MASE", _both(1.0), 0.5)
+    replace(result, candidate_score=99.0).save()
     try:
         P.require_passed("phase2", m.hash)
     except RuntimeError as e:
@@ -958,10 +1025,8 @@ def test_require_passed_replays_grid_and_acceptance_structure() -> None:
     _tmp()
     P.RegisteredGate(**GATE).save()
     m = P.EvaluationManifest(**MF); m.save()
-    P.GateResult(phase="phase2", manifest_hash=m.hash,
-                 gate_hash=P.RegisteredGate.load("phase2").hash, metric="MASE",
-                 comparator_scores=_both(1.0), candidate_score=0.5, passed=True,
-                 expected_cells=0, scored_cells=0, scored_origins=()).save()
+    result = _gate("phase2", m, "MASE", _both(1.0), 0.5)
+    replace(result, expected_cells=0, scored_cells=0, scored_origins=()).save()
     try:
         P.require_passed("phase2", m.hash)
     except RuntimeError as exc:
@@ -1095,8 +1160,8 @@ def test_require_passed_rejects_a_result_from_a_different_registered_gate():
     _tmp()
     gate = P.RegisteredGate(**GATE); gate.save()
     m = P.EvaluationManifest(**MF); m.save()
-    P.GateResult(phase="phase2", manifest_hash=m.hash, gate_hash="0" * 64, metric="MASE",
-                 comparator_scores=_both(1.0), candidate_score=0.50, passed=True).save()
+    result = _gate("phase2", m, "MASE", _both(1.0), 0.5)
+    replace(result, gate_hash="0" * 64).save()
     try:
         P.require_passed("phase2", m.hash)
     except RuntimeError as e:
@@ -1122,18 +1187,13 @@ def test_result_saves_preserve_every_distinct_attempt():
 def test_equivalent_result_key_orders_share_one_canonical_immutable_generation():
     """The content hash ignores object-key order, so its immutable bytes must ignore it too."""
     _tmp()
-    shared = {
-        "phase": "phase2",
-        "manifest_hash": "a" * 64,
-        "gate_hash": "b" * 64,
-        "metric": "MASE",
-        "candidate_score": 0.8,
-        "passed": True,
-    }
-    first = P.GateResult(
-        **shared, comparator_scores={"repaired_incumbent": 1.0, "seasonal_naive": 1.1})
-    second = P.GateResult(
-        **shared, comparator_scores={"seasonal_naive": 1.1, "repaired_incumbent": 1.0})
+    P.RegisteredGate(**GATE).save()
+    manifest = P.EvaluationManifest(**MF)
+    manifest.save()
+    first = _gate(
+        "phase2", manifest, "MASE", {"repaired_incumbent": 1.0, "seasonal_naive": 1.1}, 0.8)
+    second = replace(
+        first, comparator_scores={"seasonal_naive": 1.1, "repaired_incumbent": 1.0})
 
     first_path = first.save()
     first_bytes = first_path.read_bytes()
@@ -1176,18 +1236,14 @@ def test_beats_and_gap_from_are_not_interchangeable():
 def test_hand_authored_scores_are_NOT_detectable_and_this_is_documented():
     """The limit of the mechanism, asserted so it cannot be forgotten.
 
-    A forged result whose scores are internally consistent recomputes as a genuine pass. Closing
-    this needs access control, not serialisation -- see the module docstring. The test exists so
-    that anyone who believes the gate is tamper-proof is corrected by the suite.
+    Caller-supplied scores whose values are internally consistent recompute as a genuine pass.
+    Closing this needs access control, not serialisation -- see the module docstring. Recording
+    an attempt does not establish that a score was measured.
     """
     _tmp()
     P.RegisteredGate(**GATE).save()
     m = P.EvaluationManifest(**MF); m.save()
-    P.GateResult(phase="phase2", manifest_hash=m.hash,
-                 gate_hash=P.RegisteredGate.load("phase2").hash,
-                 metric="MASE",
-                 comparator_scores=_both(1.0), candidate_score=0.0, passed=True,
-                 expected_cells=1000, scored_cells=1000, scored_origins=ACC).save()
+    _gate("phase2", m, "MASE", _both(1.0), 0.0).save()
     assert P.require_passed("phase2", m.hash).passed, \
         "documented limitation: unmeasured scores pass"
     assert "unverifiable" in P.__doc__
@@ -1380,10 +1436,11 @@ def test_attempt_ledger_rejects_every_schema_alias() -> None:
     invalid_records = (
         [],
         {"phase": "phase2", "manifest_hash": digest},
+        {"phase": "phase2", "manifest_hash": digest, "passed": False},
         {"phase": "phase2", "manifest_hash": digest, "passed": False, "extra": 1},
-        {"phase": "../phase2", "manifest_hash": digest, "passed": False},
-        {"phase": "phase2", "manifest_hash": "short", "passed": False},
-        {"phase": "phase2", "manifest_hash": digest, "passed": 0},
+        {"phase": "../phase2", "manifest_hash": digest, "passed": False, "attempt_number": 1},
+        {"phase": "phase2", "manifest_hash": "short", "passed": False, "attempt_number": 1},
+        {"phase": "phase2", "manifest_hash": digest, "passed": 0, "attempt_number": 1},
         {"phase": "phase2", "manifest_hash": digest, "passed": False,
          "attempt_number": True},
         {"phase": "phase2", "manifest_hash": digest, "passed": False,
@@ -1396,7 +1453,7 @@ def test_attempt_ledger_rejects_every_schema_alias() -> None:
             (json.dumps(record) + "\n").encode(), "gate-attempt ledger line 1")
 
 
-def test_attempt_ledger_rejects_number_gaps_and_legacy_records_after_upgrade() -> None:
+def test_attempt_ledger_rejects_number_gaps_and_unnumbered_records_anywhere() -> None:
     digest = "a" * 64
     numbered_two = json.dumps({
         "phase": "phase2", "manifest_hash": digest, "passed": False,
@@ -1408,16 +1465,18 @@ def test_attempt_ledger_rejects_number_gaps_and_legacy_records_after_upgrade() -
         "phase": "phase2", "manifest_hash": digest, "passed": False,
         "attempt_number": 1,
     }).encode() + b"\n"
-    later_legacy = json.dumps({
+    unnumbered = json.dumps({
         "phase": "phase2", "manifest_hash": "b" * 64, "passed": False,
     }).encode() + b"\n"
-    _assert_attempt_ledger_rejected(
-        numbered_one + later_legacy, "legacy schema after numbered attempts began")
+    for payload, line_number in ((unnumbered, 1), (unnumbered + numbered_one, 1),
+                                 (numbered_one + unnumbered, 2)):
+        _assert_attempt_ledger_rejected(payload, f"line {line_number} must be an object")
 
 
 def test_attempt_reader_validates_the_full_ledger_not_only_matching_records() -> None:
     valid = json.dumps({
         "phase": "phase2", "manifest_hash": "a" * 64, "passed": False,
+        "attempt_number": 1,
     }).encode()
     _assert_attempt_ledger_rejected(valid + b'\n{"unrelated":\n', "line 2")
 
@@ -1590,34 +1649,58 @@ def test_phase_canonical_order_spans_different_manifest_hashes() -> None:
     assert canonical["passed"] is False
 
 
-def test_legacy_attempts_upgrade_without_resetting_order_or_authority() -> None:
-    """The checked-in three-field ledger remains readable and consumes attempt number one."""
+def test_gate_results_require_a_current_numbered_attempt_and_exact_ledger_record() -> None:
     _tmp()
-    gate = P.RegisteredGate(**GATE)
-    gate.save()
+    values = {
+        "phase": "phase2", "manifest_hash": "a" * 64, "gate_hash": "b" * 64,
+        "metric": "MASE", "comparator_scores": _both(1.0), "candidate_score": 0.5,
+        "passed": True,
+    }
+    try:
+        P.GateResult(**values)
+    except TypeError as exc:
+        assert "attempt_number" in str(exc), str(exc)
+    else:
+        raise AssertionError("gate result omitted its current attempt identity")
+    for invalid in (None, True, 1.0, 0, -1):
+        try:
+            P.GateResult(**values, attempt_number=invalid)
+        except ValueError as exc:
+            assert "positive integer" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"gate result accepted invalid attempt number {invalid!r}")
+
+    try:
+        P.GateResult(**values, attempt_number=1).save()
+    except RuntimeError as exc:
+        assert "no exact durable ledger record" in str(exc), str(exc)
+    else:
+        raise AssertionError("an invented attempt number published without a durable ledger row")
+    assert not (P.RESULTS / "phase2.json").exists()
+
+
+def test_result_record_cannot_fill_missing_fields_from_constructor_defaults() -> None:
+    _tmp()
+    P.RegisteredGate(**GATE).save()
     manifest = P.EvaluationManifest(**MF)
     manifest.save()
-    P.RESULTS.mkdir(parents=True, exist_ok=True)
-    legacy_record = {
-        "phase": "phase2", "manifest_hash": manifest.hash, "passed": True,
-    }
-    (P.RESULTS / "attempts.jsonl").write_text(json.dumps(legacy_record) + "\n")
-    legacy_result = P.GateResult(
-        phase="phase2", manifest_hash=manifest.hash, gate_hash=gate.hash, metric="MASE",
-        comparator_scores=_both(1.0), candidate_score=0.50, passed=True,
-        expected_cells=1000, scored_cells=1000, scored_origins=ACC,
-    )
-    legacy_result.save()
-    assert P.require_passed("phase2", manifest.hash).passed
-
-    upgraded = _gate("phase2", manifest, "MASE", _both(1.0), 0.99)
-    assert upgraded.attempt_number == 2
-    try:
-        legacy_result.save()
-    except RuntimeError as exc:
-        assert "unnumbered" in str(exc), str(exc)
-    else:
-        raise AssertionError("an unnumbered legacy result overwrote a numbered attempt")
+    result = _gate("phase2", manifest, "MASE", _both(1.0), 0.5)
+    path = result.save()
+    for omitted in (
+        "attempt_number", "measurement_evidence", "scored_origins", "expected_cells",
+        "scored_cells", "per_client", "comparator_per_client", "extra_scores", "reasons", "notes",
+    ):
+        record = asdict(result)
+        record.pop(omitted)
+        payload = json.dumps(record | {"hash": P.content_hash(record)})
+        path.write_text(payload)
+        try:
+            P.require_passed("phase2", manifest.hash)
+        except RuntimeError as exc:
+            assert "every current gate result field" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"gate result silently filled omitted {omitted}")
+        assert path.read_text() == payload
 
 
 def test_failed_atomic_canonical_replace_cleans_temp_and_is_retryable() -> None:
@@ -1688,7 +1771,8 @@ def test_attempt_append_fsyncs_content_and_new_directory_entries() -> None:
 def test_check_extras_treats_a_missing_score_as_a_failure():
     """Otherwise Gate 4 passes by simply not measuring stability."""
     g = P.RegisteredGate(**{**GATE, "extra_criteria": (
-        P.ExtraCriterion("origin_drift_pct", 0.15, "lower_is_better"),)})
+        P.ExtraCriterion("origin_drift_pct", 0.15, "lower_is_better"),),
+        "measurement_contract": {"origin_drift_pct": {"origins": ["2026-07-01", "2026-08-01"]}}})
     ok, why = g.check_extras({})
     assert not ok and "not supplied" in " ".join(why)
     assert g.check_extras({"origin_drift_pct": 0.10})[0]
@@ -1786,8 +1870,8 @@ def test_multi_client_check_requires_names_not_only_a_count():
     g = P.RegisteredGate(**GATE)
     try:
         g.check_per_client({"a": 0.5, "b": 0.5}, {}, n_clients=2)
-    except ValueError as exc:
-        assert "exact manifest client names" in str(exc)
+    except TypeError as exc:
+        assert "n_clients" in str(exc)
         return
     raise AssertionError("a multi-client check without manifest client identities is not strict")
 
@@ -1796,7 +1880,7 @@ def test_check_per_client_is_vacuous_for_a_single_client():
     """With one client the pooled result IS that client; demanding a breakdown of one would fail
     every single-client phase, M5 included, for no benefit."""
     g = P.RegisteredGate(**GATE)
-    assert g.check_per_client({}, {}, n_clients=1)[0]
+    assert g.check_per_client({}, {}, clients=("m5",))[0]
     for candidate, comparators in (
         ({"ghost": 0.0}, {}),
         ({}, {"invented": {"ghost": 0.0}}),
@@ -1846,12 +1930,11 @@ def test_require_passed_recomputes_same_client_comparator_regressions():
     m.save()
     # The pooled primary score passes, but b loses to seasonal_naive on b. A hand-authored PASS
     # must be overturned using the comparator_per_client evidence stored in the result.
-    P.GateResult(
-        phase="phase2", manifest_hash=m.hash,
-        gate_hash=P.RegisteredGate.load("phase2").hash, metric="MASE",
-        comparator_scores=_both(1.0), candidate_score=0.5, passed=True,
-        expected_cells=1000, scored_cells=1000, scored_origins=ACC,
-        per_client={"a": 0.8, "b": 0.8},
+    result = _gate(
+        "phase2", m, "MASE", _both(1.0), 0.5, per_client={"a": 0.8, "b": 0.8},
+        comparator_per_client={name: {"a": 1.0, "b": 1.0} for name in GATE["comparators"]})
+    replace(
+        result,
         comparator_per_client={
             "repaired_incumbent": {"a": 1.0, "b": 1.0},
             "seasonal_naive": {"a": 1.0, "b": 0.5},

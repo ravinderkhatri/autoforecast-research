@@ -17,7 +17,7 @@ import pathlib
 import re
 import tempfile
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime
 from typing import Any, Literal
 
@@ -29,8 +29,7 @@ RESULTS = pathlib.Path(__file__).resolve().parent.parent / "gates" / "results"
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_LEGACY_ATTEMPT_FIELDS = frozenset({"phase", "manifest_hash", "passed"})
-_ATTEMPT_FIELDS = frozenset({*_LEGACY_ATTEMPT_FIELDS, "attempt_number"})
+_ATTEMPT_FIELDS = frozenset({"phase", "manifest_hash", "passed", "attempt_number"})
 
 
 def _fsync_directory(path: pathlib.Path) -> None:
@@ -250,9 +249,8 @@ class EvaluationManifest:
 
     ``eligible_rule`` describes an intended derivation; it does not identify the cells that were
     actually materialised. A governed comparison populates this for every origin so the manifest
-    hash changes if even one ``series_id · date`` key changes. Empty remains valid for legacy and
-    explicitly exploratory manifests and is omitted from their serialisation, preserving the
-    hashes of already-registered artifacts.
+    hash changes if even one ``series_id · date`` key changes. Empty remains valid for explicitly
+    exploratory manifests and is recorded as such in their serialisation.
     """
 
     missing_forecast_policy: Literal["error", "zero"] = "error"
@@ -444,17 +442,8 @@ class EvaluationManifest:
         return content_hash(self._record())
 
     def _record(self) -> dict[str, Any]:
-        """Canonical manifest record, retaining hashes of pre-grid legacy artifacts."""
-        record = asdict(self)
-        if not self.eligible_grid_hashes:
-            # This field did not exist in registered manifests before grid byte binding. Including
-            # an empty default would rewrite their hash and make their acceptance set unreadable.
-            record.pop("eligible_grid_hashes")
-        if self.missing_forecast_policy == "error":
-            # Preserve the hash of manifests registered before a missing-forecast policy existed.
-            # Governed zero fallback is always serialised and therefore always changes the hash.
-            record.pop("missing_forecast_policy")
-        return record
+        """Canonical manifest record with every current protocol field bound to its hash."""
+        return asdict(self)
 
     def save(self, path: pathlib.Path | None = None) -> pathlib.Path:
         path = path or (REGISTRY / f"manifest_{self.name}.json")
@@ -550,8 +539,8 @@ class RegisteredGate:
     A threshold alone does not define a gate. Coverage changes with its nominal levels, cover
     period, path count, and cohort; stability changes with either origin. Before this field those
     choices lived only in a mutable runner/result file, so they could change without changing the
-    registered gate hash. Keys must exactly match ``extra_criteria``. Empty is retained only to
-    reconstruct legacy registrations; a new extra-criterion gate cannot be saved without it.
+    registered gate hash. Keys must exactly match ``extra_criteria``. Empty is valid only for a
+    gate without extra criteria.
     """
 
     per_client_policy: Literal["pooled_only", "no_client_regresses", "majority"] = \
@@ -589,26 +578,25 @@ class RegisteredGate:
             raise ValueError(f"a metric appears twice in gate {self.phase!r}: {names}")
         if not isinstance(self.measurement_contract, dict):
             raise ValueError("measurement_contract must map extra metric names to definitions")
-        if self.measurement_contract:
-            expected = {c.metric for c in self.extra_criteria}
-            actual = set(self.measurement_contract)
-            if actual != expected:
+        expected = {c.metric for c in self.extra_criteria}
+        actual = set(self.measurement_contract)
+        if actual != expected:
+            raise ValueError(
+                "measurement_contract must contain exactly the extra criteria; "
+                f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}")
+        for metric, definition in self.measurement_contract.items():
+            if not isinstance(metric, str) or not metric.strip():
+                raise ValueError("measurement_contract keys must be non-blank metric names")
+            if not isinstance(definition, dict) or not definition:
                 raise ValueError(
-                    "measurement_contract must contain exactly the extra criteria; "
-                    f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}")
-            for metric, definition in self.measurement_contract.items():
-                if not isinstance(metric, str) or not metric.strip():
-                    raise ValueError("measurement_contract keys must be non-blank metric names")
-                if not isinstance(definition, dict) or not definition:
-                    raise ValueError(
-                        f"measurement_contract[{metric!r}] must be a non-empty definition")
-            try:
-                # Deliberately no ``default=str``: opaque objects and non-finite numbers do not
-                # form a reproducible cross-process protocol value.
-                _validate_canonical_json(self.measurement_contract)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "measurement_contract must contain only finite JSON values") from exc
+                    f"measurement_contract[{metric!r}] must be a non-empty definition")
+        try:
+            # Deliberately no ``default=str``: opaque objects and non-finite numbers do not
+            # form a reproducible cross-process protocol value.
+            _validate_canonical_json(self.measurement_contract)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "measurement_contract must contain only finite JSON values") from exc
         if self.per_client_policy not in ("pooled_only", "no_client_regresses", "majority"):
             raise ValueError(f"unsupported per_client_policy: {self.per_client_policy!r}")
         if not isinstance(self.rationale, str) or not self.rationale.strip():
@@ -620,15 +608,18 @@ class RegisteredGate:
         return content_hash(self._record())
 
     def _record(self) -> dict[str, Any]:
-        """Canonical gate record, retaining hashes of pre-contract registrations."""
-        record = asdict(self)
-        if not self.measurement_contract:
-            record.pop("measurement_contract")
-        return record
+        """Canonical gate record including the complete measurement definition."""
+        return asdict(self)
 
     def save(self) -> pathlib.Path:
         path = REGISTRY / f"{self.phase}.json"
         record = self._record()
+        # Nested measurement mappings remain caller-owned. Validate the detached snapshot that
+        # will be written, even when a mapping changed after construction.
+        type(self)(**{
+            **record,
+            "extra_criteria": tuple(ExtraCriterion(**value) for value in record["extra_criteria"]),
+        })
         digest = content_hash(record)
         payload = json.dumps({"gate": record, "hash": digest}, indent=1, allow_nan=False)
         with _attempt_ledger_lock():
@@ -637,17 +628,6 @@ class RegisteredGate:
                 existing = load_exact_json(path) if path.exists() else None
             except ExactJSONError as exc:
                 raise ValueError(f"registered gate {self.phase!r} is unreadable: {exc}") from exc
-            if self.extra_criteria and not self.measurement_contract:
-                # Existing artifacts predate measurement binding and must remain readable. They may
-                # be re-saved idempotently, but no NEW gate can repeat that omission.
-                is_matching_legacy = bool(
-                    existing and "measurement_contract" not in existing.get("gate", {})
-                    and existing.get("hash") == digest)
-                if not is_matching_legacy:
-                    raise ValueError(
-                        "a new gate with extra criteria must register a measurement_contract. A "
-                        "bound without the cohort, origins, levels, and algorithm that produce its "
-                        "score can be changed after registration without changing the gate")
             if existing is not None and existing.get("hash") != digest:
                 raise ValueError(
                     f"gate {self.phase} is already registered with a different threshold. "
@@ -668,11 +648,14 @@ class RegisteredGate:
             blob = load_exact_json(path)
         except ExactJSONError as exc:
             raise ValueError(f"registered gate {phase!r} is unreadable: {exc}") from exc
-        raw = dict(blob["gate"])
-        raw["comparators"] = tuple(raw.get("comparators", ()))
+        raw = blob["gate"]
+        if type(raw) is not dict or set(raw) != {item.name for item in fields(cls)}:
+            raise ValueError(f"{path.name} must contain every current registered gate field")
+        raw = dict(raw)
+        raw["comparators"] = tuple(raw["comparators"])
         # extras round-trip as dicts through JSON; rebuild them or `.evaluate()` will not exist
         raw["extra_criteria"] = tuple(ExtraCriterion(**c)
-                                      for c in raw.get("extra_criteria", ()))
+                                      for c in raw["extra_criteria"])
         gate = cls(**raw)
         if gate.hash != blob["hash"]:
             raise ValueError(f"{path.name} has been edited since registration: hash mismatch")
@@ -733,9 +716,8 @@ class RegisteredGate:
         self,
         per_client: dict[str, float],
         comparator_per_client: dict[str, dict[str, float]],
-        n_clients: int | None = None,
         *,
-        clients: tuple[str, ...] | None = None,
+        clients: tuple[str, ...],
     ) -> tuple[bool, str]:
         """Refuse a pooled win that is a loss for the clients hidden inside it.
 
@@ -745,9 +727,8 @@ class RegisteredGate:
         reference is therefore the strongest registered comparator for each client: the minimum
         for a lower-is-better metric and the maximum for a higher-is-better metric.
 
-        ``n_clients`` remains only for compatibility with direct single-client callers.  A
-        multi-client check needs ``clients`` so an omitted client cannot make a partial mapping
-        look complete.
+        Exact manifest ``clients`` are required so an omitted client cannot make a partial
+        mapping look complete.
         """
         if type(per_client) is not dict:
             raise ValueError("per_client must be a client-to-score mapping")
@@ -758,26 +739,10 @@ class RegisteredGate:
                 raise ValueError(
                     "pooled_only gates cannot carry unregistered per-client evidence")
             return True, "NOTE per-client behaviour explicitly NOT checked (pooled_only)"
-        if clients is None:
-            if n_clients is None or n_clients <= 1:
-                # Nothing can hide: the pooled result IS that client. Requiring a per-client
-                # breakdown of one client would fail every single-client phase, M5 included.
-                if per_client or comparator_per_client:
-                    raise ValueError(
-                        "single-client evidence needs the exact manifest client name or must be "
-                        "omitted")
-                return True, "PASS per-client: single-client manifest, pooled result is the client"
-            raise ValueError(
-                "multi-client checks require the exact manifest client names; a client count "
-                "cannot detect a partial per-client score mapping")
-
         expected_clients = tuple(clients)
         if (not expected_clients or len(set(expected_clients)) != len(expected_clients)
                 or any(not isinstance(v, str) or not v.strip() for v in expected_clients)):
             raise ValueError("manifest clients must be unique, non-blank strings")
-        if n_clients is not None and n_clients != len(expected_clients):
-            raise ValueError(
-                f"client count {n_clients} disagrees with {len(expected_clients)} client names")
         if len(expected_clients) <= 1:
             # Nothing can hide: the pooled result IS that client. Requiring a per-client breakdown
             # of one client would fail every single-client phase, M5 included, for no benefit.
@@ -852,6 +817,8 @@ class GateResult:
     comparator_scores: dict[str, float]
     candidate_score: float
     passed: bool                             # a CACHED opinion; require_passed recomputes it
+    attempt_number: int
+    """One-based manifest attempt identity assigned by the durable ledger before construction."""
     expected_cells: int = 0
     scored_cells: int = 0
     """O7: a result carried a score and no proof the grid it scored was COMPLETE. A run that
@@ -874,23 +841,16 @@ class GateResult:
     This intentionally equals, rather than paraphrases, ``RegisteredGate.measurement_contract``.
     The gate hash says what was registered; this field wires the result to that definition so a
     runner cannot calculate the right-named score with different origins, cohort, or path count.
-    Empty preserves compatibility for gates with no registered measurement contract.
+    Empty is the exact evidence for a current gate without extra criteria.
     """
-    attempt_number: int | None = None
-    """One-based manifest attempt identity assigned by the durable ledger.
 
-    ``None`` is retained only for artifacts written before ordered attempts existed and for the
-    documented direct-authoring limitation. Once a phase has a numbered attempt, an unnumbered or
-    older result may be retained in immutable history but cannot replace its canonical result.
-    """
+    def __post_init__(self) -> None:
+        if type(self.attempt_number) is not int or self.attempt_number < 1:
+            raise ValueError("gate result attempt_number must be a positive integer")
 
     def save(self) -> pathlib.Path:
         _validate_name(self.phase, "phase")
         body = asdict(self)
-        if self.attempt_number is None:
-            # Preserve the byte/hash contract of pre-numbering artifacts. The authority check below
-            # permits this shape only while no numbered attempt exists for the phase.
-            body.pop("attempt_number")
         digest = content_hash(body)
         # The digest is key-order independent, so its immutable filename must have one equally
         # canonical byte representation. Otherwise two equivalent comparator mappings could share
@@ -1046,11 +1006,10 @@ def attempts_against(manifest_hash: str) -> list[dict]:
 
 def _validate_attempt_record(record: object, line_number: int) -> dict[str, object]:
     """Validate one append-only attempt without accepting JSON shape or scalar aliases."""
-    if (type(record) is not dict
-            or record.keys() not in (_LEGACY_ATTEMPT_FIELDS, _ATTEMPT_FIELDS)):
+    if type(record) is not dict or record.keys() != _ATTEMPT_FIELDS:
         raise RuntimeError(
-            f"gate-attempt ledger line {line_number} must be an object with exactly either "
-            f"{sorted(_LEGACY_ATTEMPT_FIELDS)} or {sorted(_ATTEMPT_FIELDS)}")
+            f"gate-attempt ledger line {line_number} must be an object with exactly "
+            f"{sorted(_ATTEMPT_FIELDS)}")
     phase = record["phase"]
     manifest_hash = record["manifest_hash"]
     passed = record["passed"]
@@ -1063,8 +1022,7 @@ def _validate_attempt_record(record: object, line_number: int) -> dict[str, obje
     if type(passed) is not bool:
         raise RuntimeError(
             f"gate-attempt ledger line {line_number} has a non-boolean passed field")
-    if "attempt_number" in record and (
-            type(record["attempt_number"]) is not int or record["attempt_number"] < 1):
+    if type(record["attempt_number"]) is not int or record["attempt_number"] < 1:
         raise RuntimeError(
             f"gate-attempt ledger line {line_number} has an invalid attempt number")
     return record
@@ -1086,7 +1044,6 @@ def _read_attempt_ledger_unlocked() -> list[dict[str, object]]:
             "gate-attempt ledger has a truncated final line (missing newline terminator)")
     records: list[dict[str, object]] = []
     counts: dict[str, int] = {}
-    numbered_records_seen = False
     for line_number, line in enumerate(payload.splitlines(), start=1):
         if not line:
             raise RuntimeError(
@@ -1099,17 +1056,11 @@ def _read_attempt_ledger_unlocked() -> list[dict[str, object]]:
         record = _validate_attempt_record(decoded, line_number)
         manifest_hash = record["manifest_hash"]
         counts[manifest_hash] = counts.get(manifest_hash, 0) + 1
-        if "attempt_number" in record:
-            numbered_records_seen = True
-            if record["attempt_number"] != counts[manifest_hash]:
-                raise RuntimeError(
-                    f"gate-attempt ledger line {line_number} has attempt number "
-                    f"{record['attempt_number']}, expected {counts[manifest_hash]} for its "
-                    "manifest")
-        elif numbered_records_seen:
+        if record["attempt_number"] != counts[manifest_hash]:
             raise RuntimeError(
-                f"gate-attempt ledger line {line_number} uses the legacy schema after numbered "
-                "attempts began; its publication order is ambiguous")
+                f"gate-attempt ledger line {line_number} has attempt number "
+                f"{record['attempt_number']}, expected {counts[manifest_hash]} for its "
+                "manifest")
         records.append(record)
     return records
 
@@ -1118,25 +1069,10 @@ def _attempt_publication_is_latest_unlocked(result: GateResult) -> bool:
     """Validate one result's ledger identity and report whether it owns the phase canonical."""
     records = _read_attempt_ledger_unlocked()
     phase_records = [record for record in records if record["phase"] == result.phase]
-    numbered_phase_records = [
-        record for record in phase_records if "attempt_number" in record]
-    if result.attempt_number is None:
-        if numbered_phase_records:
-            raise RuntimeError(
-                f"unnumbered gate result for phase {result.phase!r} cannot publish after numbered "
-                "attempts exist")
-        if phase_records:
-            latest_legacy = phase_records[-1]
-            if (latest_legacy["manifest_hash"] != result.manifest_hash
-                    or latest_legacy["passed"] is not result.passed):
-                raise RuntimeError(
-                    f"unnumbered gate result for phase {result.phase!r} disagrees with the latest "
-                    "legacy ledger verdict")
-        return True
     if type(result.attempt_number) is not int or result.attempt_number < 1:
-        raise RuntimeError("gate result attempt_number must be a positive integer or null")
+        raise RuntimeError("gate result attempt_number must be a positive integer")
     matching = [
-        record for record in numbered_phase_records
+        record for record in phase_records
         if record["manifest_hash"] == result.manifest_hash
         and record["attempt_number"] == result.attempt_number
     ]
@@ -1146,7 +1082,7 @@ def _attempt_publication_is_latest_unlocked(result: GateResult) -> bool:
             "durable ledger record")
     latest = phase_records[-1]
     return (
-        latest.get("attempt_number") == result.attempt_number
+        latest["attempt_number"] == result.attempt_number
         and latest["manifest_hash"] == result.manifest_hash
     )
 
@@ -1217,22 +1153,23 @@ def _require_passed_unlocked(phase: str, manifest_hash: str) -> GateResult:
     stored = blob.pop("hash", None)
     if content_hash(blob) != stored:
         raise RuntimeError(f"gate result for {phase!r} has been edited since it was written")
-    raw_scored_origins = blob.get("scored_origins", [])
+    if set(blob) != {item.name for item in fields(GateResult)}:
+        raise RuntimeError(f"result for {phase!r} must contain every current gate result field")
+    raw_scored_origins = blob["scored_origins"]
     if type(raw_scored_origins) is not list:
         raise RuntimeError(f"result for {phase!r} has non-array scored origins")
-    if type(blob.get("extra_scores", {})) is not dict:
+    if type(blob["extra_scores"]) is not dict:
         raise RuntimeError(f"result for {phase!r} has non-object extra scores")
+    if type(blob["attempt_number"]) is not int or blob["attempt_number"] < 1:
+        raise RuntimeError(f"result for {phase!r} has an invalid attempt number")
     blob["scored_origins"] = tuple(raw_scored_origins)
-    blob["reasons"] = tuple(blob.get("reasons", ()))
+    blob["reasons"] = tuple(blob["reasons"])
     result = GateResult(**blob)
 
     if type(result.passed) is not bool:
         raise RuntimeError(f"result for {phase!r} has a non-boolean passed verdict")
     if type(result.expected_cells) is not int or type(result.scored_cells) is not int:
         raise RuntimeError(f"result for {phase!r} has non-integer grid counts")
-    if (result.attempt_number is not None
-            and (type(result.attempt_number) is not int or result.attempt_number < 1)):
-        raise RuntimeError(f"result for {phase!r} has an invalid attempt number")
     if not _attempt_publication_is_latest_unlocked(result):
         raise RuntimeError(
             f"result for {phase!r} is not the latest recorded gate attempt and cannot unlock the "
@@ -1318,11 +1255,14 @@ def _manifest_with_hash(wanted: str) -> EvaluationManifest:
             continue
         if record.get("hash") != wanted:
             continue
-        raw = dict(record.get("manifest", {}))
+        raw = record.get("manifest")
+        if type(raw) is not dict or set(raw) != {item.name for item in fields(EvaluationManifest)}:
+            raise RuntimeError(f"{path.name} must contain every current manifest field")
+        raw = dict(raw)
         if content_hash(raw) != wanted:
             raise RuntimeError(f"registered manifest {path.name} has been edited: hash mismatch")
         for field_name in ("origins", "scoring_grain", "clients", "acceptance_origins"):
-            raw[field_name] = tuple(raw.get(field_name, ()))
+            raw[field_name] = tuple(raw[field_name])
         manifest = EvaluationManifest(**raw)
         if manifest.hash != wanted:
             raise RuntimeError(f"registered manifest {path.name} does not reconstruct to its hash")

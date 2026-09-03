@@ -151,7 +151,9 @@ def _mlflow() -> Any:
     try:
         import mlflow
     except ImportError as exc:  # pragma: no cover - environment dependent
-        raise MLflowExportError("MLflow export requires: pip install '.[mlflow-tracking]'") from exc
+        raise MLflowExportError(
+            "MLflow export requires the standard AutoForecast installation with dependencies"
+        ) from exc
     return mlflow
 
 
@@ -567,7 +569,7 @@ def publish_model_from_completed_bundle(
     """Backfill a logged candidate model into the existing MLflow run for a completed bundle.
 
     This changes only the non-authoritative MLflow presentation.  The completed local Bundle and
-    its artifact manifest remain untouched, which permits safe migration of older runs.
+    its artifact manifest remain untouched. Only the current bundle format is accepted.
     """
     with _completed_bundle_snapshot(
         attempt_path, source_bundle_uri=None

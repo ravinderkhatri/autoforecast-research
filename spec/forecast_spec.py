@@ -5,7 +5,9 @@ The supported topology forecasts series bottom-up with a shared latent factor.
 Use the profiler to measure dataset properties before resolving model defaults."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -17,16 +19,7 @@ class Finding:
     def __str__(self) -> str:
         return f"NOTE: {self.message}" if self.severity == "note" else self.message
 
-    def __eq__(self, other) -> bool:          # so `x in errs` still works against plain strings
-        return str(self) == other if isinstance(other, str) else NotImplemented
 
-    def __hash__(self) -> int:
-        return hash(str(self))
-
-    def startswith(self, p: str) -> bool:     # keeps `e.startswith("NOTE:")` callers working
-        return str(self).startswith(p)
-from collections.abc import Sequence
-from typing import Literal
 
 # ======================================================================================
 # 1. THE OBSERVATION CONTRACT
@@ -819,8 +812,7 @@ class ForecastModelSpec:
         return "\n".join(L)
 
     def validate(self, data: ForecastDataSpec) -> list[Finding]:
-        """Returns typed Findings. `str(f)` renders as before, and `f.startswith("NOTE:")` still
-        works, so existing callers are unaffected; new callers filter on `.severity`."""
+        """Return typed findings; filter by severity and use str(finding) for display."""
         raw: list[str] = []
         errs = raw
         if self.d_model % self.heads:

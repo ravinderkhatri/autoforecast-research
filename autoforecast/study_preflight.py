@@ -90,7 +90,9 @@ def _source_key_error(frame: DataFrame, record: dict, series_col: str) -> str | 
     return None
 
 
-def preflight_study(study: Study, options: dict) -> PreflightResult:
+def preflight_study(
+    study: Study, options: dict, *, output_dir: str | pathlib.Path | None = None,
+) -> PreflightResult:
     """Validate every registered boundary before tuning or downstream fitting.
 
     Population: the original registered canonical IDs. Strict mode retains them;
@@ -98,8 +100,9 @@ def preflight_study(study: Study, options: dict) -> PreflightResult:
     original denominator alongside frozen eligibility and masks for each window.
     Test values are never scored here: only presence and structural validity matter.
     """
-    root = study._path.parent.parent.parent / "study-preflight"
-    if root.is_symlink():
+    root = (pathlib.Path(output_dir).absolute() if output_dir is not None else
+            study._path.parent.parent.parent / "study-preflight" / study.study_id)
+    if any(p.is_symlink() for p in (root, *root.parents)):
         raise BenchmarkError("preflight output root may not be a symlink")
     root.mkdir(parents=True, exist_ok=True)
     output = pathlib.Path(tempfile.mkdtemp(prefix="check-", dir=root)) / "report.json"

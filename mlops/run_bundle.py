@@ -25,6 +25,7 @@ from mlops._safe_files import (
     snapshot_tree_types,
 )
 from mlops.provenance import ProvenanceError
+from mlops.run_report import _discard_unsealed_guide, run_guide
 
 __all__ = ["RunBundle", "load_completed_run_bundle", "open_run_bundle"]
 
@@ -130,6 +131,8 @@ class RunBundle:
             raise ProvenanceError("bundle status must be completed or failed")
         if self._finalized:
             raise ProvenanceError("run bundle is already complete")
+        if (self.path / "RUN.md").exists():
+            raise ProvenanceError("RUN.md is reserved for the generated file guide")
         manifest_path = self.path / "artifact_manifest.json"
         completion_path = self.path / "completion.json"
         descendants = tuple(self.path.rglob("*"))
@@ -159,23 +162,37 @@ class RunBundle:
             "completed_at_utc": datetime.now(UTC).isoformat(),
             "summary": dict(summary),
         }
-        self.write_json(
-            "artifact_manifest.json",
-            {
-                "schema": "mlops.artifact-manifest.v2",
-                "artifacts": artifacts,
-                "terminal_payload_sha256": hashlib.sha256(
-                    _json_bytes(terminal_payload)
-                ).hexdigest(),
-            },
+        terminal_bytes = _json_bytes(terminal_payload)
+        guide_payload = run_guide(
+            identity={"run_id": self.run_id, "task": self.task}, status=status,
+            files=[*(item["path"] for item in artifacts),
+                   "RUN.md", "artifact_manifest.json", "completion.json"],
         )
-        self.write_json(
-            "completion.json",
-            {
-                **terminal_payload,
-                "artifact_manifest_sha256": _sha256(manifest_path),
-            },
-        )
+        guide = self.write_bytes("RUN.md", guide_payload)
+        try:
+            guide_digest, guide_size = _file_identity(guide)
+            artifacts.append({"path": "RUN.md", "sha256": guide_digest, "bytes": guide_size})
+            artifacts.sort(key=lambda item: item["path"])
+            self.write_json(
+                "artifact_manifest.json",
+                {
+                    "schema": "mlops.artifact-manifest.v2",
+                    "artifacts": artifacts,
+                    "terminal_payload_sha256": hashlib.sha256(
+                        terminal_bytes
+                    ).hexdigest(),
+                },
+            )
+            self.write_json(
+                "completion.json",
+                {
+                    **terminal_payload,
+                    "artifact_manifest_sha256": _sha256(manifest_path),
+                },
+            )
+        except Exception as error:
+            _discard_unsealed_guide(self.path, guide_payload, error)
+            raise
         self._finalized = True
         return completion_path
 

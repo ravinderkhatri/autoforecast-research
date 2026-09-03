@@ -579,3 +579,58 @@ def test_hpo_preserves_declared_multiple_winners_and_rejects_policy_edit(tmp_pat
     (root / "selection.json").write_text(json.dumps(selection))
     with pytest.raises(ExperimentError, match="top_k"):
         load_study_selection(root)
+
+
+@pytest.mark.parametrize("secondary", [None, "failure_record", "failure_finalize"])
+def test_manifest_failure_preserves_original_error_and_terminates_tracking(
+    tmp_path, monkeypatch, secondary,
+):
+    from autoforecast.experiments import LocalAttempt, load_completed_attempt
+
+    class Tracking:
+        run_id = "local-test-run"
+        experiment_id = "local-test-experiment"
+        log_epoch = None
+        failures = 0
+
+        def complete(self, _path):
+            pytest.fail("failed finalization must not mark tracking completed")
+
+        def fail(self):
+            self.failures += 1
+
+    live = Tracking()
+    monkeypatch.setattr(hpo_module, "start_training_tracking", lambda **_kwargs: live)
+    spec = dataclasses.replace(load_hpo_study(_write_study(tmp_path), project_root=tmp_path),
+                               max_trials=1)
+    original = LocalAttempt.write_json
+    failure = OSError("one-shot manifest publication failure")
+    injected = False
+
+    def publish(self, relative, value):
+        nonlocal injected
+        if relative == "artifact_manifest.json" and not injected:
+            injected = True
+            raise failure
+        if (secondary == "failure_record" and relative == "evaluation/failure.json") or (
+            secondary == "failure_finalize" and relative == "artifact_manifest.json"
+        ):
+            raise OSError("secondary failure retention error")
+        return original(self, relative, value)
+
+    monkeypatch.setattr(LocalAttempt, "write_json", publish)
+    with pytest.raises(OSError) as caught:
+        run_hpo_study(spec, tmp_path / "hpo", smoke_evaluator,
+                      mlflow_tracking_uri="stub://local")
+    assert injected and live.failures == 1
+    assert caught.value is failure
+    attempts = list((tmp_path / "hpo/studies/hpo-smoke").glob("trials/*/attempts/*"))
+    assert len(attempts) == 1
+    if secondary is None:
+        assert load_completed_attempt(attempts[0])[1]["status"] == "failed"
+        details = json.loads((attempts[0] / "evaluation/failure.json").read_text())
+        assert details["message"] == str(failure)
+        assert "Execution status: **failed**" in (attempts[0] / "RUN.md").read_text()
+    else:
+        assert not (attempts[0] / "completion.json").exists()
+        assert any("secondary failure retention error" in note for note in failure.__notes__)

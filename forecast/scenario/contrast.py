@@ -89,9 +89,9 @@ def _validate_window_request(
     custom_window: object,
 ) -> None:
     """Validate the selector and reject bounds that the selected integration would ignore."""
-    if window is not None and (type(window) is not str or window not in _WINDOWS):
+    if type(window) is not str or window not in _WINDOWS:
         raise ContrastError(
-            f"window must be None or exactly one of {sorted(_WINDOWS)}, got {window!r}")
+            f"window must be exactly one of {sorted(_WINDOWS)}, got {window!r}")
     if event_support is not None and window != "event_support":
         raise ContrastError(
             "event_support is only valid with window='event_support'; refusing ignored bounds")
@@ -236,10 +236,9 @@ class Contrast:
         planned_driver_range: Driver range evaluated by the scenario.
         horizon: Positive number of forecast days against which window bounds are interpreted.
         window_bounds: Exact 1-based inclusive horizon-day bounds integrated into the effect.
-        requested_window: The caller's selector. `None` records use of the compatibility default,
-            distinct from an explicit `"horizon"` selection even though both integrate all days.
+        requested_window: The explicit integration rule selected by the caller.
         requested_window_bounds: Exact bounds supplied for an event-support or custom request,
-            before horizon clipping. `None` for implicit or explicit full-horizon integration.
+            before horizon clipping. `None` for full-horizon integration.
         episode_validated: Whether a held-out whole-episode diagnostic established that this
             contrast procedure transfers across campaigns. Query rows labelled with campaign ids
             are not such a diagnostic and cannot make a model-derived association quotable.
@@ -262,10 +261,10 @@ class Contrast:
     planned_driver_range: tuple[float, float]
     horizon: int
     window_bounds: tuple[int, int]
+    requested_window: Literal["horizon", "event_support", "custom"]
     requested_window_bounds: tuple[int, int] | None = None
     episode_validated: bool = False
     window: Literal["horizon", "event_support", "custom"] = "horizon"
-    requested_window: Literal["horizon", "event_support", "custom"] | None = None
     notes: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -308,21 +307,16 @@ class Contrast:
             raise ContrastError(
                 "window_bounds must be exact 1-based inclusive built-in integer day bounds, "
                 f"within horizon={self.horizon}, got {self.window_bounds!r}")
-        if self.requested_window is None:
-            if self.window != "horizon":
-                raise ContrastError(
-                    "requested_window=None is the compatibility horizon default and cannot "
-                    f"resolve to window={self.window!r}")
-        elif (type(self.requested_window) is not str
+        if (type(self.requested_window) is not str
               or self.requested_window not in _WINDOWS
               or self.requested_window != self.window):
             raise ContrastError(
-                "requested_window must be None or exactly match the resolved window; got "
+                "requested_window must exactly match the resolved window; got "
                 f"{self.requested_window!r} and {self.window!r}")
-        if self.requested_window in (None, "horizon"):
+        if self.requested_window == "horizon":
             if self.requested_window_bounds is not None:
                 raise ContrastError(
-                    "requested_window_bounds must be None for implicit or explicit horizon")
+                    "requested_window_bounds must be None for horizon")
             expected_bounds = (1, self.horizon)
         elif self.requested_window == "custom":
             _validate_window_request("custom", None, self.requested_window_bounds)
@@ -400,7 +394,7 @@ class Contrast:
 
 
 def _apply_window(per_cell: torch.Tensor, *,
-                  window: Literal["horizon", "event_support", "custom"] | None, origin,
+                  window: Literal["horizon", "event_support", "custom"], origin,
                   campaign_start, event_support: tuple[int, int] | None,
                   custom_window: tuple[int, int] | None,
                   horizon: int,
@@ -412,22 +406,16 @@ def _apply_window(per_cell: torch.Tensor, *,
     promotion's spike and none of its payback beyond the edge.
     """
     if per_cell.dim() == 1:
-        if window in (None, "horizon"):
-            # Per-cell totals CAN only integrate the whole horizon; the recorded window field
-            # says so. The truncation caveat rides the notes only when the caller explicitly
-            # CHOSE horizon -- notes gate quotability, and an undeclared window on output that
-            # permits no other is a recorded fact, not a disqualification.
-            notes = [] if window is None else [
+        if window == "horizon":
+            notes = [
                 "attribution_window='horizon': truncated at the forecast edge BY CHOICE, "
                 "so a payback beyond it is never debited"]
             return per_cell, "horizon", (1, horizon), notes
         raise ContrastError(
             f"window={window!r} needs per-day model output [cells, horizon]; the model_fn "
             "returned per-cell totals, which cannot be integrated over a sub-window")
-    if window in (None, "horizon"):
-        note = ("no attribution window was declared; integrating every horizon day"
-                ) if window is None else (
-                "attribution_window='horizon': truncated at the forecast edge BY CHOICE, so a "
+    if window == "horizon":
+        note = ("attribution_window='horizon': truncated at the forecast edge BY CHOICE, so a "
                 "payback beyond it is never debited")
         return per_cell.sum(dim=1), "horizon", (1, horizon), [note]
     if window == "custom":
@@ -489,7 +477,7 @@ def contrast(
     seed: int = 0,
     alpha: float = 0.1,
     episode_validated: bool = False,
-    window: Literal["horizon", "event_support", "custom"] | None = None,
+    window: Literal["horizon", "event_support", "custom"],
     event_support: tuple[int, int] | None = None,
     custom_window: tuple[int, int] | None = None,
 ) -> Contrast:
@@ -519,8 +507,7 @@ def contrast(
             'event_support' integrates the fitted kernel's support around `campaign_start`
             (requires `event_support` and per-day model output); 'horizon' integrates every
             forecast day, truncated at the forecast edge BY CHOICE and noted as such; 'custom'
-            takes explicit day bounds. None -- the compatibility default -- behaves as 'horizon'
-            and says so in the notes, because a window nobody declared is not a window.
+            takes explicit day bounds. A selector is required; None is not supported.
         event_support: `(lower, upper)` signed-day support around the campaign start, e.g.
             `(-30, 30)`. Days beyond the horizon are clipped and the contrast is labelled GROSS:
             the payback outside the forecast is never debited.

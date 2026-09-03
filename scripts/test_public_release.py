@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import importlib.metadata
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 import zipfile
 
 import pytest
 from autoforecast.project import installed_library_identity
 
-from scripts.verify_public_release import tracked_inventory, verify_wheel
+from scripts.verify_public_release import README_IMAGES, ROOT_FILES, tracked_inventory, verify_wheel
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+APPROVED_README_IMAGES = {
+    "assets/autoforecast-overview.svg",
+    "assets/01-cross-validation.svg",
+    "assets/02-workflow-function.svg",
+    "assets/03-parallel-execution.svg",
+    "assets/04-run-outputs.svg",
+}
 
 
 def command(root, *args):
@@ -112,6 +121,74 @@ def test_public_inventory_accepts_the_approved_readme_diagram(clean_wheel, tmp_p
     names, _ = tracked_inventory(root)
 
     assert name in names
+
+
+def test_public_inventory_accepts_root_readme(clean_wheel, tmp_path):
+    original, _ = clean_wheel
+    root = tmp_path / "repo"
+    shutil.copytree(original, root)
+    (root / "README.md").write_text("# Public package\n")
+    command(root, "git", "add", "README.md")
+    names, _ = tracked_inventory(root)
+    assert "README.md" in names
+
+
+def test_readme_diagrams_are_present_valid_and_approved():
+    images = set(re.findall(r"!\[[^\]]*\]\(([^)]+)\)", (ROOT / "README.md").read_text()))
+    assert images == README_IMAGES == APPROVED_README_IMAGES
+    for name in images:
+        assert pathlib.PurePosixPath(name).suffix == ".svg"
+        assert ET.parse(ROOT / name).getroot().tag == "{http://www.w3.org/2000/svg}svg"
+
+
+@pytest.mark.parametrize("name", sorted(APPROVED_README_IMAGES))
+def test_public_inventory_accepts_only_approved_readme_diagrams(clean_wheel, tmp_path, name):
+    original, _ = clean_wheel
+    root = tmp_path / "repo"
+    shutil.copytree(original, root)
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+    command(root, "git", "add", name)
+    names, _ = tracked_inventory(root)
+    assert name in names
+    original_svg = path.read_text()
+    path.write_text("<svg>\nGenerated-" + "by: invalid marker\n</svg>\n")
+    with pytest.raises(ValueError, match="public file"):
+        tracked_inventory(root)
+    path.unlink()
+    target = root / "untracked-image-source.svg"
+    target.write_text(original_svg)
+    path.symlink_to(target)
+    command(root, "git", "add", name)
+    with pytest.raises(ValueError, match="public inventory"):
+        tracked_inventory(root)
+    path.unlink()
+    path.write_text(original_svg)
+    command(root, "git", "add", name)
+    sibling = path.with_name("unapproved-diagram.svg")
+    sibling.write_text(path.read_text())
+    command(root, "git", "add", str(sibling.relative_to(root)))
+    with pytest.raises(ValueError, match="public inventory"):
+        tracked_inventory(root)
+
+
+@pytest.mark.parametrize("name", sorted(
+    {name for name in ROOT_FILES | README_IMAGES
+     if name.lower().endswith(".md") and pathlib.Path(name).name.lower() != "readme.md"}
+    | {"plan.md", "notes.MD", "docs/plan.md"}
+))
+def test_public_inventory_rejects_every_non_readme_markdown(clean_wheel, tmp_path, name):
+    # Exercise any future allowlist exception as well as ordinary private notes.
+    original, _ = clean_wheel
+    root = tmp_path / "repo"
+    shutil.copytree(original, root)
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Local notes\n")
+    command(root, "git", "add", "-f", name)
+    with pytest.raises(ValueError, match="public inventory"):
+        tracked_inventory(root)
 
 
 @pytest.mark.parametrize(
@@ -281,3 +358,14 @@ def test_release_wheel_requires_each_declared_legal_file(legal_wheel, tmp_path):
     names, config = tracked_inventory(root)
     with pytest.raises(ValueError, match="declared license pattern has no tracked file"):
         verify_wheel(root, wheel, names, config)
+
+
+def test_standard_dependencies_have_no_compatibility_only_extras():
+    import tomllib
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    extras = project["optional-dependencies"]
+    assert set(extras) == {"all-models", "data", "custom-torch", "shallow", "tft",
+                           "autogluon-zoo", "timesfm", "timesfm3"}
+    core = {value.split("==")[0] for value in project["dependencies"]}
+    assert {"pyspark", "pyarrow", "statsforecast", "optuna", "ray[tune]", "mlflow-skinny"} <= core

@@ -237,8 +237,10 @@ def test_workflow_counts_and_saved_configuration_future_reuse(
         selection["origins"] = "all"
     cfg = profile(tmp_path, selection=selection, reporting={"metrics": ["mae", "rmse", "wrmsse"]})
     seen = []
+    purposes = []
 
     def fit(request):
+        purposes.append(request.purpose)
         history = pq.read_table(request.panel.path).to_pylist()
         assert max(row["at"] for row in history) == dt.date.fromisoformat(request.origin)
         seen.append(
@@ -260,6 +262,11 @@ def test_workflow_counts_and_saved_configuration_future_reuse(
             output_dir=tmp_path / "runs",
         )
     assert len(seen) == expected_calls
+    assert purposes == (
+        ["selection"] * 6 + ["validation", "refit"]
+        if selection_stage == "tuning"
+        else ["selection", "selection", "refit"]
+    )
     assert result.provenance["work_estimate"]["total_callback_fits"] == expected_calls
     assert result.status == "completed"
     assert result.provenance["study"]["path"] == str(complete.resolve())
@@ -1180,9 +1187,9 @@ def _reseal_attempt(attempt: pathlib.Path) -> str:
     return completion["artifact_manifest_sha256"]
 
 
-@pytest.mark.parametrize("wrong_score", [False, True])
-def test_legacy_v1_reload_rejects_score_objective_mismatch(complete, spark, tmp_path, wrong_score):
-    cfg_root = tmp_path / "legacy-config"
+@pytest.mark.parametrize("missing", ["windows", "winner-config.json", "preflight.json"])
+def test_tuning_reload_requires_current_evidence(complete, spark, tmp_path, missing):
+    cfg_root = tmp_path / "obsolete-config"
     cfg_root.mkdir()
     cfg = profile(cfg_root, selection={"stage": "validation"})
     with open_study(complete, spark) as study:
@@ -1190,7 +1197,7 @@ def test_legacy_v1_reload_rejects_score_objective_mismatch(complete, spark, tmp_
             fit_predict=predict,
             config=cfg,
             implementation=implementation(),
-            output_dir=tmp_path / "legacy-search",
+            output_dir=tmp_path / "obsolete-search",
         )
     selection_path = selected.path / "selection.json"
     selection = json.loads(selection_path.read_text())
@@ -1199,25 +1206,20 @@ def test_legacy_v1_reload_rejects_score_objective_mismatch(complete, spark, tmp_
     evidence_path = attempt / "evaluation/external-run.json"
     evidence = json.loads(evidence_path.read_text())
     assert evidence["schema"] == "autoforecast.external-trial.v1"
-    evidence.pop("windows")
-    evidence.pop("aggregation")
-    evidence_path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
-    score_path = attempt / "evaluation/score.json"
-    score = json.loads(score_path.read_text())
-    if wrong_score:
-        score[evidence["context"]["metric"]] = 999.0
-    score_path.write_text(json.dumps(score, indent=2, sort_keys=True) + "\n")
+    if missing == "windows":
+        evidence.pop("windows")
+        evidence.pop("aggregation")
+        evidence_path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+    else:
+        (attempt / "metadata" / missing).unlink()
     manifest_sha = _reseal_attempt(attempt)
     for group in (selection["candidates"], selection["selected"]):
         for item in group:
             if item["attempt_path"] == chosen["attempt_path"]:
                 item["artifact_manifest_sha256"] = manifest_sha
     selection_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
-    if wrong_score:
-        with pytest.raises(HPOError, match="score|objective|selection"):
-            load_tuning_result(selected.path)
-    else:
-        assert load_tuning_result(selected.path).tuning_score == selected.tuning_score
+    with pytest.raises(HPOError, match="current.*evidence"):
+        load_tuning_result(selected.path)
 
 
 def test_workflow_reload_binds_selected_settings_to_both_fits(complete, spark, tmp_path):
@@ -1244,12 +1246,19 @@ def test_workflow_reload_binds_selected_settings_to_both_fits(complete, spark, t
         "stage_result",
         "search_profile",
         "winner",
+        "task",
     ):
         root = tmp_path / field
         shutil.copytree(result.path, root)
         path = root / "result.json"
         record = json.loads(path.read_text())
-        if field == "options":
+        if field == "task":
+            for relative in ("completion.json", "metadata/run.json"):
+                task_path = root / relative
+                task_record = json.loads(task_path.read_text())
+                task_record["task"] = "forecast-validation"
+                task_path.write_text(json.dumps(task_record))
+        elif field == "options":
             record["provenance"]["options"]["minimum_history"] += 1
         elif field == "tuning_path":
             record[field] = "/wrong/search"
@@ -1275,6 +1284,8 @@ def test_workflow_reload_binds_selected_settings_to_both_fits(complete, spark, t
             record[field]["model.level"] = 999.0
         elif field in ("validation", "testing"):
             record[field]["parameter_sha256"] = "0" * 64
+            folder = "test" if field == "testing" else "validation"
+            (root / folder / "result.json").write_text(json.dumps(record[field]))
         elif field == "source":
             record["provenance"]["configuration_source"]["trial_id"] = "wrong-trial"
         elif field == "implementation":
@@ -1283,9 +1294,9 @@ def test_workflow_reload_binds_selected_settings_to_both_fits(complete, spark, t
             record["provenance"][field] += 1
         path.write_text(json.dumps(record))
         _reseal_attempt(root)
-        with pytest.raises(HPOError, match="configuration"):
+        with pytest.raises(HPOError, match="configuration|schema|unsupported forecast workflow result"):
             load_forecast_workflow(root)
-        with pytest.raises(HPOError, match="configuration"):
+        with pytest.raises(HPOError, match="configuration|schema"):
             load_selected_configuration(root / "metadata/winner-config.json")
 
 
@@ -1562,3 +1573,503 @@ def test_collected_integrity_issues_mark_affected_role_blocked(spark, tmp_path):
     assert any(issue["stage"] == role for issue in report["issues"])
     assert report["roles"][role]["status"] == "blocked"
     assert report["roles"][report["current_check"]["stage"]]["status"] == "blocked"
+
+
+def test_fixed_workflow_has_no_optimizer_and_reuses_saved_settings(complete, spark, tmp_path, monkeypatch):
+    import autoforecast.study_workflow as workflow
+
+    cfg = profile(tmp_path, selection={"metric": "rmse"}, reporting={"metrics": ["mae"]})
+    value = yaml.safe_load(cfg.read_text())
+    value.pop("hpo")
+    cfg.write_text(yaml.safe_dump(value))
+    calls = []
+
+    def fit(request):
+        calls.append((request.purpose, request.origin, request.seed, request.model_parameters))
+        return predict(request)
+
+    def unexpected_search(*args, **kwargs):
+        pytest.fail("fixed configuration must not invoke an optimizer")
+
+    monkeypatch.setattr(workflow, "tune_study", unexpected_search)
+    with open_study(complete, spark) as study:
+        result = study.run_forecast_workflow(
+            fit_predict=fit, config=cfg, implementation=implementation(),
+            fixed_parameters={"model.level": 4.0}, output_dir=tmp_path / "fixed",
+        )
+        assert calls == [
+            ("validation", "2024-01-07", 42, {"level": 4.0}),
+            ("refit", "2024-01-09", 42, {"level": 4.0}),
+        ]
+        assert result.tuning_path is None
+        assert result.provenance["mode"] == "fixed_configuration"
+        assert result.provenance["work_estimate"]["trial_callback_fits"] == 0
+        assert result.provenance["options"]["metric"] == "rmse"
+        assert result.provenance["options"]["metrics"] == ["mae", "rmse"]
+        assert load_selected_configuration(result.selected_config)["source"]["kind"] == "fixed"
+        reused = study.run_forecast_workflow(
+            fit_predict=fit, implementation=implementation(), selected_config=result.selected_config,
+            config=cfg,
+            output_dir=tmp_path / "reused-fixed",
+        )
+        assert reused.parameters == result.parameters
+        assert len(calls) == 4
+
+        assert reused.provenance["mode"] == "saved_configuration"
+        assert reused.provenance["options"]["metric"] == "rmse"
+        assert reused.provenance["options"]["metrics"] == ["mae", "rmse"]
+        with pytest.raises(ValueError, match="fixed_parameters requires"):
+            study.run_forecast_workflow(
+                fit_predict=fit, implementation=implementation(), config=cfg,
+                fixed_parameters={}, selected_config=result.selected_config,
+            )
+        with pytest.raises(ValueError, match="undeclared"):
+            study.run_forecast_workflow(
+                fit_predict=fit, implementation=implementation(), config=cfg,
+                fixed_parameters={"model.nonexistent": 1},
+            )
+        assert len(calls) == 4
+
+    # Keep all duplicate metadata consistent so only the fixed-source binding can reject this.
+    root = tmp_path / "tampered" / result.path.name
+    shutil.copytree(result.path, root)
+    winner = json.loads((root / "metadata/winner-config.json").read_text())
+    winner["source"]["workflow_id"] = "different-workflow"
+    record = json.loads((root / "result.json").read_text())
+    record["provenance"]["configuration_source"] = winner["source"]
+    (root / "result.json").write_text(json.dumps(record))
+    (root / "metadata/winner-config.json").write_text(json.dumps(winner))
+    (root / "metadata/provenance.json").write_text(json.dumps(record["provenance"]))
+    _reseal_attempt(root)
+    with pytest.raises(HPOError, match="fixed configuration"):
+        load_forecast_workflow(root)
+
+
+@pytest.mark.parametrize("policy", ["use_available", "exclude_unavailable"])
+@pytest.mark.parametrize("fixed", [False, True])
+def test_checkpoint_resume_rechecks_same_effective_study(spark, tmp_path, policy, fixed):
+    # Exactly A/B; B begins on day 7 and lacks three days at validation.
+    manifest = register(tmp_path / "study", spark, start_b=7, count=1)
+    cfg = _one_trial(profile(
+        tmp_path, series_policy=policy, minimum_history=3,
+        selection={"origins": "all", "metric": "rmse"},
+    ))
+    calls = []
+
+    def fit(request):
+        calls.append(request.purpose)
+        return predict(request)
+
+    with open_study(manifest, spark) as study:
+        checkpoint = study.run_forecast_workflow(
+            fit_predict=fit, implementation=implementation(), config=cfg,
+            fixed_parameters={} if fixed else None, validation_only=True,
+            output_dir=tmp_path / "validation",
+        )
+        expected = ["validation"] if fixed else ["selection", "validation"]
+        assert calls == expected and checkpoint.testing is None
+        assert checkpoint.provenance["study"]["sha256"] != study._sha256
+        completed = study.run_forecast_workflow(
+            fit_predict=fit, implementation=implementation(), validation_run=checkpoint.path,
+            output_dir=tmp_path / "completed",
+        )
+        assert calls == [*expected, "refit"]
+        assert completed.testing is not None
+        assert completed.provenance["study"] == checkpoint.provenance["study"]
+        assert completed.provenance["options"] == checkpoint.provenance["options"]
+        assert completed.validation["score"]["rmse"] == checkpoint.validation["score"]["rmse"]
+    other = register(tmp_path / "other-study", spark, start_b=7, count=1, scale_b=2.0)
+    with open_study(other, spark) as study, pytest.raises(HPOError, match="exact study"):
+        study.run_forecast_workflow(
+            fit_predict=lambda _: pytest.fail("different study must not fit"),
+            implementation=implementation(), validation_run=checkpoint.path,
+            output_dir=tmp_path / "rejected",
+        )
+
+
+def test_validation_checkpoint_refits_only_after_selection(complete, spark, tmp_path, monkeypatch):
+    from autoforecast import study_tuning, study_workflow
+
+    cfg = profile(tmp_path)
+    calls = []
+
+    def fit(request):
+        calls.append(request.purpose)
+        return predict(request)
+
+    with open_study(complete, spark) as study:
+        validation = study.run_forecast_workflow(
+            fit_predict=fit, implementation=implementation(), config=cfg,
+            fixed_parameters={}, validation_only=True, output_dir=tmp_path / "validation",
+        )
+        assert calls == ["validation"]
+        assert validation.testing is None
+        original_score = study_workflow.score_study
+
+        def only_score_test(*args, **kwargs):
+            assert kwargs["contract"]["boundary"].startswith("test/"), "validation was rescored"
+            return original_score(*args, **kwargs)
+
+        monkeypatch.setattr(study_workflow, "score_study", only_score_test)
+        monkeypatch.setattr(study_tuning, "score_study", only_score_test)
+        completed = study.run_forecast_workflow(
+            fit_predict=fit, implementation=implementation(), validation_run=validation.path,
+            output_dir=tmp_path / "completed",
+        )
+        assert calls == ["validation", "refit"]
+        assert completed.validation["score"]["mae"] == validation.validation["score"]["mae"]
+        assert completed.validation["score"]["series_scores"]["sha256"] == validation.validation["score"]["series_scores"]["sha256"]
+        retained_references = (
+            completed.validation["score"]["series_scores"],
+            completed.validation["score"]["forecast_accuracy_breakdown"]["series_sums"],
+        )
+        assert all(pathlib.Path(ref["path"]).is_relative_to(completed.path) for ref in retained_references)
+        validation.path.rename(validation.path.with_name("removed-checkpoint"))
+        assert load_forecast_workflow(completed.path).testing is not None
+        for reference in retained_references:
+            assert pathlib.Path(reference["path"]).is_dir()
+            assert directory_digest(reference["path"], suffixes=(".parquet",)) == reference["sha256"]
+        assert completed.provenance["work_estimate"]["total_callback_fits"] == 1
+        assert completed.testing is not None
+
+    import mlflow
+
+    from autoforecast.run_mlflow import export_forecast_workflow
+    client = mlflow.tracking.MlflowClient(tracking_uri=f"sqlite:///{tmp_path}/mlflow.db")
+    experiment = client.create_experiment("checkpoint-export", artifact_location=str(tmp_path / "artifacts"))
+    original_upload = mlflow.tracking.MlflowClient.log_artifacts
+    fail_upload = True
+
+    def interrupted_upload(self, run_id, local_dir, artifact_path=None):
+        nonlocal fail_upload
+        if fail_upload and self.get_run(run_id).data.tags["autoforecast.stage"] == "test":
+            fail_upload = False
+            raise RuntimeError("injected upload interruption")
+        return original_upload(self, run_id, local_dir, artifact_path)
+
+    monkeypatch.setattr(mlflow.tracking.MlflowClient, "log_artifacts", interrupted_upload)
+    with pytest.raises(RuntimeError, match="injected upload"):
+        export_forecast_workflow(completed.path, tracking_uri=client.tracking_uri, experiment_id=experiment)
+    original_run_ids = {remote.info.run_id for remote in client.search_runs([experiment])}
+    assert len(original_run_ids) == 2
+    links = export_forecast_workflow(completed.path, tracking_uri=client.tracking_uri, experiment_id=experiment)
+    assert {link.run_id for link in links.values()} == original_run_ids
+    replay = export_forecast_workflow(completed.path, tracking_uri=client.tracking_uri, experiment_id=experiment)
+    assert replay == links
+    assert len(client.search_runs([experiment])) == 2
+    for stage, link in links.items():
+        remote = client.get_run(link.run_id)
+        assert remote.info.status == "FINISHED"
+        evidence = completed.validation if stage == "validation" else completed.testing
+        assert remote.data.metrics["mae"] == evidence["score"]["mae"]
+    client.log_dict(
+        links["test"].run_id, {**completed.testing["score"], "mae": 999.0}, "checked_score.json"
+    )
+    with pytest.raises(ValueError, match="remote scores differ"):
+        export_forecast_workflow(completed.path, tracking_uri=client.tracking_uri, experiment_id=experiment)
+    client.log_dict(links["test"].run_id, completed.testing["score"], "checked_score.json")
+    client.log_text(links["test"].run_id, "changed remotely", "models/constant.json")
+    with pytest.raises(ValueError, match="remote model artifacts differ"):
+        export_forecast_workflow(completed.path, tracking_uri=client.tracking_uri, experiment_id=experiment)
+
+
+@pytest.fixture(scope="module")
+def workflow_evidence(complete, spark, tmp_path_factory):
+    root = tmp_path_factory.mktemp("workflow-export-evidence")
+    cfg = profile(root, selection={"stage": "validation", "metric": "rmse"})
+    value = yaml.safe_load(cfg.read_text())
+    value["hpo"]["seed"] = 17
+    value["hyperparameters"]["model.level"]["default"] = 4.0
+    value["hyperparameters"]["model.level"]["search"]["values"].append(4.0)
+    offset = value["hyperparameters"]["training.offset"]
+    offset["default"] = 3
+    offset["valid"]["high"] = 5
+    offset["search"]["high"] = 5
+    cfg.write_text(yaml.safe_dump(value))
+    calls = []
+
+    def fit(request):
+        calls.append(
+            (
+                request.purpose,
+                request.seed,
+                dict(request.model_parameters),
+                dict(request.training_parameters),
+            )
+        )
+        return predict(request)
+
+    with open_study(complete, spark) as study:
+        checkpoint = study.run_forecast_workflow(
+            fit_predict=fit,
+            implementation=implementation(),
+            config=cfg,
+            fixed_parameters={},
+            validation_only=True,
+            output_dir=root / "validation",
+        )
+        completed = study.run_forecast_workflow(
+            fit_predict=fit,
+            implementation=implementation(),
+            validation_run=checkpoint.path,
+            output_dir=root / "completed",
+        )
+    return checkpoint, completed, calls
+
+
+def test_empty_fixed_parameters_use_profile_defaults_and_seed(workflow_evidence):
+    checkpoint, completed, calls = workflow_evidence
+    assert calls == [
+        ("validation", 17, {"level": 4.0}, {"offset": 3}),
+        ("refit", 17, {"level": 4.0}, {"offset": 3}),
+    ]
+    assert (
+        checkpoint.parameters == completed.parameters == {"model.level": 4.0, "training.offset": 3}
+    )
+
+
+@pytest.mark.parametrize("evidence", ["series_scores", "series_sums"])
+def test_checkpoint_resume_rejects_corruption_during_copy(
+    workflow_evidence, complete, spark, tmp_path, monkeypatch, evidence
+):
+    from mlops import _safe_files
+
+    checkpoint = workflow_evidence[0]
+    score = checkpoint.validation["score"]
+    reference = (
+        score["series_scores"] if evidence == "series_scores"
+        else score["forecast_accuracy_breakdown"]["series_sums"]
+    )
+    source = checkpoint.path / "validation"
+    relative = pathlib.Path(reference["path"]).relative_to(source)
+    original_copy = _safe_files.snapshot_regular_files
+    corrupted = []
+
+    def corrupt_copy(src, dest, paths):
+        result = original_copy(src, dest, paths)
+        if pathlib.Path(src) == source:
+            copied_file = next((pathlib.Path(dest) / relative).rglob("*.parquet"))
+            copied_file.write_bytes(copied_file.read_bytes() + b"corrupted-copy")
+            corrupted.append(copied_file)
+        return result
+
+    monkeypatch.setattr(_safe_files, "snapshot_regular_files", corrupt_copy)
+    with open_study(complete, spark) as study:
+        with pytest.raises(HPOError, match="validation score evidence changed during retention"):
+            study.run_forecast_workflow(
+                fit_predict=lambda _: pytest.fail("corrupt checkpoint reached final fitting"),
+                implementation=implementation(), validation_run=checkpoint.path,
+                output_dir=tmp_path / "resumed",
+            )
+    assert len(corrupted) == 1
+    assert load_forecast_workflow(checkpoint.path).testing is None
+
+
+@pytest.fixture
+def workflow_tracking(tmp_path):
+    import mlflow
+
+    client = mlflow.tracking.MlflowClient(tracking_uri=f"sqlite:///{tmp_path}/tracking.db")
+    experiment = client.create_experiment(
+        "workflow-test", artifact_location=str(tmp_path / "artifacts")
+    )
+    return client, experiment
+
+
+@pytest.mark.parametrize("defect", ["duplicate", "deleted", "identity"])
+def test_workflow_export_rejects_conflicting_remote_state(
+    workflow_evidence, workflow_tracking, defect
+):
+    from autoforecast.run_mlflow import RunMLflowError, export_forecast_workflow
+
+    completed = workflow_evidence[1]
+    client, experiment = workflow_tracking
+    options = dict(tracking_uri=client.tracking_uri, experiment_id=experiment)
+    links = export_forecast_workflow(completed.path, **options)
+    run_id = links["validation"].run_id
+    if defect == "duplicate":
+        client.create_run(experiment, tags=client.get_run(run_id).data.tags)
+    elif defect == "deleted":
+        client.delete_run(run_id)
+    else:
+        client.set_tag(run_id, "autoforecast.study_sha256", "0" * 64)
+    with pytest.raises(RunMLflowError):
+        export_forecast_workflow(completed.path, **options)
+
+
+def test_workflow_export_repairs_interrupted_termination(workflow_evidence, workflow_tracking):
+    from autoforecast.run_mlflow import export_forecast_workflow
+
+    completed = workflow_evidence[1]
+    client, experiment = workflow_tracking
+    options = dict(tracking_uri=client.tracking_uri, experiment_id=experiment)
+    links = export_forecast_workflow(completed.path, **options)
+    for link in links.values():
+        client.set_terminated(link.run_id, status="FAILED")
+    assert export_forecast_workflow(completed.path, **options) == links
+    assert all(client.get_run(link.run_id).info.status == "FINISHED" for link in links.values())
+    assert len(client.search_runs([experiment])) == 2
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_workflow_export_rejects_invalid_local_evidence_before_client(
+    workflow_evidence, tmp_path, monkeypatch, checkpoint
+):
+    from autoforecast import run_mlflow
+
+    if checkpoint:
+        source = workflow_evidence[0].path
+    else:
+        source = tmp_path / workflow_evidence[1].path.name
+        shutil.copytree(workflow_evidence[1].path, source)
+        (source / "result.json").write_text("{}")
+    monkeypatch.setattr(
+        run_mlflow, "_mlflow", lambda: pytest.fail("remote client before local verification")
+    )
+    with pytest.raises(run_mlflow.RunMLflowError):
+        run_mlflow.export_forecast_workflow(source, tracking_uri="unused", experiment_id="1")
+
+
+@pytest.mark.parametrize("kind", ["missing", "deleted"])
+def test_workflow_export_requires_existing_active_experiment(
+    workflow_evidence, workflow_tracking, kind
+):
+    import mlflow
+
+    from autoforecast.run_mlflow import RunMLflowError, export_forecast_workflow
+
+    client, experiment = workflow_tracking
+    if kind == "deleted":
+        client.delete_experiment(experiment)
+    else:
+        experiment = "99999999"
+    with pytest.raises((RunMLflowError, mlflow.exceptions.MlflowException)):
+        export_forecast_workflow(
+            workflow_evidence[1].path, tracking_uri=client.tracking_uri, experiment_id=experiment
+        )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"validation_only": True},
+        {"config": "new.yaml"},
+        {"selected_config": "saved.json"},
+        {"reuse_tuning": "search"},
+        {"fixed_parameters": {}},
+        {"tuning_origin": "2024-01-03"},
+    ],
+)
+def test_resume_rejects_configuration_conflicts_before_loading(extra):
+    from autoforecast.study_workflow import run_forecast_workflow
+
+    with pytest.raises(ValueError, match="validation_run cannot combine"):
+        run_forecast_workflow(
+            object(),
+            fit_predict=lambda _: pytest.fail("conflicting request must not fit"),
+            implementation=implementation(),
+            validation_run="absent",
+            **extra,
+        )
+
+
+def test_resume_rejects_completed_workflow_and_changed_implementation(
+    workflow_evidence, complete, spark
+):
+    checkpoint, completed, _ = workflow_evidence
+    with open_study(complete, spark) as study:
+        for path, identity, message in (
+            (completed.path, implementation(), "validation checkpoint"),
+            (checkpoint.path, {**implementation(), "version": "changed"}, "implementation"),
+        ):
+            with pytest.raises(HPOError, match=message):
+                study.run_forecast_workflow(
+                    fit_predict=lambda _: pytest.fail("invalid resume must not fit"),
+                    implementation=identity,
+                    validation_run=path,
+                )
+
+
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("field", ["seed", "implementation", "configuration_source"])
+def test_resealed_provenance_must_match_saved_settings(workflow_evidence, tmp_path, completed, field):
+    source = workflow_evidence[int(completed)]
+    root = tmp_path / source.path.name
+    shutil.copytree(source.path, root)
+    assert load_forecast_workflow(root).parameters == source.parameters
+    path = root / "result.json"
+    record = json.loads(path.read_text())
+    if field == "seed":
+        record["provenance"][field] += 1
+    elif field == "implementation":
+        record["provenance"][field]["version"] = "different-version"
+    else:
+        record["provenance"][field]["workflow_id"] = "different-origin"
+    path.write_text(json.dumps(record))
+    (root / "metadata/provenance.json").write_text(json.dumps(record["provenance"]))
+    _reseal_attempt(root)
+    for load, target in (
+        (load_forecast_workflow, root),
+        (load_selected_configuration, root / "metadata/winner-config.json"),
+    ):
+        with pytest.raises(HPOError, match="configuration differs"):
+            load(target)
+
+
+@pytest.mark.parametrize("field", ["kind", "workflow_id", "study", "tuning_path"])
+def test_resealed_fixed_checkpoint_preserves_its_origin(workflow_evidence, tmp_path, field):
+    checkpoint = workflow_evidence[0]
+    root = tmp_path / checkpoint.path.name
+    shutil.copytree(checkpoint.path, root)
+    assert load_forecast_workflow(root).testing is None
+    path, winner_path = root / "result.json", root / "metadata/winner-config.json"
+    record, saved = json.loads(path.read_text()), json.loads(winner_path.read_text())
+    if field == "tuning_path":
+        record[field] = "/different/search"
+    elif field == "study":
+        saved["source"][field]["sha256"] = "0" * 64
+    else:
+        saved["source"][field] = "different-origin"
+    record["provenance"]["configuration_source"] = saved["source"]
+    path.write_text(json.dumps(record))
+    winner_path.write_text(json.dumps(saved))
+    (root / "metadata/provenance.json").write_text(json.dumps(record["provenance"]))
+    _reseal_attempt(root)
+    for load, target in (
+        (load_forecast_workflow, root),
+        (load_selected_configuration, winner_path),
+    ):
+        with pytest.raises(HPOError, match="fixed configuration|source"):
+            load(target)
+
+
+@pytest.mark.parametrize("payload,valid", [
+    ('{"mae":1.0,"missing":null,"count":1}', True),
+    ('{ "count": 1, "missing": null, "mae": 1.0 }', True),
+    ('{"mae":true,"missing":null,"count":1}', False),
+    ('{"mae":1.0,"missing":null,"count":true}', False),
+    ('{"mae":1.0,"missing":0,"count":1}', False),
+    ('{"mae":99,"mae":1.0,"missing":null,"count":1}', False),
+])
+def test_export_verification_preserves_json_types_and_rejects_duplicate_keys(tmp_path, payload, valid):
+    from autoforecast.run_mlflow import RunMLflowError, _verify_workflow_export
+
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "model.bin").write_bytes(b"synthetic model")
+    score = tmp_path / "checked_score.json"
+    score.write_text(payload)
+
+    class Client:
+        def download_artifacts(self, run_id, name, folder):
+            return str(models if name == "models" else score)
+
+    evidence = {
+        "model_sha256": directory_digest(models),
+        "score": {"mae": 1.0, "missing": None, "count": 1},
+    }
+    if valid:
+        _verify_workflow_export(Client(), "synthetic", evidence)
+    else:
+        with pytest.raises(RunMLflowError, match="remote score"):
+            _verify_workflow_export(Client(), "synthetic", evidence)

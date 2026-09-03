@@ -43,7 +43,7 @@ class RuntimeCheck:
         hint = (
             f" Install with: uv sync --extra {self.runtime.extra}."
             if self.runtime.extra is not None
-            else ""
+            else " Install standard AutoForecast, or run uv sync in its source checkout."
         )
         return (
             f"Runtime '{self.runtime.id}' is unavailable; missing Python module(s): {missing}."
@@ -53,7 +53,7 @@ class RuntimeCheck:
 
 _RUNTIMES = {
     "builtin": ModelRuntime("builtin", (), None),
-    "classical": ModelRuntime("classical", ("statsforecast",), "classical"),
+    "classical": ModelRuntime("classical", ("statsforecast",), None),
     "custom_torch": ModelRuntime("custom_torch", ("torch", "tensorboard"), "custom-torch"),
     "shallow": ModelRuntime("shallow", ("lightgbm", "pandas"), "shallow"),
     "tft": ModelRuntime("tft", ("torch", "lightning", "pytorch_forecasting"), "tft"),

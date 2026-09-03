@@ -671,7 +671,8 @@ def _results():
     ]
     return CampaignResults(
         pa.Table.from_pylist(rows, schema=ROW_SCHEMA),
-        ({"run_id": "one", "horizon": 3}, {"run_id": "two", "horizon": 3}),
+        tuple({key: row[key] for key in ("model_id", "variant_id", "run_id", "stage", "origin")}
+              | {"horizon": 3, "frequency": "D"} for row in rows),
         {"comparison_scope": "fixed_benchmark", "target_unit": "units"},
         None,
     )
@@ -686,6 +687,58 @@ def test_result_export_identity_roundtrip_and_publication_retry_idempotent(tmp_p
     assert pq.read_table(tmp_path / "export/predictions.parquet").equals(result.rows)
     with pytest.raises(OSError, match="immutable artifact differs"):
         export_results(replace(result, metadata={"changed": True}), tmp_path / "export")
+
+
+def test_plot_uses_each_window_identity_and_nullable_variant(tmp_path, monkeypatch):
+    import math
+
+    import matplotlib.axes
+
+    observed = []
+    original = matplotlib.axes.Axes.plot
+
+    def capture(self, dates, values, **kwargs):
+        observed.append((list(dates), list(values), kwargs["label"]))
+        return original(self, dates, values, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "plot", capture)
+    cases = [
+        (None, "shared", "selection", "2024-01-01", 2, 1.0),
+        (None, "shared", "selection", "2024-01-03", 1, 2.0),
+        (None, "shared", "test", "2024-01-03", 3, 3.0),
+        ("trial0", "other", "selection", "2024-01-01", 2, 4.0),
+    ]
+    rows, windows, expected = [], [], {}
+    for variant, run, stage, origin, horizon, value in cases:
+        identity = dict(model_id="model", variant_id=variant, run_id=run,
+                        stage=stage, origin=origin)
+        dates = [dt.date.fromisoformat(origin) + dt.timedelta(days=step)
+                 for step in range(1, horizon + 1)]
+        rows.append({**identity, "benchmark_id": "benchmark", "series_id": "a",
+                     "target_date": dates[0], "prediction": value, "status": "emitted"})
+        windows.append({**identity, "frequency": "D", "horizon": horizon})
+        expected[value] = dates
+    results = CampaignResults(
+        pa.Table.from_pylist(rows, schema=ROW_SCHEMA),
+        ({"run_id": "shared", "status": "failed"}, *reversed(windows)),
+        {"comparison_scope": "fixed_study"}, None,
+    )
+    comparison_plot(results, series_id="a", output=tmp_path / "windows.png")
+    assert len(observed) == len(cases)
+    for dates, values, _ in observed:
+        assert dates == expected[values[0]]
+        assert len(values) == len(dates) and all(math.isnan(value) for value in values[1:])
+    assert len({label for _, _, label in observed}) == len(cases)
+    assert any("(no variant)" in label for _, _, label in observed)
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_plot_rejects_missing_or_ambiguous_window_metadata(tmp_path, duplicate):
+    result = _results()
+    runs = result.runs + result.runs[:1] if duplicate else result.runs[1:]
+    with pytest.raises(ValueError, match="exactly one matching forecast window"):
+        comparison_plot(replace(result, runs=runs), series_id="a", output=tmp_path / "bad.png")
+    assert not (tmp_path / "bad.png").exists()
 
 
 @pytest.mark.parametrize(
@@ -728,7 +781,7 @@ def test_plot_matches_exported_values_and_preserves_missing_predictions(
     results = replace(
         results,
         rows=pa.Table.from_pylist(rows, schema=schema),
-        runs=tuple({**run, "frequency": frequency} for run in results.runs),
+        runs=tuple({**run, "frequency": frequency, "origin": origin} for run in results.runs),
         metadata={**results.metadata, "frequency": frequency},
     )
     comparison_plot(results, series_id="a", output=tmp_path / "comparison.png")

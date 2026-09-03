@@ -898,7 +898,7 @@ def test_an_all_missing_commercial_row_has_a_distinct_missing_state_token() -> N
     assert float(routed["commercial"][1, 0]) == 99.0
 
 
-@pytest.mark.parametrize("fault", [0.5, float("nan")])
+@pytest.mark.parametrize("fault", [0.0, 1.0, 0.5, float("nan")])
 def test_custom_model_and_scenario_router_refuse_nonbinary_commercial_masks(fault) -> None:
     model = ours.CustomModel(
         8, 7, n_attributes=1, n_series=1, n_known=3, horizon=2,
@@ -918,7 +918,7 @@ def test_custom_model_and_scenario_router_refuse_nonbinary_commercial_masks(faul
         ours._with_known_future_inputs(inputs, inputs["known_future"], (0, 1, 2))
 
 
-@pytest.mark.parametrize("fault", [0.5, float("nan")])
+@pytest.mark.parametrize("fault", [0.0, 1.0, 0.5, float("nan")])
 def test_shrunk_baselines_refuse_nonbinary_observation_masks(fault) -> None:
     history = torch.ones(1, 2)
     mask = torch.ones_like(history)
@@ -2210,7 +2210,7 @@ def test_price_ladder_evaluation_exposes_exact_cell_step_evidence() -> None:
 
 
 def test_price_ladder_wrapper_preserves_controls_eligibility_and_report() -> None:
-    """The legacy wrapper and detailed route use identical controls and eligible-cell reductions."""
+    """Summary and detailed routes use identical controls and eligible-cell reductions."""
     model = SimpleNamespace(
         price_index=0, price_available_index=1,
         discount_index=None, discount_available_index=None, price_response=None,
@@ -2239,6 +2239,15 @@ def test_price_ladder_wrapper_preserves_controls_eligibility_and_report() -> Non
     assert torch.equal(evaluation.eligible, torch.tensor([[True, False]]))
     assert evaluation.prices.device.type == "cpu"
     assert evaluation.expected_demand.device.type == "cpu"
+    stored = report.as_record()
+    assert ours._checkpoint_final_price_ladder_controls({"price_ladder": stored}) == {
+        **controls, "n_series": report.n_series,
+    }
+    for unsupported in ("shared-seed-v0", "invented", None):
+        with pytest.raises(ours.OursError, match="RNG domain scheme is unsupported"):
+            ours._checkpoint_final_price_ladder_controls({
+                "price_ladder": {**stored, "rng_domain_scheme": unsupported},
+            })
 
 
 def test_reference_price_contrast_api_is_exported() -> None:
@@ -2569,7 +2578,8 @@ def test_price_ladder_refuses_vacuous_numeric_controls() -> None:
     minimal = {"known_future": known}
     for kwargs in ({"tolerance": float("nan")}, {"tolerance": 0.0},
                    {"bumps": (-1.0, 0.0)}, {"bumps": (False, 0.0)},
-                   {"seed": None}, {"seed": True}, {"rng_domain_scheme": "invented"}):
+                   {"seed": None}, {"seed": True}, {"rng_domain_scheme": "invented"},
+                   {"rng_domain_scheme": "shared-seed-v0"}):
         try:
             ours.verify_price_ladder(actual, minimal, **kwargs)
         except ours.OursError:
@@ -2858,6 +2868,24 @@ def test_a_new_client_is_forecast_from_the_checkpoint_without_retraining() -> No
     else:
         raise AssertionError("a different text width reached the trained projection")
 
+    # Unsupported or incomplete inference metadata must fail at the public replay boundary,
+    # even when a caller supplies a replacement draw count. It must publish no forecasts.
+    for field, value in (("rng_domain_scheme", "shared-seed-v0"),
+                         ("point_factor_method", None), ("point_factor_draws", None)):
+        unsupported = pathlib.Path(out) / f"unsupported_{field}.pt"
+        payload = torch.load(ck, map_location="cpu", weights_only=True)
+        if value is None:
+            payload["run"].pop(field)
+        else:
+            payload["run"][field] = value
+        torch.save(payload, unsupported)
+        refused_output = pathlib.Path(out) / f"refused_{field}"
+        with pytest.raises(ours.OursError, match="RNG domain scheme|current point replay metadata"):
+            ours.predict_from_checkpoint(
+                unsupported, a, spark(), refused_output, point_factor_draws=3,
+            )
+        assert not refused_output.exists()
+
     corrupt = pathlib.Path(out) / "missing_text.pt"
     payload = torch.load(ck, map_location="cpu", weights_only=True)
     payload["run"]["tensors"]["text"] = None
@@ -2951,11 +2979,14 @@ def test_unseen_factor_product_pairs_keep_distinct_paths_while_parameters_pool()
         "distinct raw unseen pairs collapsed because their parameter indices were all OOV"
 
 
-def test_unevidenced_identity_rows_are_explicitly_pooled_and_checkpoint_validated() -> None:
+@pytest.mark.parametrize("factor_dynamics", ["ar1", "iid"])
+def test_unevidenced_identity_rows_are_explicitly_pooled_and_checkpoint_validated(
+    factor_dynamics,
+) -> None:
     """Near-zero random initialisation is not the zero/mean pooled cold-start contract."""
     config = dict(d_model=8, encoder_days=7, n_attributes=1, n_series=5, n_known=1,
                   horizon=2, n_stores=4, factor_rank=2, n_products=3,
-                  n_heads=1, patch_size=1)
+                  factor_dynamics=factor_dynamics, n_heads=1, patch_size=1)
     model = ours.CustomModel(**config)
     with torch.no_grad():
         model.static.residual_product.weight.fill_(7.0)
@@ -6161,7 +6192,10 @@ def test_factor_and_count_randomness_use_independent_seed_domains() -> None:
     occurrence = float((count < torch.sigmoid(factor)).double().mean())
     assert abs(occurrence - 0.5) < 0.005, \
         f"conditional occurrence sampling is biased ({occurrence:.6f} vs exact 0.5)"
-    assert ours._domain_seed(seed, "factor", ours.LEGACY_RNG_DOMAIN_SCHEME) == seed
+    for unsupported in ("shared-seed-v0", "invented", None):
+        for supplied_seed in (seed, None):
+            with pytest.raises(ours.OursError, match="unknown RNG domain scheme"):
+                ours._domain_seed(supplied_seed, "factor", unsupported)
 
 
 
@@ -7100,75 +7134,51 @@ def test_the_encoder_runs_once_however_many_factor_draws_are_integrated() -> Non
         handle.remove()
 
 
-def test_the_point_forecast_does_not_move_when_the_path_artifact_grows() -> None:
-    """A point estimand must not change because a caller asked for more paths to be STORED.
-
-    Until 2026-08-25 `mean_over_factor` derived its factor count from `n_paths`, so requesting a
-    bigger path artifact silently moved yhat -- and coupled the catalogue-wide consumer to the
-    tail's sample count. The two controls are separate now, and this pins it in both directions:
-    n_paths must not move the mean, and point_factor_draws must."""
+def test_point_integration_accepts_only_its_own_draw_count() -> None:
+    """Path count belongs to path generation and is no longer an ignored point API argument."""
     model, inputs = _factor_model()
-    a = ours.mean_over_factor(model, inputs, n_paths=200, seed=0)
-    b = ours.mean_over_factor(model, inputs, n_paths=5000, seed=0)
-    assert torch.equal(a, b), \
-        "the point forecast moved because the requested PATH COUNT changed"
-
+    with pytest.raises(TypeError, match="n_paths"):
+        ours.mean_over_factor(model, inputs, n_paths=200, seed=0)
     few = ours.mean_over_factor(model, inputs, factor_draws=8, seed=0)
     many = ours.mean_over_factor(model, inputs, factor_draws=512, seed=0)
-    assert not torch.equal(few, many), \
-        "the point integration ignored its own draw count"
-    assert ours.POINT_FACTOR_DRAWS != ours.default_factor_draws(1000), \
-        "point and path defaults must not be the same knob wearing two names"
+    assert not torch.equal(few, many), "the point integration ignored its own draw count"
+    assert ours.POINT_FACTOR_DRAWS != ours.default_factor_draws(1000)
 
 
-def test_checkpoint_point_replay_never_invents_missing_historical_mc_facts() -> None:
-    """Old checkpoints omitted both the MC count and RNG-domain scheme.
-
-    The old source default was 1,000 direct-seed draws, but an invocation could override the
-    count without recording it. Therefore the historical result is unknowable from the artifact:
-    refuse an "exact replay" unless the caller explicitly requests a newly counted legacy-seeded
-    evaluation. Rank-zero models are the sole exception because count and seed cannot affect them.
-    """
-    legacy = {"seed": 0}
-    try:
-        ours._checkpoint_point_replay(legacy, None)
-    except ours.OursError as exc:
-        assert "Exact historical point replay cannot be inferred" in str(exc)
-    else:
-        raise AssertionError("missing legacy MC metadata was silently replaced by current defaults")
-
-    assert ours._checkpoint_point_replay(legacy, 1000) == (
-        "mc", 1000, ours.LEGACY_RNG_DOMAIN_SCHEME)
-    assert ours._checkpoint_point_replay(legacy, None, factorless=True) == (
-        "mc", 1, ours.LEGACY_RNG_DOMAIN_SCHEME)
+def test_checkpoint_point_replay_requires_complete_current_metadata() -> None:
     current = {"point_factor_method": "mc", "point_factor_draws": 17,
                "rng_domain_scheme": ours.RNG_DOMAIN_SCHEME}
     assert ours._checkpoint_point_replay(current, None) == (
         "mc", 17, ours.RNG_DOMAIN_SCHEME)
-    transitional = {"point_factor_method": "mc", "point_factor_draws": 25, "seed": 0}
-    try:
-        ours._checkpoint_point_replay(transitional, None)
-    except ours.OursError as exc:
-        assert "RNG trajectory-mapping scheme" in str(exc)
-    else:
-        raise AssertionError(
-            "a pre-scheme batched-draw checkpoint was called an exact canonical replay")
-    assert ours._checkpoint_point_replay(transitional, 25) == (
-        "mc", 25, ours.LEGACY_RNG_DOMAIN_SCHEME)
+    assert ours._checkpoint_point_replay(current, 25) == (
+        "mc", 25, ours.RNG_DOMAIN_SCHEME)
+    quadrature = {**current, "point_factor_method": "gauss_hermite", "point_factor_draws": None}
+    assert ours._checkpoint_point_replay(quadrature, None) == (
+        "gauss_hermite", None, ours.RNG_DOMAIN_SCHEME)
+    with pytest.raises(ours.OursError, match="silently ignored"):
+        ours._checkpoint_point_replay(quadrature, 8)
 
+    for record in (current, quadrature):
+        for field in record:
+            incomplete = {key: value for key, value in record.items() if key != field}
+            for override in (None, 25):
+                with pytest.raises(ours.OursError, match="lacks current point replay metadata"):
+                    ours._checkpoint_point_replay(incomplete, override)
+    for scheme in (None, "shared-seed-v0", "invented"):
+        for override in (None, 25):
+            with pytest.raises(ours.OursError, match="unknown RNG domain scheme"):
+                ours._checkpoint_point_replay({**current, "rng_domain_scheme": scheme}, override)
+    for invalid in (None, True, 0, -1, 1.5):
+        for override in (None, 25):
+            with pytest.raises(ours.OursError, match="positive integer"):
+                ours._checkpoint_point_replay({**current, "point_factor_draws": invalid}, override)
     for invalid in (True, 0, -1, 1.5):
-        try:
-            ours._checkpoint_point_replay(legacy, invalid)
-        except ours.OursError as exc:
-            assert "positive integer" in str(exc)
-        else:
-            raise AssertionError(f"accepted invalid point_factor_draws={invalid!r}")
-    try:
-        ours._checkpoint_point_replay({"point_factor_method": "gauss_hermite"}, 8)
-    except ours.OursError as exc:
-        assert "silently ignored" in str(exc)
-    else:
-        raise AssertionError("a meaningless MC draw override was accepted for GH replay")
+        with pytest.raises(ours.OursError, match="positive integer"):
+            ours._checkpoint_point_replay(current, invalid)
+    with pytest.raises(ours.OursError, match="must be null"):
+        ours._checkpoint_point_replay({**quadrature, "point_factor_draws": 17}, None)
+    with pytest.raises(ours.OursError, match="unknown point_factor_method"):
+        ours._checkpoint_point_replay({**current, "point_factor_method": None}, None)
 
 
 def test_the_default_uses_one_factor_scenario_per_emitted_path() -> None:

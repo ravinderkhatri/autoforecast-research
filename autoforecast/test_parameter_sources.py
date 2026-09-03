@@ -13,7 +13,7 @@ import yaml
 from mlops.provenance import capture_runtime_identity, capture_source_identity
 from mlops.run_bundle import open_run_bundle
 
-from autoforecast.experiments import open_local_attempt, seal_study_selection
+from autoforecast.experiments import ExperimentError, open_local_attempt, seal_study_selection
 from autoforecast.hpo import _trial_metadata, load_hpo_study
 from autoforecast.model_catalog import discover_candidates
 from autoforecast.parameter_sources import (
@@ -172,7 +172,6 @@ def _project(
     malformed_evidence: str | None = None,
     training_series: int = 2,
     zero_filled_count: object = 0,
-    legacy_study_metadata: bool = False,
 ):
     project = tmp_path / "project"
     model_path = project / "configs/models/neural/tft/model.yaml"
@@ -272,7 +271,7 @@ study:
     metadata = _trial_metadata(study, parameters)
     metadata["purpose"] = purpose
     metadata["parameter_execution_compatibility"] = compatibility
-    if legacy_study_metadata:
+    if malformed_evidence == "missing_study_top_k":
         metadata["study"].pop("top_k")
     attempt = open_local_attempt(
         root,
@@ -772,13 +771,10 @@ def test_retained_capsule_rechecks_data_references(
         _validate_retained_attempt_data_references(attempt)
 
 
-@pytest.mark.parametrize("legacy_study_metadata", [False, True])
 def test_reused_hpo_selection_replays_manifest_model_study_and_source_identity(
-    tmp_path: pathlib.Path, legacy_study_metadata: bool,
+    tmp_path: pathlib.Path,
 ) -> None:
-    project, candidate, study, selection, _attempt = _project(
-        tmp_path, legacy_study_metadata=legacy_study_metadata,
-    )
+    project, candidate, study, selection, _attempt = _project(tmp_path)
     record = parameter_resolution_from_selection(
         candidate,
         study,
@@ -1159,13 +1155,10 @@ def test_reused_selection_requires_runtime_and_lockfile_provenance(
         )
 
 
-@pytest.mark.parametrize("legacy_study_metadata", [False, True])
 def test_reused_hpo_selection_rejects_a_different_declared_winner_count(
-    tmp_path, legacy_study_metadata,
+    tmp_path,
 ):
-    project, candidate, study, selection, _attempt = _project(
-        tmp_path, legacy_study_metadata=legacy_study_metadata,
-    )
+    project, candidate, study, selection, _attempt = _project(tmp_path)
     with pytest.raises(ParameterSourceError, match="metadata is incompatible"):
         parameter_resolution_from_selection(
             candidate, dataclasses.replace(study, top_k=2), selection,
@@ -1173,10 +1166,13 @@ def test_reused_hpo_selection_rejects_a_different_declared_winner_count(
         )
 
 
-def test_legacy_selection_top_k_must_match_supplied_study(tmp_path):
-    project, candidate, study, selection, _attempt = _project(
-        tmp_path, legacy_study_metadata=True,
-    )
+def test_hpo_selection_requires_declared_winner_count(tmp_path: pathlib.Path) -> None:
+    with pytest.raises(ExperimentError, match="selection top_k differs from its study"):
+        _project(tmp_path, malformed_evidence="missing_study_top_k")
+
+
+def test_reused_selection_top_k_cannot_differ_from_attempt_metadata(tmp_path):
+    project, candidate, study, selection, _attempt = _project(tmp_path)
     selection.unlink()
     parameters = {
         "model.hidden_size": 16,
@@ -1185,7 +1181,6 @@ def test_legacy_selection_top_k_must_match_supplied_study(tmp_path):
         "training.learning_rate": 0.002,
     }
     metadata = _trial_metadata(study, parameters)
-    metadata["study"].pop("top_k")
     second = open_local_attempt(
         tmp_path / "hpo", study_id=study.id, trial_id="trial-0001",
         attempt_id="attempt-two", metadata=metadata,
@@ -1206,7 +1201,7 @@ def test_legacy_selection_top_k_must_match_supplied_study(tmp_path):
     record["top_k"] = 2
     record["selected"] = record["candidates"][:2]
     selection.write_text(json.dumps(record))
-    with pytest.raises(ParameterSourceError, match="metadata is incompatible"):
+    with pytest.raises(ParameterSourceError, match="selection top_k differs from its study"):
         parameter_resolution_from_selection(
             candidate, study, selection, kind="reuse_selection", project_root=project,
         )

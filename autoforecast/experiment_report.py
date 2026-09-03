@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from mlops import sanitize_web_url
+from mlops.run_report import run_guide
 
 from autoforecast._exact_json import load_exact_json
 from autoforecast.experiments import ExperimentError, load_completed_attempt, load_study_selection
@@ -36,8 +37,8 @@ def _line(points: Iterable[float], *, low: float, high: float, width: int, heigh
 
 
 def _optimization_validation(record: dict[str, Any]) -> float | None:
-    """Read the current telemetry name while retaining old immutable run compatibility."""
-    value = record.get("optimization/validation_objective", record.get("validation/objective"))
+    """Read the optimization metric recorded by the current training loop."""
+    value = record.get("optimization/validation_objective")
     return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
 
 
@@ -130,12 +131,10 @@ def render_study_report(
             "Checkpoint captured; not registered until held-out approval"
             if has_checkpoint else "No checkpoint captured"
         )
-        epoch_seconds = sum(float(epoch.get("execution/epoch_seconds",
-                                             epoch.get("resources/epoch_seconds", 0)))
+        epoch_seconds = sum(float(epoch.get("execution/epoch_seconds", 0))
                             for epoch in epochs)
         peak_rss = max(
-            (int(epoch.get("execution/process_peak_rss_bytes",
-                           epoch.get("resources/process_peak_rss_bytes", 0)))
+            (int(epoch.get("execution/process_peak_rss_bytes", 0))
              for epoch in epochs),
             default=0,
         )
@@ -184,6 +183,13 @@ selection.</p>
 </html>"""
     report = root / "report.html"
     report.write_text(document, encoding="utf-8")
+    from autoforecast.protocol import _atomic_write_text
+
+    _atomic_write_text(root / "RUN.md", run_guide(
+        identity={"search_id": root.name}, status="selected" if selection else "attempts recorded",
+        files=[p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()],
+        sealed=False,
+    ).decode("utf-8"))
     return report
 
 
