@@ -5,6 +5,8 @@
     "autoforecast/benchmark.py",
     "autoforecast/study.py",
     "autoforecast/study_tuning.py",
+    "autoforecast/study_preflight.py",
+    "autoforecast/study_workflow.py",
     "autoforecast/study_horizon_metrics.py",
     "scripts/study_example.py",
     "autoforecast/cli.py",

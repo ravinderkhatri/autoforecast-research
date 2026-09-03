@@ -24,6 +24,7 @@ from autoforecast.frequency import (
     canonical_origin,
     parse_frequency,
     parse_origin,
+    period_points,
 )
 from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
@@ -212,12 +213,21 @@ def _identity(record: dict) -> dict:
     identity.update({key: record[key] for key in (
         "role_paths", "metric_definition", "coverage_identities", "counts",
     )})
+    if "execution_policy" in record:
+        identity.update({key: record[key] for key in (
+            "execution_policy", "parent", "inherited_roles",
+        )})
     return identity
 
 
 def _normalise_recipe(recipe: dict) -> dict:
     """Freeze the current study defaults before computing its identity."""
     validate_recipe(recipe)
+    recipe = dict(recipe)
+    if "tuning_schedule" in recipe:
+        schedule = {"count": 3, **recipe.pop("tuning_schedule")}
+        recipe["tuning_windows"] = resolve_tuning_schedule(recipe, schedule)
+        recipe["resolved_tuning_schedule"] = schedule
     return {
         **recipe,
         "frequency": _recipe_cadence(recipe).code,
@@ -227,6 +237,30 @@ def _normalise_recipe(recipe: dict) -> dict:
             "series_starts", {"rule": "study_lower_bound", "values": []},
         ),
     }
+
+
+def resolve_tuning_schedule(recipe: dict, schedule: dict) -> list[dict]:
+    """Resolve inner windows backwards from the first outer origin in cadence periods.
+
+    Horizon and stride must be explicit. Only the count defaults to three; this
+    operation never expands an already registered list of windows.
+    """
+    if (type(schedule) is not dict or not {"horizon", "stride"} <= set(schedule)
+            or set(schedule) - {"horizon", "stride", "count"}):
+        raise BenchmarkError("tuning_schedule requires horizon, stride and optional count")
+    count, horizon, stride = schedule.get("count", 3), schedule["horizon"], schedule["stride"]
+    if any(type(value) is not int or value < 1 for value in (count, horizon, stride)):
+        raise BenchmarkError("tuning schedule count, horizon and stride must be positive integers")
+    cadence = _recipe_cadence(recipe)
+    end = _recipe_point(recipe["validation_origins"][0], cadence)
+    start = _recipe_point(recipe["training_start"], cadence)
+    try:
+        origins = [advance(end, cadence, -horizon - stride * i) for i in reversed(range(count))]
+    except (FrequencyError, OverflowError, ValueError) as error:
+        raise BenchmarkError("tuning schedule exceeds supported dates") from error
+    if origins[0] < start:
+        raise BenchmarkError("tuning schedule starts before available training history")
+    return [{"origin": canonical_origin(origin, cadence), "horizon": horizon} for origin in origins]
 
 
 def _metric_definition(recipe: dict) -> dict:
@@ -249,7 +283,20 @@ def artifact_path(path: pathlib.Path, record: dict, role: str) -> pathlib.Path:
     """Resolve a logical role inside an already authenticated benchmark."""
     if role not in record["artifacts"]:
         raise BenchmarkError(f"unknown benchmark role: {role}")
+    if role in record.get("inherited_roles", []):
+        parent_path = pathlib.Path(record["parent"]["path"])
+        _, parent = read_benchmark_manifest(parent_path, record["parent"]["sha256"])
+        if "execution_policy" in parent:
+            raise BenchmarkError("derived studies must reference an original frozen definition")
+        return artifact_path(parent_path, parent, role)
     return path.parent / record["role_paths"][role]
+
+
+def window_series_count(record: dict, key: str) -> int:
+    """Return the frozen forecast population, distinct from the reporting denominator."""
+    policy = record.get("execution_policy")
+    return (len(policy["windows"][key]["eligible_ids"]) if policy
+            else record["cohort_series_count"])
 
 
 def resolve_study(output_root: pathlib.Path, study_id: str) -> tuple[pathlib.Path, dict]:
@@ -284,9 +331,26 @@ def validate_recipe(recipe: dict) -> None:
     if recipe["schema_version"] != 2:
         raise BenchmarkError("preparation recipe schema_version must be 2")
     required = expected | {"metric"}
-    optional = {"frequency", "history_missing", "actual_missing", "series_starts", "tuning_windows"}
+    optional = {"frequency", "history_missing", "actual_missing", "series_starts", "tuning_windows",
+                "tuning_schedule", "resolved_tuning_schedule", "reference_metrics"}
     if not required <= set(recipe) or set(recipe) - required - optional:
         raise BenchmarkError("preparation recipe requires documented study fields")
+    if "tuning_schedule" in recipe:
+        if "tuning_windows" in recipe or "resolved_tuning_schedule" in recipe:
+            raise BenchmarkError("tuning_schedule conflicts with explicit or resolved windows")
+        resolved = dict(recipe)
+        schedule = resolved.pop("tuning_schedule")
+        validate_recipe(resolved)
+        resolved["tuning_windows"] = resolve_tuning_schedule(recipe, schedule)
+        validate_recipe(resolved)
+        return
+    if "resolved_tuning_schedule" in recipe:
+        schedule = recipe["resolved_tuning_schedule"]
+        if (type(schedule) is not dict or "count" not in schedule
+                or recipe.get("tuning_windows") != resolve_tuning_schedule(recipe, schedule)):
+            raise BenchmarkError("resolved tuning schedule differs from frozen windows")
+    if "reference_metrics" in recipe and recipe["reference_metrics"] != ["wrmsse"]:
+        raise BenchmarkError("reference_metrics currently supports only [wrmsse]")
     if recipe.get("history_missing", "preserve") != "preserve":
         raise BenchmarkError("history_missing must be preserve; correct source data before import")
     if recipe.get("actual_missing", "error") not in ("error", "mask"):
@@ -343,7 +407,6 @@ def validate_recipe(recipe: dict) -> None:
         invalid = True
     if invalid:
         raise BenchmarkError("invalid training/validation/testing boundaries")
-    earliest_origin = origins[0]
     if "tuning_windows" in recipe:
         windows = recipe["tuning_windows"]
         if type(windows) is not list or not windows:
@@ -363,7 +426,6 @@ def validate_recipe(recipe: dict) -> None:
             tuning_origins.append(origin)
         if tuning_origins != sorted(set(tuning_origins)):
             raise BenchmarkError("tuning windows must have unique, sorted origins")
-        earliest_origin = tuning_origins[0]
     for label, point in [
         *(('validation window', origin) for origin in origins),
         ("final training window", cutoff),
@@ -388,7 +450,7 @@ def validate_recipe(recipe: dict) -> None:
                 raise BenchmarkError("duplicate declared series start")
             seen.add(values)
             first = _recipe_point(entry["start"], cadence)
-            if not start <= first <= earliest_origin:
+            if not start <= first <= origins[0]:
                 raise BenchmarkError("series starts must lie within history and the first origin")
             _inclusive_period_count(start, first, cadence, label="series history start")
 
@@ -466,13 +528,17 @@ def _freeze_benchmark(
 
     from autoforecast import grid
 
-    recipe = _normalise_recipe(json.loads(json.dumps(recipe, allow_nan=False)))
+    recipe = json.loads(json.dumps(recipe, allow_nan=False))
+    if scoring_references is not None and recipe.get("metric") != "wrmsse":
+        recipe["reference_metrics"] = ["wrmsse"]
+    recipe = _normalise_recipe(recipe)
     cadence = _recipe_cadence(recipe)
     source_roles = {"selection", "final_training", "validation_score", "final_score"}
     if set(sources) != source_roles:
         raise BenchmarkError(f"provide exactly these source roles: {sorted(source_roles)}")
-    if (recipe["metric"] == "wrmsse") != (scoring_references is not None):
-        raise BenchmarkError("single-level wrmsse requires frozen scoring_references only")
+    if ((recipe["metric"] == "wrmsse" or recipe.get("reference_metrics"))
+            and scoring_references is None):
+        raise BenchmarkError("wrmsse requires frozen scoring_references")
     if study_id is not None:
         resolve_study(output_root, study_id)
     keys = recipe["source_keys"]
@@ -780,6 +846,13 @@ def _freeze_benchmark(
                     grid.time_literal(advance(origin, cadence, span), cadence),
                 )
             )
+            # A late-start series has no invented training rows. Its forecast grid
+            # still records unavailable actuals before that start explicitly.
+            cells = spark.read.parquet(str(path)).select(
+                F.col("series_id").alias(internal), F.col("date").alias(panel.time_col),
+            ).join(cells, [internal, panel.time_col], "left").withColumn(
+                MISSING_COLUMN, F.col(panel.target_col).isNull(),
+            )
             per_series = cells.groupBy(internal).agg(
                 F.count(F.lit(1)).alias("expected"),
                 F.sum(F.col(MISSING_COLUMN).cast("long")).alias("originally_missing"),
@@ -986,6 +1059,8 @@ def _validate_manifest(record: object) -> dict:
         "policies", "sources", "artifacts",
         "study_id", "role_paths", "metric_definition", "coverage", "coverage_identities",
     }
+    if "execution_policy" in record:
+        fields |= {"execution_policy", "parent", "inherited_roles"}
     mapping(record, fields, "manifest")
     recipe = record["recipe"]
     validate_recipe(recipe)
@@ -1002,10 +1077,62 @@ def _validate_manifest(record: object) -> dict:
     for name in ("source_series_count", "excluded_new_series", "cohort_series_count"):
         count(record[name], name, 1 if name == "cohort_series_count" else 0)
     cohort = record["cohort_series_count"]
+    if "execution_policy" in record:
+        parent = mapping(record["parent"], {"path", "sha256", "study_id"}, "parent")
+        sha256(parent["sha256"], "parent.sha256")
+        sha256(parent["study_id"], "parent.study_id")
+        if type(parent["path"]) is not str or not pathlib.Path(parent["path"]).is_absolute():
+            raise BenchmarkError("parent path must be absolute")
+        execution = mapping(record["execution_policy"], {
+            "series_policy", "minimum_history", "original_ids", "retained_ids",
+            "excluded_ids", "cohort_sha256", "windows", "interpretation",
+        }, "execution_policy")
+        if execution["series_policy"] not in ("exclude_unavailable", "use_available"):
+            raise BenchmarkError("unknown frozen availability policy")
+        count(execution["minimum_history"], "minimum_history", 1)
+        for name in ("original_ids", "retained_ids", "excluded_ids"):
+            ids = execution[name]
+            if (type(ids) is not list or any(type(s) is not str or not s for s in ids)
+                    or ids != sorted(set(ids))):
+                raise BenchmarkError("availability IDs must be unique sorted strings")
+        if (not execution["retained_ids"] or len(execution["retained_ids"]) != cohort
+                or set(execution["retained_ids"]) & set(execution["excluded_ids"])
+                or set(execution["retained_ids"]) | set(execution["excluded_ids"])
+                != set(execution["original_ids"])
+                or execution["cohort_sha256"] != digest(execution["retained_ids"])
+                or execution["interpretation"] != "retrospective_availability"):
+            raise BenchmarkError("availability cohort identity does not reconcile")
+        if execution["series_policy"] == "use_available" and execution["excluded_ids"]:
+            raise BenchmarkError("available-data policy must retain the original denominator")
+        windows = {boundary(s, o, h, recipe.get("frequency", "D")): h
+                   for s, o, h in study_windows(recipe)}
+        mapping(execution["windows"], windows, "availability windows")
+        for key, item in execution["windows"].items():
+            mapping(item, {"eligible_ids", "mask_sha256", "common_dates"}, "window eligibility")
+            ids = item["eligible_ids"]
+            if (type(ids) is not list or not ids or any(type(s) is not str for s in ids)
+                    or ids != sorted(set(ids)) or not set(ids) <= set(execution["retained_ids"])):
+                raise BenchmarkError("invalid window eligible IDs")
+            if (execution["series_policy"] == "exclude_unavailable"
+                    and ids != execution["retained_ids"]):
+                raise BenchmarkError("exclusion policy requires one fixed cohort")
+            sha256(item["mask_sha256"], "window mask")
+            dates = item["common_dates"]
+            stage, origin, horizon, frequency = key.split("/")
+            allowed = {canonical_origin(point, frequency)
+                       for point in period_points(origin, frequency, int(horizon))}
+            if (type(dates) is not list or any(type(d) is not str for d in dates)
+                    or dates != sorted(set(dates)) or not set(dates) <= allowed):
+                raise BenchmarkError("common scoring dates must be unique sorted strings")
+        inherited = record["inherited_roles"]
+        if (type(inherited) is not list or any(type(s) is not str for s in inherited)
+                or inherited != sorted(set(inherited))
+                or not set(inherited) <= set(record["artifacts"])):
+            raise BenchmarkError("invalid inherited role inventory")
     if record["source_series_count"] - cohort != record["excluded_new_series"]:
         raise BenchmarkError("benchmark population counts do not reconcile")
     source_roles = {"selection", "final_training", "validation_score", "final_score"}
-    if recipe["metric"] == "wrmsse":
+    if recipe["metric"] == "wrmsse" or recipe.get("reference_metrics"):
         source_roles.add("scoring_references")
     roles = source_roles | {"source-keys"}
     for name in ("artifacts", "logical_snapshots"):
@@ -1071,7 +1198,7 @@ def _validate_manifest(record: object) -> dict:
             sha256(identity[name], f"grid identity.{name}")
         for value in (item["n_cells"], identity["n_cells"]):
             count(value, "grid n_cells", 1)
-            if value != cohort * horizon:
+            if value != window_series_count(record, key) * horizon:
                 raise BenchmarkError("benchmark grid population count changed")
         if item["logical_sha256"] != identity["logical_sha256"]:
             raise BenchmarkError("benchmark grid logical identity changed")
@@ -1089,7 +1216,8 @@ def _validate_manifest(record: object) -> dict:
         for name, value in totals.items():
             count(value, f"coverage.{name}")
         missing = totals["originally_missing"]
-        if (totals["expected"] != cohort * horizon or missing > totals["expected"]
+        if (totals["expected"] != window_series_count(record, key) * horizon
+                or missing > totals["expected"]
                 or totals["zero_filled"] != 0
                 or (recipe["actual_missing"] == "error" and missing != 0)
                 or totals["excluded"] != (missing if recipe["actual_missing"] == "mask" else 0)
@@ -1122,10 +1250,23 @@ def verify_benchmark(
 ) -> tuple[pathlib.Path, dict]:
     """Authenticate frozen outputs; original mutable sources are recorded but never re-read."""
     path, record = read_benchmark_manifest(path, expected_sha256)
+    if "parent" in record:
+        parent_path, parent = read_benchmark_manifest(
+            pathlib.Path(record["parent"]["path"]), record["parent"]["sha256"],
+        )
+        if ("parent" in parent or parent["study_id"] != record["parent"]["study_id"]
+                or parent["study_id"] == record["study_id"]):
+            raise BenchmarkError("invalid derived study parent")
+        verify_benchmark(parent_path, record["parent"]["sha256"])
+        for role in record["inherited_roles"]:
+            if (record["artifacts"][role] != parent["artifacts"][role]
+                    or record["logical_snapshots"][role] != parent["logical_snapshots"][role]):
+                raise BenchmarkError("inherited artifact identity changed")
     checked = {}
     for name, expected in record["artifacts"].items():
         target = artifact_path(path, record, name)
-        if not target.resolve().is_relative_to(path.parent.resolve()):
+        if (name not in record.get("inherited_roles", [])
+                and not target.resolve().is_relative_to(path.parent.resolve())):
             raise BenchmarkError(f"benchmark artifact escaped its directory: {name}")
         if target not in checked:
             physical = directory_digest(target, suffixes=(".parquet",))
@@ -1180,7 +1321,7 @@ def _evaluation_contract_from_record(
     if metric != record["recipe"]["metric"]:
         raise BenchmarkError("metric differs from the frozen study")
     role = _actuals_role(stage)
-    return {
+    contract = {
         "schema": "autoforecast.fixed-evaluation.v2",
         "benchmark_id": record["benchmark_id"], "study_id": record["study_id"],
         "study": {"path": str(path.resolve()),
@@ -1195,3 +1336,13 @@ def _evaluation_contract_from_record(
                      **record["coverage_identities"][key],
                      "path": str(path.parent / record["coverage"][key]["path"])},
     }
+    if "execution_policy" in record:
+        policy = record["execution_policy"]
+        contract["availability"] = {
+            "series_policy": policy["series_policy"],
+            "original_series": len(policy["original_ids"]),
+            "retained_series": len(policy["retained_ids"]),
+            "cohort_sha256": policy["cohort_sha256"],
+            **policy["windows"][key], "interpretation": policy["interpretation"],
+        }
+    return contract

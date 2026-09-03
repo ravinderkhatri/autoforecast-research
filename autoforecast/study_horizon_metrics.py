@@ -9,7 +9,7 @@ from typing import Literal
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
-from autoforecast.frequency import parse_frequency, period_points
+from autoforecast.frequency import parse_frequency, parse_origin, period_points
 from autoforecast.panel import Forecast
 from autoforecast.score_spark import ScoreError
 from provenance.lineage import directory_digest
@@ -28,6 +28,7 @@ def validate_forecast_accuracy_breakdown(value: object) -> None:
 def score_horizon_metrics(
     path: Path, forecast: Forecast, spark: SparkSession, *, mode: ForecastAccuracyBreakdown,
     policy: dict, references: DataFrame | None,
+    availability: dict | None = None,
 ) -> dict:
     """Reduce validated cell statistics; collect only one aggregate per requested lead.
 
@@ -44,10 +45,22 @@ def score_horizon_metrics(
         f"date {key_type}, lead int",
     )
     cells = spark.read.parquet(str(path)).join(F.broadcast(leads), ["date"])
+    common_dates = availability is not None and availability["series_policy"] == "use_available"
+    if common_dates:
+        assert availability is not None
+        complete = F.col("date").isin([
+            parse_origin(point, cadence) for point in availability["common_dates"]
+        ])
+        cells = cells.withColumn("wrmsse_n", F.when(complete, F.col("n_scored")).otherwise(0))
+        cells = cells.withColumn("wrmsse_ss", F.when(
+            complete, F.col("sum_squared_error"),
+        ).otherwise(0.0))
     columns = (
         "expected", "originally_missing", "n_scored", "n_no_data", "n_zero_filled",
         "sum_abs_error", "sum_squared_error", "sum_error", "sum_actual",
     )
+    if common_dates:
+        columns += ("wrmsse_n", "wrmsse_ss")
     result = {
         "schema": "autoforecast.forecast-accuracy-breakdown.v1", "mode": mode,
         "frequency": cadence.code, "origin": forecast.origin, "horizon": forecast.horizon,
@@ -68,13 +81,16 @@ def score_horizon_metrics(
         if references is not None:
             values = values.join(references.select("series_id", "weight", "scale"),
                                  "series_id", "left")
+            n_name, ss_name = ("wrmsse_n", "wrmsse_ss") if common_dates else (
+                "n_scored", "sum_squared_error",
+            )
             rmsse = F.when(
-                (F.col("n_scored") > 0) & (F.col("scale") > 0),
-                F.sqrt(F.col("sum_squared_error") / F.col("n_scored"))
+                (F.col(n_name) > 0) & (F.col("scale") > 0),
+                F.sqrt(F.col(ss_name) / F.col(n_name))
                 / F.sqrt(F.col("scale")),
             )
             expressions.extend([
-                F.count(F.when(F.col("n_scored") == 0, 1)).alias("missing_series"),
+                F.count(F.when(F.col(n_name) == 0, 1)).alias("missing_series"),
                 F.count(F.when(F.col("scale").isNull() | (F.col("scale") <= 0), 1))
                 .alias("undefined_scales"),
                 F.sum("weight").alias("weight"),
@@ -105,6 +121,15 @@ def score_horizon_metrics(
                 reason = ("missing_series_actuals" if row["missing_series"] else
                           "undefined_scale" if row["undefined_scales"] else None)
                 score["wrmsse"] = None if reason else row["weighted"] / row["weight"]
+                if common_dates:
+                    assert availability is not None
+                    if len(availability["eligible_ids"]) != availability["retained_series"]:
+                        reason = "unfittable_weighted_series"
+                        score["wrmsse"] = None
+                    score["wrmsse_coverage"] = {
+                        "scored_cells": row["wrmsse_n"],
+                        "weighted_series": availability["retained_series"],
+                    }
             if any(isinstance(value, float) and not math.isfinite(value)
                    for value in score.values()):
                 raise ScoreError("horizon metric overflowed")

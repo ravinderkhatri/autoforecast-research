@@ -9,6 +9,7 @@ import pathlib
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -33,6 +34,10 @@ from autoforecast.study_horizon_metrics import (
 from autoforecast.study_scoring import score_study
 from autoforecast.study_tuning import FitPredictRequest, FitPredictResult, TuningResult, tune_study
 from provenance.lineage import directory_digest, snapshot_parquet_directory
+
+if TYPE_CHECKING:
+    from autoforecast.study_preflight import PreflightResult
+    from autoforecast.study_workflow import ForecastWorkflowResult
 
 
 def load_study(
@@ -182,6 +187,12 @@ class Study:
                 expected_sha256=expected, label=role,
             )
         frame = self._spark.read.parquet(str(destination))
+        if "execution_policy" in record and role in {
+            "selection", "final_training", "validation_score", "final_score",
+        }:
+            frame = frame.filter(F.col(self.panel.series_col).isin(
+                record["execution_policy"]["retained_ids"],
+            ))
         if stage is not None:
             start, end = self._range(stage)
             panel = self.panel
@@ -228,19 +239,49 @@ class Study:
     def tune(
         self, *, fit_predict: Callable[[FitPredictRequest], FitPredictResult],
         config: str | pathlib.Path, implementation: Mapping[str, object],
-        tuning_origin: str | None = None,
+        tuning_origin: str | None = None, output_dir: str | pathlib.Path | None = None,
+        reuse_tuning: str | pathlib.Path | None = None,
     ) -> TuningResult:
-        """Tune a Python model on a frozen inner window using sequential Optuna.
+        """Tune a Python model on selected frozen windows using sequential Optuna.
 
         Config contains an external model profile and explicit HPO budget/seed.
         Implementation records name, version, source_sha256 and dependency versions.
         The callback fits and saves predictions/model files; AutoForecast scores them.
-        The sole tuning window is the default; choose tuning_origin when several exist.
-        Outer validation/test targets never select parameters. Callback code is trusted
-        caller code, not sandboxed or attested. No final refit is performed here.
+        The sole inner window is the default; configure origins for multiple windows.
+        selection.stage=validation uses outer validation; testing never selects settings.
+        Callback code is trusted caller code, not sandboxed or attested.
+        No final refit is performed here.
+        output_dir overrides default storage; reuse_tuning verifies a completed search.
         """
         return tune_study(self, fit_predict=fit_predict, config=config,
-                          implementation=implementation, tuning_origin=tuning_origin)
+                          implementation=implementation, tuning_origin=tuning_origin,
+                          output_dir=output_dir, reuse_tuning=reuse_tuning)
+
+    def preflight(
+        self, *, config: str | pathlib.Path, tuning_origin: str | None = None,
+    ) -> PreflightResult:
+        """Check all registered stages and retain a report before invoking any model."""
+        from autoforecast.study_preflight import preflight_study
+        from autoforecast.study_tuning import _config, _resolve_options
+        _, _, _, _, controls = _config(pathlib.Path(config))
+        return preflight_study(self, _resolve_options(self, controls, tuning_origin))
+
+    def run_forecast_workflow(
+        self, *, fit_predict: Callable[[FitPredictRequest], FitPredictResult],
+        implementation: Mapping[str, object], config: str | pathlib.Path | None = None,
+        tuning_origin: str | None = None, output_dir: str | pathlib.Path | None = None,
+        reuse_tuning: str | pathlib.Path | None = None,
+        selected_config: str | pathlib.Path | None = None,
+    ) -> ForecastWorkflowResult:
+        """Tune, validate and refit; pass selected_config to fit new data without HPO.
+
+        reuse_tuning reopens an identical search. selected_config applies verified
+        winning settings to a new study. Both modes retain provenance and artifacts.
+        """
+        from autoforecast.study_workflow import run_forecast_workflow
+        return run_forecast_workflow(self, fit_predict=fit_predict, implementation=implementation,
+            config=config, tuning_origin=tuning_origin, output_dir=output_dir,
+            reuse_tuning=reuse_tuning, selected_config=selected_config)
 
     def evaluate_forecasts(
         self, *, validation_forecasts: Forecast, testing_forecasts: Forecast, model_id: str,
