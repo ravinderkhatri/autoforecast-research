@@ -667,6 +667,7 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
             (parent / marker).exists()
             for marker in (
                 "benchmark.json",
+                "selection.json",
                 "artifact_manifest.json",
                 "metadata/run.json",
                 "metadata/attempt.json",

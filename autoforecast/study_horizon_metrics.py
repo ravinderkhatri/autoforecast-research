@@ -62,7 +62,7 @@ def score_horizon_metrics(
     if common_dates:
         columns += ("wrmsse_n", "wrmsse_ss")
     result = {
-        "schema": "autoforecast.forecast-accuracy-breakdown.v1", "mode": mode,
+        "schema": "autoforecast.forecast-accuracy-breakdown.v2", "mode": mode,
         "frequency": cadence.code, "origin": forecast.origin, "horizon": forecast.horizon,
         "metric_definition": policy,
         "series_sums": {"path": str(path), "sha256": digest},
@@ -114,27 +114,38 @@ def score_horizon_metrics(
                     "zero_filled": row["n_zero_filled"], "excluded": row["n_no_data"], "scored": n,
                 },
             }
-            reason = "no_observed_actuals" if not n else None
-            if policy["metric"] == "wape" and n and not volume:
-                reason = "zero_actual_volume"
+            reasons: dict[str, str | None] = dict.fromkeys(
+                ("mae", "rmse", "bias"), "no_observed_actuals" if not n else None,
+            )
+            reasons["wape"] = (
+                "no_observed_actuals" if not n else "zero_actual_volume" if not volume else None
+            )
             if references is not None:
-                reason = ("missing_series_actuals" if row["missing_series"] else
-                          "undefined_scale" if row["undefined_scales"] else None)
-                score["wrmsse"] = None if reason else row["weighted"] / row["weight"]
+                wrmsse_reason = (
+                    "missing_series_actuals" if row["missing_series"] else
+                    "undefined_scale" if row["undefined_scales"] else None
+                )
+                score["wrmsse"] = None if wrmsse_reason else row["weighted"] / row["weight"]
                 if common_dates:
                     assert availability is not None
                     if len(availability["eligible_ids"]) != availability["retained_series"]:
-                        reason = "unfittable_weighted_series"
+                        wrmsse_reason = "unfittable_weighted_series"
                         score["wrmsse"] = None
                     score["wrmsse_coverage"] = {
                         "scored_cells": row["wrmsse_n"],
                         "weighted_series": availability["retained_series"],
                     }
+                reasons["wrmsse"] = wrmsse_reason
             if any(isinstance(value, float) and not math.isfinite(value)
                    for value in score.values()):
                 raise ScoreError("horizon metric overflowed")
-            score.update(status="unavailable" if score[policy["metric"]] is None else "scored",
-                         unavailable_reason=reason)
+            score["metric_status"] = {
+                name: {"status": "scored" if score[name] is not None else "unavailable",
+                       "reason": reason}
+                for name, reason in reasons.items()
+            }
+            primary = score["metric_status"][policy["metric"]]
+            score.update(status=primary["status"], unavailable_reason=primary["reason"])
             metrics.append(score)
         result[kind] = metrics
     if directory_digest(path, suffixes=(".parquet",)) != digest:

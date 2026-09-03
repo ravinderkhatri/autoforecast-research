@@ -224,6 +224,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         for role in ("selection", "final_training", "validation_score", "final_score")
     }
     for role in report["roles"]:
+        issue_start = len(report["issues"])
         report["current_check"] = {"stage": role, "origin": None}
         source = ds.dataset(artifact_path(study._path, record, role), format="parquet")
         schema = source.schema
@@ -233,6 +234,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             or not (
                 pa.types.is_integer(schema.field(panel.target_col).type)
                 or pa.types.is_floating(schema.field(panel.target_col).type)
+                or pa.types.is_decimal(schema.field(panel.target_col).type)
             )
         ):
             raise BenchmarkError(f"{role}: invalid ID, missing marker or target storage type")
@@ -401,8 +403,12 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                     "explanation": "prepared row and missingness counts differ from frozen counts",
                 }
             )
+        if len(report["issues"]) > issue_start:
+            report["roles"][role]["status"] = "blocked"
     if report["issues"]:
-        report["current_check"] = None
+        report["current_check"] = {
+            "stage": report["issues"][0]["stage"], "origin": None,
+        }
         raise BenchmarkError(
             "frozen prepared data integrity failed: "
             + ", ".join(sorted({issue["code"] for issue in report["issues"]}))
@@ -523,7 +529,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         if not eligible:
             raise BenchmarkError(f"{key}: no series has the required training history")
         masks, coverage = [], []
-        volume = 0.0
+        has_positive_volume = False
         for sid in eligible:
             observed = 0
             for point in points[key]:
@@ -532,7 +538,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                 observed += int(not missing)
                 # Test target magnitudes do not enter any objective capability decision.
                 if stage != "test" and value is not None:
-                    volume += value
+                    has_positive_volume |= value > 0
             coverage.append(
                 {
                     "series_id": sid,
@@ -549,7 +555,12 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             if len(eligible) == len(retained)
             and all(actuals[key].get((sid, point), (None, True))[0] is not None for sid in retained)
         ]
+        observed_cells = sum(
+            not actuals[key].get((sid, point), (None, True))[1]
+            for sid in ids for point in points[key]
+        )
         resolved[key] = {
+            "observed_cells": observed_cells,
             "eligible_ids": eligible,
             "mask_sha256": digest(masks),
             "common_dates": common,
@@ -577,7 +588,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             "trainable_series": len(eligible),
             "expected_cells": len(ids) * horizon,
             "forecast_cells": len(eligible) * horizon,
-            "observed_cells": scored,
+            "observed_cells": observed_cells,
             "filled_cells": 0,
             "scored_cells": scored,
             "scored_series": sum(r["scored"] > 0 for r in coverage),
@@ -596,7 +607,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                 "empty_scoring_mask"
                 if not scored
                 else "zero_actual_volume"
-                if objective == "wape" and volume == 0
+                if objective == "wape" and not has_positive_volume
                 else wrmsse_reason
                 if objective == "wrmsse"
                 else None

@@ -23,7 +23,7 @@ pytest_plugins = ["autoforecast.test_study"]
 
 
 def build_study(root, spark, *, frequency="D", metric="wrmsse", missing=None, scale_b=9.0,
-                zero_actuals=False, validation_horizon=3, tiny_first_actual=False):
+                zero_actuals=False, validation_horizon=3, tiny_first_actual=False, optional_references=False):
     """Two retained series, three validation steps and two test steps; no exclusions."""
     root.mkdir(parents=True, exist_ok=True)
     cadence = parse_frequency(frequency)
@@ -58,7 +58,7 @@ def build_study(root, spark, *, frequency="D", metric="wrmsse", missing=None, sc
         "actual_missing": "mask" if missing else "error",
     }
     references = None
-    if metric == "wrmsse":
+    if metric == "wrmsse" or optional_references:
         references = root / "references.parquet"
         pq.write_table(pa.Table.from_pylist([
             {"keys": {"item": series}, "stage": stage, "origin": origin,
@@ -92,7 +92,7 @@ def build_study(root, spark, *, frequency="D", metric="wrmsse", missing=None, sc
     return manifest, forecasts, points
 
 
-def evaluate(manifest, forecast, spark, output, mode="both"):
+def evaluate(manifest, forecast, spark, output, mode="both", metrics=None):
     recipe = benchmark.verify_benchmark(manifest)[1]["recipe"]
     contract = benchmark.evaluation_contract(
         manifest, stage="validation", origin=forecast.origin, horizon=forecast.horizon,
@@ -100,7 +100,7 @@ def evaluate(manifest, forecast, spark, output, mode="both"):
     )
     panel = load_dataset_contract(manifest.parent / "dataset.yaml").panel(contract["actuals"]["path"])
     return score_study(panel, forecast, spark, contract=contract, output_dir=output,
-                       forecast_accuracy_breakdown=mode)
+                       forecast_accuracy_breakdown=mode, metrics=metrics)
 
 
 def assert_breakdown_schema(report, modes, *, wrmsse=True):
@@ -109,7 +109,7 @@ def assert_breakdown_schema(report, modes, *, wrmsse=True):
     } | modes
     keys = {
         "start_lead", "end_lead", "start_time", "end_time", "mae", "rmse", "wape",
-        "bias", "coverage", "status", "unavailable_reason",
+        "bias", "coverage", "status", "unavailable_reason", "metric_status",
     } | ({"wrmsse"} if wrmsse else set())
     for mode in modes:
         assert all(set(row) == keys for row in report[mode])
@@ -122,7 +122,7 @@ def test_horizon_metrics_use_forecast_periods_and_square_errors_before_aggregati
     manifest, forecasts, points = build_study(tmp_path, spark, frequency=frequency)
     score = evaluate(manifest, forecasts[0], spark, tmp_path / "score")
     breakdown = score["forecast_accuracy_breakdown"]
-    assert breakdown["schema"] == "autoforecast.forecast-accuracy-breakdown.v1"
+    assert breakdown["schema"] == "autoforecast.forecast-accuracy-breakdown.v2"
     assert breakdown["frequency"] == parse_frequency(frequency).code
     assert breakdown["horizon"] == 3 and breakdown["origin"] == forecasts[0].origin
     assert_breakdown_schema(breakdown, {"per_step", "cumulative"})
@@ -256,14 +256,27 @@ def test_breakdown_supports_existing_cell_metrics_without_wrmsse_references(tmp_
 
 
 @pytest.mark.parametrize("metric", ["wape", "mae"])
-def test_zero_volume_wape_has_an_explicit_unavailable_reason(tmp_path, spark, metric):
-    manifest, forecasts, _ = build_study(tmp_path, spark, metric=metric, zero_actuals=True)
-    score = evaluate(manifest, forecasts[0], spark, tmp_path / "score")
+@pytest.mark.parametrize("references", ["none", "valid", "undefined"])
+def test_zero_volume_wape_has_an_explicit_unavailable_reason(tmp_path, spark, metric, references):
+    manifest, forecasts, _ = build_study(
+        tmp_path, spark, metric=metric, zero_actuals=True,
+        optional_references=references != "none", scale_b=None if references == "undefined" else 9.0,
+    )
+    score = evaluate(
+        manifest, forecasts[0], spark, tmp_path / "score",
+        metrics=("mae", "wape", "wrmsse") if references != "none" else None,
+    )
     for mode in ("per_step", "cumulative"):
         for row in score["forecast_accuracy_breakdown"][mode]:
             assert row["wape"] is None and row["mae"] == row["rmse"] == 2.0
             assert row["status"] == ("unavailable" if metric == "wape" else "scored")
             assert row["unavailable_reason"] == ("zero_actual_volume" if metric == "wape" else None)
+            assert row["metric_status"]["wape"] == {"status": "unavailable", "reason": "zero_actual_volume"}
+            if references != "none":
+                assert row["metric_status"]["wrmsse"] == {
+                    "status": "unavailable" if references == "undefined" else "scored",
+                    "reason": "undefined_scale" if references == "undefined" else None,
+                }
 
 
 def test_one_step_per_step_cumulative_and_overall_agree(tmp_path, spark):

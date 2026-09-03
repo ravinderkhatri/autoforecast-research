@@ -271,7 +271,8 @@ def _score_study_snapshot(
         "forecasted_series": forecast.n_series,
         "scored_series": per_series.filter(F.col("scored") > 0).count(),
         "expected_cells": original_count * forecast.horizon,
-        "observed_cells": result.n_scored, "filled_cells": result.n_zero_filled,
+        "observed_cells": contract.get("availability", {}).get("observed_cells", result.n_scored),
+        "filled_cells": result.n_zero_filled,
         "scored_cells": result.n_scored,
     }
     score["evaluation_status"] = (

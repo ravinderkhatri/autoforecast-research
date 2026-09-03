@@ -715,7 +715,9 @@ next_run = next_study.run_forecast_workflow(
 Inner selection with T trials and N windows performs N×T callback fits, one outer validation
 fit and one final refit. Outer-validation selection performs T+1 fits: its selected validation
 model/forecasts are reused, then the final model is fitted separately. The work estimate is
-logged before tuning. The full workflow defaults to per-step reporting; tune-only defaults to
+logged before tuning. Horizon reports use schema `autoforecast.forecast-accuracy-breakdown.v2`; each metric has its
+own status and reason, while the row status describes the primary metric. Previously saved
+reports remain readable. The full workflow defaults to per-step reporting; tune-only defaults to
 overall reporting. Returned models remain in the caller’s serialization format.
 
 Saved-settings execution performs two fresh fits and no parameter search. It allows different

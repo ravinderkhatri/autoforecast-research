@@ -1,6 +1,8 @@
 """Public workflow contracts: windows, selection, availability and future reuse."""
 
+import copy
 import datetime as dt
+import decimal
 import hashlib
 import json
 import math
@@ -726,6 +728,7 @@ def test_preflight_checks_exact_ids_and_duplicates_before_any_fit(
             )
     report = json.loads(caught.value.report_path.read_text())
     assert report["status"] == "blocked" and report["callback_count"] == 0
+    assert report["roles"][role]["status"] == "blocked"
     if defect == "wrong_date":
         assert report["issues"][0]["stage"] == role
         assert report["roles"][role]["status"] == "blocked"
@@ -1357,3 +1360,205 @@ def test_reporting_and_model_identity_keep_available_masks_and_selection_fixed(
         availability = left["evaluation_contract"]["availability"]
         assert availability["mask_sha256"]
         assert availability["eligible_ids"] == calls[0][1]
+
+
+def _one_trial(path: pathlib.Path) -> pathlib.Path:
+    value = yaml.safe_load(path.read_text())
+    value["hpo"]["max_trials"] = 1
+    path.write_text(yaml.safe_dump(value))
+    return path
+
+
+@pytest.mark.parametrize("metric", ["mae", "wape"])
+@pytest.mark.parametrize("zero", [False, True])
+def test_decimal_targets_supported_by_preflight(spark, tmp_path, metric, zero):
+    original = register(tmp_path / "original", spark, count=1)
+    record = benchmark.read_benchmark_manifest(original)[1]
+    source = pathlib.Path(record["sources"]["selection"]["path"])
+    rows = pq.read_table(source).to_pylist()
+    target = pa.array(
+        [decimal.Decimal("0" if zero else str(row["units"])).quantize(decimal.Decimal("0.01"))
+         for row in rows],
+        type=pa.decimal128(12, 2),
+    )
+    table = pq.read_table(source)
+    table = table.set_column(table.schema.get_field_index("units"), "units", target)
+    decimal_source = tmp_path / "decimal-source.parquet"
+    pq.write_table(table, decimal_source)
+    decimal_study = benchmark.freeze_benchmark(
+        contract_path=source.parent / "dataset.yaml",
+        sources=dict.fromkeys(
+            ("selection", "final_training", "validation_score", "final_score"),
+            decimal_source,
+        ),
+        recipe=record["recipe"],
+        scoring_references=pathlib.Path(record["sources"]["scoring_references"]["path"]),
+        output_root=tmp_path / "decimal-registry",
+        spark=spark,
+    )
+    cfg = profile(tmp_path, selection={"stage": "validation", "metric": metric},
+                  reporting={"metrics": [metric]})
+    with open_study(decimal_study, spark) as study:
+        if zero and metric == "wape":
+            with pytest.raises(StudyPreflightError, match="zero_actual_volume"):
+                study.preflight(config=cfg)
+        else:
+            assert study.preflight(config=cfg).report["status"] == "passed"
+
+
+def test_available_population_separates_observed_from_scored_cells(spark, tmp_path):
+    manifest = register(tmp_path / "late-study", spark, start_b=4)
+    cfg = profile(
+        tmp_path,
+        selection={"origins": ["2024-01-03"]},
+        reporting={"metrics": ["mae", "wrmsse"]},
+        series_policy="use_available",
+    )
+    with open_study(manifest, spark) as study:
+        preflight = study.preflight(config=cfg)
+        key = next(key for key in preflight.report["windows"] if key.startswith("tuning/2024-01-03"))
+        window = preflight.report["windows"][key]
+        # B has both target observations but cannot yet be fitted at the origin.
+        assert window["expected_cells"] == window["observed_cells"] == 4
+        assert window["forecast_cells"] == window["scored_cells"] == 2
+        record = benchmark.read_benchmark_manifest(preflight.study_path)[1]
+        for invalid in (-1, True, 5):
+            changed = copy.deepcopy(record)
+            changed["execution_policy"]["windows"][key]["observed_cells"] = invalid
+            with pytest.raises(benchmark.BenchmarkError, match="observed"):
+                benchmark._validate_manifest(changed)
+
+
+def test_available_score_separates_observed_from_scored_cells(spark, tmp_path):
+    manifest = register(tmp_path / "late-score-study", spark, start_b=4)
+    cfg = _one_trial(profile(
+        tmp_path,
+        selection={"origins": ["2024-01-03"]},
+        reporting={"metrics": ["mae"]},
+        series_policy="use_available",
+    ))
+    with open_study(manifest, spark) as study:
+        result = study.tune(fit_predict=predict, config=cfg, implementation=implementation())
+    population = result.windows[0]["score"]["population"]
+    assert population["expected_cells"] == population["observed_cells"] == 4
+    assert population["forecasted_series"] == 1 and population["scored_cells"] == 2
+    report = json.loads(result.validation_report.read_text())
+    window = next(value for key, value in report["windows"].items()
+                  if key.startswith("tuning/2024-01-03"))
+    availability = result.windows[0]["evaluation_contract"]["availability"]
+    assert availability["mask_sha256"] == window["mask_sha256"]
+    assert availability["observed_cells"] == window["observed_cells"]
+
+
+def test_available_horizon_status_does_not_attach_wrmsse_reason_to_scored_mae(spark, tmp_path):
+    manifest = register(tmp_path / "horizon-study", spark, start_b=4)
+    cfg = _one_trial(profile(
+        tmp_path,
+        selection={"origins": ["2024-01-03"]},
+        reporting={"metrics": ["mae", "wrmsse"], "forecast_accuracy_breakdown": "per_step"},
+        series_policy="use_available",
+    ))
+    with open_study(manifest, spark) as study:
+        result = study.tune(fit_predict=predict, config=cfg, implementation=implementation())
+    rows = result.windows[0]["score"]["forecast_accuracy_breakdown"]["per_step"]
+    assert all(row["status"] == "scored" for row in rows)
+    assert all(row["unavailable_reason"] is None for row in rows)
+    assert all(row["metric_status"]["wrmsse"] == {
+        "status": "unavailable", "reason": "unfittable_weighted_series",
+    } for row in rows)
+    assert result.windows[0]["score"]["metric_status"]["wrmsse"]["reason"] == (
+        "unfittable_weighted_series"
+    )
+
+
+def test_output_root_rejects_completed_search_namespace(spark, tmp_path):
+    manifest = register(tmp_path / "output-study", spark, count=1)
+    cfg = _one_trial(profile(tmp_path, selection={"stage": "validation"}))
+    with open_study(manifest, spark) as study:
+        selected = study.tune(
+            fit_predict=predict,
+            config=cfg,
+            implementation=implementation(),
+            output_dir=tmp_path / "searches",
+        )
+        assert (selected.path / "selection.json").is_file()
+        for relative in (".", "child", "attempts", "attempts/new/nested"):
+            for run in (study.tune, study.run_forecast_workflow):
+                with pytest.raises(HPOError, match="overlaps"):
+                    run(fit_predict=predict, config=cfg, implementation=implementation(),
+                        output_dir=selected.path / relative)
+
+
+def test_schedule_rejects_impossible_count_before_enumerating(monkeypatch):
+    calls = 0
+    real_advance = benchmark.advance
+
+    def bounded_advance(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 4:
+            raise AssertionError("resolver enumerated an already-impossible schedule")
+        return real_advance(*args, **kwargs)
+
+    monkeypatch.setattr(benchmark, "advance", bounded_advance)
+    with pytest.raises(benchmark.BenchmarkError):
+        benchmark.resolve_tuning_schedule(
+            {
+                "frequency": "D",
+                "training_start": "9998-01-01",
+                "validation_origins": ["9999-01-01"],
+            },
+            {"horizon": 1, "stride": 1, "count": 1_000_000},
+        )
+    assert calls <= 4
+
+
+def test_freeze_rejects_conflicting_reference_metric_declaration(spark, tmp_path):
+    original = register(tmp_path / "reference-original", spark, count=1)
+    record = benchmark.read_benchmark_manifest(original)[1]
+    recipe = copy.deepcopy(record["recipe"])
+    recipe["reference_metrics"] = ["mae"]
+    source = pathlib.Path(record["sources"]["selection"]["path"])
+    sources = {
+        name: pathlib.Path(record["sources"][name]["path"])
+        for name in ("selection", "final_training", "validation_score", "final_score")
+    }
+    with pytest.raises(benchmark.BenchmarkError, match="reference_metrics"):
+        benchmark.freeze_benchmark(
+            contract_path=source.parent / "dataset.yaml",
+            sources=sources,
+            recipe=recipe,
+            scoring_references=pathlib.Path(
+                record["sources"]["scoring_references"]["path"]
+            ),
+            output_root=tmp_path / "reference-registry",
+            spark=spark,
+        )
+
+
+def test_collected_integrity_issues_mark_affected_role_blocked(spark, tmp_path):
+    manifest = register(tmp_path / "report-study", spark, count=1)
+    copied = tmp_path / "report-registry/original"
+    shutil.copytree(manifest.parent, copied)
+    record = json.loads((copied / "benchmark.json").read_text())
+    role = "final_score"
+    relative = record["role_paths"][role]
+    path = copied / relative
+    table = pq.read_table(path)
+    rows = table.to_pylist()
+    rows.append(rows[0])
+    shutil.rmtree(path)
+    path.mkdir()
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), path / "part.parquet")
+    for name, target in record["role_paths"].items():
+        if target == relative:
+            record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
+            record["logical_snapshots"][name] = benchmark._parquet_hash(path)
+    changed = _publish_changed_record(copied, record)
+    cfg = profile(tmp_path, selection={"stage": "validation"})
+    with open_study(changed, spark) as study, pytest.raises(StudyPreflightError) as caught:
+        study.preflight(config=cfg)
+    report = json.loads(caught.value.report_path.read_text())
+    assert any(issue["stage"] == role for issue in report["issues"])
+    assert report["roles"][role]["status"] == "blocked"
+    assert report["roles"][report["current_check"]["stage"]]["status"] == "blocked"

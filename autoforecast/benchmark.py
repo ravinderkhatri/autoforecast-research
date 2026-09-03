@@ -255,11 +255,12 @@ def resolve_tuning_schedule(recipe: dict, schedule: dict) -> list[dict]:
     end = _recipe_point(recipe["validation_origins"][0], cadence)
     start = _recipe_point(recipe["training_start"], cadence)
     try:
-        origins = [advance(end, cadence, -horizon - stride * i) for i in reversed(range(count))]
+        first = advance(end, cadence, -horizon - stride * (count - 1))
     except (FrequencyError, OverflowError, ValueError) as error:
         raise BenchmarkError("tuning schedule exceeds supported dates") from error
-    if origins[0] < start:
+    if first < start:
         raise BenchmarkError("tuning schedule starts before available training history")
+    origins = [advance(end, cadence, -horizon - stride * i) for i in reversed(range(count))]
     return [{"origin": canonical_origin(origin, cadence), "horizon": horizon} for origin in origins]
 
 
@@ -530,7 +531,7 @@ def _freeze_benchmark(
 
     recipe = json.loads(json.dumps(recipe, allow_nan=False))
     if scoring_references is not None and recipe.get("metric") != "wrmsse":
-        recipe["reference_metrics"] = ["wrmsse"]
+        recipe.setdefault("reference_metrics", ["wrmsse"])
     recipe = _normalise_recipe(recipe)
     cadence = _recipe_cadence(recipe)
     source_roles = {"selection", "final_training", "validation_score", "final_score"}
@@ -1108,7 +1109,11 @@ def _validate_manifest(record: object) -> dict:
                    for s, o, h in study_windows(recipe)}
         mapping(execution["windows"], windows, "availability windows")
         for key, item in execution["windows"].items():
-            mapping(item, {"eligible_ids", "mask_sha256", "common_dates"}, "window eligibility")
+            mapping(item, {"eligible_ids", "mask_sha256", "common_dates", "observed_cells"},
+                    "window eligibility")
+            count(item["observed_cells"], "observed_cells")
+            if item["observed_cells"] > len(execution["original_ids"]) * windows[key]:
+                raise BenchmarkError("observed cells exceed the original window population")
             ids = item["eligible_ids"]
             if (type(ids) is not list or not ids or any(type(s) is not str for s in ids)
                     or ids != sorted(set(ids)) or not set(ids) <= set(execution["retained_ids"])):
