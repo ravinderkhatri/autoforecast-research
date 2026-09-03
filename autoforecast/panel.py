@@ -45,7 +45,7 @@ class PanelError(ValueError):
 
 
 def period_days(frequency: str) -> int:
-    """Compatibility helper for callers that still require an integral-day stride.
+    """Return an exact integral-day stride for algorithms that require one.
 
     Hourly, monthly, and yearly cadences must use :mod:`autoforecast.frequency`; they are never
     approximated as a number of days.
@@ -247,8 +247,8 @@ class Panel:
 
         JSON turns tuples into arrays and nested dataclasses into objects.  Reconstruct both
         explicitly so process-isolated and replay entry points receive the same types as an
-        in-process caller.  Missing optional fields retain dataclass defaults for old records;
-        unknown fields fail closed instead of being silently discarded.
+        in-process caller. Every current field must be present, including optional fields;
+        missing and unknown fields fail closed.
         """
         if type(record) is not dict:
             raise PanelError("panel record must be one JSON object")
@@ -256,20 +256,26 @@ class Panel:
         unknown = sorted(set(record) - fields)
         if unknown:
             raise PanelError(f"panel record has unknown field(s) {unknown}")
+        missing = sorted(fields - set(record))
+        if missing:
+            raise PanelError(f"panel record is missing current field(s) {missing}")
         restored = dict(record)
         for name in ("known_future", "static", "static_reals", "past_only", "shared_known_future"):
-            value = restored.get(name, ())
+            value = restored[name]
             if type(value) not in (list, tuple):
                 raise PanelError(f"panel record {name} must be a JSON array")
             restored[name] = tuple(value)
-        families = restored.get("covariate_families", ())
+        families = restored["covariate_families"]
         if not isinstance(families, list | tuple) or any(
             not isinstance(family, list | tuple) for family in families
         ):
             raise PanelError("covariate_families must be an array of column arrays")
         restored["covariate_families"] = tuple(tuple(family) for family in families)
-        plan = restored.get("plan")
+        plan = restored["plan"]
         if type(plan) is dict:
+            plan_fields = {field.name for field in dataclasses.fields(PlanSource)}
+            if set(plan) != plan_fields:
+                raise PanelError("panel record has malformed PlanSource: expected all current fields")
             try:
                 restored["plan"] = PlanSource(**plan)
             except (PanelError, TypeError) as exc:
@@ -842,8 +848,14 @@ class Forecast:
         Used to resume a long gate run without re-running an adapter. `n_emitted` and
         `n_declined` are recomputed from `disposition` rather than trusted from the file, so a
         record that has been edited disagrees with itself and `validate` catches it.
+        Every current dataclass field is required. Extra ranking sidecar metadata is ignored.
         """
+        if type(rec) is not dict:
+            raise ForecastError("forecast record must be one JSON object")
         fields = {f.name for f in dataclasses.fields(cls)}
+        missing = sorted(fields - set(rec))
+        if missing:
+            raise ForecastError(f"forecast record is missing current field(s) {missing}")
         return cls(**{k: v for k, v in rec.items() if k in fields})
 
 

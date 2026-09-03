@@ -33,25 +33,10 @@ autoforecast = "autoforecast.cli:main"
 # Convenience extra combines the existing model families without duplicating their requirements.
 # Standalone TimesFM 2.5 needs a second environment because it conflicts with TimesFM 3.
 all-models = ["autoforecast[shallow,custom-torch,tft,autogluon-zoo,timesfm3]"]
-# Existing workflow extra names remain compatible aliases; their libraries are now standard.
-timeseries = ["PyYAML==6.0.3", "pyspark==4.2.0", "pyarrow==24.0.0", "numpy==2.5.3", "pandas==2.3.3", "psutil==7.2.2"]
-plots = ["matplotlib==3.11.1"]
 # Optional dataset acquisition and frame libraries.
 data = ["kaggle", "pandas", "pyarrow", "numpy"]
-# Importing catalog/static contracts does not start a JVM; forecasting execution requires Java.
-spark = ["pyspark>=4,<5", "pyarrow>=24,<26"]
-# Declarative candidate-catalog loading is included in the standard install.
-catalog = ["PyYAML==6.0.3"]
-# Both HPO backends are installed by default and consume the same model-YAML schema.
-hpo-optuna = ["PyYAML==6.0.3", "optuna==5.0.0"]
-hpo-ray = ["PyYAML==6.0.3", "ray[tune]==2.58.0"]
-# Tracking libraries are standard; export to a customer-managed MLflow remains opt-in at runtime.
-mlflow-tracking = ["mlflow-skinny==3.13.0", "psutil==7.2.2"]
-# Durable overnight supervision needs process-tree RSS enforcement even when MLflow is disabled.
-campaign = ["psutil==7.2.2"]
-# Model runtimes are intentionally separate: selecting a model profile never installs every deep
-# learning stack. `uv.lock` pins the resolved transitive graph for repeatable smoke/gate runs.
-classical = ["statsforecast==2.0.1"]
+# Model runtimes are separate: selecting a profile does not install every deep-learning stack.
+# `uv.lock` pins the resolved graph for repeatable runs.
 custom-torch = ["torch>=2.5,<3", "tensorboard>=2.18,<3"]
 shallow = ["lightgbm>=4,<5", "pandas"]
 tft = ["lightning>=2.5,<3", "pytorch-forecasting>=1.3,<2"]

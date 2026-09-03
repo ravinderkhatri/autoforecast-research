@@ -6,8 +6,8 @@ input data, compares models on validation periods, refits the selected model, an
 separate test period. Each run retains its data identities, configuration, forecasts, and metrics.
 
 Start with CSV or Parquet. Column names and series keys are configurable; M5 is an optional
-benchmark, not a required data format. Data and outputs stay local unless you explicitly configure
-an external tracking service.
+benchmark, not a required data format. Execution is local by default. Shared storage, an existing
+remote cluster and external tracking are used only when explicitly configured.
 
 ![AutoForecast workflow: bring time-series data, validate and freeze a benchmark, compare models, refit, score a separate test period, and inspect verified results.](assets/autoforecast-overview.svg)
 
@@ -38,6 +38,10 @@ The standard install includes data preparation, result plots, the model catalog,
 Optuna and Ray, and MLflow tracking libraries. It also includes seasonal-naive and last-value
 baselines plus AutoETS, AutoTheta and Croston. These models need neither a GPU nor a model
 download. External tracking is used only when you configure it.
+
+Backward-compatibility shims are not provided. Saved records must satisfy their current
+contract; obsolete formats and missing required fields are rejected. Recreate unsupported
+runs with the current API rather than modifying their saved evidence.
 
 ### Choose additional models
 
@@ -265,8 +269,9 @@ Parquet directories must contain `.parquet` parts, optionally under Hive partiti
 Hidden completion markers are ignored. Visible sidecars, summary metadata, streaming logs,
 links, and special files are refused so every reader-visible observation is authenticated.
 
-Signed targets, learned imputation, raw warehouse feeds, and cloud execution are outside this
-release workflow. Use `observed_nonnegative` for measured quantities,
+Signed targets, learned imputation and raw warehouse feeds are outside this CLI release
+workflow. This CLI route does not provision or execute cloud jobs. The custom-model campaign
+API described below can connect to an explicitly supplied existing Ray cluster. Use `observed_nonnegative` for measured quantities,
 including fractional values such as energy use. The two built-in baselines support this target.
 Use `sales_given_availability` for observed retail sales. Optional retail models declare their
 supported targets and reject incompatible inputs; none of these observed-target contracts
@@ -366,6 +371,7 @@ with experiment_project("/absolute/path/to/my-experiment"):
             testing_forecasts=testing_forecasts,
             model_id="my-model",
             forecast_accuracy_breakdown="per_step",  # Default: accuracy at each forecast step.
+            output_dir="outputs/demand-baseline/scoring",  # Parent for a fresh evaluation run.
         )
         print(result["validation"]["score"])
         print(result["test"]["score"])
@@ -454,7 +460,9 @@ It creates two tiny series with unequal history starts, freezes them using `free
 loads the generated ID, accesses all roles and ranges, converts ordinary Spark predictions
 to Forecast objects, and scores both stages. It performs no model training or paid compute.
 
-Each check writes a new `study-runs/run-...` directory beside the registry, retaining
+By default, each check creates `.autoforecast/study-runs/<study-id>/evaluation-<UTC>-<UUID>/`
+beside the benchmark registry. `output_dir` sets a different parent folder, and
+`result["result_path"]` identifies the saved result. Each run retains
 forecasts, per-series scores, coverage, study/model/run IDs and artifact hashes. The existing
 scorer controls unavailable scores and WRMSSE weights. The result records verified input
 identities; it cannot prove which data external model code trained on. The result records
@@ -670,7 +678,9 @@ numbers count frequency periods (hours, days, weeks or calendar periods). An exp
 To register optional WRMSSE references for a study whose primary metric is MAE, supply
 `scoring_references` at registration. Tuning does not invent or replace references.
 
-`study.preflight(config=...)` checks all registered stages and saves a report. Tuning and the
+`study.preflight(config=...)` checks all registered stages and saves a report.
+This standalone entry point requires a profile with an `hpo` block and resolves its
+selection windows. Fixed-only profiles without `hpo` use the workflow’s automatic preflight. Tuning and the
 full workflow call it automatically before the first fit. The original registered IDs are
 the population; every required prediction must cover its entire resolved date grid.
 
@@ -687,6 +697,30 @@ In `use_available`, WRMSSE uses only dates with actuals for **every** series in 
 weighted cohort. For A/B with B missing day 2, WRMSSE uses days 1 and 3 for both; MAE can use
 all five observed cells. An unfittable weighted member or no common dates makes WRMSSE
 unavailable. No API here fills missing values or fabricates pre-start history.
+
+### Prepare additive data and scoring references
+
+`autoforecast.preparation.prepare_time_series` accepts Spark data, original ID/date/value
+column names, and explicit `fill_missing="na"` or `"zero"` and `duplicate_policy="error"`
+or `"sum"`. It supports period-start H/D/W/MS/YS, additive aggregation and calendar completion.
+An explicit null propagates to that value column in the aggregated period; absent source
+rows allow a partial sum. Calendar completion runs from each supplied series’ first through
+last observation; `series_end_date` can extend the end. It does not invent earlier periods
+or wholly absent IDs. For example, observations on January 2 and 4 insert January 3 only.
+`series_end_date` is also an inclusive source cutoff, aligned to the source frequency. Rows are checked for valid IDs, dates, finite values and source-period alignment before filtering, so the cutoff cannot hide invalid rows. Rows after it are then discarded; duplicate checks apply to the retained rows. A series with no rows on or before it is absent from the output; if no rows remain anywhere, preparation raises. Reconcile input and output ID populations when using it.
+Timestamp input requires a UTC Spark session. Weeks start on Monday; weekly-to-monthly/yearly
+aggregation is rejected. These are this helper’s restrictions, separate from study registration.
+Set `observed_col="source_observed"` to distinguish inserted periods from periods with at least
+one source row; true does not mean a complete feed. This does not decide business eligibility.
+
+`autoforecast.study_references.prepare_wrmsse_references` builds daily historical weights and
+scales with explicit source columns, forecast origins, missing-history policy, lookback,
+scale lag and scale start. It returns the existing study reference format. It uses only history
+through each origin and never excludes invalid series silently. The ID population comes from
+the complete supplied frame: a future-only new ID has invalid earlier references, so validation
+raises (or `validate=False` retains those rows for inspection). Callers must supply the intended
+population. `validate=False` bypasses reference-value validation, not input/preparation validation. At each requested origin, at least one row must exist somewhere in the supplied population on or before that origin. An individual future-only ID needs no earlier row: with `validate=False`, it remains with invalid references. If the entire population has no historical rows at a boundary, the helper raises even with `validate=False`. See the synthetic examples in
+`autoforecast/test_preparation.py`.
 
 ### Full workflow and reuse on future data
 
@@ -712,20 +746,39 @@ next_run = next_study.run_forecast_workflow(
 )
 ```
 
+For a first run with fixed settings, pass `fixed_parameters={}` to use profile defaults,
+or explicit overrides such as `fixed_parameters={"model.level": 4.0}`. This requires `config`
+and makes two fitting calls with **zero optimizer trials**. The profile's `hpo` block is optional
+in this mode; its seed is used when supplied, otherwise the recorded seed is 42. It cannot be
+combined with `selected_config`, `reuse_tuning` or `tuning_origin`. The result records
+`mode="fixed_configuration"`; it does not claim the manual settings won a search.
+
+The callback receives `request.purpose`: `"selection"`, `"validation"` or `"refit"`.
+Outer-validation tuning still uses `"selection"`. The orchestration supplies this value;
+it is not a tunable model parameter.
+
+Use `validation_only=True` to retain a checked validation checkpoint before choosing among
+models. Its `testing` field is `None`. After choosing, pass `validation_run=checkpoint.path`
+to run on the **same study and implementation**: the validation evidence is reused without
+rescoring, and only the final refit is performed. A checkpoint is not a completed test run
+and cannot be exported as one. Reusing settings on new data still uses `selected_config`.
+
 Inner selection with T trials and N windows performs N×T callback fits, one outer validation
 fit and one final refit. Outer-validation selection performs T+1 fits: its selected validation
 model/forecasts are reused, then the final model is fitted separately. The work estimate is
 logged before tuning. Horizon reports use schema `autoforecast.forecast-accuracy-breakdown.v2`; each metric has its
-own status and reason, while the row status describes the primary metric. Previously saved
-reports remain readable. The full workflow defaults to per-step reporting; tune-only defaults to
+own status and reason, while the row status describes the primary metric. Saved reports must satisfy the current supported contract; obsolete formats are rejected. The full workflow defaults to per-step reporting; tune-only defaults to
 overall reporting. Returned models remain in the caller’s serialization format.
 
 Saved-settings execution performs two fresh fits and no parameter search. It allows different
 data and dates, checks parameter names/types/domains/constraints and the declared implementation,
-and records the source search, trial, attempt and parameter digest. Both fits keep the saved
+and records the parameter digest and source identity. Search-derived settings retain search,
+trial and attempt identity; fixed-derived settings retain their source workflow and study. Both fits keep the saved
 seed, including when a current reporting configuration is supplied. It reuses settings, not
 the earlier model’s learned state.
-To retune later, pass `config=previous_run.search_config` and omit `selected_config`.
+To retune later, pass `config=previous_run.search_config` and omit `selected_config` if that
+profile contains a valid HPO configuration. A fixed-only profile may omit `hpo`; add a valid
+search configuration before using it to tune.
 `Study.tune` also exposes `selection.search_config`. Explicit old origin dates remain explicit;
 use `selection.origins: all` for a search profile intended for different registered schedules.
 You can run HPO again whenever you choose; no automatic retuning schedule is imposed. An optional
@@ -740,8 +793,164 @@ loading any model code. Use `load_forecast_workflow(path)` from `autoforecast.st
 to verify and reload a workflow. `Study.tune` also accepts `output_dir` and exposes `winner_config`.
 Output directories cannot sit inside frozen input data or an existing retained run.
 
-Failures retain a sealed failed run and validation report; they cannot reload as successful
-workflows. `status="partial"` means only some original cells were scored;
+Workflow `output_dir` controls retained evidence. Training snapshots and the callback’s
+`request.output_dir` use separate temporary directories. All Spark readers/writers must be able
+to access those temporary paths; a shared retained-output path does not configure this access.
+For distributed Spark, configure an accessible temporary filesystem before the process starts
+(for example, `TMPDIR` on each participating process) and verify access in that environment.
+Campaign workers use local Spark; their local tests do not certify a distributed Spark notebook.
+
+### Find and reuse saved outputs
+
+Use `output_dir` as an experiment folder, for example `outputs/demand-baseline`.
+Each normal workflow call creates a child such as
+`workflow-20261028t081530z-<full-random-uuid>`. The timestamp is UTC. The full random
+ID separates concurrent runs, and exclusive directory creation refuses overwrites.
+Repeating the same settings creates a separate execution; parameter and input hashes
+in the metadata explain which settings or data changed.
+
+Without an explicit destination, workflow outputs go under
+`.autoforecast/study-workflows/<study-id>/` beside the registry. Direct tuning uses
+`study-tuning/<study-id>/studies/<tune-id>/`; standalone `evaluate_forecasts` uses
+`study-runs/<study-id>/`. All three return their exact saved paths. `Study.preflight`
+and `Study.run_campaign` also accept an optional destination. Their default parents are
+`.autoforecast/study-preflight/<study-id>/` and
+`.autoforecast/study-campaigns/<study-id>/`. Preflight creates `check-…/report.json`;
+the campaign returns its exact `campaign_path`. Campaigns preserve their recovery contract: the same name, request and destination reopens verified
+work. Use a different experiment folder or campaign name for an independent repeat.
+
+Open `RUN.md` in a run or attempt folder for its status, actual files and their
+purposes. It is sealed along with the artifacts. Keep JSON metadata, YAML configuration,
+Parquet forecasts/scores and native model files in their original formats. The
+outer search and campaign guides are snapshots; their verified child bundles and
+selection/journal records remain authoritative. A completed execution may still have
+unavailable metrics; inspect the recorded evaluation status and coverage.
+
+A callback can save optional diagnostics under `request.output_dir / "artifacts"`.
+For example, write `artifacts/feature-importance.parquet` or `artifacts/training-log.jsonl`.
+Those files are retained for each window, including when a callback raises a normal
+Python exception after run allocation. Invalid arguments can fail before a run exists.
+Other callback scratch files are discarded. Abrupt process loss
+can leave an incomplete attempt; it cannot promise a finalized report.
+
+```python
+from autoforecast.results import read_workflow_results, read_tuning_results, export_results
+
+tables = read_workflow_results(run.path)  # Includes this run's search, if it performed/reused one.
+export_results(tables, run.path.parent / (run.path.name + "-analysis"))
+# For a successful standalone search: tables = read_tuning_results(selection.path)
+# For a failed search: tables = read_tuning_results(search_path_from_failure_record)
+```
+
+`read_workflow_results` reads completed workflows or validation checkpoints.
+`read_tuning_results` also reads a failed search when it contains a sealed failed attempt.
+It returns failure metadata and any windows completed before the failure; it does not
+invent a winning trial or forecast rows for unfinished windows. Unsealed attempts are
+listed separately and contribute no rows. A search with no sealed evidence cannot be
+exported this way. A failed workflow records its search path in `failure.json` and
+`metadata/tuning-reference.json` when a search was allocated.
+
+Campaigns keep the original supplied YAML text at
+`<campaign_path>/profiles/candidate-<index>.yaml`. Worker `profile.json` files contain
+normalized campaign profiles. Workflow `metadata/config.yaml` contains the supplied
+profile or a reconstructed parameter profile; it is not a complete execution specification.
+Read `metadata/winner-config.json` for effective parameter values and
+`metadata/provenance.json` for resolved reporting, selection, availability and seed settings.
+`metadata/search-config.yaml` retains the source profile associated with those parameters.
+
+The result readers verify retained evidence before returning analysis tables, preserving
+stage, origin and trial identities. `export_results` writes the supplied tables and metadata
+as Parquet, JSON and a Markdown file guide, and rejects conflicting export retries. It does
+not independently reverify the original run. Use the verified readers to obtain the tables.
+Neither step loads or retrains models. Write exports outside completed bundles. A saved-settings or checkpoint
+continuation records its earlier configuration source; it does not silently combine
+an older experiment's search rows with the new experiment.
+
+Keep the referenced frozen study and search directories: training slices are temporary,
+and a workflow folder alone is not necessarily a portable archive.
+
+### Several external models and optional parallel execution
+
+```python
+from autoforecast.study_campaign import StudyModel
+
+result = study.run_campaign(
+    models=[
+        StudyModel("my_models.baselines:fit", baseline_identity, "baseline.yaml",
+                   fixed_parameters={}, cpus=1, memory_gib=4),
+        StudyModel("my_models.forecaster:fit", model_identity, "search.yaml",
+                   cpus=2, memory_gib=6),
+    ],
+    output_dir="/shared/experiments/comparison",
+    execution="local",                 # Opt into Ray processes; the API default is sequential.
+    max_parallel_models=2,
+    final_evaluation="validation_winner",  # Or all_models.
+)
+```
+
+Model IDs in profiles must be distinct. Candidates share an objective, availability policy,
+and compatible tuning windows. Before fitting, preflight resolves the strictest declared
+history requirement once for the common study. Every candidate then uses that effective
+study and its frozen eligibility/masks. Comparison rejects different evaluation contracts.
+Unavailable objectives stop selection. Caught model-job errors appear in phase summaries;
+phase-level rejection or timeout can occur before a summary is written and is recorded by
+the existing supervisor as a failed attempt.
+
+The existing campaign runner owns phase order, attempts and recovery. Its validation phase
+runs candidate jobs; its final phase selects from validation and evaluates the requested
+models. Test scores never choose the winner. Repeating an identical request verifies saved
+outputs and resumes unfinished work instead of refitting completed models.
+
+Local mode uses the existing Ray dependency for separate model processes. Cluster mode
+requires `execution="cluster", ray_address="..."` for an existing cluster; the library does
+not provision machines. All workers need the same installed model modules/dependencies and
+shared study/output paths. Requests carry paths and hashes, not live Spark objects or notebook
+closures. Workers check input/code identity, start their own local Spark session, and retain
+separate model artifacts. A node must satisfy each job's CPU/GPU/memory declaration.
+For cluster-only placement, a `StudyModel` can add `node_labels={"pool": "forecast"}`.
+Labels are exact key/value matches. Admission requires one existing live node to satisfy every
+label and CPU/GPU/memory request together; an impossible request fails before job submission.
+The labels must already be configured on the cluster. AutoForecast delegates placement through
+[Ray label selectors](https://docs.ray.io/en/latest/ray-core/scheduling/labels.html); it does not
+provision a pool or expose Ray's selector-expression syntax through `node_labels`.
+Shared paths must support the filesystem and locking operations used by retained bundles and
+campaign recovery; this interface does not accept object-store URLs as output directories.
+
+`max_parallel_models` bounds concurrent model jobs. Spark worker counts and standard numerical
+thread settings are bounded within jobs; memory is monitored for each process tree. Custom
+model code remains trusted and must respect its resource declaration. Trials and windows
+remain sequential within a model: this avoids multiplying model, trial and Spark parallelism.
+Scheduling separate model jobs does not automatically distribute one model's training algorithm.
+
+Local parallel execution has synthetic acceptance tests. Multi-machine operation requires
+an existing shared environment; the real two-machine acceptance test is explicitly deferred.
+
+### Export checked external-model workflows
+
+```python
+from autoforecast.run_mlflow import export_forecast_workflow
+
+links = export_forecast_workflow(
+    run.path,
+    tracking_uri="sqlite:////shared/tracking/mlflow.db",
+    experiment_id="1",  # Must already exist and be active.
+)
+```
+
+This uses the existing MLflow integration, creates separate validation/test run links and
+uploads retained models, forecasts, exact scores and horizon reports without retraining or
+rescoring. It verifies a private snapshot before remote writes and checks uploaded model bytes
+and score JSON. Retrying the same workflow/experiment reuses remote run identities, including
+a partial upload. Publication must have one shared export-lock location; this is not a
+cross-storage distributed lock. Customer table publication remains caller-owned.
+
+`study.run_campaign` also accepts `tracking_uri` and `experiment_id` together to export its
+completed workflows and return `mlflow_links`. Omitting them performs no remote tracking writes.
+Export happens after successful completion; unfinished validation evidence remains local.
+
+Configuration/implementation errors can reject a request before a run opens. Failures after
+a workflow opens seal a failed bundle; available report references depend on the failure point.
+Failed bundles cannot reload as successful workflows. `status="partial"` means only some original cells were scored;
 `status="pending_actuals"` means testing forecasts exist but no testing actuals were scored.
 Neither status claims a complete evaluation. Final testing scores never feed back into HPO.
 
@@ -835,9 +1044,12 @@ CI repeats CSV and Parquet workflows for every listed cadence on Python 3.12, wi
 daily checks on Python 3.13. Source tests live beside their modules; optional-model tests require their corresponding extras. Dataset-backed
 tests report skips when the external dataset is absent.
 
-With the test extras and `pytest` installed, run `python scripts/run_tests.py`. Each module runs
+Install the `ci` development dependency group and the model extras required by the chosen
+tests, then run `python scripts/run_tests.py`. Each module runs
 in a separate process because Spark sessions belong to individual test modules. The runner
 also uses the same Python interpreter for Spark workers and the test driver.
 
 No datasets, trained weights, experiment outputs, or credentials are distributed in this
 repository. Third-party libraries and downloaded models retain their own licenses and terms.
+
+Repository examples and tests must remain organisation-neutral. Use synthetic series and generic paths; keep customer names, source-table identifiers and deployment handoffs outside this repository.

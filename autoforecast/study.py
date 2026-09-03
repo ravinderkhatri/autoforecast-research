@@ -6,11 +6,12 @@ import dataclasses
 import hashlib
 import json
 import pathlib
-import shutil
 import tempfile
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
+from mlops.run_bundle import open_run_bundle
+from mlops.run_report import new_run_id
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
@@ -259,12 +260,16 @@ class Study:
 
     def preflight(
         self, *, config: str | pathlib.Path, tuning_origin: str | None = None,
+        output_dir: str | pathlib.Path | None = None,
     ) -> PreflightResult:
         """Check all registered stages and retain a report before invoking any model."""
         from autoforecast.study_preflight import preflight_study
-        from autoforecast.study_tuning import _config, _resolve_options
+        from autoforecast.study_tuning import _config, _output_root, _resolve_options
         _, _, _, _, controls = _config(pathlib.Path(config))
-        return preflight_study(self, _resolve_options(self, controls, tuning_origin))
+        return preflight_study(
+            self, _resolve_options(self, controls, tuning_origin),
+            output_dir=_output_root(self, output_dir, "study-preflight"),
+        )
 
     def run_forecast_workflow(
         self, *, fit_predict: Callable[[FitPredictRequest], FitPredictResult],
@@ -272,20 +277,38 @@ class Study:
         tuning_origin: str | None = None, output_dir: str | pathlib.Path | None = None,
         reuse_tuning: str | pathlib.Path | None = None,
         selected_config: str | pathlib.Path | None = None,
+        fixed_parameters: Mapping[str, object] | None = None,
+        validation_only: bool = False,
+        validation_run: str | pathlib.Path | None = None,
     ) -> ForecastWorkflowResult:
-        """Tune, validate and refit; pass selected_config to fit new data without HPO.
+        """Tune, validate and refit, or use fixed/reused settings without HPO.
 
         reuse_tuning reopens an identical search. selected_config applies verified
         winning settings to a new study. Both modes retain provenance and artifacts.
+        fixed_parameters={} uses profile defaults; overrides use full parameter names.
+        Fixed mode requires config, performs two fits and no search. The profile's
+        hpo block is optional in this mode; without it the recorded seed is 42.
         """
         from autoforecast.study_workflow import run_forecast_workflow
         return run_forecast_workflow(self, fit_predict=fit_predict, implementation=implementation,
             config=config, tuning_origin=tuning_origin, output_dir=output_dir,
-            reuse_tuning=reuse_tuning, selected_config=selected_config)
+            reuse_tuning=reuse_tuning, selected_config=selected_config,
+            fixed_parameters=fixed_parameters, validation_only=validation_only,
+            validation_run=validation_run)
+
+    def run_campaign(self, *, models, output_dir=None, **execution) -> dict:
+        """Compare declared external models through the existing campaign runner.
+
+        Supply StudyModel declarations. Sequential is the default; local/cluster
+        modes use bounded Ray model jobs with importable entry points.
+        """
+        from autoforecast.study_campaign import run_study_campaign
+        return run_study_campaign(self, models=models, output_dir=output_dir, **execution)
 
     def evaluate_forecasts(
         self, *, validation_forecasts: Forecast, testing_forecasts: Forecast, model_id: str,
         forecast_accuracy_breakdown: ForecastAccuracyBreakdown = "per_step",
+        output_dir: str | pathlib.Path | None = None,
     ) -> dict:
         """Evaluate validation and test forecasts against the frozen study.
 
@@ -309,9 +332,11 @@ class Study:
         forecasts = {stage: Forecast.from_record(value.as_record()) for stage, value in (
             ("validation", validation_forecasts), ("test", testing_forecasts),
         )}
-        runs = self._path.parent.parent.parent / "study-runs"
-        runs.mkdir(parents=True, exist_ok=True)
-        output = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=runs))
+        from autoforecast.study_tuning import _output_root
+
+        runs = _output_root(self, output_dir, "study-runs")
+        bundle = open_run_bundle(runs, run_id=new_run_id("evaluation"), task="forecast-evaluation")
+        output = bundle.path
         try:
             stages = {}
             for stage, forecast in forecasts.items():
@@ -400,7 +425,9 @@ class Study:
             (output / "result.json").write_text(
                 json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n",
             )
+            bundle.finalize(status="completed", summary={"study_id": record["study_id"]})
             return result
-        except BaseException:
-            shutil.rmtree(output)
+        except Exception as error:
+            bundle.write_json("failure.json", {"error": str(error)})
+            bundle.finalize(status="failed", summary={"study_id": record["study_id"]})
             raise

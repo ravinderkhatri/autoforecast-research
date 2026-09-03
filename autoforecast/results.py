@@ -98,6 +98,22 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
         return _read_results(campaign_root, pathlib.Path(temporary))
 
 
+def read_workflow_results(
+    path: str | pathlib.Path, *, include_tuning: bool = True,
+) -> CampaignResults:
+    """Read verified custom-model workflow forecasts, scores and optional tuning windows."""
+    from autoforecast.study_results import read_workflow_results as read
+
+    return read(path, include_tuning=include_tuning)
+
+
+def read_tuning_results(path: str | pathlib.Path) -> CampaignResults:
+    """Read verified custom-model tuning attempts, including every retained window."""
+    from autoforecast.study_results import read_tuning_results as read
+
+    return read(path)
+
+
 def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) -> CampaignResults:
     def read_verified_parquet(path: str | pathlib.Path, sha256: str, **kwargs) -> pa.Table:
         snapshot = snapshot_parquet_directory(
@@ -380,6 +396,12 @@ def export_results(results: CampaignResults, output: pathlib.Path) -> pathlib.Pa
         stream = pa.BufferOutputStream()
         pq.write_table(results.series_scores, stream)
         payloads["series-scores.parquet"] = stream.getvalue().to_pybytes()
+    from mlops.run_report import run_guide
+
+    payloads["RUN.md"] = run_guide(
+        identity={"kind": "derived analysis export"}, status="exported",
+        files=[*payloads, "RUN.md"], sealed=False,
+    )
     output.mkdir(parents=True, exist_ok=True)
     publish_bytes_set(output, payloads)
     return output
@@ -401,26 +423,36 @@ def comparison_plot(
     for row in selected:
         key = (row["model_id"], row["variant_id"], row["run_id"], row["stage"], row["origin"])
         groups.setdefault(key, []).append(row)
-    figure, axis = plt.subplots(figsize=(12, 5))
-    for key, values in sorted(groups.items()):
+    traces = []
+    identity = ("model_id", "variant_id", "run_id", "stage", "origin")
+    for key, values in sorted(groups.items(), key=lambda item: tuple(
+        "" if value is None else value for value in item[0]
+    )):
         by_date = {row["target_date"]: row["prediction"] for row in values}
-        run = next(item for item in results.runs if item.get("run_id") == key[2])
-        frequency = run.get("frequency", results.metadata.get("frequency", "D"))
-        dates = period_points(key[4], frequency, run["horizon"])
-        axis.plot(
-            dates,  # pyright: ignore[reportArgumentType]  # Matplotlib accepts date units.
-            [by_date.get(day, float("nan")) for day in dates],
-            marker=".",
-            label=" / ".join(key),
+        matches = [item for item in results.runs
+                   if tuple(item.get(name) for name in identity) == key]
+        if len(matches) != 1:
+            raise ValueError("plot requires exactly one matching forecast window record")
+        run = matches[0]
+        dates = period_points(key[4], run["frequency"], run["horizon"])
+        traces.append((dates, [by_date.get(day, float("nan")) for day in dates],
+                       " / ".join("(no variant)" if part is None else part for part in key)))
+    figure, axis = plt.subplots(figsize=(12, 5))
+    try:
+        for dates, predictions, label in traces:
+            axis.plot(
+                dates,  # pyright: ignore[reportArgumentType]  # Matplotlib accepts date units.
+                predictions, marker=".", label=label,
+            )
+        axis.set(
+            title=f"{series_id} — {results.metadata['comparison_scope']}",
+            ylabel=results.metadata.get("target_unit", "prediction"),
+            xlabel="Target time",
         )
-    axis.set(
-        title=f"{series_id} — {results.metadata['comparison_scope']}",
-        ylabel=results.metadata.get("target_unit", "prediction"),
-        xlabel="Target time",
-    )
-    axis.legend(fontsize="x-small")
-    figure.autofmt_xdate()
-    figure.tight_layout()
-    figure.savefig(output)
-    plt.close(figure)
+        axis.legend(fontsize="x-small")
+        figure.autofmt_xdate()
+        figure.tight_layout()
+        figure.savefig(output)
+    finally:
+        plt.close(figure)
     return output

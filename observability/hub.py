@@ -100,18 +100,6 @@ def _metadata(report: pathlib.Path) -> tuple[str, str, str, str]:
         return "report available", "—", "—", "—"
     if type(value) is not dict:
         return "report available", "—", "—", "—"
-    # Schema v1 represented a failed Spark read as a failed data check.  That is
-    # not useful to a person deciding whether data passed quality checks: no
-    # measurements were made.  Keep the detailed incident in its own report,
-    # but say plainly here that checks did not run.
-    if value.get("schema_version") == 1 and value.get("profile") is None:
-        legacy_as_of = value.get("as_of")
-        return (
-            "data not checked",
-            "—",
-            legacy_as_of if type(legacy_as_of) is str else "—",
-            "Data could not be inspected. Data checks were not run.",
-        )
     if value.get("schema_version") == 2 and value.get("kind") == "run_incident":
         incident = value.get("incident")
         summary = incident.get("summary") if type(incident) is dict else None
@@ -149,39 +137,7 @@ def _metadata(report: pathlib.Path) -> tuple[str, str, str, str]:
             as_of if type(as_of) is str and as_of else "—",
             data_checks,
         )
-    accepted = value.get("accepted")
-    status = (
-        "data accepted"
-        if accepted is True
-        else "data rejected"
-        if accepted is False
-        else "report available"
-    )
-    fingerprint = value.get("data_fingerprint")
-    as_of = value.get("as_of")
-    blockers = value.get("blockers")
-    warnings = value.get("warnings")
-    blocker_count = len(blockers) if type(blockers) is list else 0
-    warning_count = len(warnings) if type(warnings) is list else 0
-    finding = next(
-        (
-            item
-            for collection in (blockers, warnings)
-            if type(collection) is list
-            for item in collection
-            if type(item) is str and item
-        ),
-        "",
-    )
-    data_checks = f"{blocker_count} blocker(s) · {warning_count} warning(s)"
-    if finding:
-        data_checks = f"{data_checks} — {finding}"
-    return (
-        status,
-        fingerprint if type(fingerprint) is str and fingerprint else "—",
-        as_of if type(as_of) is str and as_of else "—",
-        data_checks,
-    )
+    return "unsupported report schema", "—", "—", "Regenerate using the current report format."
 
 
 def _entries(sources: tuple[_Source, ...], repository_root: pathlib.Path) -> tuple[_Entry, ...]:
@@ -277,8 +233,6 @@ def _render(
     smoke_entries = tuple(entry for entry in entries if entry.source.id == "model-execution-smoke")
     current_data_preflights = _latest_per_data_snapshot(data_preflights)
     completed_statuses = {
-        "data accepted",
-        "data rejected",
         "data checks passed",
         "data checks failed",
     }
@@ -297,11 +251,11 @@ def _render(
         )
     else:
         accepted = sum(
-            entry.status in {"data accepted", "data checks passed"}
+            entry.status == "data checks passed"
             for entry in current_data_preflights
         )
         rejected = sum(
-            entry.status in {"data rejected", "data checks failed"}
+            entry.status == "data checks failed"
             for entry in current_data_preflights
         )
         not_checked = sum(entry.status == "data not checked" for entry in current_data_preflights)

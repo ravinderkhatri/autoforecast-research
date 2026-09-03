@@ -82,7 +82,7 @@ def test_mismatched_shapes_are_refused() -> None:
     raise AssertionError("dropped a mask that describes different channels")
 
 
-@pytest.mark.parametrize("fault", [0.5, float("nan")])
+@pytest.mark.parametrize("fault", [0.0, 1.0, 0.5, float("nan")])
 def test_drop_covariates_refuses_nonbinary_masks_even_when_rate_is_zero(fault: float) -> None:
     values = torch.ones(1, 2)
     mask = torch.ones_like(values)

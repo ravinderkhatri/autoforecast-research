@@ -12,7 +12,7 @@ import zipfile
 import pytest
 from autoforecast.project import installed_library_identity
 
-from scripts.verify_public_release import tracked_inventory, verify_wheel
+from scripts.verify_public_release import ROOT_FILES, tracked_inventory, verify_wheel
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -112,6 +112,33 @@ def test_public_inventory_accepts_the_approved_readme_diagram(clean_wheel, tmp_p
     names, _ = tracked_inventory(root)
 
     assert name in names
+
+
+def test_public_inventory_accepts_root_readme(clean_wheel, tmp_path):
+    original, _ = clean_wheel
+    root = tmp_path / "repo"
+    shutil.copytree(original, root)
+    (root / "README.md").write_text("# Public package\n")
+    command(root, "git", "add", "README.md")
+    names, _ = tracked_inventory(root)
+    assert "README.md" in names
+
+
+@pytest.mark.parametrize("name", sorted(
+    {name for name in ROOT_FILES if name.lower().endswith(".md") and name != "README.md"}
+    | {"plan.md", "notes.MD", "docs/plan.md"}
+))
+def test_public_inventory_rejects_every_non_readme_markdown(clean_wheel, tmp_path, name):
+    # Exercise any future allowlist exception as well as ordinary private notes.
+    original, _ = clean_wheel
+    root = tmp_path / "repo"
+    shutil.copytree(original, root)
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Local notes\n")
+    command(root, "git", "add", "-f", name)
+    with pytest.raises(ValueError, match="public inventory"):
+        tracked_inventory(root)
 
 
 @pytest.mark.parametrize(
@@ -281,3 +308,14 @@ def test_release_wheel_requires_each_declared_legal_file(legal_wheel, tmp_path):
     names, config = tracked_inventory(root)
     with pytest.raises(ValueError, match="declared license pattern has no tracked file"):
         verify_wheel(root, wheel, names, config)
+
+
+def test_standard_dependencies_have_no_compatibility_only_extras():
+    import tomllib
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    extras = project["optional-dependencies"]
+    assert set(extras) == {"all-models", "data", "custom-torch", "shallow", "tft",
+                           "autogluon-zoo", "timesfm", "timesfm3"}
+    core = {value.split("==")[0] for value in project["dependencies"]}
+    assert {"pyspark", "pyarrow", "statsforecast", "optuna", "ray[tune]", "mlflow-skinny"} <= core

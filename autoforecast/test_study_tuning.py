@@ -268,7 +268,7 @@ def test_bad_callback_cannot_publish_selection(frozen, spark, tmp_path, defect):
         return result
     with open_study(manifest, spark) as study, pytest.raises((HPOError, ScoreError, ForecastError, LineageError, benchmark.BenchmarkError)):
         study.tune(fit_predict=bad, config=config(tmp_path, budget=1), implementation=implementation())
-    roots = list((tmp_path / "study-tuning/studies").glob("*"))
+    roots = list((tmp_path / "study-tuning" / manifest.parent.name / "studies").glob("*"))
     assert len(roots) == 1 and not (roots[0] / "selection.json").exists()
     completions = list(roots[0].glob("trials/*/attempts/*/completion.json"))
     assert len(completions) == 1

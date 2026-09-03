@@ -54,11 +54,9 @@ def test_build_hub_links_only_allowlisted_reports_and_preserves_data_admission_s
         (preflight / "data_validation_report.json").write_text(
             json.dumps(
                 {
-                    "accepted": True,
-                    "data_fingerprint": "fingerprint-1",
-                    "as_of": "2026-08-31",
-                    "blockers": [],
-                    "warnings": ["one expected cadence warning"],
+                    "schema_version": 2, "kind": "data_checks", "accepted": True,
+                    "facts": {"data_fingerprint": "fingerprint-1", "as_of": "2026-08-31"},
+                    "checks": [{"status": "warning", "summary": "one expected cadence warning"}],
                 }
             ),
             encoding="utf-8",
@@ -77,10 +75,10 @@ def test_build_hub_links_only_allowlisted_reports_and_preserves_data_admission_s
             tensorboard_url="https://tensorboard.example.test/project",
         )
         page = output.read_text(encoding="utf-8")
-        assert "data accepted" in page
-        assert "Latest completed check: data accepted (client-v1)." in page
+        assert "data checks passed" in page
+        assert "Latest completed check: data checks passed (client-v1)." in page
         assert "History: 1 passed, 0 failed, 0 not checked." in page
-        assert "0 blocker(s) · 1 warning(s)" in page
+        assert "0 failed · 1 warning(s)" in page
         assert "one expected cadence warning" in page
         assert "fingerprint-1" in page
         assert "/.autoforecast/data-preflight/client-v1/report.html" in page
@@ -93,8 +91,8 @@ def test_build_hub_links_only_allowlisted_reports_and_preserves_data_admission_s
         assert "target='_blank'" in page
 
 
-def test_hub_labels_legacy_failed_spark_reads_as_not_checked() -> None:
-    """A failed read must not be displayed as a failed data-quality check."""
+def test_hub_does_not_interpret_obsolete_report_fields() -> None:
+    """Obsolete reports cannot assert current data-quality or incident status."""
     with tempfile.TemporaryDirectory() as temporary:
         root = pathlib.Path(temporary)
         preflight = root / ".autoforecast/data-preflight/legacy-read-error"
@@ -115,9 +113,39 @@ def test_hub_labels_legacy_failed_spark_reads_as_not_checked() -> None:
             _write_source_config(root), root / "published/index.html", repository_root=root
         )
         page = output.read_text(encoding="utf-8")
-        assert "data not checked" in page
-        assert "Data could not be inspected. Data checks were not run." in page
+        assert "unsupported report schema" in page
+        assert "Regenerate using the current report format." in page
         assert "Spark inspection failed" not in page
+
+
+def test_hub_preserves_current_failed_checks_in_summary_and_history(tmp_path) -> None:
+    preflight = tmp_path / ".autoforecast/data-preflight/rejected"
+    preflight.mkdir(parents=True)
+    (preflight / "report.html").write_text("data checks", encoding="utf-8")
+    (preflight / "data_validation_report.json").write_text(json.dumps({
+        "schema_version": 2,
+        "kind": "data_checks",
+        "accepted": False,
+        "facts": {"data_fingerprint": "failed-snapshot", "as_of": "2026-09-03"},
+        "checks": [{"status": "failed", "summary": "required values absent"}],
+    }), encoding="utf-8")
+
+    page = build_hub(
+        _write_source_config(tmp_path), tmp_path / "published/index.html", repository_root=tmp_path,
+    ).read_text(encoding="utf-8")
+
+    assert "Latest completed check: data checks failed (rejected)." in page
+    assert "History: 0 passed, 1 failed, 0 not checked." in page
+    assert "1 failed · 0 warning(s) — required values absent" in page
+    assert "failed-snapshot" in page
+    import shutil
+
+    shutil.copytree(preflight, preflight.with_name("rejected-copy"))
+    repeated = build_hub(
+        _write_source_config(tmp_path), tmp_path / "published/index.html", repository_root=tmp_path,
+    ).read_text(encoding="utf-8")
+    assert "History: 0 passed, 1 failed, 0 not checked." in repeated
+    assert "Latest completed check: data checks failed" in repeated
 
 
 def test_hub_counts_one_snapshot_once_when_a_report_is_rendered_again() -> None:
@@ -130,11 +158,9 @@ def test_hub_counts_one_snapshot_once_when_a_report_is_rendered_again() -> None:
             (preflight / "data_validation_report.json").write_text(
                 json.dumps(
                     {
-                        "accepted": True,
-                        "data_fingerprint": "same-snapshot",
-                        "as_of": "2026-09-10",
-                        "blockers": [],
-                        "warnings": [],
+                        "schema_version": 2, "kind": "data_checks", "accepted": True,
+                        "facts": {"data_fingerprint": "same-snapshot", "as_of": "2026-09-10"},
+                        "checks": [],
                     }
                 ),
                 encoding="utf-8",
@@ -223,3 +249,17 @@ def test_write_tensorboard_navigation_creates_a_real_text_event_with_the_hub_lin
         assert tag in events.Tags()["tensors"]
         text = events.Tensors(tag)[0].tensor_proto.string_val[0].decode("utf-8")
         assert hub_url in text
+
+
+def test_unversioned_sidecar_cannot_supply_status_or_snapshot_identity(tmp_path):
+    from observability.hub import _metadata
+
+    report = tmp_path / "report.html"
+    report.write_text("report")
+    (tmp_path / "data_validation_report.json").write_text(json.dumps({
+        "accepted": True, "data_fingerprint": "old-identity", "as_of": "2026-09-10",
+        "blockers": [], "warnings": [],
+    }))
+    status, fingerprint, as_of, _ = _metadata(report)
+    assert status == "unsupported report schema"
+    assert fingerprint == as_of == "—"

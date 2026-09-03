@@ -185,7 +185,7 @@ def test_study_interface_scores_match_direct_scorer_and_retain_run_identities(fr
             assert directory_digest(retained.path, suffixes=(".parquet",)) == result["forecast_artifact_sha256"]
         assert results[0]["schema"] == "autoforecast.study-check.v1"
         assert pathlib.Path(results[0]["result_path"]).parent.parent == (
-            manifest.parent.parent.parent / "study-runs"
+            manifest.parent.parent.parent / "study-runs" / study.study_id
         )
         assert results[0]["study_id"] == study.study_id
         assert results[0]["model_id"] == "external-model"
@@ -261,11 +261,14 @@ def test_study_interface_rejects_incorrect_forecast_contract(frozen, spark, tmp_
             shutil.rmtree(forecast.path)
             pathlib.Path(forecast.path).mkdir()
             pq.write_table(pa.Table.from_pylist(rows), pathlib.Path(forecast.path) / "part.parquet")
-        runs = manifest.parent.parent.parent / "study-runs"
+        runs = manifest.parent.parent.parent / "study-runs" / study.study_id
         before = set(runs.iterdir()) if runs.exists() else set()
         with pytest.raises(ValueError):
             study.evaluate_forecasts(validation_forecasts=forecast, testing_forecasts=testing, model_id="bad")
-        assert set(runs.iterdir()) == before
+        new_runs = set(runs.iterdir()) - before
+        assert len(new_runs) == 1
+        from mlops.run_bundle import load_completed_run_bundle
+        assert load_completed_run_bundle(new_runs.pop())["status"] == "failed"
 
 
 def test_study_interface_rejects_multiple_validation_origins(tmp_path, spark):
@@ -381,12 +384,15 @@ def test_study_interface_reauthenticates_between_scores(frozen, spark, tmp_path,
         validation = example_forecast(study, spark, tmp_path / "validation", "validation")
         testing = example_forecast(study, spark, tmp_path / "testing", "test")
         monkeypatch.setattr(study_api, "score_study", changed)
-        runs = manifest.parent.parent.parent / "study-runs"
+        runs = manifest.parent.parent.parent / "study-runs" / study.study_id
         before = set(runs.iterdir()) if runs.exists() else set()
         try:
             with pytest.raises(benchmark.BenchmarkError, match="changed"):
                 study.evaluate_forecasts(validation_forecasts=validation, testing_forecasts=testing, model_id="change")
-            assert set(runs.iterdir()) == before
+            new_runs = set(runs.iterdir()) - before
+            assert len(new_runs) == 1
+            from mlops.run_bundle import load_completed_run_bundle
+            assert load_completed_run_bundle(new_runs.pop())["status"] == "failed"
         finally:
             manifest.write_bytes(raw)
 
@@ -453,11 +459,14 @@ def test_study_interface_rejects_retained_forecast_changes_after_scoring(frozen,
         validation = example_forecast(study, spark, tmp_path / "validation", "validation")
         testing = example_forecast(study, spark, tmp_path / "testing", "test")
         monkeypatch.setattr(study_api, "score_study", changed)
-        runs = manifest.parent.parent.parent / "study-runs"
+        runs = manifest.parent.parent.parent / "study-runs" / study.study_id
         before = set(runs.iterdir()) if runs.exists() else set()
         with pytest.raises(benchmark.BenchmarkError, match="retained study .* changed"):
             study.evaluate_forecasts(validation_forecasts=validation, testing_forecasts=testing, model_id="change")
-        assert set(runs.iterdir()) == before
+        new_runs = set(runs.iterdir()) - before
+        assert len(new_runs) == 1
+        from mlops.run_bundle import load_completed_run_bundle
+        assert load_completed_run_bundle(new_runs.pop())["status"] == "failed"
 
 
 def test_study_interface_preserves_registry_path_integrity(frozen, spark, tmp_path):

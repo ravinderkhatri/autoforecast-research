@@ -1371,10 +1371,8 @@ def parameter_resolution_from_selection(
         "objective": study.objective,
         "direction": study.direction,
         "backend": study.backend,
+        "top_k": study.top_k,
     }
-    # New HPO attempts bind the winner count; older sealed attempts omit this field.
-    if isinstance(selected_study, dict) and "top_k" in selected_study:
-        expected_study["top_k"] = study.top_k
     parameters = metadata.get("hyperparameters")
     expected_data = {"name": study.data["id"], **study.data}
     if (

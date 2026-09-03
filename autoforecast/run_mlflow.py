@@ -23,6 +23,7 @@ __all__ = [
     "RunMLflowError",
     "RunMLflowLink",
     "export_run_bundle",
+    "export_forecast_workflow",
     "start_live_run_bundle_tracking",
 ]
 
@@ -207,7 +208,9 @@ def _mlflow() -> Any:
     try:
         import mlflow
     except ImportError as error:  # pragma: no cover - optional runtime boundary
-        raise RunMLflowError("MLflow tracking requires: uv sync --extra mlflow-tracking") from error
+        raise RunMLflowError(
+            "MLflow tracking requires the standard AutoForecast installation with dependencies"
+        ) from error
     return mlflow
 
 
@@ -419,9 +422,7 @@ def export_run_bundle(
         if not isinstance(model_id, str) or not model_id:
             raise RunMLflowError("resolved run has no model ID")
         comparison = None if comparison_path is None else _load(pathlib.Path(comparison_path))
-        with mlflow.start_run(
-            experiment_id=experiment.experiment_id, run_name=model_id
-        ) as active:
+        with mlflow.start_run(experiment_id=experiment.experiment_id, run_name=model_id) as active:
             mlflow.set_tags(
                 {
                     "autoforecast.export_schema": "generic-run-v1",
@@ -456,3 +457,154 @@ def export_run_bundle(
             )
             _log_safe_artifacts(mlflow, root)
             return RunMLflowLink(tracking_uri, experiment.experiment_id, active.info.run_id)
+
+
+def export_forecast_workflow(
+    bundle_path: str | pathlib.Path,
+    *,
+    tracking_uri: str,
+    experiment_id: str,
+) -> dict[str, RunMLflowLink]:
+    """Export verified validation/test evidence to an existing experiment, retryably.
+
+    The immutable workflow remains authoritative. A single local publisher holds
+    a lock outside it; remote identity tags recover an upload interrupted after run
+    creation. Retries reuse the same two run IDs and never fit or score. This is a
+    completed-workflow exporter, not live tracking of partially fitted workflows.
+    """
+    import math
+
+    from autoforecast.campaign import _open_lock
+    from autoforecast.study_workflow import load_forecast_workflow
+
+    if not all(isinstance(value, str) and value.strip() for value in (tracking_uri, experiment_id)):
+        raise RunMLflowError("tracking_uri and experiment_id must be nonblank strings")
+    # Authenticate and snapshot before constructing a remote client or writing there.
+    with _completed_run_snapshot(bundle_path) as (root, completion):
+        if completion.get("task") != "forecast-workflow" or completion.get("status") != "completed":
+            raise RunMLflowError("only completed forecast workflows may be exported")
+        workflow = load_forecast_workflow(root)
+        if workflow.testing is None:
+            raise RunMLflowError("validation checkpoints cannot be exported as completed workflows")
+        manifest_sha = hashlib.sha256((root / "artifact_manifest.json").read_bytes()).hexdigest()
+        identity = hashlib.sha256(
+            json.dumps([manifest_sha, tracking_uri, experiment_id], separators=(",", ":")).encode()
+        ).hexdigest()
+        source = pathlib.Path(bundle_path).absolute()
+        state_root = source.parent / ".workflow-exports"
+        if state_root.is_symlink():
+            raise RunMLflowError("workflow export directory cannot be a symlink")
+        state_root.mkdir(exist_ok=True)
+        import fcntl
+
+        with _open_lock(state_root / (identity + ".lock")) as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            mlflow = _mlflow()
+            client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+            experiment = client.get_experiment(experiment_id)
+            if experiment is None or experiment.lifecycle_stage != "active":
+                raise RunMLflowError("supply an existing active MLflow experiment")
+            links = {}
+            for stage, evidence in (
+                ("validation", workflow.validation),
+                ("test", workflow.testing),
+            ):
+                key = identity + "-" + stage
+                matches = client.search_runs(
+                    [experiment_id],
+                    filter_string=f"tags.`autoforecast.export_key` = '{key}'",
+                    max_results=2,
+                    run_view_type=mlflow.entities.ViewType.ALL,
+                )
+                if len(matches) > 1:
+                    raise RunMLflowError("multiple remote runs claim the same workflow export")
+                tags = {
+                    "autoforecast.export_key": key,
+                    "autoforecast.workflow_id": source.name,
+                    "autoforecast.manifest_sha256": manifest_sha,
+                    "autoforecast.stage": stage,
+                    "autoforecast.study_sha256": workflow.provenance["study"]["sha256"],
+                    "autoforecast.export_schema": "forecast-workflow-v1",
+                }
+                remote = (
+                    matches[0]
+                    if matches
+                    else client.create_run(
+                        experiment_id,
+                        tags=tags,
+                        run_name=f"{source.name}-{stage}",
+                    )
+                )
+                if any(remote.data.tags.get(name) != value for name, value in tags.items()):
+                    raise RunMLflowError("MLflow run identity differs from the verified workflow")
+                run_id = remote.info.run_id
+                if remote.info.lifecycle_stage != "active":
+                    raise RunMLflowError("the recorded workflow export run has been deleted")
+                links[stage] = RunMLflowLink(tracking_uri, experiment_id, run_id)
+                if remote.data.tags.get("autoforecast.export_complete") == manifest_sha:
+                    _verify_workflow_export(client, run_id, evidence)
+                    if remote.info.status != "FINISHED":
+                        client.set_terminated(run_id, status="FINISHED")
+                    continue
+                try:
+                    client.log_dict(run_id, evidence["score"], "checked_score.json")
+                    client.log_dict(run_id, workflow.parameters, "model_config.json")
+                    client.log_dict(run_id, workflow.provenance, "workflow_provenance.json")
+                    client.log_dict(
+                        run_id, evidence["evaluation_contract"], "evaluation_contract.json"
+                    )
+                    client.log_artifacts(run_id, str(evidence["model_artifacts"]), "models")
+                    client.log_artifacts(run_id, str(root / stage / "forecasts"), "forecasts")
+                    client.log_artifacts(run_id, str(root / stage / "scores"), "scores")
+                    score = evidence["score"]
+                    rows = [("", score, 0)]
+                    breakdown = score.get("forecast_accuracy_breakdown") or {}
+                    for kind in ("per_step", "cumulative"):
+                        rows.extend(
+                            (kind + "_", point, point["end_lead"])
+                            for point in breakdown.get(kind, [])
+                        )
+                    for prefix, point, step in rows:
+                        values = {
+                            name: point.get(name)
+                            for name in ("mae", "rmse", "wape", "bias", "wrmsse")
+                        }
+                        values.update(
+                            {
+                                "coverage_" + name: value
+                                for name, value in point.get("coverage", {}).items()
+                            }
+                        )
+                        for name, value in values.items():
+                            if type(value) in (int, float) and math.isfinite(value):
+                                client.log_metric(
+                                    run_id, prefix + name, float(value), timestamp=0, step=step
+                                )
+                    _verify_workflow_export(client, run_id, evidence)
+                    client.set_tag(run_id, "autoforecast.export_complete", manifest_sha)
+                    client.set_terminated(run_id, status="FINISHED")
+                except Exception:
+                    client.set_terminated(run_id, status="FAILED")
+                    raise
+            return links
+
+
+def _verify_workflow_export(client: Any, run_id: str, evidence: dict) -> None:
+    """Check remote model bytes and the full score, including unavailable values."""
+    from provenance.lineage import directory_digest
+
+    with tempfile.TemporaryDirectory(prefix="autoforecast-export-check-") as folder:
+        models = client.download_artifacts(run_id, "models", folder)
+        if directory_digest(models) != evidence["model_sha256"]:
+            raise RunMLflowError("remote model artifacts differ from the verified workflow")
+        score_path = client.download_artifacts(run_id, "checked_score.json", folder)
+        from autoforecast._exact_json import load_exact_json
+
+        try:
+            remote_score = json.dumps(
+                load_exact_json(pathlib.Path(score_path)), sort_keys=True, allow_nan=False
+            )
+        except (OSError, ValueError) as error:
+            raise RunMLflowError("cannot verify remote scores") from error
+        if remote_score != json.dumps(evidence["score"], sort_keys=True, allow_nan=False):
+            raise RunMLflowError("remote scores differ from the verified workflow")

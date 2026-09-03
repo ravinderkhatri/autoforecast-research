@@ -10,12 +10,14 @@ Run: python3 forecast/models/mft/test_factor.py
 
 from __future__ import annotations
 
+import io
 import pathlib
 import sys
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent.parent))
 
+import pytest
 import torch
 from forecast.models.mft.factor import MAX_PHI, FactorError, SharedLatentFactor
 from spec.likelihood import AR1
@@ -132,16 +134,37 @@ def test_iid_draw_is_exactly_the_generators_independent_normals() -> None:
     assert torch.equal(f.innovation_scale, torch.ones(RANK, dtype=torch.float64))
 
 
-def test_iid_theta_is_state_compatible_but_cannot_reintroduce_persistence() -> None:
-    """Strict checkpoint loading keeps working, while a saved AR theta is inert in IID mode."""
+def test_factor_states_reject_different_dynamics_without_dummy_iid_parameters() -> None:
     ar1 = factor(factor_dynamics="ar1", init_phi=0.83)
     iid = factor(factor_dynamics="iid")
-    assert ar1.state_dict().keys() == iid.state_dict().keys()
-    iid.load_state_dict(ar1.state_dict(), strict=True)
-    assert not iid.theta.requires_grad
-    assert bool((iid.theta != 0).all()), "the compatibility load did not exercise a nonzero theta"
-    assert torch.equal(iid.phi, torch.zeros(RANK, dtype=torch.float64))
-    assert torch.equal(iid.innovation_scale, torch.ones(RANK, dtype=torch.float64))
+    assert "theta" in ar1.state_dict()
+    assert "theta" not in iid.state_dict()
+    assert not hasattr(iid, "theta")
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        iid.load_state_dict(ar1.state_dict(), strict=True)
+    with pytest.raises(RuntimeError, match="Missing key"):
+        ar1.load_state_dict(iid.state_dict(), strict=True)
+
+
+def test_same_dynamics_state_round_trip_preserves_draws_and_dtype() -> None:
+    for dynamics in ("ar1", "iid"):
+        for dtype in (torch.float32, torch.float64):
+            source = factor(factor_dynamics=dynamics).to(dtype=dtype, device="cpu")
+            stream = io.BytesIO()
+            torch.save(source.state_dict(), stream)
+            stream.seek(0)
+            restored = factor(factor_dynamics=dynamics).to(dtype=dtype, device="cpu")
+            restored.load_state_dict(torch.load(stream, weights_only=True), strict=True)
+            expected = source.draw(2, 7, 5, generator=gen(19))
+            actual = restored.draw(2, 7, 5, generator=gen(19))
+            assert torch.equal(expected, actual)
+            assert actual.dtype == dtype and actual.device.type == "cpu"
+            assert restored.phi.dtype == restored.innovation_scale.dtype == dtype
+            assert restored.phi.device == restored.loading_occurrence.weight.device
+            if dynamics == "iid":
+                assert torch.equal(actual, torch.randn(5, 2, 7, RANK, dtype=dtype, generator=gen(19)))
+                assert torch.equal(restored.phi, torch.zeros(RANK, dtype=dtype))
+                assert torch.equal(restored.innovation_scale, torch.ones(RANK, dtype=dtype))
 
 
 def test_unknown_factor_dynamics_is_refused() -> None:

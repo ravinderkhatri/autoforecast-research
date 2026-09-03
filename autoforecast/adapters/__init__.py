@@ -72,7 +72,7 @@ def _validate_span(panel: Panel, origin: str, horizon: int, *, adapter: str):
 
 
 def _validate_daily_span(panel: Panel, origin: str, horizon: int, *, adapter: str):
-    """Compatibility validator for implementations that still require exact daily input."""
+    """Require exact daily input for models whose current contract is daily-only."""
     cadence = parse_frequency(panel.frequency)
     if cadence.unit != "D" or cadence.multiplier != 1:
         raise ValueError(
@@ -355,10 +355,10 @@ def register_defaults(*, quiet: bool = False,
         ("timesfm_v8", _timesfm_v8), ("zoo", _zoo), ("foundation", _foundation),
         ("mft", _mft),
     )
-    legacy_modules = {name for name, _ in loaders}
+    explicit_modules = {name for name, _ in loaders}
     loaders += tuple(
         (definition.module, functools.partial(_descriptor_loader, name))
-        for name, definition in DESCRIPTORS.items() if definition.module not in legacy_modules
+        for name, definition in DESCRIPTORS.items() if definition.module not in explicit_modules
     )
     if only is not None:
         known = {n for n, _ in loaders}

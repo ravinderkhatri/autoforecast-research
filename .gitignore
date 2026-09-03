@@ -38,3 +38,7 @@ mlflow.db
 !.github/
 !.github/**
 !.pre-commit-config.yaml
+
+# Keep local Markdown notes out of every commit.
+*.[mM][dD]
+![rR][eE][aA][dD][mM][eE].[mM][dD]

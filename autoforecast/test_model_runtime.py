@@ -19,7 +19,8 @@ def test_profile_runtime_check_reports_missing_modules_without_importing_them() 
         result = check_runtime("classical")
     assert not result.available
     assert result.missing_modules == ("statsforecast",)
-    assert "uv sync --extra classical" in result.summary
+    assert "uv sync" in result.summary
+    assert "--extra" not in result.summary
 
 
 def test_builtin_runtime_is_available_without_optional_packages() -> None:

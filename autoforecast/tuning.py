@@ -290,7 +290,7 @@ def materialize_manual_parameters(
 def suggest_optuna_parameters(spec: TuningSpec, trial: _OptunaTrial) -> dict[str, object]:
     """Suggest one complete trial from ``spec`` through Optuna's public trial API.
 
-    The caller installs ``.[hpo-optuna]`` and owns study construction, storage, objective metric,
+    The standard installation includes Optuna. The caller owns study construction, storage, metric,
     seed, and trial budget.  Keeping those experiment facts out of model YAML prevents a model
     edit from silently changing a registered evaluation protocol.
     """
@@ -326,7 +326,9 @@ def ray_param_space(spec: TuningSpec) -> dict[str, object]:
     try:
         from ray import tune
     except ImportError as exc:  # pragma: no cover - installation-dependent boundary
-        raise TuningError("Ray Tune requires: pip install '.[hpo-ray]'") from exc
+        raise TuningError(
+            "Ray Tune requires the standard AutoForecast installation with dependencies"
+        ) from exc
     values: dict[str, object] = {}
     for parameter in spec.parameters:
         domain = parameter.search

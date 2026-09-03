@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import json
 import pathlib
 import sys
 import tempfile
@@ -24,7 +26,7 @@ from autoforecast.data_admission import (
 from autoforecast.model_catalog import discover_candidates, load_selection_policy
 from autoforecast.model_names import REVISION_MODELS
 from autoforecast.model_readiness import create_resolved_run, model_registration
-from autoforecast.panel import Panel
+from autoforecast.panel import Panel, PlanSource
 from autoforecast.profiling import Profile
 from autoforecast.tracking_plan import tracking_plan
 from autoforecast.tuning_support import tuning_support
@@ -82,6 +84,33 @@ def test_dataset_contract_maps_client_columns_to_generic_panel_roles() -> None:
             "units_sold",
             "D",
         )
+
+
+def test_dataset_authoring_defaults_and_plan_survive_persisted_round_trip(tmp_path) -> None:
+    path = tmp_path / "dataset.yaml"
+    path.write_text(
+        "schema_version: 1\ndataset:\n  id: daily\n  panel:\n"
+        "    series_col: id\n    time_col: date\n    target_col: qty\n"
+        "    known_future: [price]\n    price_col: price\n"
+        "    plan:\n      path: /plans\n      valid_date_col: valid_date\n"
+        "      known_at_col: known_at\n      price_col: price\n"
+    )
+    contract = load_dataset_contract(path)
+    panel = contract.panel("/panel")
+    assert panel.frequency == "D" and panel.season_length == 7
+    assert panel.static_reals == () and panel.past_only == ()
+    assert panel.plan == PlanSource("/plans", "valid_date", "known_at", price_col="price")
+    assert Panel.from_record(json.loads(json.dumps(dataclasses.asdict(panel)))) == panel
+    # Preparation serializes the authoring roles back to YAML. They must stay plain values.
+    import yaml
+
+    prepared_path = tmp_path / "prepared-dataset.yaml"
+    prepared_path.write_text(yaml.safe_dump({
+        "schema_version": 2,
+        "dataset": {"id": contract.id, "panel": contract.panel_roles,
+                    "required_series_count": 1},
+    }))
+    assert load_dataset_contract(prepared_path).panel("/panel") == panel
 
 
 def test_revision_adapter_registration_contracts_are_exact() -> None:
@@ -281,4 +310,24 @@ def test_dataset_contract_refuses_incomplete_and_nonstring_role_names(tmp_path):
             "schema_version": 1, "dataset": {"id": "measurements", "panel": roles},
         }))
         with pytest.raises(DatasetContractError, match="dataset.panel"):
+            load_dataset_contract(path)
+
+
+def test_dataset_authoring_refuses_malformed_plan_sources(tmp_path) -> None:
+    import pytest
+    import yaml
+
+    from autoforecast.data_admission import DatasetContractError
+
+    path = tmp_path / "dataset.yaml"
+    valid = {"path": "/plans", "valid_date_col": "date", "known_at_col": "known_at",
+             "price_col": "price"}
+    for plan in ("not-a-mapping", {}, {**valid, "unknown": "unsupported"},
+                 {**valid, "price_col": None}):
+        path.write_text(yaml.safe_dump({
+            "schema_version": 1, "dataset": {"id": "daily", "panel": {
+                "series_col": "id", "time_col": "date", "target_col": "qty", "plan": plan,
+            }},
+        }))
+        with pytest.raises(DatasetContractError):
             load_dataset_contract(path)

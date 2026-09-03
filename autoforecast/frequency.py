@@ -28,7 +28,7 @@ class Cadence:
     """One parsed cadence declaration.
 
     ``unit`` is the model-capability family. ``code`` keeps anchor semantics for identities:
-    compatibility aliases ``ME`` and ``YE`` canonicalise to ``M`` and ``Y`` respectively.
+    standard spellings ``ME`` and ``YE`` canonicalise to ``M`` and ``Y`` respectively.
     """
 
     code: str

@@ -588,22 +588,26 @@ def _evaluate(
                 pass
         return outcome.validation_objective
     except Exception as exc:
-        if not (attempt.path / "completion.json").exists():
-            attempt.write_json(
-                "evaluation/failure.json",
-                {
-                    "schema": "autoforecast.hpo-failure.v1",
-                    "exception_type": type(exc).__name__,
-                    "message": str(exc),
-                    "traceback": traceback.format_exc(),
-                },
-            )
-            attempt.finalize(status="failed", summary={"test_metrics": "not_evaluated"})
-        if live is not None:
-            try:
-                live.fail()
-            except Exception:
-                pass
+        try:
+            if not (attempt.path / "completion.json").exists():
+                attempt.write_json(
+                    "evaluation/failure.json",
+                    {
+                        "schema": "autoforecast.hpo-failure.v1",
+                        "exception_type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+                attempt.finalize(status="failed", summary={"test_metrics": "not_evaluated"})
+        except Exception as retention_error:
+            exc.add_note(f"Failed-attempt retention also failed: {retention_error}")
+        finally:
+            if live is not None:
+                try:
+                    live.fail()
+                except Exception:
+                    pass
         raise
 
 
@@ -618,7 +622,9 @@ def _run_optuna(
     try:
         import optuna
     except ImportError as exc:  # pragma: no cover - environment dependent
-        raise HPOError("Optuna runner requires: pip install '.[hpo-optuna]'") from exc
+        raise HPOError(
+            "Optuna runner requires the standard AutoForecast installation with dependencies"
+        ) from exc
     sampler = optuna.samplers.TPESampler(seed=study.seed)
     direction = cast(Literal["minimize", "maximize"], study.direction)
     optuna_study = optuna.create_study(direction=direction, sampler=sampler)
@@ -653,7 +659,9 @@ def _run_ray(
         from ray import tune
         from ray.tune.search.basic_variant import BasicVariantGenerator
     except ImportError as exc:  # pragma: no cover - environment dependent
-        raise HPOError("Ray runner requires: pip install '.[hpo-ray]'") from exc
+        raise HPOError(
+            "Ray runner requires the standard AutoForecast installation with dependencies"
+        ) from exc
 
     # A session created here is local and owned by this runner.  Keep its workers on the exact
     # interpreter that imported Ray.  Invoking ``uv run`` as the worker command makes uv resolve
@@ -968,27 +976,36 @@ def _run_hpo_study_locked(
         raise HPOError("mlflow_tracking_uri must be a non-blank string when supplied")
     if not isinstance(mlflow_experiment, str) or not mlflow_experiment:
         raise HPOError("mlflow_experiment must be a non-blank string")
-    if study.backend == "optuna":
-        _run_optuna(
-            study,
-            output,
-            evaluator,
-            mlflow_tracking_uri=mlflow_tracking_uri,
-            mlflow_experiment=mlflow_experiment,
+    study_root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        study_root.mkdir()
+    except FileExistsError as error:
+        raise HPOError(f"study output already exists: {study_root}") from error
+    try:
+        if study.backend == "optuna":
+            _run_optuna(
+                study,
+                output,
+                evaluator,
+                mlflow_tracking_uri=mlflow_tracking_uri,
+                mlflow_experiment=mlflow_experiment,
+            )
+        else:
+            _run_ray(
+                study,
+                output,
+                evaluator,
+                mlflow_tracking_uri=mlflow_tracking_uri,
+                mlflow_experiment=mlflow_experiment,
+            )
+        seal_study_selection(
+            study_root,
+            top_k=study.top_k,
+            direction=study.direction,
+            required_trial_count=study.max_trials,
         )
-    else:
-        _run_ray(
-            study,
-            output,
-            evaluator,
-            mlflow_tracking_uri=mlflow_tracking_uri,
-            mlflow_experiment=mlflow_experiment,
-        )
-    seal_study_selection(
-        study_root,
-        top_k=study.top_k,
-        direction=study.direction,
-        required_trial_count=study.max_trials,
-    )
-    sync_hpo_selection_to_mlflow(study_root, tracking_uri=mlflow_tracking_uri)
-    return render_study_report(study_root, mlflow_url=mlflow_tracking_uri)
+        sync_hpo_selection_to_mlflow(study_root, tracking_uri=mlflow_tracking_uri)
+        return render_study_report(study_root, mlflow_url=mlflow_tracking_uri)
+    except Exception as error:
+        vars(error)["tuning_path"] = study_root
+        raise

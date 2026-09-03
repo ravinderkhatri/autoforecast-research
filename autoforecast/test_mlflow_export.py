@@ -78,7 +78,7 @@ def test_publish_model_from_completed_bundle_reuses_the_verified_linked_run(
         metadata={
             "comparability_fingerprint": "a" * 64,
             "model": {"id": "candidate", "adapter": "mft"},
-            "study": {"direction": "minimize"},
+            "study": {"direction": "minimize", "top_k": 1},
             "hyperparameters": {"training.learning_rate": 0.001},
             "data": {
                 "name": "bundle-data",
@@ -170,7 +170,7 @@ def test_completed_attempt_snapshot_is_detached_before_remote_upload(
         metadata={
             "comparability_fingerprint": "a" * 64,
             "model": {"id": "candidate"},
-            "study": {"direction": "minimize"},
+            "study": {"direction": "minimize", "top_k": 1},
             "hyperparameters": {},
             "data": {
                 "name": "data",
@@ -218,7 +218,7 @@ def test_completed_bundle_exports_one_way_to_real_mlflow_with_safe_evidence() ->
             metadata={
                 "comparability_fingerprint": "a" * 64,
                 "model": {"id": "example-model"},
-                "study": {"direction": "minimize"},
+                "study": {"direction": "minimize", "top_k": 1},
                 "hyperparameters": {"training.learning_rate": 0.001},
                 "data": {
                     "name": "client-data-not-exported",
@@ -276,7 +276,7 @@ def test_live_tracking_uploads_epoch_history_and_safe_completed_artifacts() -> N
             metadata={
                 "comparability_fingerprint": "c" * 64,
                 "model": {"id": "example-model"},
-                "study": {"direction": "minimize"},
+                "study": {"direction": "minimize", "top_k": 1},
                 "hyperparameters": {"training.learning_rate": 0.001},
                 "data": {
                     "name": "client-data-not-exported",

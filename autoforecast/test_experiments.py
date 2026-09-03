@@ -149,15 +149,19 @@ def test_attempt_write_bytes_refuses_unsafe_or_linked_paths(tmp_path: pathlib.Pa
     assert not (outside / "escaped.bin").exists()
 
 
+@pytest.mark.parametrize("top_k", [1, None, True, 2])
 def test_load_study_selection_accepts_only_a_selection_bound_to_its_path(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, top_k,
 ) -> None:
+    study_metadata = {"direction": "minimize"}
+    if top_k is not None:
+        study_metadata["top_k"] = top_k
     attempt = open_local_attempt(
         tmp_path,
         study_id="smoke",
         trial_id="trial1",
         attempt_id="attempt1",
-        metadata={**_metadata(learning_rate=0.001), "study": {"direction": "minimize"}},
+        metadata={**_metadata(learning_rate=0.001), "study": study_metadata},
     )
     attempt.write_json(
         "evaluation/validation.json",
@@ -171,6 +175,10 @@ def test_load_study_selection_accepts_only_a_selection_bound_to_its_path(
     )
     attempt.finalize(status="completed", summary={})
     study_root = tmp_path / "studies/smoke"
+    if type(top_k) is not int or top_k != 1:
+        with pytest.raises(ExperimentError, match="selection top_k differs"):
+            seal_study_selection(study_root, top_k=1, direction="minimize", required_trial_count=1)
+        return
     selection_path = seal_study_selection(
         study_root, top_k=1, direction="minimize", required_trial_count=1
     )
@@ -192,7 +200,7 @@ def test_load_study_selection_recomputes_ranked_candidates_before_reuse(
             study_id="smoke",
             trial_id=f"trial{number}",
             attempt_id="attempt1",
-            metadata={**_metadata(learning_rate=number / 1000), "study": {"direction": "minimize"}},
+            metadata={**_metadata(learning_rate=number / 1000), "study": {"direction": "minimize", "top_k": 1}},
         )
         attempt.write_json(
             "evaluation/validation.json",
@@ -222,7 +230,7 @@ def test_equal_objectives_break_ties_by_parameters_before_random_attempt_ids(
     parameters = (("trial-z", 0.001), ("trial-a", 0.003))
     identities: dict[str, str] = {}
     for trial_id, learning_rate in parameters:
-        metadata = {**_metadata(learning_rate=learning_rate), "study": {"direction": "minimize"}}
+        metadata = {**_metadata(learning_rate=learning_rate), "study": {"direction": "minimize", "top_k": 1}}
         identities[trial_id] = hashlib.sha256(
             json.dumps(metadata["hyperparameters"], separators=(",", ":"), sort_keys=True).encode(
                 "utf-8"
@@ -634,7 +642,7 @@ def test_sealed_validation_selection_authorizes_only_top_k_and_renders_a_portabl
                 root, study_id="smoke", trial_id=f"trial{number}", attempt_id="attempt1",
                 metadata={
                     **_metadata(learning_rate=0.001 * number),
-                    "study": {"direction": "minimize"},
+                    "study": {"direction": "minimize", "top_k": 1},
                 },
             )
             attempt.write_json("evaluation/validation.json", {
@@ -710,3 +718,39 @@ def test_report_refuses_an_attempt_whose_hashed_artifact_changed_after_completio
             assert "does not match bytes" in str(exc)
         else:
             raise AssertionError("report rendered a post-completion mutation")
+
+
+def test_report_reads_only_current_optimization_metric():
+    from autoforecast.experiment_report import _optimization_validation
+
+    assert _optimization_validation({"optimization/validation_objective": 2.0}) == 2.0
+    assert _optimization_validation({"validation/objective": 1.0}) is None
+    assert _optimization_validation({"optimization/validation_objective": 2.0,
+                                     "validation/objective": 1.0}) == 2.0
+
+
+@pytest.mark.parametrize("spelling", ["current", "obsolete", "both"])
+def test_report_reads_only_current_execution_metrics(tmp_path, spelling):
+    attempt = open_local_attempt(
+        tmp_path, study_id="resources", trial_id="trial", attempt_id="attempt",
+        metadata=_metadata(learning_rate=0.1),
+    )
+    epochs = []
+    for epoch, seconds, rss in [(1, 1.25, 3000), (2, 2.75, 2000)]:
+        row = {"epoch": epoch}
+        if spelling != "obsolete":
+            row.update({"execution/epoch_seconds": seconds,
+                        "execution/process_peak_rss_bytes": rss})
+        if spelling != "current":
+            row.update({"resources/epoch_seconds": 123.456,
+                        "resources/process_peak_rss_bytes": 7654321})
+        epochs.append(row)
+    attempt.write_bytes("metrics/epochs.jsonl", "".join(
+        json.dumps(row) + "\n" for row in epochs).encode())
+    attempt.finalize(status="completed", summary={})
+    report = render_study_report(tmp_path / "studies/resources").read_text()
+    table = report.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+    expected = "<td>0.000</td><td>0</td>" if spelling == "obsolete" else (
+        "<td>4.000</td><td>3000</td>")
+    assert expected in table
+    assert "246.912" not in table and "7654321" not in table

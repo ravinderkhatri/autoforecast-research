@@ -80,7 +80,7 @@ def test_validate_accepts_the_real_m5_panel() -> None:
     assert p.season_length == 7
 
 
-def test_panel_record_round_trip_restores_json_types_and_old_defaults() -> None:
+def test_panel_record_round_trip_restores_current_json_types() -> None:
     panel = Panel(
         "/panel",
         "id",
@@ -102,18 +102,21 @@ def test_panel_record_round_trip_restores_json_types_and_old_defaults() -> None:
     assert isinstance(restored.static_reals, tuple)
     assert isinstance(restored.plan, PlanSource)
 
-    historical = dict(record)
-    historical.pop("static_reals")
-    historical.pop("frequency")
-    old = Panel.from_record(historical)
-    assert old.static_reals == () and old.frequency == "D"
+    for field in record:
+        incomplete = {key: value for key, value in record.items() if key != field}
+        with pytest.raises(PanelError, match="missing current field"):
+            Panel.from_record(incomplete)
+    for field in record["plan"]:
+        incomplete_plan = {key: value for key, value in record["plan"].items() if key != field}
+        with pytest.raises(PanelError, match="malformed PlanSource"):
+            Panel.from_record({**record, "plan": incomplete_plan})
 
 
 def test_panel_record_refuses_ambiguous_container_shapes() -> None:
     base = dataclasses.asdict(Panel("/panel", "id", "date", "qty"))
     cases = (
         ([], "one JSON object"),
-        ({}, "malformed fields"),
+        ({}, "missing current field"),
         ({**base, "known_future": "price"}, "JSON array"),
         ({**base, "plan": "not-an-object"}, "object or null"),
         ({**base, "unknown_field": "silent drift"}, "unknown field"),
@@ -648,6 +651,16 @@ def test_from_record_round_trips_a_forecast() -> None:
                         {"emitted": 3, "declined_no_source": 1}).validate()
     rebuilt = Forecast.from_record(json.loads(json.dumps(original.as_record()))).validate()
     assert rebuilt == original
+    sidecar = {**original.as_record(), "cache_identity": {"version": "current"},
+               "reconciliation": {"source_forecast": original.as_record()}}
+    assert Forecast.from_record(sidecar).validate() == original
+    for field in dataclasses.fields(Forecast):
+        incomplete = {key: value for key, value in original.as_record().items()
+                      if key != field.name}
+        with pytest.raises(ForecastError, match="missing current field"):
+            Forecast.from_record(incomplete)
+    with pytest.raises(ForecastError, match="one JSON object"):
+        Forecast.from_record([])  # type: ignore[arg-type]
 
 
 def test_from_record_recomputes_the_totals_rather_than_trusting_them() -> None:

@@ -10,16 +10,16 @@ import math
 import pathlib
 import re
 import tempfile
-import uuid
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from typing import TYPE_CHECKING, cast
 
-from mlops._safe_files import _platform_absolute
+from mlops._safe_files import _platform_absolute, read_regular_bytes, snapshot_tree_types
+from mlops.run_report import new_run_id
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from autoforecast._exact_json import load_exact_json
+from autoforecast._exact_json import loads_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast.benchmark import boundary, digest, evaluation_contract, verify_benchmark
 from autoforecast.data_admission import _load_dataset_contract_bytes
@@ -60,8 +60,12 @@ class FitPredictRequest:
     ``panel.path`` contains only training rows through ``origin``. Save forecasts
     beneath ``output_dir`` and at least one model file beneath ``output_dir/model``.
     Apply the supplied model/training parameters and seed in the caller's code.
+    Optional logs or diagnostics under output_dir/artifacts are retained too.
+    Other scratch files are deleted after the callback returns.
     The seed is held constant across trials to compare parameter configurations.
     Dataframes borrow the study's Spark session and are valid during the callback.
+    purpose is selection (including outer-validation searches), validation, or refit.
+    It is assigned by orchestration, never by model hyperparameters.
     """
 
     training_data: DataFrame
@@ -74,6 +78,7 @@ class FitPredictRequest:
     training_parameters: dict[str, object]
     seed: int
     output_dir: pathlib.Path
+    purpose: str = "selection"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,14 +114,43 @@ class TuningResult:
     model_format: str
     trial_history: tuple[dict, ...]
     provenance: dict
-    windows: tuple[dict, ...] = ()
-    winner_config: pathlib.Path | None = None
-    validation_report: pathlib.Path | None = None
-    search_config: pathlib.Path | None = None
+    windows: tuple[dict, ...]
+    winner_config: pathlib.Path
+    validation_report: pathlib.Path
+    search_config: pathlib.Path
 
 
 def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
+
+
+def _retained_manifest(completion: dict, payload: bytes) -> dict:
+    """Anchor one immutable manifest to the completion verified by the existing loader."""
+    if hashlib.sha256(payload).hexdigest() != completion["artifact_manifest_sha256"]:
+        raise HPOError("retained manifest differs from verified completion")
+    manifest = cast(dict, loads_exact_json(payload))
+    terminal = {key: value for key, value in completion.items()
+                if key != "artifact_manifest_sha256"}
+    terminal_bytes = (
+        json.dumps(terminal, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode()
+    if hashlib.sha256(terminal_bytes).hexdigest() != manifest["terminal_payload_sha256"]:
+        raise HPOError("retained completion differs from its sealed terminal payload")
+    return manifest
+
+
+def _retained_bytes(root: pathlib.Path, relative: str, manifest: dict) -> bytes:
+    """Read once, then authenticate the exact bytes that the consumer will parse."""
+    payload = read_regular_bytes(root, relative)
+    entries = [entry for entry in manifest["artifacts"] if entry["path"] == relative]
+    if (len(entries) != 1 or len(payload) != entries[0]["bytes"]
+            or hashlib.sha256(payload).hexdigest() != entries[0]["sha256"]):
+        raise HPOError(f"retained artifact differs from its sealed bytes: {relative}")
+    return payload
+
+
+def _retained_json(root: pathlib.Path, relative: str, manifest: dict) -> dict:
+    return cast(dict, loads_exact_json(_retained_bytes(root, relative, manifest)))
 
 
 def _implementation_record(value: Mapping[str, object]) -> dict:
@@ -142,7 +176,11 @@ def _implementation_record(value: Mapping[str, object]) -> dict:
     return json.loads(_json_bytes(dict(value)))
 
 
-def _config(path: pathlib.Path) -> tuple[bytes, TuningSpec, int, int, dict]:
+def _config(
+    path: pathlib.Path,
+    *,
+    require_hpo: bool = True,
+) -> tuple[bytes, TuningSpec, int, int, dict]:
     """Read once: profile settings and explicit budget; dates come only from the study."""
     if path.is_symlink() or not path.is_file():
         raise TuningError("external tuning config must be a regular file")
@@ -151,7 +189,7 @@ def _config(path: pathlib.Path) -> tuple[bytes, TuningSpec, int, int, dict]:
         value = loads_exact_yaml(raw)
     except ExactYAMLError as error:
         raise TuningError(f"invalid YAML in external tuning config: {error}") from error
-    if type(value) is not dict or "hpo" not in value:
+    if type(value) is not dict or (require_hpo and "hpo" not in value):
         raise TuningError("external tuning config requires an hpo mapping")
     controls = {
         name: value.pop(name)
@@ -163,7 +201,7 @@ def _config(path: pathlib.Path) -> tuple[bytes, TuningSpec, int, int, dict]:
         )
         if name in value
     }
-    options = value.pop("hpo")
+    options = value.pop("hpo", {"backend": "optuna", "max_trials": 1, "seed": 42})
     if type(options) is not dict or set(options) != {"backend", "max_trials", "seed"}:
         raise TuningError("hpo requires exactly backend, max_trials and seed")
     if options["backend"] != "optuna":
@@ -180,6 +218,20 @@ def _config(path: pathlib.Path) -> tuple[bytes, TuningSpec, int, int, dict]:
     spec = loads_external_tuning_spec(profile, source_path=path)
     spec = dataclasses.replace(spec, source_sha256=hashlib.sha256(raw).hexdigest())
     return raw, spec, budget, seed, controls
+
+
+def _validation_controls(controls: dict) -> dict:
+    """Skip search windows while retaining the declared comparison and reporting rules."""
+    selection = controls.get("selection", {})
+    if type(selection) is not dict:
+        raise TuningError("selection must be a mapping")
+    return {
+        **controls,
+        "selection": {
+            **{key: value for key, value in selection.items() if key not in {"stage", "origins"}},
+            "stage": "validation",
+        },
+    }
 
 
 def _resolve_options(study: Study, controls: dict, tuning_origin: str | None) -> dict:
@@ -274,7 +326,12 @@ def _resolve_options(study: Study, controls: dict, tuning_origin: str | None) ->
 
 def _window_result(attempt: pathlib.Path, evidence: dict) -> dict:
     record = dict(evidence)
-    for relative in (record["forecast"]["path"], record["model_path"]):
+    if ("artifacts_path" in record) != ("artifacts_sha256" in record):
+        raise HPOError("callback artifacts require both path and checksum")
+    paths = [record["forecast"]["path"], record["model_path"]]
+    if "artifacts_path" in record:
+        paths.append(record["artifacts_path"])
+    for relative in paths:
         path = pathlib.PurePosixPath(relative)
         if path.is_absolute() or ".." in path.parts:
             raise HPOError("retained window path must stay within its run")
@@ -299,7 +356,13 @@ def _window_result(attempt: pathlib.Path, evidence: dict) -> dict:
         or directory_digest(model) != record["model_sha256"]
     ):
         raise HPOError("retained window model or forecasts changed")
-    return {**record, "forecasts": forecast, "model_artifacts": model}
+    extra = {}
+    if "artifacts_path" in record:
+        artifacts = attempt / record["artifacts_path"]
+        if directory_digest(artifacts) != record["artifacts_sha256"]:
+            raise HPOError("retained callback artifacts changed")
+        extra["artifacts"] = artifacts
+    return {**record, "forecasts": forecast, "model_artifacts": model, **extra}
 
 
 def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
@@ -308,8 +371,13 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
     selection = load_study_selection(root)
     chosen = selection["selected"][0]
     attempt = root / chosen["attempt_path"]
-    metadata, _ = load_completed_attempt(attempt)
-    evidence = load_exact_json(attempt / "evaluation/external-run.json")
+    manifest_bytes = read_regular_bytes(attempt, "artifact_manifest.json")
+    _, completion = load_completed_attempt(attempt)
+    manifest = _retained_manifest(completion, manifest_bytes)
+    if completion["artifact_manifest_sha256"] != chosen["artifact_manifest_sha256"]:
+        raise HPOError("selected attempt manifest differs from selection")
+    metadata = _retained_json(attempt, "metadata/attempt.json", manifest)
+    evidence = _retained_json(attempt, "evaluation/external-run.json", manifest)
     if type(evidence) is not dict or evidence.get("schema") not in {
         "autoforecast.external-trial.v1",
         "autoforecast.external-trial.v2",
@@ -318,7 +386,7 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
     context = evidence["context"]
     if hashlib.sha256(_json_bytes(context)).hexdigest() != selection["comparability_fingerprint"]:
         raise HPOError("external selection context differs from its frozen identity")
-    profile = (attempt / "metadata/external-profile.yaml").read_bytes()
+    profile = _retained_bytes(attempt, "metadata/external-profile.yaml", manifest)
     if hashlib.sha256(profile).hexdigest() != context["profile_sha256"]:
         raise HPOError("external profile differs from its frozen identity")
     if (
@@ -331,34 +399,17 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
     )
     dataset_path = study_path.parent / "dataset.yaml"
     dataset = _load_dataset_contract_bytes(dataset_path.read_bytes(), dataset_path)
-    if "windows" in evidence:
-        windows = tuple(_window_result(attempt, window) for window in evidence["windows"])
-        if (
-            not windows
-            or len(windows) != len(context["windows"])
-            or [w["boundary"] for w in windows]
-            != [w["evaluation_contract"]["boundary"] for w in context["windows"]]
-            or any(w["parameter_sha256"] != digest(metadata["hyperparameters"]) for w in windows)
-        ):
-            raise HPOError("window scores, parameters or aggregate differ from selection")
-    else:
-        forecast_record = cast(dict, load_exact_json(attempt / "evaluation/forecast.json"))
-        windows = (
-            _window_result(
-                attempt,
-                {
-                    "forecast": {**forecast_record, "path": "forecasts"},
-                    "model_path": "model",
-                    "forecast_sha256": evidence["forecast_sha256"],
-                    "model_sha256": evidence["model_sha256"],
-                    "model_format": evidence["model_format"],
-                    "boundary": context["evaluation_contract"]["boundary"],
-                    "evaluation_contract": context["evaluation_contract"],
-                    "parameter_sha256": digest(metadata["hyperparameters"]),
-                    "score": load_exact_json(attempt / "evaluation/score.json"),
-                },
-            ),
-        )
+    if not isinstance(evidence.get("windows"), list):
+        raise HPOError("external trial requires current window evidence; rerun the search")
+    windows = tuple(_window_result(attempt, window) for window in evidence["windows"])
+    if (
+        not windows
+        or len(windows) != len(context["windows"])
+        or [w["boundary"] for w in windows]
+        != [w["evaluation_contract"]["boundary"] for w in context["windows"]]
+        or any(w["parameter_sha256"] != digest(metadata["hyperparameters"]) for w in windows)
+    ):
+        raise HPOError("window scores, parameters or aggregate differ from selection")
     if any(
         window["forecasts"].adapter != context["model_id"]
         or window["forecasts"].target_estimand
@@ -374,15 +425,17 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
     ):
         raise HPOError("saved window scores differ from the selected objective")
     winner = attempt / "metadata/winner-config.json"
-    if winner.exists():
-        saved = load_selected_configuration(winner)
-        if (
-            saved["parameters"] != metadata["hyperparameters"]
-            or saved["profile_sha256"] != context["profile_sha256"]
-            or saved["implementation"] != context["implementation"]
-            or saved["seed"] != context["seed"]
-        ):
-            raise HPOError("saved winner configuration differs from the selected trial")
+    preflight = attempt / "metadata/preflight.json"
+    if not winner.is_file() or not preflight.is_file():
+        raise HPOError("current tuning results require winner settings and preflight evidence")
+    saved = load_selected_configuration(winner)
+    if (
+        saved["parameters"] != metadata["hyperparameters"]
+        or saved["profile_sha256"] != context["profile_sha256"]
+        or saved["implementation"] != context["implementation"]
+        or saved["seed"] != context["seed"]
+    ):
+        raise HPOError("saved winner configuration differs from the selected trial")
     return TuningResult(
         path=root,
         parameters=dict(metadata["hyperparameters"]),
@@ -395,11 +448,9 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
         trial_history=tuple(selection["candidates"]),
         provenance=context,
         windows=windows,
-        winner_config=winner if winner.exists() else None,
+        winner_config=winner,
         search_config=attempt / "metadata/external-profile.yaml",
-        validation_report=attempt / "metadata/preflight.json"
-        if (attempt / "metadata/preflight.json").exists()
-        else None,
+        validation_report=preflight,
     )
 
 
@@ -469,26 +520,45 @@ def _fit_window(
     seed: int,
     metrics: list[str],
     breakdown: ForecastAccuracyBreakdown,
+    purpose: str = "selection",
 ) -> dict:
+    if purpose not in {"selection", "validation", "refit"}:
+        raise ValueError("unknown fitting purpose")
     context = inputs.verify()
     panel = inputs.panel
     origin, horizon = context["origin"], context["horizon"]
+    extras = {}
     with tempfile.TemporaryDirectory(prefix="autoforecast-fit-") as temporary:
         work = pathlib.Path(temporary)
-        result = callback(
-            FitPredictRequest(
-                training_data=spark.read.parquet(panel.path),
-                series_mapping=spark.read.parquet(str(inputs.mapping_path)),
-                panel=Panel.from_record(dataclasses.asdict(panel)),
-                origin=origin,
-                forecast_dates=tuple(period_points(origin, panel.frequency, horizon)),
-                model_id=model_id,
-                model_parameters=json.loads(_json_bytes(model_parameters)),
-                training_parameters=json.loads(_json_bytes(training_parameters)),
-                seed=seed,
-                output_dir=work,
+        try:
+            result = callback(
+                FitPredictRequest(
+                    training_data=spark.read.parquet(panel.path),
+                    series_mapping=spark.read.parquet(str(inputs.mapping_path)),
+                    panel=Panel.from_record(dataclasses.asdict(panel)),
+                    origin=origin,
+                    forecast_dates=tuple(period_points(origin, panel.frequency, horizon)),
+                    model_id=model_id,
+                    model_parameters=json.loads(_json_bytes(model_parameters)),
+                    training_parameters=json.loads(_json_bytes(training_parameters)),
+                    seed=seed,
+                    output_dir=work,
+                    purpose=purpose,
+                )
             )
-        )
+        finally:
+            artifact_source = work / "artifacts"
+            if artifact_source.exists() or artifact_source.is_symlink():
+                kinds = snapshot_tree_types(artifact_source)
+                if (artifact_source.is_symlink() or not artifact_source.is_dir()
+                        or any(kind not in {"file", "directory"} for kind in kinds.values())):
+                    raise HPOError("callback artifacts may not contain symlinks or special files")
+                if "file" in kinds.values():
+                    artifact_sha = directory_digest(artifact_source)
+                    _copy_run_artifact_directory(artifact_source, output / "artifacts")
+                    if directory_digest(output / "artifacts") != artifact_sha:
+                        raise HPOError("callback artifacts changed while retaining files")
+                    extras = {"artifacts_path": "artifacts", "artifacts_sha256": artifact_sha}
         inputs.verify()
         if (
             type(result) is not FitPredictResult
@@ -537,6 +607,7 @@ def _fit_window(
     )
     inputs.verify()
     record = {
+        **extras,
         "boundary": fixed["boundary"],
         "evaluation_contract": fixed,
         "forecast": {**forecast.as_record(), "path": "forecasts"},
@@ -567,32 +638,58 @@ class _ExternalTrialBridge:
     def __call__(self, request: TrialRequest) -> TrialOutcome:
         context = json.loads(self.context_bytes)
         records = []
-        for index, inputs in enumerate(self.inputs):
-            prefix = "" if len(self.inputs) == 1 else f"windows/{index:04d}"
-            directory = request.attempt.path / prefix
-            record = _fit_window(
-                self.spark,
-                self.callback,
-                inputs,
-                directory,
-                model_id=context["model_id"],
-                model_parameters=request.model_parameters,
-                training_parameters=request.training_parameters,
-                seed=context["seed"],
-                metrics=context["options"]["metrics"],
-                breakdown=context["options"]["breakdown"],
-            )
-            value = record["score"].get(context["metric"])
-            if type(value) not in (int, float) or not math.isfinite(value):
-                raise HPOError("external trial requires a finite tuning objective in every window")
-            record["forecast"]["path"] = str(pathlib.PurePosixPath(prefix) / "forecasts")
-            record["model_path"] = str(pathlib.PurePosixPath(prefix) / "model")
-            records.append(record)
+        request.attempt.write_bytes("metadata/external-profile.yaml", self.profile_bytes)
+        request.attempt.write_bytes("metadata/preflight.json", self.report_bytes)
+        try:
+            for index, inputs in enumerate(self.inputs):
+                prefix = "" if len(self.inputs) == 1 else f"windows/{index:04d}"
+                directory = request.attempt.path / prefix
+                record = _fit_window(
+                    self.spark,
+                    self.callback,
+                    inputs,
+                    directory,
+                    model_id=context["model_id"],
+                    model_parameters=request.model_parameters,
+                    training_parameters=request.training_parameters,
+                    seed=context["seed"],
+                    metrics=context["options"]["metrics"],
+                    breakdown=context["options"]["breakdown"],
+                )
+                value = record["score"].get(context["metric"])
+                if type(value) not in (int, float) or not math.isfinite(value):
+                    raise HPOError(
+                        "external trial requires a finite tuning objective in every window"
+                    )
+                record["forecast"]["path"] = str(pathlib.PurePosixPath(prefix) / "forecasts")
+                record["model_path"] = str(pathlib.PurePosixPath(prefix) / "model")
+                if "artifacts_path" in record:
+                    record["artifacts_path"] = str(pathlib.PurePosixPath(prefix) / "artifacts")
+                records.append(record)
+        finally:
+            # A failed trial still owns its exact inputs and any windows completed before failure.
+            evidence = {
+                "schema": "autoforecast.external-trial.v1"
+                if len(self.inputs) == 1 else "autoforecast.external-trial.v2",
+                "context": context,
+                "windows": records,
+                "aggregation": "mean_of_window_scores",
+                "model_format": records[0]["model_format"]
+                if len(self.inputs) == 1 and records else "per_window",
+                "training_attestation": "caller_supplied",
+                "test_metrics": "not_evaluated",
+            }
+            if len(self.inputs) == 1 and records:
+                evidence.update({
+                    "forecast_sha256": records[0]["forecast_sha256"],
+                    "model_sha256": records[0]["model_sha256"],
+                })
+            elif (request.attempt.path / "windows").is_dir():
+                evidence["windows_sha256"] = directory_digest(request.attempt.path / "windows")
+            request.attempt.write_json("evaluation/external-run.json", evidence)
         value = math.fsum(record["score"][context["metric"]] for record in records) / len(records)
         for inputs in self.inputs:
             inputs.verify()
-        request.attempt.write_bytes("metadata/external-profile.yaml", self.profile_bytes)
-        request.attempt.write_bytes("metadata/preflight.json", self.report_bytes)
         parameters = {
             **{"model." + k: v for k, v in request.model_parameters.items()},
             **{"training." + k: v for k, v in request.training_parameters.items()},
@@ -620,30 +717,6 @@ class _ExternalTrialBridge:
         if len(records) == 1:
             request.attempt.write_json("evaluation/forecast.json", records[0]["forecast"])
             request.attempt.write_json("evaluation/score.json", records[0]["score"])
-        request.attempt.write_json(
-            "evaluation/external-run.json",
-            {
-                "schema": "autoforecast.external-trial.v1"
-                if len(records) == 1
-                else "autoforecast.external-trial.v2",
-                "context": context,
-                "windows": records,
-                "aggregation": "mean_of_window_scores",
-                **(
-                    {
-                        "forecast_sha256": records[0]["forecast_sha256"],
-                        "model_sha256": records[0]["model_sha256"],
-                    }
-                    if len(records) == 1
-                    else {
-                        "windows_sha256": directory_digest(request.attempt.path / "windows"),
-                    }
-                ),
-                "model_format": records[0]["model_format"] if len(records) == 1 else "per_window",
-                "training_attestation": "caller_supplied",
-                "test_metrics": "not_evaluated",
-            },
-        )
         return TrialOutcome(float(value), {"validation/" + context["metric"]: float(value)})
 
 
@@ -651,7 +724,7 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
     root = (
         pathlib.Path(supplied).absolute()
         if supplied is not None
-        else study._path.parent.parent.parent / name
+        else study._path.parent.parent.parent / name / study.study_id
     )
     root = _platform_absolute(root)
     if any(path.is_symlink() for path in (root, *root.parents)):
@@ -700,7 +773,7 @@ def tune_study(
     raw, tuning, budget, seed, controls = _config(pathlib.Path(config))
     options = _resolve_options(study, controls, tuning_origin)
     root = _output_root(study, output_dir, "study-tuning")
-    preflight = preflight_study(study, options)
+    preflight = preflight_study(study, options, output_dir=root / "preflight")
     with ExitStack() as stack:
         if preflight.study_id != study.study_id:
             study = stack.enter_context(
@@ -786,7 +859,7 @@ def tune_study(
             "validation_series": study.n_series,
             "test": "reserved_not_evaluated",
         }
-        identifier = "tune-" + uuid.uuid4().hex
+        identifier = new_run_id("tune")
         spec = HPOStudySpec(
             id=identifier,
             backend="optuna",
@@ -805,19 +878,53 @@ def tune_study(
         bridge = _ExternalTrialBridge(
             study._spark, fit_predict, inputs, context_bytes, raw, _json_bytes(preflight.report)
         )
-        run_hpo_study(spec, root, bridge)
-        return load_tuning_result(root / "studies" / identifier)
+        search_path = root / "studies" / identifier
+        try:
+            run_hpo_study(spec, root, bridge)
+        except Exception as error:
+            # Preserve the callback's exception type while exposing the library-owned location.
+            if getattr(error, "tuning_path", None) == search_path:
+                from mlops.run_report import run_guide
+
+                from autoforecast.protocol import _atomic_write_text
+
+                _atomic_write_text(search_path / "RUN.md", run_guide(
+                    identity={"search_id": identifier, "study_id": study.study_id},
+                    status="failed",
+                    files=[p.relative_to(search_path).as_posix()
+                           for p in search_path.rglob("*") if p.is_file()],
+                    sealed=False,
+                ).decode())
+            raise
+        return load_tuning_result(search_path)
 
 
-def _validate_workflow_configuration(root: pathlib.Path, record: dict, saved: dict) -> None:
+def _validate_workflow_configuration(
+    root: pathlib.Path, record: dict, saved: dict, manifest: dict,
+) -> None:
     """Require the summary and both fits to refer to the retained winner settings."""
-    if (
-        set(record)
-        != {"schema", "status", "parameters", "provenance", "tuning_path", "validation", "testing"}
-        or record["schema"] != "autoforecast.forecast-workflow.v1"
-    ):
+    validation_only = record.get("schema") == "autoforecast.forecast-validation.v1"
+    labels = (
+        (("validation", "validation"),)
+        if validation_only
+        else (
+            ("validation", "validation"),
+            ("testing", "test"),
+        )
+    )
+    if set(record) != {
+        "schema",
+        "status",
+        "parameters",
+        "provenance",
+        "tuning_path",
+        *[label for label, _ in labels],
+    } or record["schema"] not in {
+        "autoforecast.forecast-workflow.v1",
+        "autoforecast.forecast-validation.v1",
+    }:
         raise HPOError("unsupported workflow configuration record")
-    profile_bytes = (root / "metadata/search-config.yaml").read_bytes()
+    profile_bytes = _retained_bytes(root, "metadata/search-config.yaml", manifest)
     if (
         profile_bytes != saved["profile_text"].encode("utf-8")
         or hashlib.sha256(profile_bytes).hexdigest() != saved["profile_sha256"]
@@ -825,17 +932,28 @@ def _validate_workflow_configuration(root: pathlib.Path, record: dict, saved: di
         raise HPOError("workflow search configuration differs from its retained profile")
     parameters_sha = digest(record["parameters"])
     provenance = record["provenance"]
-    if provenance != load_exact_json(root / "metadata/provenance.json"):
+    if provenance.get("mode") == "fixed_configuration":
+        if (
+            saved.get("source")
+            != {
+                "kind": "fixed",
+                "workflow_id": root.name,
+                "study": provenance["study"],
+            }
+            or record["tuning_path"] is not None
+        ):
+            raise HPOError("fixed configuration differs from its originating workflow")
+    if provenance != _retained_json(root, "metadata/provenance.json", manifest):
         raise HPOError("workflow configuration differs from its recorded execution provenance")
     if record["tuning_path"] is not None and (
         pathlib.Path(record["tuning_path"]).name != saved["source"]["search_id"]
     ):
         raise HPOError("workflow configuration names a different source search")
-    for label, stage in (("validation", "validation"), ("testing", "test")):
+    for label, stage in labels:
         window = record[label]
         contract = window["evaluation_contract"]
         if (
-            window != load_exact_json(root / stage / "result.json")
+            window != _retained_json(root, stage + "/result.json", manifest)
             or not window["boundary"].startswith(stage + "/")
             or window["boundary"] != contract["boundary"]
             or contract["study"] != provenance["study"]
@@ -844,15 +962,15 @@ def _validate_workflow_configuration(root: pathlib.Path, record: dict, saved: di
             or window["model_path"] != stage + "/model"
         ):
             raise HPOError("workflow stage configuration differs from its retained evidence")
-    if record["status"] != record["testing"]["score"]["evaluation_status"]:
+    if (
+        record["status"]
+        != record["validation" if validation_only else "testing"]["score"]["evaluation_status"]
+    ):
         raise HPOError("workflow configuration status differs from testing coverage")
     if (
         parameters_sha != saved["parameter_sha256"]
         or parameters_sha != digest(saved["parameters"])
-        or any(
-            record[stage]["parameter_sha256"] != parameters_sha
-            for stage in ("validation", "testing")
-        )
+        or any(record[stage]["parameter_sha256"] != parameters_sha for stage, _ in labels)
         or provenance["implementation"] != saved["implementation"]
         or type(provenance["seed"]) is not int
         or provenance["seed"] != saved["seed"]
@@ -871,25 +989,44 @@ def load_selected_configuration(path: str | pathlib.Path) -> dict:
     if source.name != "winner-config.json" or source.parent.name != "metadata":
         raise HPOError("selected_config must name a retained trial's metadata/winner-config.json")
     attempt = source.parent.parent
+    manifest_bytes = read_regular_bytes(attempt, "artifact_manifest.json")
     if (attempt / "metadata/run.json").is_file():
         from mlops.run_bundle import load_completed_run_bundle
 
         completion = load_completed_run_bundle(attempt)
-        if completion["status"] != "completed" or completion["task"] != "forecast-workflow":
+        if completion["status"] != "completed" or completion["task"] not in {
+            "forecast-workflow",
+            "forecast-validation",
+        }:
             raise HPOError("selected configuration requires a successful workflow")
-        result = cast(dict, load_exact_json(attempt / "result.json"))
-        _validate_workflow_configuration(attempt, result, cast(dict, load_exact_json(source)))
+        manifest = _retained_manifest(completion, manifest_bytes)
+        saved = _retained_json(attempt, "metadata/winner-config.json", manifest)
+        result = _retained_json(attempt, "result.json", manifest)
+        expected_schema = (
+            "autoforecast.forecast-validation.v1"
+            if completion["task"] == "forecast-validation"
+            else "autoforecast.forecast-workflow.v1"
+        )
+        if result.get("schema") != expected_schema:
+            raise HPOError("workflow task and configuration schema differ")
+        _validate_workflow_configuration(attempt, result, saved, manifest)
         metadata = {
             "hyperparameters": result["parameters"],
-            "model": {"id": cast(dict, load_exact_json(source))["model_id"]},
+            "model": {"id": saved["model_id"]},
         }
     else:
-        metadata, _ = load_completed_attempt(attempt)
+        _, completion = load_completed_attempt(attempt)
+        manifest = _retained_manifest(completion, manifest_bytes)
+        metadata = _retained_json(attempt, "metadata/attempt.json", manifest)
+        saved = _retained_json(attempt, "metadata/winner-config.json", manifest)
         search = attempt.parents[3]
         selection = load_study_selection(search)
-        if not any(search / item["attempt_path"] == attempt for item in selection["selected"]):
+        if not any(
+            search / item["attempt_path"] == attempt
+            and item["artifact_manifest_sha256"] == completion["artifact_manifest_sha256"]
+            for item in selection["selected"]
+        ):
             raise HPOError("configuration belongs to an unselected trial")
-    saved = load_exact_json(source)
     if (
         not isinstance(saved, dict)
         or saved.get("schema") != "autoforecast.selected-configuration.v1"
@@ -899,7 +1036,7 @@ def load_selected_configuration(path: str | pathlib.Path) -> dict:
     ):
         raise HPOError("selected configuration differs from its sealed trial")
     if "study_id" in metadata:
-        context = cast(dict, load_exact_json(attempt / "evaluation/external-run.json"))["context"]
+        context = _retained_json(attempt, "evaluation/external-run.json", manifest)["context"]
         expected_source = {
             "study": context["study"],
             "search_id": metadata["study_id"],

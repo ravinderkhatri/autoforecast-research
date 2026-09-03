@@ -29,7 +29,7 @@ def _binary_mask(
     *,
     error_type: type[ValueError] = BranchError,
 ) -> Tensor:
-    """Validate a public availability boundary and return a Boolean view/copy."""
+    """Require a Boolean availability tensor with the exact current shape and device."""
     if (
         not isinstance(mask, Tensor)
         or mask.shape != reference.shape
@@ -38,16 +38,13 @@ def _binary_mask(
         shape = None if not isinstance(mask, Tensor) else tuple(mask.shape)
         device = None if not isinstance(mask, Tensor) else mask.device
         raise error_type(
-            f"{name} must be a binary 0/1 mask matching shape {tuple(reference.shape)} "
+            f"{name} must be a Boolean binary 0/1 mask matching shape {tuple(reference.shape)} "
             f"and device {reference.device}; got shape {shape} and device {device}"
         )
-    if mask.dtype != torch.bool and (
-        mask.is_complex()
-        or not bool(torch.isfinite(mask).all())
-        or bool(((mask != 0) & (mask != 1)).any())
-    ):
-        raise error_type(f"{name} must be a binary 0/1 mask; got dtype {mask.dtype}")
-    return mask.bool()
+    if mask.dtype != torch.bool:
+        raise error_type(f"{name} must be a Boolean binary 0/1 mask; got dtype {mask.dtype}")
+    return mask
+
 
 
 class RevIN(nn.Module):

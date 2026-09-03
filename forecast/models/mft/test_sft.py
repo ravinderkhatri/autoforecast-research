@@ -21,7 +21,7 @@ def test_level_statistics():
     assert values[0, 2].item() == pytest.approx(2 / 3)
     assert values[0, 3].item() == pytest.approx(math.log1p(3))
     assert values[0, 4].item() == 0.75
-    assert torch.isfinite(level_statistics(torch.zeros(1, 28), torch.zeros(1, 28))).all()
+    assert torch.isfinite(level_statistics(torch.zeros(1, 28), torch.zeros(1, 28, dtype=torch.bool))).all()
     for bad in (
         torch.tensor([1.0]),
         torch.tensor([[-1.0]]),
@@ -238,7 +238,7 @@ def test_sft_passes_partial_week_masks_to_every_consumer(monkeypatch):
     assert torch.equal(recorded["decoder"][0], memory)
 
 
-@pytest.mark.parametrize("fault", [0.5, float("nan")])
+@pytest.mark.parametrize("fault", [0.0, 1.0, 0.5, float("nan")])
 def test_sft_refuses_nonbinary_masks_at_every_public_mask_boundary(fault):
     history = torch.ones(1, 4)
     invalid = torch.ones_like(history)
@@ -286,14 +286,14 @@ def test_shifted_hurdle_nll_normalizes_and_mean_is_exact():
     logit = torch.full_like(y, math.log(0.2 / 0.8), requires_grad=True)
     excess = torch.full_like(y, 2.0, requires_grad=True)
     distribution = ShiftedHurdlePrediction(logit, excess, torch.ones_like(y))
-    probability = (-distribution.nll(y, torch.ones_like(y))).exp()
+    probability = (-distribution.nll(y, torch.ones_like(y, dtype=torch.bool))).exp()
     torch.testing.assert_close(probability.sum(), torch.tensor(1.0, dtype=torch.double))
     torch.testing.assert_close((probability * y).sum(), distribution.mean()[0, 0])
     assert distribution.mean()[0, 0].item() == pytest.approx(0.6)
     distribution.mean().sum().backward()
     assert excess.grad is not None and logit.grad is not None
     assert excess.grad.min() > 0 and logit.grad.min() > 0
-    assert distribution.nll(y, torch.zeros_like(y)).sum() == 0
+    assert distribution.nll(y, torch.zeros_like(y, dtype=torch.bool)).sum() == 0
 
 
 @pytest.mark.parametrize("fault", ["fraction", "negative", "nan", "shape", "excess", "k"])
@@ -319,7 +319,7 @@ def test_shifted_hurdle_refuses_invalid_targets_and_parameters(fault):
         else "finite nonnegative integers"
     )
     with pytest.raises(ValueError, match=message):
-        ShiftedHurdlePrediction(torch.zeros(1, 2), excess, k).nll(target, torch.ones_like(target))
+        ShiftedHurdlePrediction(torch.zeros(1, 2), excess, k).nll(target, torch.ones_like(target, dtype=torch.bool))
 
 
 @pytest.mark.parametrize(
@@ -349,7 +349,7 @@ def test_shifted_hurdle_parameter_domain_at_mean_and_likelihood(field, value, me
     parameters = dict(logit=torch.zeros(1, 2), excess=torch.ones(1, 2), dispersion=torch.ones(1, 2))
     prediction = ShiftedHurdlePrediction(**dict(parameters, **{field: value}))
     target = torch.ones(1, 2)
-    for call in (prediction.mean, lambda: prediction.nll(target, torch.ones_like(target))):
+    for call in (prediction.mean, lambda: prediction.nll(target, torch.ones_like(target, dtype=torch.bool))):
         with pytest.raises(ValueError, match=message):
             call()
 
@@ -405,9 +405,9 @@ def test_complete_model_event_support_and_day_locality():
         baseline_logit=torch.zeros(2, 7),
         baseline_log_size=torch.ones(2, 7),
         event_distance=torch.zeros(2, 7, 2),
-        event_present=torch.zeros(2, 7, 2),
+        event_present=torch.zeros(2, 7, 2, dtype=torch.bool),
         aggregate_history=torch.ones(2, 28),
-        aggregate_observed=torch.ones(2, 28),
+        aggregate_observed=torch.ones(2, 28, dtype=torch.bool),
     )
     with torch.no_grad():
         model.dispersion_residual.weight[:, 0].copy_(torch.tensor([0.0, 1.0]))
@@ -463,7 +463,7 @@ def test_complete_model_event_support_and_day_locality():
         model.occurrence.weight.fill_(0.1)
         baseline = model(**inputs).mean()
         unsupported = dict(
-            inputs, event_distance=torch.full((2, 7, 2), 15.0), event_present=torch.ones(2, 7, 2)
+            inputs, event_distance=torch.full((2, 7, 2), 15.0), event_present=torch.ones(2, 7, 2, dtype=torch.bool)
         )
         torch.testing.assert_close(model(**unsupported).mean(), baseline, rtol=0, atol=0)
         present = inputs["event_present"].clone()
@@ -494,10 +494,10 @@ def test_complete_model_event_support_and_day_locality():
             inputs["event_distance"], inputs["event_present"], inputs["category_index"]
         )
     empty = torch.zeros(2, 7, 0)
-    assert not eventless.event_residual(empty, empty, None).any()
+    assert not eventless.event_residual(empty, empty.bool(), None).any()
     with pytest.raises(ValueError, match="category_index"):
-        eventless.event_residual(empty, empty, torch.zeros(1, dtype=torch.long))
-    assert not eventless.event_residual(empty, empty, inputs["category_index"]).any()
+        eventless.event_residual(empty, empty.bool(), torch.zeros(1, dtype=torch.long))
+    assert not eventless.event_residual(empty, empty.bool(), inputs["category_index"]).any()
     assert eventless.event_penalty() == 0
 
 
@@ -567,14 +567,14 @@ def test_sft_dispersion_domain(dtype, head):
     for value in (math.exp(-90), 1e20):
         k = torch.tensor([[value]], dtype=dtype, requires_grad=True)
         prediction = ShiftedHurdlePrediction(torch.zeros_like(k), torch.ones_like(k), k, head)
-        for call in (prediction.mean, lambda p=prediction: p.nll(target, torch.ones_like(target))):
+        for call in (prediction.mean, lambda p=prediction: p.nll(target, torch.ones_like(target, dtype=torch.bool))):
             with pytest.raises(ValueError, match="dispersion"):
                 call()
     for log_k in (-4.0, 0.0, 4.0):
         theta = torch.tensor([[log_k]], dtype=torch.float64, requires_grad=True)
         k = theta.exp()
         prediction = ShiftedHurdlePrediction(torch.zeros_like(k), torch.ones_like(k), k, head)
-        loss = prediction.nll(target, torch.ones_like(target)).sum()
+        loss = prediction.nll(target, torch.ones_like(target, dtype=torch.bool)).sum()
         loss.backward()
         count = 2 if head == "negbin" else 1
         expected = (

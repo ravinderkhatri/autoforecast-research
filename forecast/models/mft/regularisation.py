@@ -56,7 +56,8 @@ def drop_covariates(
         rate: Share of available channels to hide, in `[0, 1)`.
         generator: Seeded, for reproducibility.
         allow_empty: Permit hiding the last channel only for callers with a tested missing-row
-            representation. Default False preserves the legacy attention safeguard.
+            representation. Default False keeps one channel for attention that requires an
+            observed token.
 
     Returns:
         `(values, mask)` -- values UNCHANGED, mask with some True entries turned False. The values
@@ -84,7 +85,7 @@ def drop_covariates(
 
     keep = torch.rand(mask.shape, device=mask.device, generator=generator) >= rate
     dropped = mask & keep
-    # Legacy callers retain a channel. Revisions opt into their tested missing-row path.
+    # Attention requiring an observed token retains a channel; other callers opt into empty rows.
     empty = dropped.any(dim=-1).logical_not() & mask.any(dim=-1)
     if not allow_empty and bool(empty.any()):
         first_available = mask[empty].float().argmax(dim=-1)

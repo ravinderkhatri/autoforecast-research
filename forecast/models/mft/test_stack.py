@@ -101,7 +101,7 @@ def test_revin_refuses_the_wrong_rank() -> None:
     raise AssertionError("accepted a rank it cannot interpret")
 
 
-@pytest.mark.parametrize("fault", [0.5, float("nan")])
+@pytest.mark.parametrize("fault", [0.0, 1.0, 0.5, float("nan")])
 def test_branches_refuse_nonbinary_masks_at_every_public_mask_boundary(fault: float) -> None:
     """A fractional/NaN availability value must not silently become ``True``."""
     history = torch.ones(1, ENC)
@@ -128,13 +128,12 @@ def test_branches_refuse_nonbinary_masks_at_every_public_mask_boundary(fault: fl
         CommercialBranch(2, D)(torch.ones(1, 2), channel_mask)
 
 
-def test_branches_accept_binary_numeric_masks_for_compatibility() -> None:
-    """Persisted callers historically use float 0/1 masks; preserve that valid contract."""
+def test_branches_accept_current_boolean_masks() -> None:
     history = torch.ones(1, ENC)
-    mask = torch.ones_like(history)
+    mask = torch.ones_like(history, dtype=torch.bool)
     RevIN(1)(history.unsqueeze(-1), mask)
     DemandHistoryBranch(D, ENC)(history, mask, censored=torch.zeros_like(mask))
-    CommercialBranch(2, D)(torch.ones(1, 2), torch.ones(1, 2))
+    CommercialBranch(2, D)(torch.ones(1, 2), torch.ones(1, 2, dtype=torch.bool))
 
 
 def test_binary_mask_rejects_type_shape_and_device_mismatches() -> None:
@@ -148,9 +147,10 @@ def test_binary_mask_rejects_type_shape_and_device_mismatches() -> None:
         with pytest.raises(BranchError, match="binary 0/1 mask"):
             _binary_mask(invalid, reference, "test availability")
     numeric = torch.tensor([[0, 1, 0], [1, 0, 1]])
-    actual = _binary_mask(numeric, reference, "test availability")
-    assert actual.dtype == torch.bool
-    torch.testing.assert_close(actual, numeric.bool())
+    with pytest.raises(BranchError, match="Boolean"):
+        _binary_mask(numeric, reference, "test availability")
+    boolean = numeric.bool()
+    assert _binary_mask(boolean, reference, "test availability") is boolean
 
 
 def test_demand_covariate_boundaries_and_masked_nonfinite_values() -> None:
@@ -531,7 +531,7 @@ def test_the_event_kernel_evaluates_each_horizon_distance() -> None:
         assert torch.allclose(got[:, step], want)
 
 
-@pytest.mark.parametrize("fault", [0.5, float("nan")])
+@pytest.mark.parametrize("fault", [0.0, 1.0, 0.5, float("nan")])
 def test_event_and_fusion_refuse_nonbinary_masks(fault: float) -> None:
     event_mask = torch.ones(1, 2)
     event_mask[0, 0] = fault
