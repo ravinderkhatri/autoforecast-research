@@ -66,7 +66,7 @@ def load_forecast_workflow(path: str | pathlib.Path) -> ForecastWorkflowResult:
     if record["schema"] != "autoforecast.forecast-workflow.v1":
         raise HPOError("unsupported forecast workflow result")
     _validate_workflow_configuration(
-        record, cast(dict, load_exact_json(root / "metadata/winner-config.json"))
+        root, record, cast(dict, load_exact_json(root / "metadata/winner-config.json"))
     )
     stages = {stage: _window_result(root, record[stage]) for stage in ("validation", "testing")}
     return ForecastWorkflowResult(

@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 
 class StudyPreflightError(BenchmarkError):
-    """A blocked run; ``report_path`` retains the complete validation evidence."""
+    """A blocked run; ``report_path`` retains checks completed before the blocking error."""
 
     def __init__(self, message: str, report_path: pathlib.Path):
         super().__init__(f"{message}; report: {report_path}")
@@ -117,6 +117,9 @@ def preflight_study(study: Study, options: dict) -> PreflightResult:
         result = _preflight(study, options, report, output)
     except Exception as error:
         report["status"] = "blocked"
+        context = report.get("current_check") or {}
+        if context.get("stage") in report.get("roles", {}):
+            report["roles"][context["stage"]]["status"] = "blocked"
         if not report["issues"]:
             report["issues"].append(
                 {
@@ -124,13 +127,14 @@ def preflight_study(study: Study, options: dict) -> PreflightResult:
                     "severity": "error",
                     "explanation": str(error),
                     "series_id": None,
-                    "stage": None,
-                    "origin": None,
+                    "stage": context.get("stage"),
+                    "origin": context.get("origin"),
                     "dates": [],
                 }
             )
         _write_json(output, report)
         raise StudyPreflightError(str(error), output) from error
+    report["current_check"] = None
     _write_json(output, report)
     return result
 
@@ -157,6 +161,10 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         if result.study_id != record["study_id"]:
             raise BenchmarkError("derived availability contract changed")
         return result
+    report.update(
+        original_count=record["cohort_series_count"],
+        current_check={"stage": "source-keys", "origin": None},
+    )
     panel, recipe = study.panel, record["recipe"]
     frequency = panel.frequency
     cadence = parse_frequency(frequency)
@@ -205,7 +213,18 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         original_cohort_sha256=digest(ids),
         preparation_rule=record["policies"],
     )
-    for role in ("selection", "final_training", "validation_score", "final_score"):
+    report["roles"] = {
+        role: {
+            "expected_count": len(ids),
+            "actual_count": None,
+            "missing_ids": None,
+            "extra_ids": None,
+            "status": "not_checked",
+        }
+        for role in ("selection", "final_training", "validation_score", "final_score")
+    }
+    for role in report["roles"]:
+        report["current_check"] = {"stage": role, "origin": None}
         source = ds.dataset(artifact_path(study._path, record, role), format="parquet")
         schema = source.schema
         if (
@@ -344,6 +363,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             "missing_ids": sorted(id_set - present),
             "extra_ids": sorted(present - id_set, key=str),
             "actual_ids_sha256": digest(sorted(present, key=str)),
+            "status": "checked",
         }
         for sid in ids:
             first = max(lower, starts[sid])
@@ -382,11 +402,13 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                 }
             )
     if report["issues"]:
+        report["current_check"] = None
         raise BenchmarkError(
             "frozen prepared data integrity failed: "
             + ", ".join(sorted({issue["code"] for issue in report["issues"]}))
         )
     for key, (_stage, _origin, _horizon) in by_key.items():
+        report["current_check"] = {"stage": _stage, "origin": _origin}
         grid_path = study._path.parent / record["grids"][key]["path"]
         expected = {(sid, point) for sid in ids for point in points[key]}
         seen_grid = set()
@@ -413,9 +435,17 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                     "scored": len(points[key]) - excluded,
                 }
             )
-        if sorted(coverage, key=lambda row: str(row["series_id"])) != expected_coverage:
+        if (
+            any(
+                type(row.get(name)) is not int
+                for row in coverage
+                for name in ("expected", "originally_missing", "zero_filled", "excluded", "scored")
+            )
+            or sorted(coverage, key=lambda row: str(row["series_id"])) != expected_coverage
+        ):
             raise BenchmarkError(f"{key}: frozen coverage differs from actual rows and masks")
     references = {}
+    report["current_check"] = {"stage": "scoring_references", "origin": None}
     if "scoring_references" in record["artifacts"]:
         for row in _rows(artifact_path(study._path, record, "scoring_references")):
             key, sid = row["boundary"], row["series_id"]

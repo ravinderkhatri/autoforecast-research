@@ -237,6 +237,8 @@ def test_workflow_counts_and_saved_configuration_future_reuse(
     seen = []
 
     def fit(request):
+        history = pq.read_table(request.panel.path).to_pylist()
+        assert max(row["at"] for row in history) == dt.date.fromisoformat(request.origin)
         seen.append(
             (request.origin, dict(request.model_parameters), dict(request.training_parameters))
         )
@@ -717,6 +719,10 @@ def test_preflight_checks_exact_ids_and_duplicates_before_any_fit(
             )
     report = json.loads(caught.value.report_path.read_text())
     assert report["status"] == "blocked" and report["callback_count"] == 0
+    if defect == "wrong_date":
+        assert report["issues"][0]["stage"] == role
+        assert report["roles"][role]["status"] == "blocked"
+        assert report["roles"]["final_score"]["status"] == "not_checked"
 
 
 def test_testing_target_values_cannot_change_selection(complete, spark, tmp_path):
@@ -835,15 +841,28 @@ def _publish_changed_record(copied: pathlib.Path, record: dict) -> pathlib.Path:
     return final / "benchmark.json"
 
 
-def _copy_and_corrupt_coverage(manifest: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
+def _copy_and_corrupt_coverage(
+    manifest: pathlib.Path, root: pathlib.Path, stage: str, defect: str
+) -> pathlib.Path:
     copied = root / "registry/original"
     shutil.copytree(manifest.parent, copied)
     record = json.loads((copied / "benchmark.json").read_text())
-    key = next(key for key in record["coverage"] if key.startswith("tuning/"))
+    key = next(key for key in record["coverage"] if key.startswith(stage + "/"))
     path = copied / record["coverage"][key]["path"]
     table = pq.read_table(path)
     rows = table.to_pylist()
-    rows[0]["series_id"] = rows[1]["series_id"]
+    if defect == "duplicate_id":
+        rows[0]["series_id"] = rows[1]["series_id"]
+    elif defect == "wrong_type":
+        table = table.set_column(
+            table.schema.get_field_index("scored"),
+            "scored",
+            pa.array(table["scored"].to_pylist(), type=pa.float64()),
+        )
+        rows = table.to_pylist()
+    else:
+        rows[0]["scored"] += 1
+        rows[1]["scored"] -= 1
     shutil.rmtree(path)
     path.mkdir(parents=True)
     pq.write_table(type(table).from_pylist(rows, schema=table.schema), path / "part.parquet")
@@ -852,8 +871,12 @@ def _copy_and_corrupt_coverage(manifest: pathlib.Path, root: pathlib.Path) -> pa
     return _publish_changed_record(copied, record)
 
 
-def test_preflight_rejects_coverage_mask_mismatch_before_callback(complete, spark, tmp_path):
-    manifest = _copy_and_corrupt_coverage(complete, tmp_path / "coverage-mask")
+@pytest.mark.parametrize("stage", ["tuning", "validation", "test"])
+@pytest.mark.parametrize("defect", ["duplicate_id", "wrong_type", "redistribution"])
+def test_preflight_rejects_coverage_mask_mismatch_before_callback(
+    complete, spark, tmp_path, stage, defect
+):
+    manifest = _copy_and_corrupt_coverage(complete, tmp_path / "coverage-mask", stage, defect)
     cfg_root = tmp_path / "coverage-config"
     cfg_root.mkdir()
     cfg = profile(cfg_root, selection={"origins": ["2024-01-03"]})
@@ -929,6 +952,20 @@ def test_winner_retains_unique_source_and_parameter_digest(complete, spark, tmp_
     assert saved["parameter_sha256"] == benchmark.digest(saved["parameters"])
     assert saved["source"]["search_id"] == selected.path.name
     assert saved["source"]["attempt_id"] == chosen["attempt_id"]
+    assert saved["source"]["study"] == selected.provenance["study"]
+    saved["source"]["study"]["sha256"] = "0" * 64
+    selected.winner_config.write_text(json.dumps(saved))
+    attempt = selected.winner_config.parent.parent
+    manifest_sha = _reseal_attempt(attempt)
+    path = selected.path / "selection.json"
+    selection = json.loads(path.read_text())
+    for group in (selection["candidates"], selection["selected"]):
+        for item in group:
+            if item["attempt_path"] == chosen["attempt_path"]:
+                item["artifact_manifest_sha256"] = manifest_sha
+    path.write_text(json.dumps(selection))
+    with pytest.raises(HPOError, match="source"):
+        load_selected_configuration(selected.winner_config)
 
 
 def _copy_manifest(manifest: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
@@ -1088,7 +1125,8 @@ def test_exact_reuse_rejects_changed_config_and_study(complete, spark, tmp_path)
             implementation=implementation(),
             reuse_tuning=selected.path,
         )
-    other = register(tmp_path / "exact-reuse-other", spark, shift=31, count=1)
+    # Keep dates/options identical: only the frozen reference data identity changes.
+    other = register(tmp_path / "exact-reuse-other", spark, count=3, scale_b=2.0)
     with open_study(other, spark) as study, pytest.raises(Exception, match="differs"):
         study.tune(
             fit_predict=lambda _: pytest.fail("changed study must not fit"),
@@ -1182,12 +1220,48 @@ def test_workflow_reload_binds_selected_settings_to_both_fits(complete, spark, t
             output_dir=tmp_path / "original",
         )
     assert load_forecast_workflow(result.path).parameters == result.parameters
-    for field in ("parameters", "validation", "testing", "seed", "implementation", "source"):
+    for field in (
+        "parameters",
+        "validation",
+        "testing",
+        "seed",
+        "implementation",
+        "source",
+        "options",
+        "tuning_path",
+        "status",
+        "swapped_stages",
+        "stage_result",
+        "search_profile",
+        "winner",
+    ):
         root = tmp_path / field
         shutil.copytree(result.path, root)
         path = root / "result.json"
         record = json.loads(path.read_text())
-        if field == "parameters":
+        if field == "options":
+            record["provenance"]["options"]["minimum_history"] += 1
+        elif field == "tuning_path":
+            record[field] = "/wrong/search"
+        elif field == "status":
+            record[field] = "pending_actuals"
+        elif field == "swapped_stages":
+            record["validation"], record["testing"] = record["testing"], record["validation"]
+            (root / "validation/result.json").write_text(json.dumps(record["validation"]))
+            (root / "test/result.json").write_text(json.dumps(record["testing"]))
+        elif field == "stage_result":
+            duplicate = json.loads((root / "validation/result.json").read_text())
+            duplicate["parameter_sha256"] = "0" * 64
+            (root / "validation/result.json").write_text(json.dumps(duplicate))
+        elif field == "search_profile":
+            search = root / "metadata/search-config.yaml"
+            search.write_bytes(search.read_bytes() + b"\n")
+        elif field == "winner":
+            winner = root / "metadata/winner-config.json"
+            saved = json.loads(winner.read_text())
+            saved["parameters"]["model.level"] = 999.0
+            winner.write_text(json.dumps(saved))
+        elif field == "parameters":
             record[field]["model.level"] = 999.0
         elif field in ("validation", "testing"):
             record[field]["parameter_sha256"] = "0" * 64
@@ -1238,3 +1312,41 @@ def test_preflight_checks_source_key_and_start_mapping(complete, spark, tmp_path
                 config=cfg,
                 implementation=implementation(),
             )
+
+
+def test_reporting_and_model_identity_keep_available_masks_and_selection_fixed(
+    incomplete, spark, tmp_path
+):
+    results, calls = [], []
+
+    def fit(request):
+        ids = sorted(row[request.panel.series_col] for row in request.series_mapping.collect())
+        calls.append((request.origin, ids, dict(request.model_parameters), request.seed))
+        return predict(request)
+
+    for name, metrics in (("first", ["mae"]), ("second", ["mae", "rmse", "wrmsse", "bias"])):
+        folder = tmp_path / name
+        folder.mkdir()
+        cfg = profile(
+            folder,
+            selection={"origins": "all"},
+            reporting={"metrics": metrics},
+            series_policy="use_available",
+        )
+        with open_study(incomplete, spark) as study:
+            results.append(
+                study.tune(
+                    fit_predict=fit,
+                    config=cfg,
+                    implementation={**implementation(), "name": name},
+                )
+            )
+    first, second = results
+    assert len(calls) == 8 and calls[:4] == calls[4:]
+    assert first.parameters == second.parameters and first.tuning_score == second.tuning_score
+    assert first.provenance["study_id"] == second.provenance["study_id"]
+    for left, right in zip(first.windows, second.windows, strict=True):
+        assert left["evaluation_contract"] == right["evaluation_contract"]
+        availability = left["evaluation_contract"]["availability"]
+        assert availability["mask_sha256"]
+        assert availability["eligible_ids"] == calls[0][1]

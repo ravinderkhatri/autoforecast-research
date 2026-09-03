@@ -22,6 +22,7 @@ from pyspark.sql import functions as F
 from autoforecast._exact_json import load_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast.benchmark import boundary, digest, evaluation_contract, verify_benchmark
+from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.experiments import load_completed_attempt, load_study_selection
 from autoforecast.frequency import (
     TimePoint,
@@ -280,6 +281,18 @@ def _window_result(attempt: pathlib.Path, evidence: dict) -> dict:
     forecast = Forecast.from_record(record["forecast"])
     forecast = dataclasses.replace(forecast, path=str(attempt / record["forecast"]["path"]))
     forecast.validate()
+    contract = record["evaluation_contract"]
+    _stage, origin, horizon, frequency = record["boundary"].split("/")
+    if (
+        contract["boundary"] != record["boundary"]
+        or (forecast.origin, forecast.horizon, forecast.frequency)
+        != (origin, int(horizon), frequency)
+        or forecast.n_declined
+        or forecast.n_emitted != contract["grid"]["n_cells"]
+        or type(record["model_format"]) is not str
+        or not record["model_format"].strip()
+    ):
+        raise HPOError("retained window forecast or model format differs from its boundary")
     model = attempt / record["model_path"]
     if (
         directory_digest(forecast.path, suffixes=(".parquet",)) != record["forecast_sha256"]
@@ -313,7 +326,11 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
         or context["model_id"] != metadata["model"]["id"]
     ):
         raise HPOError("external selection budget or model differs from its context")
-    verify_benchmark(pathlib.Path(context["study"]["path"]), context["study"]["sha256"])
+    study_path, _ = verify_benchmark(
+        pathlib.Path(context["study"]["path"]), context["study"]["sha256"]
+    )
+    dataset_path = study_path.parent / "dataset.yaml"
+    dataset = _load_dataset_contract_bytes(dataset_path.read_bytes(), dataset_path)
     if "windows" in evidence:
         windows = tuple(_window_result(attempt, window) for window in evidence["windows"])
         if (
@@ -336,10 +353,20 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
                     "model_sha256": evidence["model_sha256"],
                     "model_format": evidence["model_format"],
                     "boundary": context["evaluation_contract"]["boundary"],
+                    "evaluation_contract": context["evaluation_contract"],
+                    "parameter_sha256": digest(metadata["hyperparameters"]),
                     "score": load_exact_json(attempt / "evaluation/score.json"),
                 },
             ),
         )
+    if any(
+        window["forecasts"].adapter != context["model_id"]
+        or window["forecasts"].target_estimand
+        != dataset.panel(window["forecasts"].path).target_estimand
+        or type(window["score"]) is not dict
+        for window in windows
+    ):
+        raise HPOError("saved forecast identity or score differs from the selected context")
     scores = [window["score"].get(context["metric"]) for window in windows]
     if (
         any(type(value) not in (int, float) or not math.isfinite(value) for value in scores)
@@ -348,10 +375,12 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
         raise HPOError("saved window scores differ from the selected objective")
     winner = attempt / "metadata/winner-config.json"
     if winner.exists():
-        saved = cast(dict, load_exact_json(winner))
+        saved = load_selected_configuration(winner)
         if (
             saved["parameters"] != metadata["hyperparameters"]
             or saved["profile_sha256"] != context["profile_sha256"]
+            or saved["implementation"] != context["implementation"]
+            or saved["seed"] != context["seed"]
         ):
             raise HPOError("saved winner configuration differs from the selected trial")
     return TuningResult(
@@ -779,10 +808,43 @@ def tune_study(
         return load_tuning_result(root / "studies" / identifier)
 
 
-def _validate_workflow_configuration(record: dict, saved: dict) -> None:
+def _validate_workflow_configuration(root: pathlib.Path, record: dict, saved: dict) -> None:
     """Require the summary and both fits to refer to the retained winner settings."""
+    if (
+        set(record)
+        != {"schema", "status", "parameters", "provenance", "tuning_path", "validation", "testing"}
+        or record["schema"] != "autoforecast.forecast-workflow.v1"
+    ):
+        raise HPOError("unsupported workflow configuration record")
+    profile_bytes = (root / "metadata/search-config.yaml").read_bytes()
+    if (
+        profile_bytes != saved["profile_text"].encode("utf-8")
+        or hashlib.sha256(profile_bytes).hexdigest() != saved["profile_sha256"]
+    ):
+        raise HPOError("workflow search configuration differs from its retained profile")
     parameters_sha = digest(record["parameters"])
     provenance = record["provenance"]
+    if provenance != load_exact_json(root / "metadata/provenance.json"):
+        raise HPOError("workflow configuration differs from its recorded execution provenance")
+    if record["tuning_path"] is not None and (
+        pathlib.Path(record["tuning_path"]).name != saved["source"]["search_id"]
+    ):
+        raise HPOError("workflow configuration names a different source search")
+    for label, stage in (("validation", "validation"), ("testing", "test")):
+        window = record[label]
+        contract = window["evaluation_contract"]
+        if (
+            window != load_exact_json(root / stage / "result.json")
+            or not window["boundary"].startswith(stage + "/")
+            or window["boundary"] != contract["boundary"]
+            or contract["study"] != provenance["study"]
+            or window["forecast"]["adapter"] != saved["model_id"]
+            or window["forecast"]["path"] != stage + "/forecasts"
+            or window["model_path"] != stage + "/model"
+        ):
+            raise HPOError("workflow stage configuration differs from its retained evidence")
+    if record["status"] != record["testing"]["score"]["evaluation_status"]:
+        raise HPOError("workflow configuration status differs from testing coverage")
     if (
         parameters_sha != saved["parameter_sha256"]
         or parameters_sha != digest(saved["parameters"])
@@ -815,7 +877,7 @@ def load_selected_configuration(path: str | pathlib.Path) -> dict:
         if completion["status"] != "completed" or completion["task"] != "forecast-workflow":
             raise HPOError("selected configuration requires a successful workflow")
         result = cast(dict, load_exact_json(attempt / "result.json"))
-        _validate_workflow_configuration(result, cast(dict, load_exact_json(source)))
+        _validate_workflow_configuration(attempt, result, cast(dict, load_exact_json(source)))
         metadata = {
             "hyperparameters": result["parameters"],
             "model": {"id": cast(dict, load_exact_json(source))["model_id"]},
@@ -835,13 +897,21 @@ def load_selected_configuration(path: str | pathlib.Path) -> dict:
         or saved.get("parameter_sha256") != digest(saved.get("parameters"))
     ):
         raise HPOError("selected configuration differs from its sealed trial")
-    if "study_id" in metadata and saved["source"] != {
-        "study": saved["source"]["study"],
-        "search_id": metadata["study_id"],
-        "trial_id": metadata["trial_id"],
-        "attempt_id": metadata["attempt_id"],
-    }:
-        raise HPOError("saved configuration source differs from its sealed trial")
+    if "study_id" in metadata:
+        context = cast(dict, load_exact_json(attempt / "evaluation/external-run.json"))["context"]
+        expected_source = {
+            "study": context["study"],
+            "search_id": metadata["study_id"],
+            "trial_id": metadata["trial_id"],
+            "attempt_id": metadata["attempt_id"],
+        }
+        if (
+            saved["source"] != expected_source
+            or saved["implementation"] != context["implementation"]
+            or saved["seed"] != context["seed"]
+            or saved["profile_sha256"] != context["profile_sha256"]
+        ):
+            raise HPOError("saved configuration source differs from its sealed trial")
     raw_profile = saved["profile_text"].encode("utf-8")
     if (
         hashlib.sha256(raw_profile).hexdigest() != saved["profile_sha256"]
