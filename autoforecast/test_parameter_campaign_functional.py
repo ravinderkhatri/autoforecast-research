@@ -231,9 +231,9 @@ study:
                 "device": "cpu",
                 "batch_size": 32,
                 "gradient_microbatch_size": 16,
-                # macOS accounts the Spark JVM plus Python process tree above 3 GiB even for
-                # this two-series fixture; 4 GiB retains a strict, CI-portable ceiling.
-                "memory_gib": 4.0,
+                # The Linux Spark and Torch process tree exceeds 4 GiB for this tiny fixture.
+                # Keep a finite allowance for the functional run; ceiling enforcement has its own test.
+                "memory_gib": 5.0,
                 "min_free_disk_gib": 0.1,
             },
             "tracking": {"mlflow": False},
