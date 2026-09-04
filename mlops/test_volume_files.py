@@ -323,6 +323,42 @@ def test_parquet_snapshot_downloads_parts_but_not_reader_ignored_markers(volume,
     assert set(downloads) == {*parts, *markers}
 
 
+def test_volume_snapshot_identity_downloads_source_once_and_copies_its_bytes(volume, monkeypatch):
+    import tempfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from provenance.lineage import directory_digest, snapshot_parquet_identity
+
+    root, client = volume
+    source = root / "admitted"
+    source.mkdir()
+    parts = {}
+    for index in range(3):
+        output = io.BytesIO()
+        pq.write_table(pa.table({"x": [index]}), output)
+        parts[f"part-{index:05d}.parquet"] = output.getvalue()
+    for name, value in {**parts, "_SUCCESS": b""}.items():
+        client.values[str(source / name)] = value
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(Path(path).name)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    with tempfile.TemporaryDirectory() as temporary:
+        copy, sha256 = snapshot_parquet_identity(source, Path(temporary) / "copy", label="admitted")
+        # The identity describes the copied bytes; the caller rechecks the source later.
+        assert sorted(downloads) == sorted(parts)
+        assert directory_digest(copy, suffixes=(".parquet",)) == sha256
+        assert sorted(p.name for p in copy.iterdir()) == sorted(parts)
+    downloads.clear()
+    assert directory_digest(source, suffixes=(".parquet",)) == sha256
+
+
 def test_volume_logical_reuse_downloads_once_and_ignores_stale_mount(volume, monkeypatch):
     import pyarrow as pa
     import pyarrow.parquet as pq

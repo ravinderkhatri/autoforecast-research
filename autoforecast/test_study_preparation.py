@@ -356,6 +356,28 @@ def test_source_change_between_capture_and_preparation_blocks_registration(
     assert not list((registry.root / "registrations").glob("*.*"))
 
 
+def test_bound_staged_artifact_that_disappears_blocks_registration(spark, tmp_path, monkeypatch):
+    from autoforecast import study_registration
+
+    path = configuration(tmp_path)
+    listing = study_registration._staging_directories
+    removed = []
+
+    def lose_bound_artifact(folder):
+        # The first listing after preparation is the admission binding loop.
+        if folder.name == "admission-staging" and not removed:
+            shutil.rmtree(folder / "declared_starting")
+            removed.append(folder / "declared_starting")
+        return listing(folder)
+
+    monkeypatch.setattr(study_registration, "_staging_directories", lose_bound_artifact)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    with pytest.raises(ValueError, match="materialization changed before publication"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert removed
+    assert not list((registry.root / "registrations").glob("*.*"))
+
+
 def test_evidence_write_failure_and_interrupted_retry_keep_completed_baseline(
     spark, tmp_path, monkeypatch,
 ):
