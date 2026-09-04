@@ -332,13 +332,14 @@ def test_campaign_rejects_impossible_sequential_resources_before_fitting(tmp_pat
     from autoforecast.study_campaign import run_study_campaign
 
     declared = models(tmp_path)
+    study = SimpleNamespace(recipe={"validation_origins": ["2024-01-07"]})
     with pytest.raises(ValueError, match="GPU reservations require"):
         run_study_campaign(
-            None, models=[replace(declared[0], gpus=1)], output_dir=tmp_path / "rejected"
+            study, models=[replace(declared[0], gpus=1)], output_dir=tmp_path / "rejected"
         )
     with pytest.raises(ValueError, match="CPU request exceeds"):
         run_study_campaign(
-            None, models=[replace(declared[0], cpus=10**9)], output_dir=tmp_path / "rejected"
+            study, models=[replace(declared[0], cpus=10**9)], output_dir=tmp_path / "rejected"
         )
     assert not (tmp_path / "rejected").exists()
 
@@ -1016,9 +1017,10 @@ def test_campaign_exports_only_verified_completed_results(
 @pytest.mark.parametrize("labels", [[], {"": "pool"}, {"pool": ""}, {"pool": 1}, {1: "pool"}])
 def test_node_labels_reject_invalid_declarations_before_preflight(tmp_path, labels):
     declared = models(tmp_path)
+    study = SimpleNamespace(recipe={"validation_origins": ["2024-01-07"]})
     with pytest.raises(ValueError, match="node_labels must"):
         study_campaign.run_study_campaign(
-            None, models=[replace(declared[0], node_labels=labels)],
+            study, models=[replace(declared[0], node_labels=labels)],
             output_dir=tmp_path / "output", execution="cluster", ray_address="test-only",
         )
     assert not (tmp_path / "output").exists()
@@ -1027,9 +1029,10 @@ def test_node_labels_reject_invalid_declarations_before_preflight(tmp_path, labe
 @pytest.mark.parametrize("execution", ["sequential", "local"])
 def test_node_labels_require_existing_cluster(tmp_path, execution):
     declared = models(tmp_path)
+    study = SimpleNamespace(recipe={"validation_origins": ["2024-01-07"]})
     with pytest.raises(ValueError, match="node_labels require"):
         study_campaign.run_study_campaign(
-            None, models=[replace(declared[0], node_labels={"pool": "forecast"})],
+            study, models=[replace(declared[0], node_labels={"pool": "forecast"})],
             output_dir=tmp_path / "output", execution=execution,
         )
     assert not (tmp_path / "output").exists()

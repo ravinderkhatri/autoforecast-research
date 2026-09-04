@@ -441,7 +441,7 @@ def test_initialization_parent_is_not_validation_evidence(
 
     benchmark_path = tmp_path / "benchmark.json"
     frozen = {
-        "benchmark_id": "benchmark", "recipe": {"target_unit": "units"},
+        "benchmark_id": "benchmark", "recipe": {"target_unit": "units", "validation_origins": []},
         "key_types": {}, "cohort_series_count": 1,
         "artifacts": {role: "a" * 64 for role in ("selection", "final_training", "final_score", "source-keys")},
     }
@@ -557,7 +557,8 @@ def test_reader_retains_selection_actual_snapshot_for_revised_history(tmp_path, 
     _reader_boundary(tmp_path, monkeypatch, [], [], benchmark)
     frozen = {
         "benchmark_id": "benchmark",
-        "recipe": {"target_unit": "units", "history_policy": "revised_snapshot"},
+        "recipe": {"target_unit": "units", "history_policy": "revised_snapshot",
+                   "validation_origins": []},
         "key_types": {},
         "cohort_series_count": 1,
         "artifacts": {"selection": "1" * 64, "final_training": "2" * 64, "final_score": "3" * 64,

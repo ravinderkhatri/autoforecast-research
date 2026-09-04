@@ -96,7 +96,7 @@ def test_default_refuses_even_one_missing_actual_at_registration(tmp_path, spark
 
 @pytest.mark.parametrize("policy", ["guess"])
 def test_study_rejects_imputation_policy_before_reading_data(tmp_path, policy):
-    with pytest.raises(benchmark.BenchmarkError, match="actual_missing must be error, mask"):
+    with pytest.raises(benchmark.BenchmarkError, match="actual_missing: invalid enum"):
         prepare(tmp_path, object(), policy=policy)
 
 
@@ -182,7 +182,7 @@ def test_missing_policy_defaults_preserve_data_and_only_explicit_zero_is_admitte
     ] == "zero"
     # Version 4 supports explicit zero preparation; mask/error remain invalid history rules.
     for policy in ("mask", "error"):
-        with pytest.raises(benchmark.BenchmarkError, match="history_missing must be preserve"):
+        with pytest.raises(benchmark.BenchmarkError, match="history_missing: invalid enum"):
             benchmark._normalise_recipe({**recipe, "history_missing": policy})
 
 

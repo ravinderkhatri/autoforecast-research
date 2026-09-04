@@ -276,7 +276,7 @@ def test_study_interface_rejects_multiple_validation_origins(tmp_path, spark):
     recipe["validation_origins"] = ["2024-01-03", "2024-01-05"]
     manifest = benchmark.freeze_benchmark(contract_path=contract, sources=sources, recipe=recipe,
                                           output_root=tmp_path / "registry", spark=spark)
-    with pytest.raises(benchmark.BenchmarkError, match="exactly one validation origin"):
+    with pytest.raises(benchmark.BenchmarkError, match="load_study supports at most one outer validation origin"):
         load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark)
 
 

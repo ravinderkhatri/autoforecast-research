@@ -494,6 +494,63 @@ print(directory_digest(sys.argv[1]))
     _refuses(lambda: subject.validate_executable_source_snapshot(authorization), "differs")
 
 
+def test_source_snapshots_retain_and_authenticate_runtime_schema() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    source = pathlib.Path(__file__).resolve().parent.parent
+    relative = "autoforecast/study_config.schema.json"
+    for installed in (False, True):
+        workspace, repository = _repository()
+        for name in ("autoforecast/_study_config.py", relative):
+            shutil.copyfile(source / name, repository / name)
+        _git(repository, "add", "autoforecast")
+        _git(repository, "commit", "--quiet", "-m", "retain configuration schema")
+        # Package installers may share cached files through hardlinks.
+        cached_schema = workspace / "cached-schema.json"
+        if installed:
+            os.link(repository / relative, cached_schema)
+            assert (repository / relative).stat().st_nlink == 2
+        # The installed route uses package identity instead of a Git checkout.
+        identity = SimpleNamespace(as_record=lambda: {"artifact_sha256": "a" * 64})
+        with patch("autoforecast.project.installed_library_identity", return_value=identity):
+            authorization = subject.materialize_executable_source_snapshot(
+                repository, workspace / "snapshots", installed=installed,
+            )
+            snapshot = pathlib.Path(authorization["root"])
+            assert (snapshot / relative).read_bytes() == (source / relative).read_bytes()
+            imported = subprocess.run(
+                [sys.executable, "-B", "-c", """
+import json
+from autoforecast._study_config import study_config_schema
+print(json.dumps(study_config_schema(), sort_keys=True))
+"""],
+                cwd=snapshot, env={**os.environ, "PYTHONPATH": str(snapshot)},
+                text=True, capture_output=True, check=False,
+            )
+            assert imported.returncode == 0, imported.stderr
+            assert json.loads(imported.stdout) == json.loads((source / relative).read_bytes())
+            subject.validate_live_executable_source_identity(authorization)
+            assert (snapshot / relative).stat().st_nlink == 1
+            if not installed:
+                # Checkout sources still refuse shared files.
+                os.link(repository / relative, cached_schema)
+                _refuses(
+                    lambda value=authorization: subject.validate_live_executable_source_identity(value),
+                    "must not be hard-linked",
+                )
+                cached_schema.unlink()
+            # A changed schema must invalidate the same snapshot as changed Python code.
+            resource = snapshot / relative
+            resource.chmod(0o644)
+            resource.write_text("{}\n")
+            resource.chmod(0o444)
+            _refuses(
+                lambda value=authorization: subject.validate_executable_source_snapshot(value),
+                "differs",
+            )
+
+
 if __name__ == "__main__":
     for name, function in sorted(globals().items()):
         if name.startswith("test_"):

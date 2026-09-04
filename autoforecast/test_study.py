@@ -223,7 +223,7 @@ def test_obsolete_recipe_is_rejected_before_runtime(tmp_path):
     for key in ("metric", "actual_missing", "series_starts"):
         recipe.pop(key)
     sources.pop("validation_score")
-    with pytest.raises(benchmark.BenchmarkError, match="schema_version must be 2"):
+    with pytest.raises(benchmark.BenchmarkError, match="schema_version: invalid enum"):
         benchmark.freeze_benchmark(
             contract_path=contract, sources=sources, recipe=recipe,
             output_root=tmp_path / "frozen", spark=object(),

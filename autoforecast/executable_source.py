@@ -25,7 +25,8 @@ EXECUTABLE_SOURCE_MANIFEST_SCHEMA = "autoforecast.executable-source-manifest.v2"
 EXECUTABLE_SOURCE_SNAPSHOT_SCHEMA = "autoforecast.executable-source-snapshot.v2"
 SOURCE_MANIFEST_FILENAME = "_autoforecast_source_manifest.json"
 SOURCE_ROOTS = ("autoforecast", "forecast", "mlops", "provenance", "scripts", "spec")
-SUPPORTING_EXECUTABLE_SOURCES = ("pyproject.toml", "uv.lock")
+RUNTIME_RESOURCE_SOURCES = ("autoforecast/study_config.schema.json",)
+SUPPORTING_EXECUTABLE_SOURCES = ("pyproject.toml", "uv.lock", *RUNTIME_RESOURCE_SOURCES)
 
 # These are called out separately so an apparently complete manifest cannot silently omit the
 # experiment boundary, provider implementations, isolated bridge, structural producer, or final
@@ -46,6 +47,7 @@ CRITICAL_EXECUTABLE_SOURCES = (
     "mlops/__init__.py",
     "mlops/_safe_files.py",
     "mlops/_volume_files.py",
+    *RUNTIME_RESOURCE_SOURCES,
 )
 
 
@@ -64,6 +66,10 @@ def build_installed_executable_source_manifest(root: pathlib.Path) -> dict[str, 
             if path.is_symlink():
                 raise ExecutableSourceError("installed source contains a symlink")
             files[path.relative_to(root).as_posix()] = _file_sha256(path)
+    for relative in RUNTIME_RESOURCE_SOURCES:
+        files[relative] = _file_sha256(
+            _assert_regular_live_source(root, relative, allow_hardlinks=True)
+        )
     if set(CRITICAL_EXECUTABLE_SOURCES) - set(files):
         raise ExecutableSourceError("installed wheel lacks required executable sources")
     return {"schema": "autoforecast.installed-executable-source.v1",
@@ -306,7 +312,9 @@ def _index_python_blobs(root: pathlib.Path) -> dict[str, tuple[str, str]]:
     return entries
 
 
-def _assert_regular_live_source(root: pathlib.Path, relative: str) -> pathlib.Path:
+def _assert_regular_live_source(
+    root: pathlib.Path, relative: str, *, allow_hardlinks: bool = False,
+) -> pathlib.Path:
     path = root
     parts = pathlib.PurePosixPath(relative).parts
     for part in parts[:-1]:
@@ -330,7 +338,7 @@ def _assert_regular_live_source(root: pathlib.Path, relative: str) -> pathlib.Pa
         raise ExecutableSourceError(
             f"executable Python source path is not a regular file: {relative}"
         )
-    if metadata.st_nlink != 1:
+    if metadata.st_nlink != 1 and not allow_hardlinks:
         raise ExecutableSourceError(
             f"executable Python source path must not be hard-linked: {relative}"
         )
