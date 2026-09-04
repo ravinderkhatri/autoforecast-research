@@ -51,6 +51,32 @@ class SensorPreparation:
         )
 
 
+def test_preparation_cannot_reuse_file_checks_made_before_it_changes_a_study(spark, tmp_path):
+    """Inspecting an existing study during preparation cannot hide later changed files."""
+    from autoforecast.study import load_study
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    study_id = register_study(path, registry=registry, prepare=SensorPreparation())
+
+    class InspectAndChange(SensorPreparation):
+        def prepare(self, context):
+            with load_study(study_id, registry_root=registry.root / "benchmarks", spark=spark):
+                pass
+            registry.definition(study_id)
+            part = next((registry.root / "benchmarks" / study_id / "selection").glob("*.parquet"))
+            table = pq.read_table(part)
+            field = table.schema.field("value")
+            changed = table.set_column(table.schema.get_field_index("value"), field,
+                                       pa.array([500.0] * len(table), type=field.type))
+            pq.write_table(changed, part)
+            part.with_name("." + part.name + ".crc").unlink(missing_ok=True)
+            return super().prepare(context)
+
+    with pytest.raises(ValueError, match="changed"):
+        register_study(path, registry=registry, prepare=InspectAndChange())
+
+
 def test_formats_retry_evidence_and_offline_inputs(spark, tmp_path):
     """Population: two synthetic sensors, both retained, with no eligibility exclusions."""
     path = configuration(tmp_path)

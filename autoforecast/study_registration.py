@@ -1212,6 +1212,11 @@ class StudyRegistry:
         elif (definition["schema"] == "autoforecast.registration.v4"
               or definition["source"].get("kind") == "supplied_stages"):
             raise ValueError("supplied stage provenance is missing its frozen identity")
+        elif binding.get("schema") == "autoforecast.source-version-identity.v1":
+            if ("source_version" not in definition["source"]
+                    or "admission_evidence" in definition
+                    or binding["sha256"] != digest(definition["source"])):
+                raise ValueError("source version provenance differs from the frozen identity")
         elif "admission_evidence" in definition:
             admission = _verify_admission(
                 self.root, definition["admission_evidence"], trusted=True,
@@ -2268,11 +2273,10 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             value["source"].update(_retained=record, _manifest_sha256=sha,
                                    population=record["population"],
                                    require_matching_population=record["require_matching_population"])
-        with one_use():
-            return _register_captured_study(
-                value, registry, prepare, preparation_settings, check_id, issues_root, event,
-                inputs=inputs, native_inputs=native_inputs,
-            )
+        return _register_captured_study(
+            value, registry, prepare, preparation_settings, check_id, issues_root, event,
+            inputs=inputs, native_inputs=native_inputs,
+        )
 
 
 def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_tables=False,
@@ -2394,7 +2398,10 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
     if registry.store is not None:
         with operation("Create or validate registry tables", engine="Spark"):
             registry.store.prepare(lock_path=registry.root / ".delta-provision.lock")
-    with tempfile.TemporaryDirectory(prefix="af-register-", dir=registry.scratch_root) as temporary:
+    with (
+        tempfile.TemporaryDirectory(prefix="af-register-", dir=registry.scratch_root) as temporary,
+        ExitStack() as checks,
+    ):
         root = pathlib.Path(temporary)
         contract_path = root / "dataset.yaml"
         contract_path.write_bytes(_bytes(value["dataset"]))
@@ -2419,7 +2426,9 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
         findings = _save_findings(registry, findings, issues_root, "source", check_id)
         if findings.filter(F.col("status") == "failed").limit(1).count():
             raise ValueError(f"structural source issues block registration: {issues_root}")
-        admission_identity = (source_record if inputs is not None else None)
+        admission_identity = (
+            source_record if inputs is not None or "source_version" in source_record else None
+        )
         captured = {}
         staging = issues_root / "admission-staging"
         preparation_metadata = None
@@ -2603,6 +2612,8 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                 },
             }
         event("admission", "PASS", retained_series=retained, excluded_references=len(exclusions))
+        # Preparation has finished. Do not reuse any checks it made before changing files.
+        checks.enter_context(one_use())
         event("freeze", "START")
         capture = current_capture()
         prepared_admission = None
@@ -2634,6 +2645,8 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             native_inventory=native_inventory if capture is not None else None,
             admission_identity=({"schema": ("autoforecast.supplied-stage-identity.v1"
                                             if inputs is not None
+                                            else "autoforecast.source-version-identity.v1"
+                                            if prepare is None and "source_version" in source_record
                                             else "autoforecast.admission-identity.v1"),
                                  "sha256": digest(admission_identity)}
                                 if admission_identity is not None else None),
