@@ -32,6 +32,39 @@ REUSE_EXEMPTION = (
 
 NAME = "seasonal_naive"
 
+
+def fit_study_baseline(request):
+    """Bridge the existing adapter to study runs and retain its complete fitted state."""
+    import dataclasses
+    import json
+
+    from autoforecast.study_tuning import FitPredictResult
+    from provenance.lineage import directory_digest, snapshot_parquet_directory
+
+    if set(request.model_parameters) != {"season_length"} or request.training_parameters:
+        raise ValueError("seasonal_naive study settings require only model.season_length")
+    panel = dataclasses.replace(request.panel,
+                                season_length=request.model_parameters["season_length"])
+    model = request.output_dir / "model"
+    model.mkdir()
+    # The learned state is the observed history, not merely the parameter value.
+    snapshot_parquet_directory(
+        pathlib.Path(panel.path), model / "history",
+        expected_sha256=directory_digest(panel.path, suffixes=(".parquet",)),
+        label="seasonal naive fitted history",
+    )
+    (model / "panel.json").write_text(json.dumps(
+        {**dataclasses.asdict(panel), "path": "history", "origin": request.origin},
+        sort_keys=True,
+    ))
+    fitted_panel = dataclasses.replace(panel, path=str(model / "history"))
+    forecast = seasonal_naive(
+        fitted_panel, request.origin, len(request.forecast_dates),
+        spark=request.training_data.sparkSession, out_dir=request.output_dir / "forecasts",
+    )
+    return FitPredictResult(dataclasses.replace(forecast, adapter=request.model_id),
+                            "seasonal-naive-history-v1")
+
 EMITTED = "emitted"
 EMITTED_CENSORED = "emitted_from_lower_bound"
 DECLINED_NO_SOURCE = "declined_no_source"

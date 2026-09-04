@@ -11,7 +11,7 @@ import json
 import pathlib
 import tempfile
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,9 +32,25 @@ class RunMLflowError(ValueError):
     """A sealed bundle cannot be mirrored safely to MLflow."""
 
 
+def resolve_study_experiment(*, tracking_uri: str, experiment: str) -> str:
+    """Resolve an existing active destination before fitting; never create one."""
+    if not all(isinstance(value, str) and value.strip() for value in (tracking_uri, experiment)):
+        raise RunMLflowError("tracking requires a URI and an existing experiment name or ID")
+    mlflow = _mlflow()
+    if mlflow.active_run() is not None:
+        raise RunMLflowError("end the active MLflow run before starting a registered workflow")
+    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+    found = (client.get_experiment(experiment) if experiment.isdigit()
+             else client.get_experiment_by_name(experiment))
+    if found is None or found.lifecycle_stage != "active":
+        raise RunMLflowError("supply an existing active MLflow experiment")
+    return found.experiment_id
+
+
 @contextmanager
 def _completed_run_snapshot(
     bundle_path: str | pathlib.Path,
+    *, scratch_root: str | pathlib.Path | None = None,
 ) -> Iterator[tuple[pathlib.Path, dict[str, Any]]]:
     """Yield a verified private copy so remote upload cannot race mutable local paths."""
     source = pathlib.Path(bundle_path)
@@ -54,7 +70,9 @@ def _completed_run_snapshot(
     )
     if len(relative_paths) != len(artifacts) + 2:
         raise RunMLflowError("completed bundle artifact manifest is invalid")
-    with tempfile.TemporaryDirectory(prefix="autoforecast-run-mlflow-snapshot-") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="autoforecast-run-mlflow-snapshot-", dir=scratch_root,
+    ) as temporary:
         snapshot = pathlib.Path(temporary) / source.name
         try:
             snapshot_regular_files(source, snapshot, relative_paths)
@@ -584,7 +602,8 @@ def export_forecast_workflow(
                     client.set_tag(run_id, "autoforecast.export_complete", manifest_sha)
                     client.set_terminated(run_id, status="FINISHED")
                 except Exception:
-                    client.set_terminated(run_id, status="FAILED")
+                    with suppress(Exception):
+                        client.set_terminated(run_id, status="FAILED")
                     raise
             return links
 

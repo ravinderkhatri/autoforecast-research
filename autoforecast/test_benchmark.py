@@ -75,7 +75,7 @@ def test_external_sort_matches_reference_and_bounds_each_sort_and_merge(tmp_path
     monkeypatch.setattr(benchmark, "_write_hash_run", checked_write)
     monkeypatch.setattr(benchmark, "_merge_hash_runs", checked_merge)
     monkeypatch.setattr(ds, "dataset", lambda *args, **kwargs: CheckedDataset(dataset(*args, **kwargs)))
-    assert benchmark._parquet_hash(path) == expected
+    assert benchmark.parquet_content_hash(path) == expected
     assert sum(writes) == size and scans
     assert bool(merges) == (size > 3)
 
@@ -90,9 +90,9 @@ def test_external_sort_retains_duplicates_and_is_layout_independent(tmp_path, mo
     pq.write_table(pa.Table.from_pylist(rows), original / "one.parquet")
     pq.write_table(pa.Table.from_pylist(rows[1:][::-1]), rearranged / "one.parquet")
     pq.write_table(pa.Table.from_pylist(rows[:1]), rearranged / "two.parquet")
-    assert benchmark._parquet_hash(original) == benchmark._parquet_hash(rearranged)
+    assert benchmark.parquet_content_hash(original) == benchmark.parquet_content_hash(rearranged)
     pq.write_table(pa.Table.from_pylist(rows[1:]), original / "one.parquet")
-    assert benchmark._parquet_hash(original) != benchmark._parquet_hash(rearranged)
+    assert benchmark.parquet_content_hash(original) != benchmark.parquet_content_hash(rearranged)
 
 
 def test_external_sort_cleans_scratch_after_merge_failure(tmp_path, monkeypatch):
@@ -110,7 +110,7 @@ def test_external_sort_cleans_scratch_after_merge_failure(tmp_path, monkeypatch)
 
     monkeypatch.setattr(benchmark, "_merge_hash_runs", fail_merge)
     with pytest.raises(OSError, match="injected sort write failure"):
-        benchmark._parquet_hash(path)
+        benchmark.parquet_content_hash(path)
     assert list(scratch.iterdir()) == []
 
 
@@ -158,7 +158,7 @@ def _frozen_example(tmp_path):
         grid_rows = [{"series_id": series, "date": dt.date.fromisoformat(origin) + dt.timedelta(days=i)}
                      for series in keys for i in range(1, 8)]
         pq.write_table(pa.Table.from_pylist(grid_rows), destination / "part.parquet")
-        logical = benchmark._parquet_hash(destination)
+        logical = benchmark.parquet_content_hash(destination)
         grids[key] = {"path": f"grids/{key}", "sha256": benchmark.directory_digest(destination),
                       "logical_sha256": logical, "n_cells": 14}
         identities[key] = {"content_sha256": logical, "logical_sha256": logical, "n_cells": 14}
@@ -172,13 +172,13 @@ def _frozen_example(tmp_path):
         coverage[key] = {"path": f"coverage/{key}",
                          "sha256": benchmark.directory_digest(coverage_path)}
         coverage_identities[key] = {
-            "content_sha256": benchmark._parquet_hash(coverage_path),
+            "content_sha256": benchmark.parquet_content_hash(coverage_path),
             "counts": {name: 2 * count for name, count in counts.items()},
         }
     record = {
         "schema": benchmark.STUDY_SCHEMA, "recipe": recipe, "key_types": {"shop": "string", "sku": "bigint"},
         "contract_sha256": hashlib.sha256((project / "dataset.yaml").read_bytes()).hexdigest(),
-        "logical_snapshots": {name: benchmark._parquet_hash(root / name) for name in tables},
+        "logical_snapshots": {name: benchmark.parquet_content_hash(root / name) for name in tables},
         "source_series_count": 2, "excluded_new_series": 0, "cohort_series_count": 2,
         "dataset_sha256": hashlib.sha256((root / "dataset.yaml").read_bytes()).hexdigest(),
         "grid_identities": identities, "grids": grids,
@@ -492,3 +492,50 @@ def test_inclusive_period_count_refuses_reversed_or_shifted_endpoints(frequency,
             benchmark.parse_origin(start, cadence), benchmark.parse_origin(end, cadence),
             cadence, label="test window",
         )
+
+
+def test_typed_row_hash_canonicalizes_nested_maps_without_reordering_arrays(tmp_path):
+    from decimal import Decimal
+
+    from provenance.lineage import directory_digest
+
+    schema = pa.schema([
+        ("id", pa.string()), ("amount", pa.decimal128(12, 2)),
+        ("at", pa.timestamp("us")),
+        ("nested", pa.struct([("map", pa.map_(pa.string(), pa.list_(pa.int32())))])),
+    ])
+    first = {"id": "雪,\n", "amount": Decimal("12.30"),
+             "at": dt.datetime(2024, 1, 1, 12, 3, 4, 123456),
+             "nested": {"map": [("z", [2, 1]), ("a", [None, 3])]}}
+    null = {"id": "B", "amount": None, "at": None, "nested": None}
+    left, right = tmp_path / "one.parquet", tmp_path / "two.parquet"
+    pq.write_table(pa.Table.from_pylist([first, null], schema=schema), left)
+    reverse = copy.deepcopy(first)
+    reverse["nested"]["map"].reverse()
+    pq.write_table(pa.Table.from_pylist([null, reverse], schema=schema), right, compression="gzip")
+    expected = benchmark.parquet_content_hash(left)
+    assert benchmark.parquet_content_hash(right) == expected
+    assert directory_digest(left) != directory_digest(right)
+    reverse["nested"]["map"][1][1].reverse()
+    pq.write_table(pa.Table.from_pylist([null, reverse], schema=schema), right)
+    assert benchmark.parquet_content_hash(right) != expected
+    pq.write_table(pa.Table.from_pylist([first, null, null], schema=schema), right)
+    assert benchmark.parquet_content_hash(right) != expected
+    pq.write_table(pa.Table.from_pylist([], schema=schema), right)
+    empty = benchmark.parquet_content_hash(right)
+    pq.write_table(pa.Table.from_pylist([], schema=schema.remove(1)), right)
+    assert benchmark.parquet_content_hash(right) != empty
+
+
+def test_logical_hash_rejects_duplicate_map_keys_and_corrupt_members(tmp_path):
+    path = tmp_path / "rows"
+    path.mkdir()
+    schema = pa.schema([("m", pa.map_(pa.string(), pa.int32()))])
+    pq.write_table(pa.Table.from_pylist([{"m": [("a", 1), ("a", 2)]}], schema=schema),
+                   path / "part.parquet")
+    with pytest.raises(benchmark.BenchmarkError, match="unique map keys"):
+        benchmark.parquet_content_hash(path)
+    pq.write_table(pa.Table.from_pylist([{"m": []}], schema=schema), path / "part.parquet")
+    (path / "corrupt.parquet").write_bytes(b"not parquet")
+    with pytest.raises(pa.ArrowInvalid):
+        benchmark.parquet_content_hash(path)

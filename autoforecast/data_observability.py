@@ -14,7 +14,7 @@ import json
 import os
 import pathlib
 
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from spec.forecast_spec import STATE_CODES
@@ -34,6 +34,8 @@ __all__ = [
     "DataFacts",
     "RunIncident",
     "inspect_panel",
+    "report_source_issues",
+    "summarize_source_issues",
     "run_incident_from_error",
     "write_data_observability_report",
 ]
@@ -128,6 +130,181 @@ def _definition_passes() -> list[CheckResult]:
             "The requested forecast meaning matches the declared data contract.",
         ),
     ]
+
+
+def _nonfinite(column):
+    value = column.cast("double")
+    return F.isnan(value) | (F.abs(value) == F.lit(float("inf")))
+
+
+def _source_value_issues(frame, *, keys, time_col, numeric, forbid_blank):
+    """Shared factual predicates; policy and calendar interpretation belong to callers."""
+    from pyspark.sql.types import StringType
+
+    from autoforecast.benchmark import _PYTHON_WHITESPACE
+
+    def finding(code, column, predicate, message):
+        return F.when(predicate, F.struct(
+            F.lit(column).alias("column"), F.lit(code).alias("issue_code"),
+            F.col(column).cast("string").alias("observed_value"),
+            F.lit(message).alias("message"),
+        ))
+
+    predicates = [finding("NULL_ID", key, F.col(key).isNull(), "Series key is null.")
+                  for key in keys]
+    if forbid_blank:
+        predicates.extend(
+            finding("BLANK_ID", key, F.translate(F.col(key), _PYTHON_WHITESPACE, "") == "",
+                    "The study identifier contract forbids blank keys.")
+            for key in keys if isinstance(frame.schema[key].dataType, StringType)
+        )
+    predicates.append(finding("NULL_DATE", time_col, F.col(time_col).isNull(),
+                              "Observation time is null."))
+    predicates.extend(finding("NONFINITE_VALUE", name, _nonfinite(F.col(name)),
+                              "Declared numeric value is NaN or infinite.") for name in numeric)
+    values = frame.select(
+        F.struct(*[F.col(key) for key in keys]).alias("keys"),
+        F.col(time_col).cast("string").alias("time"),
+        F.explode(F.array(*predicates)).alias("issue"),
+    ).filter(F.col("issue").isNotNull())
+    return values.select(
+        "keys", F.lit(None).cast("string").alias("stage"),
+        F.lit(None).cast("string").alias("origin"), "time", "issue.*",
+        F.lit("failed").alias("status"), F.lit(1).cast("long").alias("affected_rows"),
+    )
+
+
+def _duplicate_keys(frame, keys, count_name):
+    return frame.groupBy(*keys).agg(F.count(F.lit(1)).alias(count_name)).filter(
+        F.col(count_name) > 1,
+    )
+
+
+def report_source_issues(frame: DataFrame, *, contract, recipe: dict) -> DataFrame:
+    """Report factual source issues against an existing dataset/study contract.
+
+    The recipe declares unique source-key/time observations and nonblank string
+    keys. Its range and every tuning/validation/test window are explicit. Declared
+    series_starts also describe expected series wholly absent from the source;
+    otherwise starts come from each series' first in-range observation. Findings
+    preserve typed source keys, and time/origin use string representations.
+
+    Missing history/actual findings are warnings, not admission decisions. Finite
+    negatives are not nonfinite values. This function does not fill, aggregate,
+    exclude, persist, or change the input. Duplicate findings count excess rows
+    per key/time; other findings count one affected cell. Multiple windows can
+    intentionally report the same cell under different origins.
+    """
+    from pyspark.sql.types import BooleanType, NumericType, StructField, StructType
+
+    from autoforecast.benchmark import (
+        START_COLUMN,
+        _normalise_recipe,
+        _period_frame,
+        study_windows,
+    )
+    from autoforecast.column_names import validate_column_names
+    from autoforecast.frequency import advance
+
+    recipe = _normalise_recipe(recipe)
+    panel = contract.panel(".")
+    panel.validate_column_names()
+    keys, time_col = recipe["source_keys"], panel.time_col
+    validate_column_names(frame.columns)
+    numeric = list(dict.fromkeys(
+        [panel.target_col, *panel.static_reals, *panel.past_only, *panel.known_future],
+    ))
+    if set([*keys, time_col, *numeric]) - set(frame.columns):
+        raise DataCheckError("source lacks declared key, time or numeric columns")
+    if any(not isinstance(frame.schema[name].dataType, NumericType) and not (
+        name in (*panel.past_only, *panel.known_future)
+        and isinstance(frame.schema[name].dataType, BooleanType)
+    ) for name in numeric):
+        raise DataCheckError("declared numeric source columns require numeric storage types")
+    cadence = parse_frequency(panel.frequency)
+    if cadence.code != recipe["frequency"]:
+        raise DataCheckError("source contract and study frequency differ")
+    from autoforecast.grid import canonical_key
+
+    time_type = frame.schema[time_col].dataType.typeName()
+    allowed = {"timestamp_ntz"} if cadence.key_kind == "timestamp" else {"date", "timestamp_ntz"}
+    if time_type not in allowed:
+        raise DataCheckError("source time requires date or timezone-naive timestamp storage")
+    canonical_time, valid_time = canonical_key(time_col, cadence)
+    if frame.filter(F.col(time_col).isNotNull() & ~valid_time).limit(1).count():
+        raise DataCheckError("source contains off-grid or lossy time values")
+    frame = frame.withColumn(time_col, canonical_time)
+    start = parse_origin(recipe["training_start"], cadence)
+    end = advance(parse_origin(recipe["final_train_cutoff"], cadence), cadence,
+                  recipe["final_test_horizon"])
+    issues = _source_value_issues(frame, keys=keys, time_col=time_col,
+                                  numeric=numeric, forbid_blank=True)
+
+    def rows(source, code, column, message, *, stage=None, origin=None,
+             value=None, status="failed", affected=None):
+        return source.select(
+            F.struct(*[F.col(key) for key in keys]).alias("keys"),
+            F.lit(stage).cast("string").alias("stage"),
+            F.lit(origin).cast("string").alias("origin"),
+            F.col(time_col).cast("string").alias("time"),
+            F.lit(column).alias("column"), F.lit(code).alias("issue_code"),
+            (F.lit(None) if value is None else value).cast("string").alias("observed_value"),
+            F.lit(message).alias("message"), F.lit(status).alias("status"),
+            (F.lit(1) if affected is None else affected).cast("long").alias("affected_rows"),
+        )
+
+    in_range = F.col(time_col).between(time_literal(start, cadence), time_literal(end, cadence))
+    issues = issues.unionByName(rows(
+        frame.filter(~in_range), "OUTSIDE_DATE_RANGE", time_col,
+        "Observation lies outside the declared study input range.", value=F.col(time_col),
+    ))
+    count_name, = fresh_internal_names(frame.columns, ("_duplicate_count",))
+    duplicates = _duplicate_keys(frame, [*keys, time_col], count_name)
+    issues = issues.unionByName(rows(
+        duplicates, "DUPLICATE_DATE", time_col,
+        "The study contract requires one observation per source key and time.",
+        value=F.col(count_name), affected=F.col(count_name) - 1,
+    ))
+    valid = frame.filter(in_range & F.col(time_col).isNotNull())
+    for key in keys:
+        valid = valid.filter(F.col(key).isNotNull())
+    declarations = recipe["series_starts"]["values"]
+    if declarations:
+        schema = StructType([*(frame.schema[key] for key in keys),
+                             StructField(START_COLUMN, frame.schema[time_col].dataType)])
+        cohort = frame.sparkSession.createDataFrame([
+            (*[entry["keys"][key] for key in keys], parse_origin(entry["start"], cadence))
+            for entry in declarations
+        ], schema)
+    else:
+        first_origin = parse_origin(recipe["validation_origins"][0], cadence)
+        cohort = valid.filter(F.col(time_col) <= time_literal(first_origin, cadence)).groupBy(
+            *keys,
+        ).agg(F.min(time_col).alias(START_COLUMN))
+    present = valid.filter(F.col(panel.target_col).isNotNull()).select(*keys, time_col).distinct()
+    for stage, origin, horizon in study_windows(recipe):
+        cutoff = parse_origin(origin, cadence)
+        for actual, low, high in (
+            (False, start, cutoff),
+            (True, advance(cutoff, cadence, 1), advance(cutoff, cadence, horizon)),
+        ):
+            grid = cohort.crossJoin(_period_frame(frame.sparkSession, low, high, cadence, time_col))
+            if not actual:
+                grid = grid.filter(F.col(time_col) >= F.col(START_COLUMN))
+            missing = grid.join(present, [*keys, time_col], "left_anti")
+            issues = issues.unionByName(rows(
+                missing, "MISSING_ACTUAL" if actual else "MISSING_HISTORY", panel.target_col,
+                "Expected calendar cell has no non-null target.",
+                stage=stage, origin=origin, status="warning",
+            ))
+    return issues
+
+
+def summarize_source_issues(issues: DataFrame) -> DataFrame:
+    """Summarize the detailed report without re-running source predicates."""
+    return issues.groupBy("stage", "origin", "column", "issue_code", "status").agg(
+        F.count(F.lit(1)).alias("findings"), F.sum("affected_rows").alias("affected_rows"),
+    )
 
 
 def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckReport | RunIncident:
@@ -242,9 +419,7 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         )
     )
     duplicate_row = (
-        frame.groupBy(panel.series_col, time_name)
-        .agg(F.count(F.lit(1)).alias(duplicate_count_name))
-        .filter(F.col(duplicate_count_name) > 1)
+        _duplicate_keys(frame, [panel.series_col, time_name], duplicate_count_name)
         .agg(F.sum(F.col(duplicate_count_name) - 1).alias(duplicate_sum_name))
         .collect()[0]
     )
@@ -263,10 +438,7 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
             denominator=n_rows,
         )
     )
-    target_as_double = F.col(panel.target_col).cast("double")
-    invalid_target = frame.filter(
-        F.isnan(target_as_double) | (F.abs(target_as_double) == F.lit(float("inf")))
-    ).count()
+    invalid_target = frame.filter(_nonfinite(F.col(panel.target_col))).count()
     checks.append(
         CheckResult(
             "valid_target_values",

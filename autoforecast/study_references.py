@@ -9,7 +9,27 @@ from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import NumericType, StringType, StructType
 
-from autoforecast.preparation import _column, prepare_time_series
+from autoforecast.preparation import (
+    _column,
+    _validate_preparation_policies,
+    prepare_time_series,
+)
+
+
+def validate_reference_settings(*, series_id, date_col, target_col, weight_col,
+                                missing_history, duplicate_policy, weight_window_days=28,
+                                scale_lag=1, scale_start="first_positive"):
+    """Validate calculator settings independently of its input rows."""
+    _validate_preparation_policies(fill_missing=missing_history, duplicate_policy=duplicate_policy)
+    for name, value in (("weight_window_days", weight_window_days), ("scale_lag", scale_lag)):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if scale_start not in {"first_positive", "history_start"}:
+        raise ValueError("scale_start must be first_positive or history_start")
+    names = [*series_id, date_col, target_col, weight_col]
+    if (not series_id or any(not isinstance(name, str) or not name.strip() for name in names)
+            or len({name.casefold() for name in names}) != len(names)):
+        raise ValueError("series, date, target and weight columns must be nonblank and distinct")
 
 
 def prepare_wrmsse_references(
@@ -39,19 +59,14 @@ def prepare_wrmsse_references(
     validate=False returns them for check_wrmsse_references, without dropping
     or admitting series. Caller-owned exclusions require a separate decision.
     """
-    for name, value in (("weight_window_days", weight_window_days), ("scale_lag", scale_lag)):
-        if type(value) is not int or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
-    if scale_start not in {"first_positive", "history_start"}:
-        raise ValueError("scale_start must be first_positive or history_start")
+    validate_reference_settings(
+        series_id=series_id, date_col=date_col, target_col=target_col, weight_col=weight_col,
+        missing_history=missing_history, duplicate_policy=duplicate_policy,
+        weight_window_days=weight_window_days, scale_lag=scale_lag, scale_start=scale_start,
+    )
     if type(validate) is not bool:
         raise ValueError("validate must be boolean")
     windows = _reference_origins(origins)
-    if (
-        not series_id
-        or len(set([*series_id, date_col, target_col, weight_col])) != len(series_id) + 3
-    ):
-        raise ValueError("series, date, target and weight columns must be distinct")
     keys = [f"key_{i}" for i in range(len(series_id))]
     history = data.select(
         *[_column(name).alias(key) for name, key in zip(series_id, keys, strict=False)],

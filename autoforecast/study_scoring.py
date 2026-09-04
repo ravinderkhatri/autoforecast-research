@@ -63,6 +63,7 @@ def score_study(
     output_dir: pathlib.Path,
     forecast_accuracy_breakdown: ForecastAccuracyBreakdown = "none",
     metrics: tuple[str, ...] | None = None,
+    scratch_root: str | pathlib.Path | None = None,
 ) -> dict:
     """Score the full frozen grid and retain per-series coverage and unavailable scores."""
     validate_forecast_accuracy_breakdown(forecast_accuracy_breakdown)
@@ -99,7 +100,7 @@ def score_study(
             raise ScoreError("requested WRMSSE requires registered scoring references")
         inputs["references"] = (artifact_path(path, study, "scoring_references"),
                                 study["artifacts"]["scoring_references"])
-    with tempfile.TemporaryDirectory(prefix="autoforecast-score-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="autoforecast-score-", dir=scratch_root) as temporary:
         root = pathlib.Path(temporary)
         try:
             snapshots = {
@@ -147,7 +148,8 @@ def _score_study_snapshot(
     raw_path = output_dir / "cell-sums"
     horizon_path = output_dir / "horizon-cell-sums"
     result = score_forecast(
-        panel, forecast, spark, missing_actual="no_data",
+        panel, forecast, spark,
+        missing_actual="sparse_zero" if policy["actual_missing"] == "zero" else "no_data",
         eligible_grid=str(snapshots["grid"]), original_missing_column=MISSING_COLUMN,
         series_scores_path=str(raw_path),
         horizon_sums_path=str(horizon_path) if need_horizon else None,
@@ -271,7 +273,9 @@ def _score_study_snapshot(
         "forecasted_series": forecast.n_series,
         "scored_series": per_series.filter(F.col("scored") > 0).count(),
         "expected_cells": original_count * forecast.horizon,
-        "observed_cells": contract.get("availability", {}).get("observed_cells", result.n_scored),
+        "observed_cells": contract.get("availability", {}).get(
+            "observed_cells", result.n_scored - result.n_zero_filled,
+        ),
         "filled_cells": result.n_zero_filled,
         "scored_cells": result.n_scored,
     }

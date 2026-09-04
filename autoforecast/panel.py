@@ -331,21 +331,8 @@ class Panel:
         except (TypeError, KeyError, AttributeError, ValueError) as exc:
             raise PanelError(f"invalid panel column mapping: {exc}") from exc
 
-    def validate(self) -> Panel:
-        """Refuse a panel that does not describe its own Parquet. Returns self so it can chain.
-
-        Checks the Parquet SCHEMA, not just the strings the caller passed. A column name that is
-        merely present in the dataclass proves nothing about the file, and every
-        adapter downstream would fail later and less legibly.
-
-        Raises:
-            PanelError: the path does not exist; a role column is missing from the Parquet
-                schema; one column is given two roles; the target is also declared known-future;
-                or `season_length` is not positive.
-        """
-        p = pathlib.Path(self.path)
-        if not p.exists():
-            raise PanelError(f"panel path does not exist: {self.path}")
+    def validate_metadata(self) -> None:
+        """Validate declared settings before opening data or starting a runtime."""
         if self.plan is not None and not isinstance(self.plan, PlanSource):
             raise PanelError("plan must be a PlanSource or None")
         if self.status_prob_cols is not None:
@@ -374,7 +361,7 @@ class Panel:
                 or self.season_length < 1):
             raise PanelError(f"season_length must be >= 1, got {self.season_length}")
         try:
-            cadence = parse_frequency(self.frequency)
+            parse_frequency(self.frequency)
         except FrequencyError as exc:
             raise PanelError(str(exc)) from exc
         if self.target_estimand not in ("sales_given_availability", "unconstrained_demand",
@@ -496,6 +483,24 @@ class Panel:
             )
 
         self.validate_column_names()
+
+    def validate(self) -> Panel:
+        """Refuse a panel that does not describe its own Parquet. Returns self so it can chain.
+
+        Checks the Parquet SCHEMA, not just the strings the caller passed. A column name that is
+        merely present in the dataclass proves nothing about the file, and every
+        adapter downstream would fail later and less legibly.
+
+        Raises:
+            PanelError: the path does not exist; a role column is missing from the Parquet
+                schema; one column is given two roles; the target is also declared known-future;
+                or `season_length` is not positive.
+        """
+        p = pathlib.Path(self.path)
+        if not p.exists():
+            raise PanelError(f"panel path does not exist: {self.path}")
+        self.validate_metadata()
+        cadence = parse_frequency(self.frequency)
         roles = self.role_columns
         schema = pq.read_schema(_any_fragment(p))
         if len(schema.names) != len(set(schema.names)):

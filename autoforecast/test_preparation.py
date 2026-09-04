@@ -12,6 +12,33 @@ from autoforecast.preparation import prepare_time_series
 from autoforecast.study_references import prepare_wrmsse_references
 
 
+def test_fit_slice_zero_fill_and_static_features_never_borrow_future_values(spark):
+    from autoforecast.panel import Panel
+    from autoforecast.preparation import prepare_fit_history
+
+    frame = spark.createDataFrame([
+        ("A", dt.date(2024, 1, 1), 2.0, None, 7.0),
+        ("A", dt.date(2024, 1, 2), None, None, None),
+        ("A", dt.date(2024, 1, 3), 4.0, "future-label", 99.0),
+    ], "id string,day date,y double,label string,past double")
+    panel = Panel(path="unused", series_col="id", time_col="day", target_col="y",
+                  static=("label",), past_only=("past",))
+    early = prepare_fit_history(frame, panel=panel, origin="2024-01-02", missing="zero")
+    rows = early.orderBy("day").collect()
+    assert [row.y for row in rows] == [2.0, 0.0]
+    assert [row.label for row in rows] == [None, None]
+    assert [row.past for row in rows] == [7.0, None]
+    late = prepare_fit_history(frame, panel=panel, origin="2024-01-03", missing="preserve")
+    assert [row.label for row in late.orderBy("day").collect()] == ["future-label"] * 3
+    assert late.filter("y is null").count() == 1
+    assert frame.filter("y is null").count() == 1
+    changed = frame.unionByName(spark.createDataFrame([
+        ("A", dt.date(2024, 1, 4), 4.0, "changed", 99.0),
+    ], frame.schema))
+    with pytest.raises(ValueError, match="static feature changes"):
+        prepare_fit_history(changed, panel=panel, origin="2024-01-04", missing="zero")
+
+
 @pytest.fixture(scope="module")
 def spark():
     session = (

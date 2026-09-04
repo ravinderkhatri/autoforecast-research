@@ -8,6 +8,7 @@ import json
 import math
 import pathlib
 import shutil
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,8 +17,13 @@ import yaml
 
 from autoforecast import benchmark
 from autoforecast.hpo import HPOError
+from autoforecast.panel import Forecast, Panel
 from autoforecast.study_preflight import StudyPreflightError
-from autoforecast.study_tuning import load_selected_configuration, load_tuning_result
+from autoforecast.study_tuning import (
+    FitPredictResult,
+    load_selected_configuration,
+    load_tuning_result,
+)
 from autoforecast.study_workflow import load_forecast_workflow
 from autoforecast.test_study_tuning import (
     config,
@@ -715,7 +721,7 @@ def test_preflight_checks_exact_ids_and_duplicates_before_any_fit(
     for name, target in record["role_paths"].items():
         if target == relative:
             record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
-            record["logical_snapshots"][name] = benchmark._parquet_hash(path)
+            record["logical_snapshots"][name] = benchmark.parquet_content_hash(path)
     identity = benchmark.digest(benchmark._identity(record))
     record["study_id"] = record["benchmark_id"] = identity
     (copied / "benchmark.json").write_text(json.dumps(record))
@@ -884,7 +890,7 @@ def _copy_and_corrupt_coverage(
     path.mkdir(parents=True)
     pq.write_table(type(table).from_pylist(rows, schema=table.schema), path / "part.parquet")
     record["coverage"][key]["sha256"] = directory_digest(path, suffixes=(".parquet",))
-    record["coverage_identities"][key]["content_sha256"] = benchmark._parquet_hash(path)
+    record["coverage_identities"][key]["content_sha256"] = benchmark.parquet_content_hash(path)
     return _publish_changed_record(copied, record)
 
 
@@ -1078,7 +1084,7 @@ def test_preflight_report_names_every_integrity_failure(complete, spark, tmp_pat
         for name, target_path in record["role_paths"].items():
             if target_path == relative:
                 record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
-                record["logical_snapshots"][name] = benchmark._parquet_hash(path)
+                record["logical_snapshots"][name] = benchmark.parquet_content_hash(path)
         defects.append(relative)
     manifest = _publish_changed_record(copied, record)
     cfg_root = tmp_path / "report-config"
@@ -1323,7 +1329,7 @@ def test_preflight_checks_source_key_and_start_mapping(complete, spark, tmp_path
     for name, target in record["role_paths"].items():
         if target == relative:
             record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
-            record["logical_snapshots"][name] = benchmark._parquet_hash(path)
+            record["logical_snapshots"][name] = benchmark.parquet_content_hash(path)
     manifest = _publish_changed_record(copied, record)
     cfg = profile(tmp_path, selection={"stage": "validation"})
     with open_study(manifest, spark) as study:
@@ -1564,7 +1570,7 @@ def test_collected_integrity_issues_mark_affected_role_blocked(spark, tmp_path):
     for name, target in record["role_paths"].items():
         if target == relative:
             record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
-            record["logical_snapshots"][name] = benchmark._parquet_hash(path)
+            record["logical_snapshots"][name] = benchmark.parquet_content_hash(path)
     changed = _publish_changed_record(copied, record)
     cfg = profile(tmp_path, selection={"stage": "validation"})
     with open_study(changed, spark) as study, pytest.raises(StudyPreflightError) as caught:
@@ -2073,3 +2079,704 @@ def test_export_verification_preserves_json_types_and_rejects_duplicate_keys(tmp
     else:
         with pytest.raises(RunMLflowError, match="remote score"):
             _verify_workflow_export(Client(), "synthetic", evidence)
+
+
+def test_workflow_owns_spark_visible_scratch_without_global_temp_state(complete, spark, tmp_path):
+    import tempfile
+
+    from autoforecast.study import load_study
+
+    scratch = tmp_path / "shared-scratch"
+    scratch.mkdir()
+    global_before = tempfile.tempdir
+    captured = []
+
+    def callback(request):
+        for path in (pathlib.Path(request.panel.path), request.output_dir):
+            assert path.is_relative_to(scratch)
+            captured.append(path)
+        return predict(request)
+
+    with load_study(complete.parent.name, registry_root=complete.parent.parent,
+                    spark=spark, scratch_root=scratch) as study:
+        result = study.run_forecast_workflow(
+            fit_predict=callback, implementation=implementation(), config=config(tmp_path),
+            fixed_parameters={}, output_dir=tmp_path / "runs",
+        )
+        assert all(pathlib.Path(evidence["model_artifacts"]).exists()
+                   for evidence in (result.validation, result.testing))
+    assert tempfile.tempdir == global_before
+    assert not list(scratch.iterdir())
+    assert all(not path.exists() for path in captured)
+    assert load_forecast_workflow(result.path).testing["score"] == result.testing["score"]
+
+
+def test_export_preserves_upload_error_when_failure_termination_also_fails(
+    workflow_evidence, workflow_tracking, monkeypatch,
+):
+    import mlflow
+
+    from autoforecast.run_mlflow import export_forecast_workflow
+
+    client, experiment = workflow_tracking
+    monkeypatch.setattr(mlflow.tracking, "MlflowClient", lambda **_: client)
+
+    def fail_upload(*args, **kwargs):
+        raise RuntimeError("primary upload failure")
+
+    def fail_termination(*args, **kwargs):
+        raise OSError("secondary termination failure")
+
+    monkeypatch.setattr(client, "log_dict", fail_upload)
+    monkeypatch.setattr(client, "set_terminated", fail_termination)
+    with pytest.raises(RuntimeError, match="primary upload failure"):
+        export_forecast_workflow(workflow_evidence[1].path,
+                                 tracking_uri=client.tracking_uri, experiment_id=experiment)
+
+
+def test_callback_artifact_copy_failure_has_retention_fail_event(tmp_path, monkeypatch):
+    from autoforecast import study_tuning
+
+    origin = "2024-01-05"
+    panel = Panel(
+        str(tmp_path / "training"),
+        "series_id",
+        "day",
+        "value",
+        target_estimand="observed_nonnegative",
+    )
+    context = {"origin": origin, "horizon": 2, "evaluation_contract": {"study_id": "known"}}
+    inputs = SimpleNamespace(panel=panel, mapping_path=tmp_path / "mapping", verify=lambda: context)
+    spark = SimpleNamespace(read=SimpleNamespace(parquet=lambda _: object()))
+    output = tmp_path / "validation"
+
+    def callback(request):
+        artifact = request.output_dir / "artifacts"
+        artifact.mkdir()
+        (artifact / "trace.json").write_text("{}")
+        return FitPredictResult(
+            Forecast(
+                "custom",
+                str(request.output_dir / "forecasts"),
+                origin,
+                2,
+                1,
+                {"emitted": 2},
+                target_estimand="observed_nonnegative",
+            ),
+            "test-format",
+        )
+
+    def fail_copy(*args, **kwargs):
+        raise OSError("injected artifact copy failure")
+
+    monkeypatch.setattr(study_tuning, "_copy_run_artifact_directory", fail_copy)
+    with pytest.raises(OSError, match="injected artifact copy failure"):
+        study_tuning._fit_window(
+            spark,
+            callback,
+            inputs,
+            output,
+            model_id="custom",
+            model_parameters={},
+            training_parameters={},
+            seed=1,
+            metrics=["mae"],
+            breakdown="none",
+        )
+    events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
+    print("ARTIFACT_EVENTS=" + json.dumps([(e["stage"], e["status"]) for e in events]))
+    assert any(e["stage"] == "artifact_retention" and e["status"] == "FAIL" for e in events)
+
+
+def test_workflow_seal_failure_never_announces_workflow_pass(tmp_path, monkeypatch):
+    from mlops.run_bundle import RunBundle
+
+    from autoforecast import study_workflow
+    from autoforecast.test_study_tuning import config, implementation
+
+    manifest = tmp_path / "benchmarks" / "known" / "benchmark.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    recipe = {
+        "metric": "mae",
+        "frequency": "D",
+        "validation_origins": ["2024-01-05"],
+        "validation_horizon": 2,
+        "final_train_cutoff": "2024-01-07",
+        "final_test_horizon": 2,
+    }
+    study = SimpleNamespace(
+        study_id="known",
+        _path=manifest,
+        _sha256="a" * 64,
+        _snapshots=SimpleNamespace(name=str(scratch)),
+        _spark=object(),
+        recipe=recipe,
+        _record=lambda **_: {"sources": {}},
+    )
+    preflight = SimpleNamespace(
+        study_id="known", study_path=manifest, study_sha256="a" * 64, report={}
+    )
+    preflight.report_path = tmp_path / "preflight-report.json"
+    preflight.report_path.write_text(json.dumps(preflight.report))
+    monkeypatch.setattr(study_workflow, "preflight_study", lambda *args, **kwargs: preflight)
+    monkeypatch.setattr(
+        study_workflow,
+        "_prepare_window",
+        lambda *args, **kwargs: SimpleNamespace(verify=lambda: {}),
+    )
+    monkeypatch.setattr(
+        study_workflow,
+        "_fit_window",
+        lambda *args, **kwargs: {
+            "forecast": {"path": "forecasts"},
+            "model_path": "model",
+            "score": {"evaluation_status": "completed"},
+        },
+    )
+    original = RunBundle.finalize
+
+    def fail_completed_seal(self, *, status, summary):
+        if status == "completed":
+            raise OSError("injected completion write failure")
+        return original(self, status=status, summary=summary)
+
+    monkeypatch.setattr(RunBundle, "finalize", fail_completed_seal)
+    output = tmp_path / "runs"
+    with pytest.raises(OSError, match="injected completion write failure"):
+        study_workflow.run_forecast_workflow(
+            study,
+            fit_predict=lambda _: None,
+            implementation=implementation(),
+            config=config(tmp_path),
+            fixed_parameters={},
+            output_dir=output,
+        )
+    events = [
+        json.loads(line)
+        for f in output.glob("*/events.jsonl")
+        for line in f.read_text().splitlines()
+    ]
+    print("SEAL_EVENTS=" + json.dumps([(e["stage"], e["status"]) for e in events]))
+    assert not any(e["stage"] == "workflow" and e["status"] == "PASS" for e in events)
+
+
+@pytest.mark.parametrize("operation", ["artifact_retention", "scoring"])
+def test_reused_validation_operation_has_current_failure_stage(tmp_path, monkeypatch, operation):
+    import yaml
+
+    from autoforecast import study_workflow
+    from autoforecast.test_study_tuning import config, implementation
+
+    manifest = tmp_path / "benchmarks" / "known" / "benchmark.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    recipe = {
+        "metric": "mae",
+        "frequency": "D",
+        "validation_origins": ["2024-01-05"],
+        "validation_horizon": 2,
+        "final_train_cutoff": "2024-01-07",
+        "final_test_horizon": 2,
+    }
+    study = SimpleNamespace(
+        study_id="known",
+        _path=manifest,
+        _sha256="a" * 64,
+        _snapshots=SimpleNamespace(name=str(scratch)),
+        _spark=object(),
+        recipe=recipe,
+        _record=lambda **_: {"sources": {}},
+    )
+    preflight = SimpleNamespace(
+        study_id="known", study_path=manifest, study_sha256="a" * 64, report={}
+    )
+    preflight.report_path = tmp_path / "preflight-report.json"
+    preflight.report_path.write_text(json.dumps(preflight.report))
+    panel = Panel(
+        str(tmp_path / "training"),
+        "series_id",
+        "day",
+        "value",
+        target_estimand="observed_nonnegative",
+    )
+    monkeypatch.setattr(study_workflow, "preflight_study", lambda *args, **kwargs: preflight)
+    monkeypatch.setattr(
+        study_workflow,
+        "_prepare_window",
+        lambda *args, **kwargs: SimpleNamespace(
+            verify=lambda: {"evaluation_contract": {"actuals": {"path": "actuals"}}}, panel=panel
+        ),
+    )
+    profile = config(tmp_path, budget=1)
+    value = yaml.safe_load(profile.read_text())
+    value["selection"] = {"stage": "validation"}
+    profile.write_text(yaml.safe_dump(value))
+    forecast = Forecast(
+        "custom-constant",
+        str(tmp_path / "selected-forecast"),
+        "2024-01-05",
+        2,
+        1,
+        {"emitted": 2},
+        target_estimand="observed_nonnegative",
+    )
+    window = {
+        "model_artifacts": tmp_path / "model",
+        "forecasts": forecast,
+        "forecast_sha256": "b" * 64,
+        "evaluation_contract": {"actuals": {"path": "actuals"}},
+    }
+    selected = SimpleNamespace(
+        path=tmp_path / "search", winner_config=tmp_path / "winner.json", windows=(window,)
+    )
+    saved = {
+        "parameters": {"model.level": 0.0, "training.offset": 0},
+        "source": {},
+        "profile_text": profile.read_text(),
+    }
+    monkeypatch.setattr(study_workflow, "tune_study", lambda *args, **kwargs: selected)
+    monkeypatch.setattr(study_workflow, "load_tuning_result", lambda *args, **kwargs: selected)
+    monkeypatch.setattr(
+        study_workflow, "load_selected_configuration", lambda *args, **kwargs: saved
+    )
+
+    def copy(*args, **kwargs):
+        if operation == "artifact_retention":
+            raise OSError("injected selected artifact retention failure")
+
+    monkeypatch.setattr(study_workflow, "_copy_run_artifact_directory", copy)
+    monkeypatch.setattr(
+        study_workflow, "snapshot_parquet_directory", lambda source, dest, **kwargs: dest
+    )
+
+    def fail_score(*args, **kwargs):
+        raise OSError("injected selected scoring failure")
+
+    monkeypatch.setattr(study_workflow, "score_study", fail_score)
+    output = tmp_path / "runs"
+    with pytest.raises(OSError, match="injected selected"):
+        study_workflow.run_forecast_workflow(
+            study,
+            fit_predict=lambda _: None,
+            implementation=implementation(),
+            config=profile,
+            output_dir=output,
+        )
+    events = [
+        json.loads(line)
+        for f in output.glob("**/events.jsonl")
+        for line in f.read_text().splitlines()
+    ]
+    print(
+        "REUSE_" + operation + "_EVENTS=" + json.dumps([(e["stage"], e["status"]) for e in events])
+    )
+    assert any(e["stage"] == operation and e["status"] == "FAIL" for e in events)
+
+
+def test_completed_workflow_links_survive_secondary_audit_failure(tmp_path, monkeypatch):
+    from autoforecast import study_workflow
+
+    path = tmp_path / "completed-workflow"
+    path.mkdir()
+    (path / "artifact_manifest.json").write_text("{}")
+    profile = tmp_path / "model.yaml"
+    profile.write_text("{}")
+    result = SimpleNamespace(path=path, run_id=path.name, study_id="known", status="completed")
+
+    class Study:
+        registration = {"sha256": "a" * 64}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+    class Registry:
+        root = tmp_path
+        runtime = {}
+        store = SimpleNamespace(validate_destinations=lambda: None)
+
+        def _registration_path(self, _):
+            pass
+
+        def load_study(self, _):
+            return Study()
+
+        def publish_results(self, *args, **kwargs):
+            raise OSError("primary publication error")
+
+    native = study_workflow._stage_event
+
+    def broken_terminal_event(path, stage, status, **context):
+        if stage == "run" and status == "FAIL":
+            raise OSError("secondary audit write error")
+        return native(path, stage, status, **context)
+
+    monkeypatch.setattr(study_workflow, "_stage_event", broken_terminal_event)
+    monkeypatch.setattr(study_workflow, "run_forecast_workflow", lambda *args, **kwargs: result)
+    with pytest.raises(OSError, match="primary publication error") as caught:
+        study_workflow.run_study(
+            "known",
+            lambda _: None,
+            registry=Registry(),
+            model_config=profile,
+            implementation={},
+            publish=True,
+        )
+    print(
+        "RECOVERY_LINKS="
+        + json.dumps(
+            {
+                "workflow_path": str(getattr(caught.value, "workflow_path", None)),
+                "audit_path": str(getattr(caught.value, "audit_path", None)),
+            }
+        )
+    )
+    assert caught.value.workflow_path == path
+    assert caught.value.audit_path.exists()
+
+
+@pytest.mark.parametrize("failed_write", ["sidecar", "event", "seal"])
+def test_failure_sidecar_error_does_not_skip_terminal_stage_or_failed_seal(
+    tmp_path, monkeypatch, failed_write,
+):
+    from mlops.run_bundle import RunBundle
+
+    from autoforecast import study_workflow
+    from autoforecast.test_study_tuning import config, implementation
+
+    manifest = tmp_path / "benchmarks" / "known" / "benchmark.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    recipe = {
+        "metric": "mae",
+        "frequency": "D",
+        "validation_origins": ["2024-01-05"],
+        "validation_horizon": 2,
+        "final_train_cutoff": "2024-01-07",
+        "final_test_horizon": 2,
+    }
+    study = SimpleNamespace(
+        study_id="known",
+        _path=manifest,
+        _sha256="a" * 64,
+        _snapshots=SimpleNamespace(name=str(scratch)),
+        _spark=object(),
+        recipe=recipe,
+        _record=lambda **_: {"sources": {}},
+    )
+    preflight = SimpleNamespace(
+        study_id="known", study_path=manifest, study_sha256="a" * 64, report={}
+    )
+    preflight.report_path = tmp_path / "preflight-report.json"
+    preflight.report_path.write_text(json.dumps(preflight.report))
+    monkeypatch.setattr(study_workflow, "preflight_study", lambda *args, **kwargs: preflight)
+    monkeypatch.setattr(
+        study_workflow,
+        "_prepare_window",
+        lambda *args, **kwargs: SimpleNamespace(verify=lambda: {}),
+    )
+
+    def fail_fit(*args, **kwargs):
+        raise RuntimeError("primary operation failure")
+
+    monkeypatch.setattr(study_workflow, "_fit_window", fail_fit)
+    native = RunBundle.write_json
+
+    def fail_sidecar(self, name, record):
+        if name == "failure.json" and failed_write == "sidecar":
+            raise OSError("secondary sidecar write failure")
+        return native(self, name, record)
+
+    monkeypatch.setattr(RunBundle, "write_json", fail_sidecar)
+    native_event, native_seal = study_workflow._stage_event, RunBundle.finalize
+
+    def fail_event(path, stage, status, **context):
+        if status == "FAIL" and failed_write == "event":
+            raise OSError("secondary event failure")
+        return native_event(path, stage, status, **context)
+
+    def fail_seal(self, **kwargs):
+        if failed_write == "seal":
+            raise OSError("secondary seal failure")
+        return native_seal(self, **kwargs)
+
+    monkeypatch.setattr(study_workflow, "_stage_event", fail_event)
+    monkeypatch.setattr(RunBundle, "finalize", fail_seal)
+    output = tmp_path / "runs"
+    with pytest.raises(RuntimeError, match="primary operation failure"):
+        study_workflow.run_forecast_workflow(
+            study,
+            fit_predict=lambda _: None,
+            implementation=implementation(),
+            config=config(tmp_path),
+            fixed_parameters={},
+            output_dir=output,
+        )
+    events = [
+        json.loads(line)
+        for f in output.glob("*/events.jsonl")
+        for line in f.read_text().splitlines()
+    ]
+    completions = list(output.glob("*/completion.json"))
+    print(
+        "SECONDARY_SIDECAR="
+        + json.dumps(
+            {
+                "events": [(e["stage"], e["status"]) for e in events],
+                "completion_count": len(completions),
+            }
+        )
+    )
+    assert any(e["status"] == "FAIL" for e in events) == (failed_write != "event")
+    assert len(completions) == (0 if failed_write == "seal" else 1)
+    if completions:
+        assert json.loads(completions[0].read_text())["status"] == "failed"
+    assert bool(list(output.glob("*/failure.json"))) == (failed_write != "sidecar")
+
+
+def test_validation_checkpoint_copy_failure_has_retention_fail_event(tmp_path, monkeypatch):
+    import yaml
+    from mlops import _safe_files
+
+    from autoforecast import study_workflow
+    from autoforecast.study_tuning import _resolve_options
+    from autoforecast.test_study_tuning import config, implementation
+
+    manifest = tmp_path / "benchmarks" / "known" / "benchmark.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    recipe = {
+        "metric": "mae",
+        "frequency": "D",
+        "validation_origins": ["2024-01-05"],
+        "validation_horizon": 2,
+        "final_train_cutoff": "2024-01-07",
+        "final_test_horizon": 2,
+    }
+    study = SimpleNamespace(
+        study_id="known",
+        _path=manifest,
+        _sha256="a" * 64,
+        _snapshots=SimpleNamespace(name=str(scratch)),
+        _spark=object(),
+        recipe=recipe,
+        _record=lambda **_: {"sources": {}},
+    )
+    preflight = SimpleNamespace(
+        study_id="known", study_path=manifest, study_sha256="a" * 64, report={}
+    )
+    preflight.report_path = tmp_path / "preflight-report.json"
+    preflight.report_path.write_text(json.dumps(preflight.report))
+    fixed = {"actuals": {"path": "actuals"}}
+    monkeypatch.setattr(study_workflow, "preflight_study", lambda *args, **kwargs: preflight)
+    monkeypatch.setattr(
+        study_workflow,
+        "_prepare_window",
+        lambda *args, **kwargs: SimpleNamespace(verify=lambda: {"evaluation_contract": fixed}),
+    )
+    profile = config(tmp_path)
+    value = yaml.safe_load(profile.read_text())
+    value.pop("hpo")
+    options = _resolve_options(study, {"selection": {"stage": "validation"}}, None)
+    options["selection_boundaries"] = []
+    old = tmp_path / "previous"
+    (old / "validation").mkdir(parents=True)
+    (old / "validation" / "trace.json").write_text("{}")
+    (old / "artifact_manifest.json").write_text("{}")
+    previous = SimpleNamespace(
+        path=old,
+        testing=None,
+        selected_config=tmp_path / "winner.json",
+        provenance={
+            "study": {"path": str(manifest.resolve()), "sha256": "a" * 64},
+            "options": options,
+        },
+        validation={"evaluation_contract": fixed},
+    )
+    saved = {
+        "parameters": {"model.level": 0.0, "training.offset": 0},
+        "source": {},
+        "profile_text": yaml.safe_dump(value),
+        "profile": value,
+        "implementation": implementation(),
+        "model_id": "custom-constant",
+        "seed": 9,
+    }
+    monkeypatch.setattr(study_workflow, "load_forecast_workflow", lambda *args, **kwargs: previous)
+    monkeypatch.setattr(
+        study_workflow, "load_selected_configuration", lambda *args, **kwargs: saved
+    )
+
+    def fail_snapshot(*args, **kwargs):
+        raise OSError("injected checkpoint retention failure")
+
+    monkeypatch.setattr(_safe_files, "snapshot_regular_files", fail_snapshot)
+    output = tmp_path / "runs"
+    with pytest.raises(OSError, match="injected checkpoint retention failure"):
+        study_workflow.run_forecast_workflow(
+            study,
+            fit_predict=lambda _: None,
+            implementation=implementation(),
+            validation_run=old,
+            output_dir=output,
+        )
+    events = [
+        json.loads(line)
+        for f in output.glob("**/events.jsonl")
+        for line in f.read_text().splitlines()
+    ]
+    print("CHECKPOINT_EVENTS=" + json.dumps([(e["stage"], e["status"]) for e in events]))
+    assert any(e["stage"] == "artifact_retention" and e["status"] == "FAIL" for e in events)
+
+
+def test_startup_records_sanitized_tracking_and_table_destinations(tmp_path, monkeypatch):
+    from autoforecast import run_mlflow, study_workflow
+
+    class Registry:
+        root = tmp_path
+        runtime = {
+            "tracking": "mlflow",
+            "publish": True,
+            "tracking_uri": "https://user:password@tracking.example?token=secret#private",
+            "mlflow_experiment": "42",
+        }
+        store = SimpleNamespace(
+            validate_destinations=lambda: None,
+            tables={"study_results": "generic.results", "forecasts": "generic.forecasts"},
+        )
+
+        def _registration_path(self, _):
+            pass
+
+        def load_study(self, _):
+            raise RuntimeError("stop after tracking setup")
+
+    monkeypatch.setattr(run_mlflow, "resolve_study_experiment", lambda **_: "42")
+    with pytest.raises(RuntimeError, match="stop after tracking setup") as caught:
+        study_workflow.run_study(
+            "known",
+            lambda _: None,
+            registry=Registry(),
+            model_config=tmp_path / "model.yaml",
+            implementation={},
+        )
+    events = [json.loads(line) for line in caught.value.audit_path.read_text().splitlines()]
+    startup = [e for e in events if e["stage"] in {"configuration", "tracking_setup"}]
+    print("STARTUP_CONTEXT=" + json.dumps(startup))
+    assert "https://tracking.example" in json.dumps(startup)
+    assert all(secret not in json.dumps(startup)
+               for secret in ("password", "token=secret", "private", "user:"))
+    assert "42" in json.dumps(startup)
+    assert "generic.results" in json.dumps(startup)
+
+
+def test_summary_includes_model_and_retained_excluded_counts(tmp_path):
+    from autoforecast.panel import Forecast
+    from autoforecast.study_workflow import ForecastWorkflowResult
+
+    score = {
+        "reported_metrics": ["mae"],
+        "mae": 1.0,
+        "coverage": {"expected": 2, "original_expected": 4},
+        "population": {"original_series": 2, "forecasted_series": 1},
+        "availability": {"retained_series": 1},
+    }
+    result = ForecastWorkflowResult(
+        tmp_path / "run",
+        "completed",
+        {},
+        {
+            "score": score,
+            "forecasts": Forecast(
+                "my_model", str(tmp_path / "forecasts"), "2024-01-01", 2, 1, {"emitted": 2}
+            ),
+        },
+        None,
+        {
+            "study": {"path": str(tmp_path / "study" / "benchmark.json")},
+            "registration": {"study_id": "parent"},
+        },
+        None,
+        tmp_path / "selected",
+        tmp_path / "search",
+    )
+    summary = result.summary()
+    print("RESULT_SUMMARY=" + json.dumps(summary))
+    assert "my_model" in json.dumps(summary)
+    assert summary["retained_series"] == 1 and summary["excluded_series"] == 1
+
+
+def test_preflight_emits_required_warning_for_permitted_series_exclusion(tmp_path, monkeypatch):
+    from autoforecast import study_workflow
+    from autoforecast.test_study_tuning import config, implementation
+
+    manifest = tmp_path / "benchmarks" / "known" / "benchmark.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    recipe = {
+        "metric": "mae",
+        "frequency": "D",
+        "validation_origins": ["2024-01-05"],
+        "validation_horizon": 2,
+        "final_train_cutoff": "2024-01-07",
+        "final_test_horizon": 2,
+    }
+    study = SimpleNamespace(
+        study_id="known",
+        _path=manifest,
+        _sha256="a" * 64,
+        _snapshots=SimpleNamespace(name=str(scratch)),
+        _spark=object(),
+        recipe=recipe,
+        _record=lambda **_: {"sources": {}},
+    )
+    report = {
+        "original_count": 2,
+        "retained_count": 1,
+        "excluded_ids": ["B"],
+        "issues": [{"code": "insufficient_history", "severity": "availability"}],
+    }
+    preflight = SimpleNamespace(
+        study_id="known", study_path=manifest, study_sha256="a" * 64, report=report
+    )
+    preflight.report_path = tmp_path / "preflight-report.json"
+    preflight.report_path.write_text(json.dumps(preflight.report))
+    monkeypatch.setattr(study_workflow, "preflight_study", lambda *args, **kwargs: preflight)
+
+    def stop_after_preflight(*args, **kwargs):
+        raise RuntimeError("stop after permitted exclusion")
+
+    monkeypatch.setattr(study_workflow, "_prepare_window", stop_after_preflight)
+    output = tmp_path / "runs"
+    with pytest.raises(RuntimeError, match="stop after permitted exclusion"):
+        study_workflow.run_forecast_workflow(
+            study,
+            fit_predict=lambda _: None,
+            implementation=implementation(),
+            config=config(tmp_path),
+            fixed_parameters={},
+            output_dir=output,
+        )
+    events = [
+        json.loads(line)
+        for f in output.glob("*/events.jsonl")
+        for line in f.read_text().splitlines()
+    ]
+    passed = [e for e in events if e["stage"] == "preflight" and e["status"] == "PASS"]
+    print("PREFLIGHT_CONTEXT=" + json.dumps(passed))
+    assert any(e.get("warnings") for e in passed)
+    assert any(e.get("retained_series", e.get("retained_count")) == 1 for e in passed)

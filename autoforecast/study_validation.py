@@ -57,27 +57,29 @@ class StudyValidation:
                 or np.any(prediction < 0)):
             raise ValueError("study checkpoint predictions must cover the finite nonnegative grid")
         policy = json.loads(self.contract_json)["metric_policy"]
-        if policy["actual_missing"] not in {"error", "mask"}:
-            raise ValueError("actual_missing must be error or mask")
+        if policy["actual_missing"] not in {"error", "mask", "zero"}:
+            raise ValueError("actual_missing must be error, mask or zero")
         missing_count = int((~self.observed).sum())
         if policy["actual_missing"] == "error" and missing_count:
             raise ValueError(f"scoring requires complete actuals; missing={missing_count}")
-        count = self.observed.sum(axis=1)
+        scored = (np.ones_like(self.observed) if policy["actual_missing"] == "zero"
+                  else self.observed)
+        count = scored.sum(axis=1)
         if self.metric == "wrmsse" and np.any(count == 0):
             raise ValueError("WRMSSE requires observations for every retained series")
         n = int(count.sum())
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            error = np.where(self.observed, prediction - self.target, 0.0)
+            error = np.where(scored, prediction - self.target, 0.0)
             squared = np.square(error).sum(axis=1)
             absolute = float(np.abs(error).sum())
-            volume = float(np.where(self.observed, self.target, 0.0).sum())
+            volume = float(np.where(scored, self.target, 0.0).sum())
             if not np.isfinite([squared.sum(), absolute, volume]).all():
                 raise ValueError("study checkpoint metric overflowed")
             result: dict[str, float | int | None] = {
                 "rmse": float(np.sqrt(squared.sum() / n)) if n else None,
                 "mae": absolute / n if n else None,
                 "wape": absolute / volume if volume else None,
-                "observed_cells": n,
+                "observed_cells": int(self.observed.sum()),
             }
             if self.metric == "wrmsse":
                 assert self.weight is not None and self.scale is not None
@@ -192,14 +194,17 @@ def _read_window(contract, sha, snapshots, panel, origin, horizon, series_ids) -
     missing[row, column] = flags
     if contract["metric_policy"]["actual_missing"] == "error" and missing.any():
         raise ValueError(f"scoring requires complete actuals; missing={int(missing.sum())}")
+    zero = contract["metric_policy"]["actual_missing"] == "zero"
     observed = ~missing
+    if zero:
+        target[missing] = 0.0
     coverage = ds.dataset(snapshots["coverage"], format="parquet").to_table().to_pylist()
     expected = [{
         "series_id": series, "expected": horizon,
         "originally_missing": int(missing[index].sum()),
-        "zero_filled": 0,
-        "excluded": int(missing[index].sum()),
-        "scored": int(observed[index].sum()),
+        "zero_filled": int(missing[index].sum()) if zero else 0,
+        "excluded": 0 if zero else int(missing[index].sum()),
+        "scored": horizon if zero else int(observed[index].sum()),
     } for index, series in enumerate(series_ids)]
     if sorted(coverage, key=lambda item: item["series_id"]) != sorted(
         expected, key=lambda item: item["series_id"],

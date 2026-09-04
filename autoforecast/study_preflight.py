@@ -27,11 +27,11 @@ from autoforecast.benchmark import (
     _actuals_role,
     _identity,
     _inclusive_period_count,
-    _parquet_hash,
     _publish_frozen_benchmark,
     artifact_path,
     boundary,
     digest,
+    parquet_content_hash,
     study_windows,
     verify_benchmark,
 )
@@ -159,6 +159,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             record["parent"]["study_id"],
             registry_root=parent_path.parent.parent,
             spark=study._spark,
+            scratch_root=study._snapshots.name,
         ) as parent:
             result = _preflight(parent, options, report, output)
         if result.study_id != record["study_id"]:
@@ -439,7 +440,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                     "series_id": sid,
                     "expected": len(points[key]),
                     "originally_missing": missing,
-                    "zero_filled": 0,
+                    "zero_filled": missing if recipe["actual_missing"] == "zero" else 0,
                     "excluded": excluded,
                     "scored": len(points[key]) - excluded,
                 }
@@ -506,7 +507,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                 for p in points[key]
                 if actuals[key].get((sid, p), (None, True))[0] is None
             ]
-            if missing:
+            if missing and recipe["actual_missing"] != "zero":
                 excluded.add(sid)
                 report["issues"].append(
                     {
@@ -537,7 +538,8 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             observed = 0
             for point in points[key]:
                 value, missing = actuals[key].get((sid, point), (None, True))
-                masks.append([sid, canonical_origin(point, frequency), not missing])
+                masks.append([sid, canonical_origin(point, frequency),
+                              not missing or recipe["actual_missing"] == "zero"])
                 observed += int(not missing)
                 # Test target magnitudes do not enter any objective capability decision.
                 if stage != "test" and value is not None:
@@ -547,16 +549,18 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
                     "series_id": sid,
                     "expected": horizon,
                     "originally_missing": horizon - observed,
-                    "zero_filled": 0,
-                    "excluded": horizon - observed,
-                    "scored": observed,
+                    "zero_filled": horizon - observed if recipe["actual_missing"] == "zero" else 0,
+                    "excluded": 0 if recipe["actual_missing"] == "zero" else horizon - observed,
+                    "scored": horizon if recipe["actual_missing"] == "zero" else observed,
                 }
             )
         common = [
             canonical_origin(point, frequency)
             for point in points[key]
             if len(eligible) == len(retained)
-            and all(actuals[key].get((sid, point), (None, True))[0] is not None for sid in retained)
+            and (recipe["actual_missing"] == "zero" or all(
+                actuals[key].get((sid, point), (None, True))[0] is not None for sid in retained
+            ))
         ]
         observed_cells = sum(
             not actuals[key].get((sid, point), (None, True))[1]
@@ -592,7 +596,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             "expected_cells": len(ids) * horizon,
             "forecast_cells": len(eligible) * horizon,
             "observed_cells": observed_cells,
-            "filled_cells": 0,
+            "filled_cells": sum(row["zero_filled"] for row in coverage),
             "scored_cells": scored,
             "scored_series": sum(r["scored"] > 0 for r in coverage),
             "common_wrmsse_dates": len(common),
@@ -706,7 +710,7 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
                 pq.write_table(table, scratch / role / "part.parquet")
                 record["role_paths"][role] = role
                 record["artifacts"][role] = directory_digest(scratch / role, suffixes=(".parquet",))
-                record["logical_snapshots"][role] = _parquet_hash(scratch / role)
+                record["logical_snapshots"][role] = parquet_content_hash(scratch / role)
                 record["inherited_roles"].remove(role)
             for role, counts in role_counts.items():
                 record["counts"][role] = {
@@ -735,7 +739,7 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
                 n_cells=len(table),
             )
             record["grid_identities"][key] = {
-                "content_sha256": _parquet_hash(path),
+                "content_sha256": parquet_content_hash(path),
                 "logical_sha256": logical,
                 "n_cells": len(table),
             }
@@ -744,7 +748,7 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
             pq.write_table(pa.Table.from_pylist(coverage_rows[key]), path / "part.parquet")
             record["coverage"][key]["sha256"] = directory_digest(path, suffixes=(".parquet",))
             record["coverage_identities"][key] = {
-                "content_sha256": _parquet_hash(path),
+                "content_sha256": parquet_content_hash(path),
                 "counts": {
                     name: sum(row[name] for row in coverage_rows[key])
                     for name in (

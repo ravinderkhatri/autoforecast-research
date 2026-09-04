@@ -8,6 +8,7 @@ import json
 import pathlib
 import tempfile
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from mlops.run_bundle import open_run_bundle
@@ -44,12 +45,15 @@ if TYPE_CHECKING:
 def load_study(
     study_id: str, *, registry_root: str | pathlib.Path | None = None,
     spark: SparkSession | None = None,
+    scratch_root: str | pathlib.Path | None = None,
 ) -> Study:
     """Load an existing ID from the project's .autoforecast/benchmarks registry.
 
     Use ``experiment_project`` once for the session, or supply ``registry_root``.
     Spark must be supplied or active. The returned context manager owns its private
     snapshots, never the caller's session. Close it after using its dataframes.
+    ``scratch_root`` must be an existing filesystem directory visible to Spark
+    workers. It controls operation-owned snapshots without changing global state.
     """
     registry = (pathlib.Path(registry_root) if registry_root is not None else
                 project_root(pathlib.Path.cwd()) / ".autoforecast/benchmarks").absolute()
@@ -73,7 +77,9 @@ def load_study(
     session = spark if spark is not None else SparkSession.getActiveSession()
     if session is None:
         raise ValueError("Supply a supported Spark session or activate one before load_study")
-    return Study(path, sha, session, tempfile.TemporaryDirectory(prefix="autoforecast-study-"))
+    return Study(path, sha, session, tempfile.TemporaryDirectory(
+        prefix="autoforecast-study-", dir=scratch_root,
+    ))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,18 +90,24 @@ class Study:
     _sha256: str = dataclasses.field(repr=False)
     _spark: SparkSession = dataclasses.field(repr=False, compare=False)
     _snapshots: tempfile.TemporaryDirectory = dataclasses.field(repr=False, compare=False)
+    _registration: bytes | None = dataclasses.field(default=None, repr=False)
     _closed: bool = dataclasses.field(default=False, init=False, repr=False, compare=False)
 
     def __enter__(self) -> Study:
         try:
             self._record()
         except BaseException:
-            self.close()
+            with suppress(Exception):
+                self.close()
             raise
         return self
 
     def __exit__(self, *_exc) -> None:
-        self.close()
+        if _exc and _exc[0] is not None:
+            with suppress(Exception):
+                self.close()
+        else:
+            self.close()
 
     def close(self) -> None:
         """Release study snapshots; returned lazy dataframes must no longer be used."""
@@ -112,6 +124,11 @@ class Study:
     @property
     def study_id(self) -> str:
         return self._record()["study_id"]
+
+    @property
+    def registration(self) -> dict | None:
+        """A fresh view of the registry binding authenticated at load time, if any."""
+        return json.loads(self._registration) if self._registration is not None else None
 
     @property
     def recipe(self) -> dict:
@@ -208,7 +225,7 @@ class Study:
 
     @property
     def training_data(self) -> DataFrame:
-        return self._frame("selection", "training")
+        return self._fit_data("selection", "training", self.recipe["validation_origins"][0])
 
     @property
     def validation_data(self) -> DataFrame:
@@ -216,7 +233,15 @@ class Study:
 
     @property
     def refit_data(self) -> DataFrame:
-        return self._frame("final_training", "refit")
+        return self._fit_data("final_training", "refit", self.recipe["final_train_cutoff"])
+
+    def _fit_data(self, role: str, stage: str, origin: str) -> DataFrame:
+        from autoforecast.preparation import prepare_fit_history
+
+        return prepare_fit_history(
+            self._frame(role, stage), panel=self.panel, origin=origin,
+            missing=self.recipe["history_missing"],
+        )
 
     @property
     def testing_data(self) -> DataFrame:
@@ -386,6 +411,7 @@ class Study:
                     dataclasses.replace(self.panel, path=fixed["actuals"]["path"]),
                     forecast, self._spark, contract=fixed, output_dir=output / stage / "scores",
                     forecast_accuracy_breakdown=forecast_accuracy_breakdown,
+                    scratch_root=self._snapshots.name,
                 )
                 scoring = output / stage / "score.json"
                 payload = (json.dumps(score, sort_keys=True, allow_nan=False) + "\n").encode()

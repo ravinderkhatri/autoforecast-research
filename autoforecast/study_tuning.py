@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import hashlib
 import json
 import logging
@@ -10,8 +11,10 @@ import math
 import pathlib
 import re
 import tempfile
+import time
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, cast
 
 from mlops._safe_files import _platform_absolute, read_regular_bytes, snapshot_tree_types
@@ -21,17 +24,20 @@ from pyspark.sql import functions as F
 
 from autoforecast._exact_json import loads_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
-from autoforecast.benchmark import boundary, digest, evaluation_contract, verify_benchmark
+from autoforecast.benchmark import (
+    MISSING_COLUMN,
+    boundary,
+    digest,
+    evaluation_contract,
+    verify_benchmark,
+)
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.experiments import load_completed_attempt, load_study_selection
 from autoforecast.frequency import (
     TimePoint,
     canonical_origin,
-    parse_frequency,
-    parse_origin,
     period_points,
 )
-from autoforecast.grid import time_literal
 from autoforecast.hpo import HPOError, HPOStudySpec, TrialOutcome, TrialRequest, run_hpo_study
 from autoforecast.hpo_bridge import _copy_run_artifact_directory
 from autoforecast.panel import Forecast, Panel
@@ -51,6 +57,41 @@ from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 if TYPE_CHECKING:
     from autoforecast.study import Study
+
+
+_LOG_LEVEL = ContextVar("autoforecast_log_level", default=logging.INFO)
+
+
+def _stage_event(path, stage, status, *, elapsed=None, **context):
+    """Retain factual stage outcomes even when console logging is reduced."""
+    event = {"timestamp": dt.datetime.now(dt.UTC).isoformat(), "stage": stage,
+             "status": status, "elapsed_seconds": elapsed, **context}
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as stream:
+        stream.write(json.dumps(event, sort_keys=True, allow_nan=False) + "\n")
+    level = (logging.ERROR if status == "FAIL" else logging.WARNING
+             if status == "UNAVAILABLE" or context.get("warnings") else logging.INFO)
+    if level >= _LOG_LEVEL.get():
+        with suppress(Exception):
+            logging.getLogger("autoforecast.stages").log(level, "%s", json.dumps(event))
+
+
+@contextmanager
+def _stage(path, name, **context):
+    start = time.monotonic()
+    _stage_event(path, name, "START", **context)
+    outcome = {}
+    try:
+        yield outcome
+    except BaseException as error:
+        with suppress(Exception):
+            _stage_event(path, name, "FAIL", elapsed=time.monotonic() - start,
+                         error_type=type(error).__name__, reason=str(error), **context)
+        raise
+    else:
+        status = outcome.pop("status", "PASS")
+        _stage_event(path, name, status, elapsed=time.monotonic() - start, **context, **outcome)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -482,17 +523,17 @@ def _prepare_window(
     if fixed["study"]["sha256"] != study._sha256:
         raise HPOError("study changed before fitting")
     panel = study.panel
-    frame = study.refit_data if stage == "test" else study.training_data
+    frame = study._fit_data(
+        "final_training" if stage == "test" else "selection",
+        "refit" if stage == "test" else "training", origin,
+    )
     mapping = study.series_mapping
     eligible = fixed.get("availability", {}).get("eligible_ids")
     if eligible is not None:
         frame = frame.filter(F.col(panel.series_col).isin(eligible))
         mapping = mapping.filter(F.col(panel.series_col).isin(eligible))
     training, mapping_path = root / "training", root / "series-mapping"
-    frame.filter(
-        F.col(panel.time_col)
-        <= time_literal(parse_origin(origin, panel.frequency), parse_frequency(panel.frequency))
-    ).write.parquet(str(training))
+    frame.write.parquet(str(training))
     mapping.write.parquet(str(mapping_path))
     study._record(data=True)
     context = {
@@ -500,12 +541,44 @@ def _prepare_window(
         "stage": stage,
         "origin": origin,
         "horizon": horizon,
+        "history_zero_filled": (frame.filter(F.col(MISSING_COLUMN)).count()
+                                if study.recipe["history_missing"] == "zero" else 0),
         "training_sha256": directory_digest(training, suffixes=(".parquet",)),
         "mapping_sha256": directory_digest(mapping_path, suffixes=(".parquet",)),
     }
     return _WindowInput(
         dataclasses.replace(panel, path=str(training)), mapping_path, _json_bytes(context)
     )
+
+
+def _retain_callback_artifacts(work, output):
+    artifact_source = work / "artifacts"
+    if artifact_source.exists() or artifact_source.is_symlink():
+        kinds = snapshot_tree_types(artifact_source)
+        if (artifact_source.is_symlink() or not artifact_source.is_dir()
+                or any(kind not in {"file", "directory"} for kind in kinds.values())):
+            raise HPOError("callback artifacts may not contain symlinks or special files")
+        if "file" in kinds.values():
+            artifact_sha = directory_digest(artifact_source)
+            _copy_run_artifact_directory(artifact_source, output / "artifacts")
+            if directory_digest(output / "artifacts") != artifact_sha:
+                raise HPOError("callback artifacts changed while retaining files")
+            return {"artifacts_path": "artifacts", "artifacts_sha256": artifact_sha}
+    return {}
+
+
+def _scoring_outcome(score):
+    """Summarize the same checked score for fitted and reused validation models."""
+    outcome = {}
+    outcome["coverage"] = score["coverage"]
+    outcome["evaluation_status"] = score["evaluation_status"]
+    outcome["metric_status"] = score["metric_status"]
+    outcome["warnings"] = [
+        name for name in ("zero_filled", "excluded") if score["coverage"].get(name, 0)
+    ]
+    if score["evaluation_status"] == "pending_actuals":
+        outcome["status"] = "UNAVAILABLE"
+    return outcome
 
 
 def _fit_window(
@@ -521,6 +594,8 @@ def _fit_window(
     metrics: list[str],
     breakdown: ForecastAccuracyBreakdown,
     purpose: str = "selection",
+    run_id: str | None = None,
+    trial_id: str | None = None,
 ) -> dict:
     if purpose not in {"selection", "validation", "refit"}:
         raise ValueError("unknown fitting purpose")
@@ -528,83 +603,92 @@ def _fit_window(
     panel = inputs.panel
     origin, horizon = context["origin"], context["horizon"]
     extras = {}
-    with tempfile.TemporaryDirectory(prefix="autoforecast-fit-") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="autoforecast-fit-", dir=pathlib.Path(inputs.panel.path).parent,
+    ) as temporary:
         work = pathlib.Path(temporary)
         try:
-            result = callback(
-                FitPredictRequest(
-                    training_data=spark.read.parquet(panel.path),
-                    series_mapping=spark.read.parquet(str(inputs.mapping_path)),
-                    panel=Panel.from_record(dataclasses.asdict(panel)),
-                    origin=origin,
-                    forecast_dates=tuple(period_points(origin, panel.frequency, horizon)),
-                    model_id=model_id,
-                    model_parameters=json.loads(_json_bytes(model_parameters)),
-                    training_parameters=json.loads(_json_bytes(training_parameters)),
-                    seed=seed,
-                    output_dir=work,
-                    purpose=purpose,
+            with _stage(output / "events.jsonl", "fit_predict", model_id=model_id,
+                        origin=origin, purpose=purpose, window=output.name,
+                        study_id=context["evaluation_contract"]["study_id"],
+                        run_id=run_id, trial_id=trial_id,
+                        history_zero_filled=context.get("history_zero_filled", 0),
+                        warnings=(["history_zero_filled"]
+                                  if context.get("history_zero_filled", 0) else [])):
+                result = callback(
+                    FitPredictRequest(
+                        training_data=spark.read.parquet(panel.path),
+                        series_mapping=spark.read.parquet(str(inputs.mapping_path)),
+                        panel=Panel.from_record(dataclasses.asdict(panel)),
+                        origin=origin,
+                        forecast_dates=tuple(period_points(origin, panel.frequency, horizon)),
+                        model_id=model_id,
+                        model_parameters=json.loads(_json_bytes(model_parameters)),
+                        training_parameters=json.loads(_json_bytes(training_parameters)),
+                        seed=seed,
+                        output_dir=work,
+                        purpose=purpose,
+                    )
                 )
+        except BaseException:
+            with suppress(Exception):
+                _retain_callback_artifacts(work, output)
+            raise
+        with _stage(output / "events.jsonl", "artifact_retention", model_id=model_id,
+                    origin=origin, run_id=run_id, trial_id=trial_id):
+            extras = _retain_callback_artifacts(work, output)
+            inputs.verify()
+            if (
+                type(result) is not FitPredictResult
+                or type(result.forecasts) is not Forecast
+                or type(result.model_format) is not str
+                or not result.model_format.strip()
+            ):
+                raise HPOError(
+                    "fit_predict must return FitPredictResult with a Forecast and model_format"
+                )
+            forecast = Forecast.from_record(result.forecasts.as_record())
+            if (forecast.origin, forecast.horizon, forecast.frequency, forecast.adapter) != (
+                origin,
+                horizon,
+                panel.frequency,
+                model_id,
+            ):
+                raise HPOError("external forecast uses the wrong model or tuning boundary")
+            if not pathlib.Path(forecast.path).resolve().is_relative_to(work.resolve()):
+                raise HPOError("external forecasts must be saved beneath output_dir")
+            model_source = work / "model"
+            if not model_source.is_dir() or not any(p.is_file() for p in model_source.rglob("*")):
+                raise HPOError("external trial requires saved model files beneath output_dir/model")
+            model_sha = directory_digest(model_source)
+            _copy_run_artifact_directory(model_source, output / "model")
+            if directory_digest(output / "model") != model_sha:
+                raise HPOError("external model changed while retaining artifacts")
+            forecast_sha = directory_digest(forecast.path, suffixes=(".parquet",))
+            retained = snapshot_parquet_directory(
+                pathlib.Path(forecast.path),
+                output / "forecasts",
+                expected_sha256=forecast_sha,
+                label="external forecasts",
             )
-        finally:
-            artifact_source = work / "artifacts"
-            if artifact_source.exists() or artifact_source.is_symlink():
-                kinds = snapshot_tree_types(artifact_source)
-                if (artifact_source.is_symlink() or not artifact_source.is_dir()
-                        or any(kind not in {"file", "directory"} for kind in kinds.values())):
-                    raise HPOError("callback artifacts may not contain symlinks or special files")
-                if "file" in kinds.values():
-                    artifact_sha = directory_digest(artifact_source)
-                    _copy_run_artifact_directory(artifact_source, output / "artifacts")
-                    if directory_digest(output / "artifacts") != artifact_sha:
-                        raise HPOError("callback artifacts changed while retaining files")
-                    extras = {"artifacts_path": "artifacts", "artifacts_sha256": artifact_sha}
-        inputs.verify()
-        if (
-            type(result) is not FitPredictResult
-            or type(result.forecasts) is not Forecast
-            or type(result.model_format) is not str
-            or not result.model_format.strip()
-        ):
-            raise HPOError(
-                "fit_predict must return FitPredictResult with a Forecast and model_format"
-            )
-        forecast = Forecast.from_record(result.forecasts.as_record())
-        if (forecast.origin, forecast.horizon, forecast.frequency, forecast.adapter) != (
-            origin,
-            horizon,
-            panel.frequency,
-            model_id,
-        ):
-            raise HPOError("external forecast uses the wrong model or tuning boundary")
-        if not pathlib.Path(forecast.path).resolve().is_relative_to(work.resolve()):
-            raise HPOError("external forecasts must be saved beneath output_dir")
-        model_source = work / "model"
-        if not model_source.is_dir() or not any(p.is_file() for p in model_source.rglob("*")):
-            raise HPOError("external trial requires saved model files beneath output_dir/model")
-        model_sha = directory_digest(model_source)
-        _copy_run_artifact_directory(model_source, output / "model")
-        if directory_digest(output / "model") != model_sha:
-            raise HPOError("external model changed while retaining artifacts")
-        forecast_sha = directory_digest(forecast.path, suffixes=(".parquet",))
-        retained = snapshot_parquet_directory(
-            pathlib.Path(forecast.path),
-            output / "forecasts",
-            expected_sha256=forecast_sha,
-            label="external forecasts",
-        )
-        forecast = dataclasses.replace(forecast, path=str(retained))
-        forecast.validate()
+            forecast = dataclasses.replace(forecast, path=str(retained))
+            forecast.validate()
     fixed = context["evaluation_contract"]
-    score = score_study(
-        dataclasses.replace(panel, path=fixed["actuals"]["path"]),
-        forecast,
-        spark,
-        contract=fixed,
-        output_dir=output / "scores",
-        metrics=tuple(metrics),
-        forecast_accuracy_breakdown=breakdown,
-    )
+    with _stage(output / "events.jsonl", "scoring", model_id=model_id,
+                origin=origin, purpose=purpose, window=output.name,
+                study_id=context["evaluation_contract"]["study_id"],
+                run_id=run_id, trial_id=trial_id) as outcome:
+        score = score_study(
+            dataclasses.replace(panel, path=fixed["actuals"]["path"]),
+            forecast,
+            spark,
+            contract=fixed,
+            output_dir=output / "scores",
+            metrics=tuple(metrics),
+            forecast_accuracy_breakdown=breakdown,
+            scratch_root=pathlib.Path(inputs.panel.path).parent,
+        )
+        outcome.update(_scoring_outcome(score))
     inputs.verify()
     record = {
         **extras,
@@ -640,33 +724,7 @@ class _ExternalTrialBridge:
         records = []
         request.attempt.write_bytes("metadata/external-profile.yaml", self.profile_bytes)
         request.attempt.write_bytes("metadata/preflight.json", self.report_bytes)
-        try:
-            for index, inputs in enumerate(self.inputs):
-                prefix = "" if len(self.inputs) == 1 else f"windows/{index:04d}"
-                directory = request.attempt.path / prefix
-                record = _fit_window(
-                    self.spark,
-                    self.callback,
-                    inputs,
-                    directory,
-                    model_id=context["model_id"],
-                    model_parameters=request.model_parameters,
-                    training_parameters=request.training_parameters,
-                    seed=context["seed"],
-                    metrics=context["options"]["metrics"],
-                    breakdown=context["options"]["breakdown"],
-                )
-                value = record["score"].get(context["metric"])
-                if type(value) not in (int, float) or not math.isfinite(value):
-                    raise HPOError(
-                        "external trial requires a finite tuning objective in every window"
-                    )
-                record["forecast"]["path"] = str(pathlib.PurePosixPath(prefix) / "forecasts")
-                record["model_path"] = str(pathlib.PurePosixPath(prefix) / "model")
-                if "artifacts_path" in record:
-                    record["artifacts_path"] = str(pathlib.PurePosixPath(prefix) / "artifacts")
-                records.append(record)
-        finally:
+        def retain_evidence():
             # A failed trial still owns its exact inputs and any windows completed before failure.
             evidence = {
                 "schema": "autoforecast.external-trial.v1"
@@ -687,6 +745,40 @@ class _ExternalTrialBridge:
             elif (request.attempt.path / "windows").is_dir():
                 evidence["windows_sha256"] = directory_digest(request.attempt.path / "windows")
             request.attempt.write_json("evaluation/external-run.json", evidence)
+
+        try:
+            for index, inputs in enumerate(self.inputs):
+                prefix = "" if len(self.inputs) == 1 else f"windows/{index:04d}"
+                directory = request.attempt.path / prefix
+                record = _fit_window(
+                    self.spark,
+                    self.callback,
+                    inputs,
+                    directory,
+                    model_id=context["model_id"],
+                    model_parameters=request.model_parameters,
+                    training_parameters=request.training_parameters,
+                    seed=context["seed"],
+                    metrics=context["options"]["metrics"],
+                    breakdown=context["options"]["breakdown"],
+                    run_id=request.study.id, trial_id=request.trial_id,
+                )
+                value = record["score"].get(context["metric"])
+                if type(value) not in (int, float) or not math.isfinite(value):
+                    raise HPOError(
+                        "external trial requires a finite tuning objective in every window"
+                    )
+                record["forecast"]["path"] = str(pathlib.PurePosixPath(prefix) / "forecasts")
+                record["model_path"] = str(pathlib.PurePosixPath(prefix) / "model")
+                if "artifacts_path" in record:
+                    record["artifacts_path"] = str(pathlib.PurePosixPath(prefix) / "artifacts")
+                records.append(record)
+        except BaseException:
+            with suppress(Exception):
+                retain_evidence()
+            raise
+        else:
+            retain_evidence()
         value = math.fsum(record["score"][context["metric"]] for record in records) / len(records)
         for inputs in self.inputs:
             inputs.verify()
@@ -781,6 +873,7 @@ def tune_study(
                     preflight.study_id,
                     registry_root=preflight.study_path.parent.parent,
                     spark=study._spark,
+                    scratch_root=study._snapshots.name,
                 )
             )
         record, recipe = study._record(data=True), study.recipe
@@ -806,7 +899,9 @@ def tune_study(
             study.n_series,
         )
         temporary = pathlib.Path(
-            stack.enter_context(tempfile.TemporaryDirectory(prefix="autoforecast-inputs-"))
+            stack.enter_context(tempfile.TemporaryDirectory(
+                prefix="autoforecast-inputs-", dir=study._snapshots.name,
+            ))
         )
         inputs = tuple(
             _prepare_window(study, options["stage"], w["origin"], w["horizon"], temporary / str(i))

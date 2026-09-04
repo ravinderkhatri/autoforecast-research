@@ -8,7 +8,7 @@ from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import DateType, NumericType, TimestampNTZType, TimestampType
 
-from autoforecast.frequency import parse_frequency
+from autoforecast.frequency import parse_frequency, parse_origin
 
 _PERIODS = {
     "hourly": ("hour", "INTERVAL 1 HOUR"),
@@ -29,6 +29,48 @@ _CONVERSIONS = {
 def _column(name: str) -> Column:
     """Read a literal column name, including spaces, dots, or backticks."""
     return F.col("`" + name.replace("`", "``") + "`")
+
+
+def _validate_preparation_policies(*, fill_missing, duplicate_policy, aggregation="sum"):
+    if aggregation != "sum" or duplicate_policy not in {"error", "sum"}:
+        raise ValueError("aggregation must be sum and duplicate_policy must be error or sum")
+    if fill_missing not in {"zero", "na"}:
+        raise ValueError("fill_missing must be 'zero' or 'na'")
+
+
+def prepare_fit_history(frame: DataFrame, *, panel, origin: str, missing: str) -> DataFrame:
+    """Prepare only a fit slice; frozen actuals and past-only values stay unchanged.
+
+    The freezer already owns calendar completion and per-series starts. This
+    operation never aggregates rows or invents earlier history. Static labels may
+    fill inserted cells only when their observed non-null value is invariant in
+    this fit slice. Explicit null targets and absent-calendar targets follow the
+    same declared history policy. The original-missing marker remains factual.
+    """
+    from autoforecast.column_names import fresh_internal_names
+    from autoforecast.grid import time_literal
+
+    if missing not in {"preserve", "zero"}:
+        raise ValueError("fit missing policy must be preserve or zero")
+    cadence = parse_frequency(panel.frequency)
+    frame = frame.filter(
+        F.col(panel.time_col) <= time_literal(parse_origin(origin, cadence), cadence),
+    )
+    if missing == "zero":
+        frame = frame.withColumn(panel.target_col, F.coalesce(
+            F.col(panel.target_col), F.lit(0).cast(frame.schema[panel.target_col].dataType),
+        ))
+    for feature in (*panel.static, *panel.static_reals):
+        value, count = fresh_internal_names(frame.columns, ("_static_value", "_static_count"))
+        labels = frame.groupBy(panel.series_col).agg(
+            F.first(feature, ignorenulls=True).alias(value),
+            F.countDistinct(feature).alias(count),
+        )
+        if labels.filter(F.col(count) > 1).limit(1).count():
+            raise ValueError(f"static feature changes within the fit history: {feature}")
+        frame = frame.join(labels.select(panel.series_col, value), panel.series_col, "left")
+        frame = frame.withColumn(feature, F.coalesce(F.col(feature), F.col(value))).drop(value)
+    return frame
 
 
 def _cutoff(value: str | date | datetime, source_frequency: str) -> datetime | None:
@@ -107,8 +149,8 @@ def prepare_time_series(
     if source_code not in names or output_code not in names:
         raise ValueError("preparation supports period-start H, D, W, MS and YS")
     source_frequency, frequency = names[source_code], names[output_code]
-    if aggregation != "sum" or duplicate_policy not in {"error", "sum"}:
-        raise ValueError("aggregation must be sum and duplicate_policy must be error or sum")
+    _validate_preparation_policies(fill_missing=fill_missing,
+                                   duplicate_policy=duplicate_policy, aggregation=aggregation)
     if observed_col is not None and (
         not isinstance(observed_col, str)
         or not observed_col
@@ -121,8 +163,6 @@ def prepare_time_series(
         raise ValueError(
             f"cannot convert {source_frequency} to {frequency} without finer source data"
         )
-    if fill_missing not in {"zero", "na"}:
-        raise ValueError("fill_missing must be 'zero' or 'na'")
     if (
         not isinstance(series_id, list)
         or not series_id

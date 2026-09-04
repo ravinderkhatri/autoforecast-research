@@ -39,6 +39,16 @@ def test_checkpoint_metrics_match_hand_calculated_cell_denominators():
     assert zero["observed_cells"] == 4
 
 
+def test_explicit_zero_checkpoint_uses_filled_denominator_but_keeps_observed_count():
+    study = dataclasses.replace(window(), contract_json=json.dumps({
+        "metric_policy": {"metric": "rmse", "actual_missing": "zero"},
+    }))
+    score = study.score(np.array([[2.0, 99.0], [4.0, 1.0]]))
+    assert score["rmse"] == pytest.approx(math.sqrt((14 + 99**2) / 4))
+    assert score["mae"] == 105 / 4
+    assert score["observed_cells"] == 3
+
+
 def test_checkpoint_flat_wrmsse_uses_all_declared_weights_and_scales():
     score = window(
         metric="wrmsse", weight=np.array([1.0, 3.0]), scale=np.array([1.0, 4.0]),

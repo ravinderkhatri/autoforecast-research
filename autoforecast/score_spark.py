@@ -254,8 +254,9 @@ def score_forecast(
     if (original_missing_column is not None
             and (eligible_grid is None or series_scores_path is None)):
         raise ScoreError("original missingness requires a fixed grid and per-series score output")
-    if original_missing_column is not None and missing_actual == "sparse_zero":
-        raise ScoreError("study scoring never fills missing actuals")
+    # A frozen study may explicitly declare zero preparation. The original
+    # missingness marker remains factual and still must match the raw null target;
+    # the existing sparse-zero reduction retains filled and missing denominators.
     joined = _join_actuals(fc, panel, panel_cadence, spark, original_missing_column)
     actual = F.col("_actual")
     bad_actual = (joined.filter(

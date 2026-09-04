@@ -54,6 +54,9 @@
     "autoforecast/score_spark.py",
     "autoforecast/study_campaign.py",
     "autoforecast/preparation.py",
-    "autoforecast/study_references.py"
+    "autoforecast/study_references.py",
+    "autoforecast/study_registration.py",
+    "autoforecast/integrations/delta.py",
+    "autoforecast/data_observability.py"
   ]
 }

@@ -95,6 +95,207 @@ zero. Missing evaluation values are errors by default; explicit masking records 
 Choose the intended series population and date rules before freezing. A new dataset or changed
 rules require a new study identity.
 
+## Register once and run by study ID
+
+Use the package API when another application owns the data query and model code:
+
+```python
+import logging
+from autoforecast import register_study, run_study
+from autoforecast.study_registration import StudyRegistry
+
+logging.basicConfig(level=logging.INFO)
+registry = StudyRegistry.from_config("study.yaml", spark=spark)
+study_id = register_study("study.yaml", registry=registry)
+result = run_study(study_id, "seasonal_naive", registry=registry)
+print(result.summary())
+```
+
+Registration checks and freezes data; it does not fit a model. Runs load the frozen ID and
+delegate to the existing preflight, tuning, fitting and scoring workflow. The advanced
+`load_study()` and `Study.run_forecast_workflow()` interfaces remain available.
+The built-in convenience route currently supports `seasonal_naive` and retains its history
+and panel settings as the fitted model. Other models supply the existing `FitPredictRequest`
+to `FitPredictResult` callback or a `StudyModel` declaration:
+
+```python
+result = run_study(
+    study_id, my_fit_predict,
+    registry=registry,
+    model_config="model.yaml",
+    implementation={
+        "name": "my-model", "version": "1",
+        "source_sha256": code_sha256,
+        "dependencies": {"my-model-package": "1.0.0"},
+    },
+    tracking="none", publish=False,
+)
+```
+
+The callback receives its fit history, panel, source-key mapping, origin, forecast dates,
+parameters, seed and output directory. It needs no global Study object. It saves predictions
+and model files using the existing callback contract. An explicit `hpo` block in the model
+profile enables tuning; without one, profile defaults run without HPO. `fixed_parameters={}`
+also explicitly skips tuning. Model settings cannot override registered dates or scoring rules.
+
+`study.yaml` combines the existing dataset and recipe formats with source/storage settings.
+All dates below must be quoted YAML strings. The selected source must contain the declared
+population, one row per key/date, and only the declared input date range.
+
+```yaml
+schema_version: 1
+dataset:
+  schema_version: 1
+  dataset:
+    id: example
+    panel:
+      series_col: item
+      time_col: day
+      target_col: quantity
+      frequency: D
+      season_length: 7
+      target_estimand: observed_nonnegative
+recipe:
+  schema_version: 2
+  source_keys: [item]
+  frequency: D
+  training_start: "2024-01-01"
+  validation_origins: ["2024-01-28"]
+  validation_horizon: 7
+  final_train_cutoff: "2024-02-04"
+  final_test_horizon: 7
+  history_policy: fixed
+  new_series_policy: error
+  target_unit: units
+  feature_availability: {}
+  metric: mae
+  history_missing: preserve
+  actual_missing: mask
+source:
+  kind: parquet
+  path: input.parquet
+storage:
+  root: saved-studies
+runtime:
+  tracking: none
+  publish: false
+  log_level: INFO
+```
+
+Paths resolve relative to the config file. Duplicate YAML keys, aliases and unknown settings
+are rejected. Registration infers each series' available start from its first observation
+through the validation origin, or uses explicit `recipe.series_starts` declarations. It never
+invents history before that start. `history_missing: zero` fills only each model's fit slice;
+raw actuals remain unchanged. `actual_missing: zero` explicitly scores missing actuals as zero
+and records the original missing and filled counts. `mask` excludes them from the score;
+`error` refuses missing actuals. Static features fill only from evidence available by the fit
+cutoff; past-only features are not filled from future observations.
+
+For WRMSSE, add `references: {path: references.parquet}` or supply `weight_col`,
+`missing_history`, `duplicate_policy` and optional `weight_window_days`, `scale_lag`,
+`scale_start` for the existing daily reference calculator. `invalid_references` defaults to
+`error`; explicit `exclude` removes affected keys across every window and rechecks the retained
+weight total. It records the keys, reasons and excluded reference weights/scales. This is
+separate from model-profile availability exclusion. Generic source findings remain under
+`checks/`, including failed registrations; they do not impose application business rules.
+Registration reference reporting currently requires daily studies.
+With Delta storage, successful source and reference reports are linked to the study before its
+registration is published. Failed attempts keep their findings without a successful study link.
+
+For a fresh process, configure `AUTOFORECAST_REGISTRY_ROOT` and optional
+`AUTOFORECAST_SCRATCH_ROOT` / `AUTOFORECAST_DELTA_NAMESPACE`, or set `AUTOFORECAST_CONFIG`.
+Environment storage settings take precedence over YAML in both registration and loading;
+an explicit `registry=` overrides both. Config-based loading reads storage/runtime settings
+only, never the original source SQL.
+There is no process-global active registry. Separate explicit registries can run concurrently.
+
+### Optional Delta storage and publication
+
+Supply a Delta-enabled Spark session and credentials through your runtime. Core file workflows
+do not require Delta. The integration tests use Spark 4.2 with Delta 4.4.1. Add
+`storage.namespace: catalog.schema` and optionally a `storage.tables` mapping for the five roles:
+`studies`, `frozen_observations`, `study_data_issues`, `study_results`, `forecasts`.
+Only explicit registration provisions these tables; reads and runs never do.
+Initial table creation is serialized using the existing POSIX file-lock primitive under the
+registry root. All processes provisioning the same tables must share that root and working
+file-lock semantics. Row publication then uses native Delta transactions concurrently.
+
+For Delta source queries, replace `source` with:
+
+```yaml
+source:
+  kind: delta
+  sql: source.sql
+  tables:
+    observations: catalog.schema.observations
+```
+
+`source.sql` contains a read-only query over the declared aliases, for example
+`SELECT item, day, quantity FROM observations`. The integration pins each table version once,
+runs the query in an isolated Spark session and materializes its result before checking it.
+Undeclared tables, commands and unsupported query operators are rejected. Source SQL, versions,
+typed schema, input counts and admission decisions are retained with the registration.
+
+The five tables are shared across studies. Frozen observations use a `snapshot_id, row_json`
+envelope plus an authenticated typed schema, so independent studies can use different column
+names and types. Readback checks both the transport and the decoded typed content using the
+existing bounded Parquet row hash. Arrays retain order; maps are canonicalized. Duplicates
+affect the hash. Logical row hashes and physical artifact hashes remain distinct identities.
+String-key maps and ordinary Spark scalar/array/struct types are supported; unsupported types
+fail registration. Delta storage requires a UTC Spark session.
+
+This is a new registration format and frozen-benchmark v4; historical IDs/formats are not
+adapted or rewritten. The table snapshot **and** authenticated Parquet artifacts are retained.
+Execution still reads Parquet; this is not zero-copy or table-native execution. Protect the
+local registration baseline and artifact root with storage permissions. Hashes cannot protect
+against an actor who can rewrite every trusted baseline. File roots must support POSIX atomic
+publication, and scratch paths must be visible to Spark workers; object-store URLs are not
+supported filesystem roots. No process-global temporary directory is changed.
+
+Native Delta transaction IDs make identical writes retryable; different content for the same
+identity is rejected. Definitions and both result-stage rows are published last, so partial
+snapshot/forecast writes are not discoverable as completed studies/results. Multiple tables
+and files are not one transaction. Do not delete/recreate destination tables or expire native
+transaction records while writers are in flight. Sequential retries also compare existing rows.
+
+### Tracking, publication and returned evidence
+
+| Tracking | Publish | Effect |
+|---|---|---|
+| `none` | `False` | Retain local checked workflow evidence only; no MLflow API calls |
+| `mlflow` | `False` | Also export checked evidence to an existing active experiment |
+| `none` | `True` | Also publish tables with durable model paths and null MLflow links |
+| `mlflow` | `True` | Export tracking evidence and publish tables |
+
+Explicit arguments override environment controls, which override registry runtime settings.
+The environment controls are `AUTOFORECAST_TRACKING`, `AUTOFORECAST_PUBLISH` (`true`/`false`),
+`AUTOFORECAST_LOG_LEVEL`, `AUTOFORECAST_TRACKING_URI` and `AUTOFORECAST_MLFLOW_EXPERIMENT`.
+Defaults are `tracking="none"`,
+`publish=False`, `log_level="INFO"`. MLflow requires `tracking_uri=` and
+`mlflow_experiment=` (an existing name or ID), or the corresponding runtime settings.
+It validates the experiment before fitting and refuses an unrelated active run. It never
+creates an experiment. Tracking exports completed evidence through the existing exporter.
+
+`result.study_id`, `parent_study_id`, `run_id`, `validation_metrics`, `testing_metrics`,
+`coverage`, `model_links`, `publication` and `summary()` expose the saved workflow. Full scores,
+metric availability/reasons, per-series contributions and configured horizon results remain
+in `result.validation` / `result.testing` and the sealed directory at `result.path`.
+Unavailable values remain `None`. All returned paths refer to durable evidence.
+The summary distinguishes the retained/excluded cohort from each stage's forecasted series count.
+
+Stage events use standard Python logging and retained JSONL evidence. They include cohort counts,
+exclusion and fill warnings, and the actual copy/scoring outcomes when reusing saved models.
+The sealed completion record establishes successful workflow completion. Reduced console verbosity
+does not remove audit records. Failed publication leaves the completed model workflow intact;
+the exception's `workflow_path` and `audit_path` identify recovery evidence. Load it with
+`load_forecast_workflow(workflow_path)` from `autoforecast.study_workflow`, then retry
+`registry.publish_results(result.study_id, result.path)` using that loaded result. This uses
+the effective ID even when preflight derived a cohort, without fitting or scoring again. When
+tracking was used, recover verified links with `export_forecast_workflow()` and pass them as
+`mlflow_links=`. Dashboard SQL is available from `registry.store.dashboard_sql()`; it joins
+study ID **and** registered SHA, leaving run/stage identity on each result row. Creating a
+dashboard view remains an explicit caller action.
+
 ## Inspect daily WRMSSE reference issues
 
 Use the strict numeric report before registering caller-supplied or calculated references:

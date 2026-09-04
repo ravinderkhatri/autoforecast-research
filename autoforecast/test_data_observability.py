@@ -13,6 +13,7 @@ import tempfile
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pyspark.sql import functions as F
 
 from autoforecast.data_admission import validate_model_compatibility
 from autoforecast.data_observability import (
@@ -509,3 +510,183 @@ def test_preflight_cli_keeps_a_read_failure_out_of_the_data_check_report() -> No
         page = (output / "report.html").read_text(encoding="utf-8")
         assert "Could not read the requested data" in page
         assert "Spark inspection failed" not in page
+
+
+def _source_study_context():
+    from autoforecast.data_admission import DatasetContract
+
+    contract = DatasetContract("synthetic-source", {
+        "series_col": "item", "time_col": "day", "target_col": "units",
+        "frequency": "D", "target_estimand": "observed_nonnegative",
+    }, pathlib.Path("synthetic.yaml"))
+    recipe = {
+        "schema_version": 2, "source_keys": ["item", "store"],
+        "training_start": "2024-01-01", "validation_origins": ["2024-01-05"],
+        "validation_horizon": 2, "final_train_cutoff": "2024-01-07", "final_test_horizon": 2,
+        "history_policy": "fixed", "new_series_policy": "error", "target_unit": "units",
+        "feature_availability": {}, "metric": "rmse", "actual_missing": "mask",
+        "series_starts": {"rule": "declared", "values": [
+            {"keys": {"item": "A", "store": 1}, "start": "2024-01-01"},
+            {"keys": {"item": "B", "store": 2}, "start": "2024-01-04"},
+        ]},
+    }
+    return contract, recipe
+
+
+def test_source_findings_are_factual_and_keep_all_windows_and_original_keys():
+    from autoforecast.data_observability import report_source_issues, summarize_source_issues
+
+    spark = _spark()
+    contract, recipe = _source_study_context()
+    recipe["tuning_windows"] = [
+        {"origin": "2024-01-01", "horizon": 2},
+        {"origin": "2024-01-02", "horizon": 1},
+    ]
+    rows = [
+        ("A", 1, dt.date(2024, 1, 1), -2.0),
+        ("A", 1, dt.date(2024, 1, 1), -2.0),
+        ("A", 1, dt.date(2024, 1, 2), None),
+        ("A", 1, dt.date(2024, 1, 4), float("inf")),
+        ("A", 1, dt.date(2024, 1, 5), float("nan")),
+        ("A", 1, dt.date(2024, 1, 6), 0.0),
+        ("A", 1, dt.date(2024, 1, 10), 3.0),
+        (None, 1, dt.date(2024, 1, 1), 2.0),
+        (" \t", 1, dt.date(2024, 1, 1), 2.0),
+        ("A", 1, None, 2.0),
+    ]
+    frame = spark.createDataFrame(rows, "item string,store int,day date,units double")
+    before = sorted(frame.toJSON().collect())
+    issues = report_source_issues(frame, contract=contract, recipe=recipe).cache()
+    try:
+        records = [row.asDict(recursive=True) for row in issues.collect()]
+        assert {row["issue_code"] for row in records} == {
+            "NULL_ID", "BLANK_ID", "NULL_DATE", "OUTSIDE_DATE_RANGE", "NONFINITE_VALUE",
+            "DUPLICATE_DATE", "MISSING_HISTORY", "MISSING_ACTUAL",
+        }
+        nonfinite = [row for row in records if row["issue_code"] == "NONFINITE_VALUE"]
+        assert {row["observed_value"] for row in nonfinite} == {"Infinity", "NaN"}
+        duplicate, = (row for row in records if row["issue_code"] == "DUPLICATE_DATE")
+        assert (duplicate["observed_value"], duplicate["affected_rows"]) == ("2", 1)
+        assert duplicate["keys"] == {"item": "A", "store": 1}
+        missing = [row for row in records if row["issue_code"].startswith("MISSING_")]
+        assert all(row["status"] == "warning" for row in missing)
+        assert not any(row["keys"]["item"] == "B" and row["time"] < "2024-01-04"
+                       and row["issue_code"] == "MISSING_HISTORY" for row in missing)
+        assert {row["origin"] for row in missing if row["keys"]["item"] == "A"
+                and row["time"] == "2024-01-03" and row["issue_code"] == "MISSING_ACTUAL"} == {
+                    "2024-01-01", "2024-01-02",
+                }
+        assert {row["time"] for row in missing if row["keys"]["item"] == "B"
+                and row["stage"] == "test" and row["issue_code"] == "MISSING_ACTUAL"} == {
+                    "2024-01-08", "2024-01-09",
+                }
+        assert not any(row["time"] == "2024-01-06" and row["keys"]["item"] == "A"
+                       and row["issue_code"] == "MISSING_ACTUAL" for row in records)
+        summaries = summarize_source_issues(issues).collect()
+        assert sum(row.findings for row in summaries) == len(records)
+        assert sum(row.affected_rows for row in summaries) == sum(
+            row["affected_rows"] for row in records)
+        assert sorted(frame.toJSON().collect()) == before
+    finally:
+        issues.unpersist()
+
+
+def test_source_report_empty_schema_and_unequal_inferred_starts():
+    from autoforecast.data_observability import report_source_issues
+
+    spark = _spark()
+    contract, recipe = _source_study_context()
+    rows = [(item, store, dt.date(2024, 1, day), 0.0 if day == 6 else -1.0)
+            for item, store, first in (("A", 1, 1), ("B", 2, 4)) for day in range(first, 10)]
+    frame = spark.createDataFrame(rows, "item string,store int,day date,units double")
+    clean = report_source_issues(frame, contract=contract, recipe=recipe)
+    assert clean.count() == 0
+    recipe.pop("series_starts")
+    inferred = report_source_issues(frame, contract=contract, recipe=recipe)
+    assert inferred.count() == 0
+    assert inferred.schema == clean.schema
+    broken = report_source_issues(frame.filter("day < date'2024-01-09'"),
+                                  contract=contract, recipe=recipe)
+    assert broken.schema == clean.schema
+    missing = broken.collect()
+    assert len(missing) == 2
+    assert {row.keys["item"] for row in missing} == {"A", "B"}
+    assert all(row.issue_code == "MISSING_ACTUAL" and row.time == "2024-01-09" for row in missing)
+
+
+@pytest.mark.parametrize("case", ["missing", "nonnumeric", "cadence", "timezone", "lossy", "integer"])
+def test_source_report_rejects_invalid_schema_or_time_without_changing_input(case):
+    import dataclasses
+
+    from autoforecast.data_observability import DataCheckError, report_source_issues
+
+    spark = _spark()
+    contract, recipe = _source_study_context()
+    frame = spark.createDataFrame([("A", 1, dt.date(2024, 1, 1), 1.0)],
+                                  "item string,store int,day date,units double")
+    if case == "missing":
+        frame = frame.drop("units")
+    elif case == "nonnumeric":
+        frame = frame.withColumn("units", F.col("units").cast("string"))
+    elif case == "cadence":
+        contract = dataclasses.replace(contract, panel_roles={**contract.panel_roles, "frequency": "H"})
+    elif case == "timezone":
+        frame = frame.withColumn("day", F.col("day").cast("timestamp"))
+    elif case == "lossy":
+        frame = frame.withColumn("day", F.col("day").cast("timestamp_ntz") + F.expr("INTERVAL 1 HOUR"))
+    else:
+        frame = frame.withColumn("day", F.lit(1))
+    before = (frame.schema.json(), frame.toJSON().collect())
+    with pytest.raises(DataCheckError):
+        report_source_issues(frame, contract=contract, recipe=recipe)
+    assert (frame.schema.json(), frame.toJSON().collect()) == before
+
+
+@pytest.mark.parametrize("frequency,storage", [("D", "timestamp_ntz"), ("H", "timestamp_ntz"),
+                                                ("MS", "date")])
+def test_source_report_preserves_cadence_and_declared_starts(frequency, storage):
+    import dataclasses
+
+    from autoforecast.data_observability import DataCheckError, report_source_issues
+    from autoforecast.frequency import advance, parse_origin
+
+    spark = _spark()
+    contract, recipe = _source_study_context()
+    contract = dataclasses.replace(contract, panel_roles={**contract.panel_roles,
+                                                         "frequency": frequency})
+    first = parse_origin("2024-01-01T00:00:00" if frequency == "H" else "2024-01-01", frequency)
+    points = [advance(first, frequency, index) for index in range(9)]
+    recipe.update(frequency=frequency, training_start=points[0].isoformat(),
+                  validation_origins=[points[4].isoformat()], final_train_cutoff=points[6].isoformat())
+    recipe["series_starts"]["values"][0]["start"] = points[0].isoformat()
+    recipe["series_starts"]["values"][1]["start"] = points[3].isoformat()
+    rows = [(item, store, point, 1.0) for item, store, start in (("A", 1, 0), ("B", 2, 3))
+            for point in points[start:]]
+    source_type = "timestamp_ntz" if frequency == "H" else "date"
+    frame = spark.createDataFrame(rows, f"item string,store int,day {source_type},units double")
+    frame = frame.withColumn("day", F.col("day").cast(storage))
+    assert report_source_issues(frame, contract=contract, recipe=recipe).count() == 0
+    shortened = frame.filter(~((F.col("item") == "B") & (F.col("day") == F.lit(points[-1]))))
+    missing = report_source_issues(shortened, contract=contract, recipe=recipe).collect()
+    assert len(missing) == 1 and missing[0].issue_code == "MISSING_ACTUAL"
+    assert missing[0].keys["item"] == "B"
+    if frequency == "MS":
+        with pytest.raises(DataCheckError, match="off-grid"):
+            report_source_issues(frame.withColumn("day", F.date_add("day", 1)),
+                                 contract=contract, recipe=recipe)
+
+
+def test_source_report_accepts_boolean_past_covariates():
+    import dataclasses
+
+    from autoforecast.data_observability import report_source_issues
+
+    spark = _spark()
+    contract, recipe = _source_study_context()
+    contract = dataclasses.replace(contract, panel_roles={**contract.panel_roles,
+                                                         "past_only": ("flag",)})
+    frame = spark.createDataFrame([
+        (item, store, dt.date(2024, 1, day), 1.0, day % 2 == 0)
+        for item, store, first in (("A", 1, 1), ("B", 2, 4)) for day in range(first, 10)
+    ], "item string,store int,day date,units double,flag boolean")
+    assert report_source_issues(frame, contract=contract, recipe=recipe).count() == 0

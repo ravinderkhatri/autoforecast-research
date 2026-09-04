@@ -138,15 +138,23 @@ def test_original_missing_flags_are_validated_before_scoring(tmp_path, spark, ca
     panel = Panel(str(source), "id", "date", "y", target_estimand="observed_nonnegative")
     forecast = Forecast("test", str(prediction), "2024-01-01", 1, 1, {"emitted": 1},
                         target_estimand="observed_nonnegative")
-    message = "study scoring never fills missing actuals" if case == "sparse_zero" else None
-    with pytest.raises(ScoreError, match=message):
-        score_forecast(
-            panel, forecast, spark,
-            missing_actual="sparse_zero" if case == "sparse_zero" else "no_data",
-            original_missing_column=flag,
-            eligible_grid=None if case == "no_grid" else str(grid),
-            series_scores_path=None if case == "no_output" else str(tmp_path / "scores"),
-        )
+    options = dict(
+        missing_actual="sparse_zero" if case == "sparse_zero" else "no_data",
+        original_missing_column=flag,
+        eligible_grid=None if case == "no_grid" else str(grid),
+        series_scores_path=None if case == "no_output" else str(tmp_path / "scores"),
+    )
+    if case == "sparse_zero":
+        # Frozen benchmark v4 deliberately admits explicit zero preparation while
+        # retaining the factual original-missing marker and filled denominator.
+        result = score_forecast(panel, forecast, spark, **options)
+        assert result.n_scored == result.n_zero_filled == 1
+        assert result.mae == 2.0
+        assert spark.read.parquet(str(tmp_path / "scores")).first().originally_missing == 1
+    else:
+        with pytest.raises(ScoreError):
+            score_forecast(panel, forecast, spark, **options)
+
 
 
 @pytest.mark.parametrize("case", ["model", "score", "missing_metric", "metric", "ranking", "contract", "multiple"])

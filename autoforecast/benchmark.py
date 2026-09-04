@@ -28,7 +28,7 @@ from autoforecast.frequency import (
 )
 from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
-STUDY_SCHEMA = "autoforecast.frozen-benchmark.v3"
+STUDY_SCHEMA = "autoforecast.frozen-benchmark.v4"
 MISSING_COLUMN = "__af_original_missing"
 START_COLUMN = "__af_history_start"
 
@@ -141,17 +141,44 @@ def _merge_hash_runs(paths: list[pathlib.Path], destination: pathlib.Path) -> No
         output.writelines(heapq.merge(*[iter(partial(source.read, 32), b"") for source in inputs]))
 
 
-def _parquet_hash(path: pathlib.Path) -> str:
-    """Hash typed rows with bounded sort buffers, preserving the original v1 identity.
+def _canonical_row_value(value, dtype):
+    """Normalize typed maps recursively; arrays retain order and nulls stay null."""
+    import pyarrow as pa
+
+    if value is None:
+        return None
+    if pa.types.is_map(dtype):
+        entries = value.items() if isinstance(value, dict) else value
+        normalized = [(_canonical_row_value(key, dtype.key_type),
+                       _canonical_row_value(item, dtype.item_type)) for key, item in entries]
+        encoded_keys = [json.dumps(key, sort_keys=True, default=str) for key, _ in normalized]
+        if any(key is None for key, _ in normalized) or len(set(encoded_keys)) != len(encoded_keys):
+            raise BenchmarkError("logical row hashing requires non-null, unique map keys")
+        return sorted(normalized, key=lambda pair: json.dumps(
+            pair, sort_keys=True, separators=(",", ":"), default=str,
+        ))
+    if pa.types.is_struct(dtype):
+        return {field.name: _canonical_row_value(value[field.name], field.type) for field in dtype}
+    if (pa.types.is_list(dtype) or pa.types.is_large_list(dtype)
+            or pa.types.is_fixed_size_list(dtype)):
+        return [_canonical_row_value(item, dtype.value_type) for item in value]
+    return value
+
+
+def parquet_content_hash(path: pathlib.Path) -> str:
+    """Hash typed rows with bounded sort buffers and order-independent map entries.
 
     Each run holds at most 65,536 32-byte digests; merge passes open at most 64 runs.
     Arrow batches hold at most 8,192 rows. Temporary runs are removed on success or failure.
     """
+    import pyarrow as pa
     import pyarrow.dataset as ds
 
-    dataset = ds.dataset(path, format="parquet", exclude_invalid_files=True)
+    dataset = ds.dataset(path, format="parquet", exclude_invalid_files=False)
     columns = sorted(dataset.schema.names)
     schema = [(name, str(dataset.schema.field(name).type)) for name in columns]
+    nested = {name: dataset.schema.field(name).type for name in columns
+              if pa.types.is_nested(dataset.schema.field(name).type)}
     hashed = hashlib.sha256(json.dumps(schema).encode())
     with tempfile.TemporaryDirectory(prefix="autoforecast-row-hashes-") as temporary:
         root = pathlib.Path(temporary)
@@ -162,6 +189,8 @@ def _parquet_hash(path: pathlib.Path) -> str:
             batch_readahead=1, fragment_readahead=1, use_threads=False,
         ).to_batches():
             for row in batch.to_pylist():
+                for name, dtype in nested.items():
+                    row[name] = _canonical_row_value(row[name], dtype)
                 payload = json.dumps(
                     row, sort_keys=True, separators=(",", ":"), default=str,
                 ).encode()
@@ -308,7 +337,7 @@ def resolve_study(output_root: pathlib.Path, study_id: str) -> tuple[pathlib.Pat
     path, record = verify_benchmark(output_root / study_id / "benchmark.json")
     if (record["schema"] != STUDY_SCHEMA or record.get("study_id") != study_id
             or record["benchmark_id"] != study_id):
-        raise BenchmarkError("study_id must resolve to the matching version-3 study")
+        raise BenchmarkError("study_id must resolve to the matching current-format study")
     return path, record
 
 
@@ -352,11 +381,11 @@ def validate_recipe(recipe: dict) -> None:
             raise BenchmarkError("resolved tuning schedule differs from frozen windows")
     if "reference_metrics" in recipe and recipe["reference_metrics"] != ["wrmsse"]:
         raise BenchmarkError("reference_metrics currently supports only [wrmsse]")
-    if recipe.get("history_missing", "preserve") != "preserve":
-        raise BenchmarkError("history_missing must be preserve; correct source data before import")
-    if recipe.get("actual_missing", "error") not in ("error", "mask"):
+    if recipe.get("history_missing", "preserve") not in ("preserve", "zero"):
+        raise BenchmarkError("history_missing must be preserve or zero")
+    if recipe.get("actual_missing", "error") not in ("error", "mask", "zero"):
         raise BenchmarkError(
-            "actual_missing must be error or mask; scoring never fills missing targets"
+            "actual_missing must be error, mask or explicit zero preparation"
         )
     if recipe["metric"] not in ("rmse", "mae", "wape", "wrmsse"):
         raise BenchmarkError("study metric must be rmse, mae, wape, or single-level wrmsse")
@@ -477,6 +506,34 @@ def _actuals_role(stage: str) -> str:
         raise BenchmarkError("unknown study evaluation stage") from error
 
 
+def validate_study_panel(panel, recipe: dict) -> None:
+    """Check panel and recipe metadata before source access or storage writes."""
+    panel.validate_metadata()
+    if (
+        parse_frequency(panel.frequency).code != _recipe_cadence(recipe).code
+        or panel.target_estimand not in ("sales_given_availability", "observed_nonnegative")
+        or panel.negative_target_policy != "refuse"
+        or panel.status_prob_cols
+        or panel.plan
+    ):
+        raise BenchmarkError(
+            "recipe frequency must match a supported nonnegative observed-target panel"
+        )
+    availability = recipe["feature_availability"]
+    try:
+        validate_column_names(list(dict.fromkeys([
+            *recipe["source_keys"], panel.time_col, panel.target_col, *panel.known_future,
+            *panel.static, *panel.static_reals, *panel.past_only,
+            *availability.values(), *([panel.exposure_col] if panel.exposure_col else []),
+        ])))
+    except ValueError as error:
+        raise BenchmarkError(str(error)) from error
+    if not isinstance(availability, dict) or set(availability) != set(panel.known_future):
+        raise BenchmarkError("every known_future feature needs an availability-evidence column")
+    if panel.known_future and not panel.exposure_col:
+        raise BenchmarkError("future features require exposure_col for existing target masking")
+
+
 def freeze_benchmark(
     *,
     contract_path: pathlib.Path,
@@ -486,6 +543,7 @@ def freeze_benchmark(
     spark,
     study_id: str | None = None,
     scoring_references: pathlib.Path | None = None,
+    scratch_root: str | pathlib.Path | None = None,
 ) -> pathlib.Path:
     """Freeze one study from authenticated, operation-owned input snapshots."""
     with ExitStack() as inputs:
@@ -493,7 +551,7 @@ def freeze_benchmark(
             return _freeze_benchmark(
                 contract_path=contract_path, sources=sources, recipe=recipe,
                 output_root=output_root, spark=spark, study_id=study_id,
-                scoring_references=scoring_references, inputs=inputs,
+                scoring_references=scoring_references, inputs=inputs, scratch_root=scratch_root,
             )
         except LineageError as error:
             raise BenchmarkError(str(error)) from error
@@ -509,6 +567,7 @@ def _freeze_benchmark(
     inputs: ExitStack,
     study_id: str | None = None,
     scoring_references: pathlib.Path | None = None,
+    scratch_root: str | pathlib.Path | None = None,
 ) -> pathlib.Path:
     """Validate source scope, normalize keys, and publish immutable role snapshots and grids.
 
@@ -553,29 +612,8 @@ def _freeze_benchmark(
     contract_bytes = contract_path.read_bytes()
     contract = _load_dataset_contract_bytes(contract_bytes, contract_path)
     panel = contract.panel(sources["selection"])
-    if (
-        parse_frequency(panel.frequency).code != cadence.code
-        or panel.target_estimand not in ("sales_given_availability", "observed_nonnegative")
-        or panel.negative_target_policy != "refuse"
-        or panel.status_prob_cols
-        or panel.plan
-    ):
-        raise BenchmarkError(
-            "recipe frequency must match a supported nonnegative observed-target panel"
-        )
+    validate_study_panel(panel, recipe)
     availability = recipe["feature_availability"]
-    try:
-        validate_column_names(list(dict.fromkeys([
-            *keys, panel.time_col, panel.target_col, *panel.known_future,
-            *panel.static, *panel.static_reals, *panel.past_only,
-            *availability.values(), *([panel.exposure_col] if panel.exposure_col else []),
-        ])))
-    except ValueError as error:
-        raise BenchmarkError(str(error)) from error
-    if not isinstance(availability, dict) or set(availability) != set(panel.known_future):
-        raise BenchmarkError("every known_future feature needs an availability-evidence column")
-    if panel.known_future and not panel.exposure_col:
-        raise BenchmarkError("future features require exposure_col for existing target masking")
     for path in sources.values():
         contract.panel(path).validate()
     all_sources = dict(sources)
@@ -584,7 +622,7 @@ def _freeze_benchmark(
     before = {name: directory_digest(path, suffixes=(".parquet",))
               for name, path in all_sources.items()}
     snapshot_root = pathlib.Path(inputs.enter_context(tempfile.TemporaryDirectory(
-        prefix="autoforecast-freeze-",
+        prefix="autoforecast-freeze-", dir=scratch_root,
     )))
     read_paths = {}
     physical_inputs = {}
@@ -859,7 +897,8 @@ def _freeze_benchmark(
                 F.sum(F.col(MISSING_COLUMN).cast("long")).alias("originally_missing"),
             ).withColumnRenamed(internal, "series_id")
             per_series = per_series.withColumn(
-                "zero_filled", F.lit(0).cast("long"),
+                "zero_filled", F.col("originally_missing")
+                if recipe["actual_missing"] == "zero" else F.lit(0).cast("long"),
             ).withColumn(
                 "excluded", F.col("originally_missing")
                 if recipe["actual_missing"] == "mask" else F.lit(0).cast("long"),
@@ -880,7 +919,7 @@ def _freeze_benchmark(
             coverage_path = "coverage/" + key
             per_series.write.parquet(str(scratch / coverage_path))
             coverage_identities[key] = {
-                "content_sha256": _parquet_hash(scratch / coverage_path),
+                "content_sha256": parquet_content_hash(scratch / coverage_path),
                 "counts": {name: int(totals[name]) for name in names},
             }
             coverage[key] = {
@@ -888,7 +927,7 @@ def _freeze_benchmark(
                 "sha256": directory_digest(scratch / coverage_path, suffixes=(".parquet",)),
             }
         authenticate_sources()
-        logical_snapshots = {name: _parquet_hash(scratch / name) for name in artifact_roles}
+        logical_snapshots = {name: parquet_content_hash(scratch / name) for name in artifact_roles}
         role_paths = {name: name for name in artifact_roles}
         # Logical roles remain distinct even when their exact typed rows share storage.
         written = {}
@@ -904,7 +943,7 @@ def _freeze_benchmark(
             dataset_sha256=hashlib.sha256((scratch / "dataset.yaml").read_bytes()).hexdigest(),
             grid_identities={
                 key: {
-                    "content_sha256": _parquet_hash(scratch / item["path"]),
+                    "content_sha256": parquet_content_hash(scratch / item["path"]),
                     "logical_sha256": item["logical_sha256"],
                     "n_cells": item["n_cells"],
                 }
@@ -929,7 +968,8 @@ def _freeze_benchmark(
             "coverage": coverage,
             "counts": counts,
             "policies": {
-                "history_missing": "preserve", "actual_missing": recipe["actual_missing"],
+                "history_missing": recipe["history_missing"],
+                "actual_missing": recipe["actual_missing"],
                 "missing_definition": "absent_row_or_null_target",
                 "confirmed_zero": "observed", "missing_indicator": MISSING_COLUMN,
             },
@@ -951,16 +991,11 @@ def _freeze_benchmark(
     return destination / "benchmark.json"
 
 
-def _prepare_scoring_references(path, key_map, keys, recipe, spark):
-    """Bind caller-supplied weights and scales to each complete frozen boundary.
-
-    The nested keys field keeps arbitrary source key names separate from metric fields.
-    Deriving business weights or scales is deliberately outside preparation.
-    """
+def _normalise_reference_frame(raw, key_map, keys):
+    """Validate source-key types and build the existing canonical reference identities."""
     from pyspark.sql import functions as F
     from pyspark.sql.types import NumericType, StringType, StructType
 
-    raw = spark.read.parquet(str(path))
     if set(raw.columns) != {"keys", "stage", "origin", "weight", "scale"}:
         raise BenchmarkError("scoring references require keys, stage, origin, weight, and scale")
     key_type = raw.schema["keys"].dataType
@@ -981,13 +1016,13 @@ def _prepare_scoring_references(path, key_map, keys, recipe, spark):
         "stage", "origin", F.col("weight").cast("double").alias("weight"),
         F.col("scale").cast("double").alias("scale"),
     )
-    invalid_weight = (F.col("weight").isNull() | F.isnan("weight")
-                      | (F.abs(F.col("weight")) == float("inf")) | (F.col("weight") < 0))
-    invalid_scale = (F.col("scale").isNotNull()
-                     & (F.isnan("scale") | (F.abs(F.col("scale")) == float("inf"))
-                        | (F.col("scale") < 0)))
-    if frame.filter(invalid_weight | invalid_scale).limit(1).count():
-        raise BenchmarkError("scoring references contain invalid weights or scales")
+    return frame
+
+
+def _reference_boundaries(frame, key_map, recipe, spark):
+    """Require the exact cohort at every boundary before any numeric exclusion."""
+    from pyspark.sql import functions as F
+
     cadence = _recipe_cadence(recipe)
     boundaries = study_windows(recipe)
     declared = spark.createDataFrame([
@@ -1002,6 +1037,22 @@ def _prepare_scoring_references(path, key_map, keys, recipe, spark):
         raise BenchmarkError(
             "scoring references must cover every retained series and boundary once"
         )
+    return declared
+
+
+def _prepare_scoring_references(path, key_map, keys, recipe, spark):
+    """Bind validated numeric references to complete frozen boundaries."""
+    from pyspark.sql import functions as F
+
+    frame = _normalise_reference_frame(spark.read.parquet(str(path)), key_map, keys)
+    invalid_weight = (F.col("weight").isNull() | F.isnan("weight")
+                      | (F.abs(F.col("weight")) == float("inf")) | (F.col("weight") < 0))
+    invalid_scale = (F.col("scale").isNotNull()
+                     & (F.isnan("scale") | (F.abs(F.col("scale")) == float("inf"))
+                        | (F.col("scale") < 0)))
+    if frame.filter(invalid_weight | invalid_scale).limit(1).count():
+        raise BenchmarkError("scoring references contain invalid weights or scales")
+    declared = _reference_boundaries(frame, key_map, recipe, spark)
     totals = frame.groupBy("stage", "origin").agg(F.sum("weight").alias("total"))
     if totals.filter(
         F.col("total").isNull() | (F.col("total") <= 0)
@@ -1152,7 +1203,7 @@ def _validate_manifest(record: object) -> dict:
             raise BenchmarkError("benchmark source path must be a nonblank string")
         sha256(value["sha256"], f"sources.{role}.sha256")
     policies = {
-        "history_missing": "preserve", "actual_missing": recipe["actual_missing"],
+        "history_missing": recipe["history_missing"], "actual_missing": recipe["actual_missing"],
         "missing_definition": "absent_row_or_null_target",
         "confirmed_zero": "observed", "missing_indicator": MISSING_COLUMN,
     }
@@ -1223,7 +1274,7 @@ def _validate_manifest(record: object) -> dict:
         missing = totals["originally_missing"]
         if (totals["expected"] != window_series_count(record, key) * horizon
                 or missing > totals["expected"]
-                or totals["zero_filled"] != 0
+                or totals["zero_filled"] != (missing if recipe["actual_missing"] == "zero" else 0)
                 or (recipe["actual_missing"] == "error" and missing != 0)
                 or totals["excluded"] != (missing if recipe["actual_missing"] == "mask" else 0)
                 or totals["scored"] != totals["expected"] - totals["excluded"]):
@@ -1277,7 +1328,7 @@ def verify_benchmark(
             physical = directory_digest(target, suffixes=(".parquet",))
             if physical != expected:
                 raise BenchmarkError(f"benchmark artifact changed: {name}")
-            checked[target] = physical, _parquet_hash(target)
+            checked[target] = physical, parquet_content_hash(target)
         if checked[target] != (expected, record["logical_snapshots"][name]):
             raise BenchmarkError(f"benchmark artifact changed: {name}")
     for key, item in record["grids"].items():
@@ -1285,7 +1336,7 @@ def verify_benchmark(
         if (
             not target.resolve().is_relative_to(path.parent.resolve())
             or directory_digest(target, suffixes=(".parquet",)) != item["sha256"]
-            or _parquet_hash(target) != record["grid_identities"][key]["content_sha256"]
+            or parquet_content_hash(target) != record["grid_identities"][key]["content_sha256"]
             or item["logical_sha256"] != record["grid_identities"][key]["logical_sha256"]
             or item["n_cells"] != record["grid_identities"][key]["n_cells"]
         ):
@@ -1294,7 +1345,8 @@ def verify_benchmark(
         target = path.parent / item["path"]
         if (not target.resolve().is_relative_to(path.parent.resolve())
                 or directory_digest(target, suffixes=(".parquet",)) != item["sha256"]
-                or _parquet_hash(target) != record["coverage_identities"][key]["content_sha256"]):
+                or parquet_content_hash(target)
+                != record["coverage_identities"][key]["content_sha256"]):
             raise BenchmarkError("study scoring coverage changed")
     if (
         hashlib.sha256((path.parent / "dataset.yaml").read_bytes()).hexdigest()
