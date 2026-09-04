@@ -3,21 +3,21 @@
   <desc id="description">Bring hourly, daily, weekly, monthly or yearly CSV or Parquet data with configurable columns and series keys. Validate and freeze the dataset. Compare models on validation periods, refit the selected model, and score a separate test period. Inspect forecasts, metrics, plots and run evidence. M5 and additional model runtimes are optional.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
-      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#91a4ba" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
     </marker>
     <style>
-      text { font-family: Arial, Helvetica, sans-serif; fill: #172b4d; }
+      text { font-family: Arial, Helvetica, sans-serif; fill: #e6edf3; }
       .heading { font-size: 24px; font-weight: 700; }
-      .body { font-size: 18px; fill: #334155; }
+      .body { font-size: 18px; fill: #c8d5e3; }
       .step { font-size: 16px; font-weight: 700; fill: #ffffff; text-anchor: middle; }
-      .edge { fill: none; stroke: #64748b; stroke-width: 2.5; marker-end: url(#arrow); }
-      .edge-label { font-size: 15px; fill: #526174; text-anchor: middle; }
+      .edge { fill: none; stroke: #91a4ba; stroke-width: 2.5; marker-end: url(#arrow); }
+      .edge-label { font-size: 15px; fill: #a7b6c8; text-anchor: middle; }
       .icon { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
     </style>
   </defs>
-  <rect width="1280" height="816" rx="24" fill="#ffffff"/>
+  <rect width="1280" height="816" rx="24" fill="#0d1117"/>
   <text x="48" y="65" font-size="38" font-weight="700">AutoForecast</text>
-  <text x="48" y="101" font-size="21" fill="#526174">Your time series. Comparable models. A separate final test.</text>
+  <text x="48" y="101" font-size="21" fill="#a7b6c8">Your time series. Comparable models. A separate final test.</text>
 
   <path class="edge" d="M 396 264 H 458"/>
   <text class="edge-label" x="431" y="244">map</text>
@@ -31,11 +31,11 @@
   <text class="edge-label" x="431" y="524">inspect</text>
 
   <g>
-    <rect x="48" y="164" width="348" height="200" rx="16" fill="#fff8e8" stroke="#dcaa36" stroke-width="1.5"/>
+    <rect x="48" y="164" width="348" height="200" rx="16" fill="#302719" stroke="#dba94d" stroke-width="1.5"/>
     <circle cx="82" cy="200" r="16" fill="#996b10"/>
     <text class="step" x="82" y="206">1</text>
     <text class="heading" x="109" y="208">Bring your data</text>
-    <g class="icon" stroke="#996b10" transform="translate(345 186)">
+    <g class="icon" stroke="#f4c16d" transform="translate(345 186)">
       <path d="M 0 0 H 17 L 25 8 V 28 H 0 Z M 17 0 V 8 H 25 M 6 15 H 19 M 6 21 H 19"/>
     </g>
     <text class="body" x="72" y="252">CSV or typed Parquet</text>
@@ -44,11 +44,11 @@
   </g>
 
   <g>
-    <rect x="466" y="164" width="348" height="200" rx="16" fill="#eaf3fd" stroke="#5792ce" stroke-width="1.5"/>
+    <rect x="466" y="164" width="348" height="200" rx="16" fill="#192b45" stroke="#6aa5df" stroke-width="1.5"/>
     <circle cx="500" cy="200" r="16" fill="#2563a6"/>
     <text class="step" x="500" y="206">2</text>
     <text class="heading" x="527" y="208">Validate + freeze</text>
-    <g class="icon" stroke="#2563a6" transform="translate(765 186)">
+    <g class="icon" stroke="#79b8ff" transform="translate(765 186)">
       <path d="M 12 0 L 25 5 V 15 Q 25 24 12 30 Q 0 24 0 15 V 5 Z M 6 14 L 11 19 L 20 10"/>
     </g>
     <text class="body" x="490" y="252">Check the declared frequency</text>
@@ -57,11 +57,11 @@
   </g>
 
   <g>
-    <rect x="884" y="164" width="348" height="200" rx="16" fill="#f2edfa" stroke="#a184bf" stroke-width="1.5"/>
+    <rect x="884" y="164" width="348" height="200" rx="16" fill="#2a223b" stroke="#af91d0" stroke-width="1.5"/>
     <circle cx="918" cy="200" r="16" fill="#78549d"/>
     <text class="step" x="918" y="206">3</text>
     <text class="heading" x="945" y="208">Compare models</text>
-    <g class="icon" stroke="#78549d" transform="translate(1182 186)">
+    <g class="icon" stroke="#c4a5eb" transform="translate(1182 186)">
       <path d="M 0 28 H 28 M 3 28 V 16 H 9 V 28 M 13 28 V 6 H 19 V 28 M 23 28 V 0 H 29 V 28"/>
     </g>
     <text class="body" x="908" y="252">Seasonal-naive · last-value</text>
@@ -70,11 +70,11 @@
   </g>
 
   <g>
-    <rect x="884" y="444" width="348" height="200" rx="16" fill="#eaf3fd" stroke="#5792ce" stroke-width="1.5"/>
+    <rect x="884" y="444" width="348" height="200" rx="16" fill="#192b45" stroke="#6aa5df" stroke-width="1.5"/>
     <circle cx="918" cy="480" r="16" fill="#2563a6"/>
     <text class="step" x="918" y="486">4</text>
     <text class="heading" x="945" y="488">Refit + forecast</text>
-    <g class="icon" stroke="#2563a6" transform="translate(1182 468)">
+    <g class="icon" stroke="#79b8ff" transform="translate(1182 468)">
       <path d="M 0 28 V 0 M 0 28 H 30 M 4 23 L 10 17 L 16 20 L 22 10"/>
       <path d="M 22 10 L 29 3" stroke-dasharray="3 3"/>
     </g>
@@ -84,11 +84,11 @@
   </g>
 
   <g>
-    <rect x="466" y="444" width="348" height="200" rx="16" fill="#eaf6ef" stroke="#75aa88" stroke-width="1.5"/>
+    <rect x="466" y="444" width="348" height="200" rx="16" fill="#1b3027" stroke="#79ba95" stroke-width="1.5"/>
     <circle cx="500" cy="480" r="16" fill="#34734c"/>
     <text class="step" x="500" y="486">5</text>
     <text class="heading" x="527" y="488">Score the final test</text>
-    <g class="icon" stroke="#34734c" transform="translate(765 468)">
+    <g class="icon" stroke="#8bd5a7" transform="translate(765 468)">
       <circle cx="13" cy="14" r="13"/>
       <path d="M 6 14 L 11 19 L 21 9"/>
     </g>
@@ -98,11 +98,11 @@
   </g>
 
   <g>
-    <rect x="48" y="444" width="348" height="200" rx="16" fill="#edf6f7" stroke="#75a8ae" stroke-width="1.5"/>
+    <rect x="48" y="444" width="348" height="200" rx="16" fill="#183035" stroke="#6eb8c0" stroke-width="1.5"/>
     <circle cx="82" cy="480" r="16" fill="#367780"/>
     <text class="step" x="82" y="486">6</text>
     <text class="heading" x="109" y="488">Inspect + reuse</text>
-    <g class="icon" stroke="#367780" transform="translate(343 467)">
+    <g class="icon" stroke="#6edbc6" transform="translate(343 467)">
       <path d="M 0 0 H 29 V 28 H 0 Z M 0 8 H 29 M 9 8 V 28 M 9 18 H 29"/>
     </g>
     <text class="body" x="72" y="532">Forecasts, metrics and plots</text>
@@ -110,8 +110,8 @@
     <text class="body" x="72" y="596">Retained logs and run evidence</text>
   </g>
 
-  <rect x="48" y="683" width="1184" height="74" rx="12" fill="#f4f6f9" stroke="#d4dde7" stroke-width="1"/>
+  <rect x="48" y="683" width="1184" height="74" rx="12" fill="#161f2c" stroke="#43546b" stroke-width="1"/>
   <text x="70" y="712" font-size="16" font-weight="700" letter-spacing="1">REPRODUCIBLE BY DESIGN</text>
-  <text x="70" y="739" font-size="18" fill="#526174">Data, configuration and code identities · retained run evidence · resume and tamper checks</text>
-  <text x="48" y="790" font-size="16" fill="#526174">Hourly · daily (default) · weekly · monthly · yearly. Finite, nonnegative observations. Optional model support varies.</text>
+  <text x="70" y="739" font-size="18" fill="#a7b6c8">Data, configuration and code identities · retained run evidence · resume and tamper checks</text>
+  <text x="48" y="790" font-size="16" fill="#a7b6c8">Hourly · daily (default) · weekly · monthly · yearly. Finite, nonnegative observations. Optional model support varies.</text>
 </svg>
