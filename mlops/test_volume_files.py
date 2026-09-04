@@ -3,12 +3,13 @@
 import hashlib
 import io
 import json
+import logging
 import pathlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from autoforecast import _execution as events
@@ -2019,6 +2020,96 @@ def test_upload_failure_found_at_close_marks_the_run_unverified(volume, monkeypa
     assert writer.result == "UNVERIFIED" and writer.audit_error
     assert f"Audit write failed: {writer.audit_error}" in writer.render()
     assert not any(p.endswith("closed.json") for p in client.values)
+
+
+def _fail_upload(monkeypatch, stage, status):
+    """Fail every upload of one event, which is saved in the background; others save."""
+    publish = _volume_files.publish_audit_segment
+
+    def unavailable(path, payload, **kwargs):
+        event = json.loads(payload)
+        if (event["stage"], event["status"]) == (stage, status):
+            raise OSError(f"{stage} event unavailable")
+        return publish(path, payload, **kwargs)
+
+    monkeypatch.setattr(_volume_files, "publish_audit_segment", unavailable)
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.ERROR])
+@pytest.mark.parametrize("options", [
+    {"display": "logs"}, {"display": "progress"}, {"display": "both"}, {"progress": "off"},
+])
+def test_upload_failure_found_at_close_is_shown_for_every_display(volume, monkeypatch,
+                                                                  options, level):
+    root, _ = volume
+    logger = logging.getLogger("autoforecast.stages")
+    monkeypatch.setattr(logger, "handlers", [])  # configure_logging adds to this list
+    monkeypatch.setattr(logger, "level", logger.level)
+    monkeypatch.setattr(logger, "propagate", logger.propagate)
+    monkeypatch.setattr(events, "_DISPLAY", None)
+    stream = io.StringIO()
+    events.configure_logging(stream=stream, **options)
+    _fail_upload(monkeypatch, "work", "PASS")
+    with pytest.raises(OSError, match="unacknowledged"):
+        with events.Execution(root / "events.jsonl", ["work"], level=level):
+            events._stage_event(root / "events.jsonl", "work", "START")
+            events._stage_event(root / "events.jsonl", "work", "PASS")
+    assert "UNVERIFIED" in stream.getvalue()
+
+
+def test_completed_run_keeps_its_recovery_fields_when_the_last_upload_fails(volume,
+                                                                            monkeypatch):
+    import contextlib
+    import dataclasses
+
+    from autoforecast import study_workflow
+
+    root, client = volume
+    workflow = root / "completed-workflow"
+    workflow.mkdir()
+    (workflow / "artifact_manifest.json").write_text("{}")
+    (root / "model.json").write_text("{}")
+
+    @dataclasses.dataclass
+    class Result:
+        path: Path
+        study_id: str = "registered"
+        run_id: str = "completed"
+        status: str = "completed"
+
+    @contextlib.contextmanager
+    def load_study(_):
+        yield SimpleNamespace(registration={"sha256": "a" * 64})
+
+    registry = SimpleNamespace(root=root, runtime={}, store=None, load_study=load_study,
+                               _registration_path=lambda _: None)
+    monkeypatch.setattr(study_workflow, "run_forecast_workflow", lambda *a, **k: Result(workflow))
+    _fail_upload(monkeypatch, "run", "PASS")
+    with pytest.raises(OSError, match="run event unavailable") as caught:
+        study_workflow.run_study("registered", cast(Any, lambda _: None), registry=registry,
+                                 model_config=root / "model.json", implementation={})
+    recovery = vars(caught.value)
+    assert (recovery["workflow_path"], recovery["study_id"], recovery["registered_study_id"]) == (
+        workflow, "registered", "registered")
+    assert recovery["audit_path"] is not None
+    assert not any(p.endswith("closed.json") for p in client.values)
+
+
+def test_completed_registration_keeps_its_evidence_note_when_the_last_upload_fails(
+        volume, monkeypatch):
+    from autoforecast import study_registration as registration
+    from autoforecast.test_execution_boundaries import _Registry
+    from autoforecast.test_study_registration import configuration
+
+    root, _ = volume
+    registry = _Registry(root=root / "registry", scratch_root=root / "scratch", runtime={},
+                         store=None)
+    monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "a" * 64)
+    _fail_upload(monkeypatch, "Study registered", "INFO")
+    with pytest.raises(OSError, match="Study registered event unavailable") as caught:
+        registration.register_study(configuration(root / "input"), registry=cast(Any, registry))
+    assert any(note.startswith("Registration attempt evidence: ")
+               for note in getattr(caught.value, "__notes__", []))
 
 
 def test_download_progress_advances_while_a_large_file_is_still_arriving(volume, monkeypatch):

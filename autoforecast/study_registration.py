@@ -2114,6 +2114,8 @@ def register_study(
                 )
                 record_result(study_id=study_id, evidence=str(issues_root))
                 note("Study registered", study_id=study_id, evidence=str(issues_root))
+                # Save the events still uploading, so a failure keeps the evidence note.
+                execution.flush_audit(audit)
                 return study_id
             except BaseException as error:
                 status = "FAIL" if isinstance(error, Exception) else "CANCELLED"

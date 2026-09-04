@@ -396,7 +396,7 @@ def run_study(
             study_action="create" if create else "reuse",
             publish_results=settings["publish"],
             **({"model_label": model_label} if model_label is not None else {}),
-        ):
+        ) as execution:
             result = None
             try:
                 with _stage(audit, "configuration", study_id=study_id) as outcome:
@@ -648,6 +648,8 @@ def run_study(
                     run_id=result.run_id,
                     evaluation_status=result.status,
                 )
+                # Save the events still uploading, so a failure keeps the recovery fields.
+                execution.flush_audit(audit)
                 return dataclasses.replace(
                     result,
                     publication={**publication, "audit_path": str(audit)},

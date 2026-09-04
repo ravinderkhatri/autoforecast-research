@@ -636,6 +636,11 @@ class Execution:
                     if self.result not in {"FAIL", "CANCELLED"}:
                         self.result = "UNVERIFIED"
                     self.audit_error = type(failure).__name__
+                    # The panel may be hidden, so report it as an event line as well.
+                    with suppress(BaseException):
+                        _emit(_safe({**self.identity, "stage": "Execution audit",
+                                     "status": "UNVERIFIED",
+                                     "audit_error": self.audit_error}), self.level)
                     self.refresh(force=True, final=True)
                     raise OSError("execution audit has an unacknowledged event") from failure
             state = self.audit_segments.get(self.audit)
