@@ -1065,7 +1065,8 @@ class StudyRegistry:
                     storage[key] = (str(pathlib.Path(value).expanduser().absolute())
                                     if key != "namespace" else value)
         _validate_storage(storage)
-        settings = dict(storage)
+        # Registration reads input_identity from the study config; the registry does not take it.
+        settings = {key: setting for key, setting in storage.items() if key != "input_identity"}
         for key in ("root", "scratch_root"):
             if key in settings:
                 settings[key] = base / settings[key]

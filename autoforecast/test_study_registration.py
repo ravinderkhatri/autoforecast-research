@@ -662,6 +662,21 @@ def test_input_identity_setting_is_checked_before_source_access(tmp_path, identi
     assert validate_study_config(path).input_storage["input_identity"] == "rows"
 
 
+@pytest.mark.parametrize("identity", ["rows", "source_version"])
+def test_registry_reads_a_config_that_sets_input_identity(spark, tmp_path, identity):
+    """A study config that sets input_identity also builds its registry; a wrong value is refused."""
+    path = configuration(tmp_path)
+    value = yaml.safe_load(path.read_text())
+    value["storage"]["input_identity"] = identity
+    path.write_text(yaml.safe_dump(value))
+    registry = StudyRegistry.from_config(path, spark=spark)
+    assert registry.root == (tmp_path / value["storage"]["root"]).absolute()
+    value["storage"]["input_identity"] = "versions"
+    path.write_text(yaml.safe_dump(value))
+    with pytest.raises(ValueError, match="storage.input_identity must be rows or source_version"):
+        StudyRegistry.from_config(path, spark=spark)
+
+
 def test_source_version_claim_requires_its_frozen_identity(spark, tmp_path):
     """A saved definition cannot claim a source identity the frozen study never bound."""
     from autoforecast.benchmark import digest
