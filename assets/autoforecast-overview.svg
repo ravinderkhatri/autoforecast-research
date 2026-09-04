@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="816" viewBox="0 0 1280 816" role="img" aria-labelledby="title description">
   <title id="title">AutoForecast: from time-series data to reproducible forecasts</title>
-  <desc id="description">Bring hourly, daily, weekly, monthly or yearly CSV or Parquet data with configurable columns and series keys. Validate and freeze the dataset. Compare models on validation periods, refit the selected model, and score a separate test period. Inspect forecasts, metrics, plots and run evidence. M5 and additional model runtimes are optional.</desc>
+  <desc id="description">Bring hourly, daily, weekly, monthly or yearly CSV or Parquet data with configurable columns and series keys. Validate and freeze the dataset. Compare baselines, MFT, SFT, HMFNet, PACT or your own Python model on validation periods, refit the selected model, and score a separate test period. Inspect forecasts, metrics, plots and run evidence. M5 and additional model runtimes are optional.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
       <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#91a4ba" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -65,8 +65,9 @@
       <path d="M 0 28 H 28 M 3 28 V 16 H 9 V 28 M 13 28 V 6 H 19 V 28 M 23 28 V 0 H 29 V 28"/>
     </g>
     <text class="body" x="908" y="252">Seasonal-naive · last-value</text>
-    <text class="body" x="908" y="284">Optional model adapters</text>
-    <text class="body" x="908" y="316">Select on validation periods</text>
+    <text class="body" x="908" y="280">MFT · SFT · HMFNet · PACT</text>
+    <text class="body" x="908" y="308">Or connect your Python model</text>
+    <text class="body" x="908" y="336">Select on validation periods</text>
   </g>
 
   <g>
