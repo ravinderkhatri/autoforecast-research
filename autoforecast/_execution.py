@@ -238,7 +238,8 @@ class _Console(logging.StreamHandler):
             else:
                 if not transition:
                     text = "\n".join(line for line in text.splitlines()
-                                     if line.startswith(("RUN ", "Stage ", "Operation:")))
+                                     if line.startswith(("RUN ", "Stage ", "Model fits:",
+                                                         "Now fitting:", "Operation:")))
                 self.stream.write(text + "\n")
                 self.flush()
 
@@ -344,6 +345,67 @@ def _emit(event, level, *, announce=False):
                     ))
 
 
+def _approximate(seconds):
+    """Round a duration the way a person reads an estimate."""
+    if seconds < 60:
+        return f"{max(round(seconds), 1)} s"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+
+
+_BAR_WIDTH = 20
+
+
+class _ModelFits:
+    """Count a run's model fits and estimate the rest from their measured rate.
+
+    The rate is the time from the first fit's start to the latest fit's finish, divided
+    by the fits done, so the work between fits is spread over them. Like tqdm and
+    Keras, nothing is estimated before a fit has finished.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.planned = None
+        self.done = 0
+        self.first_start = None
+        self.last_finish = None
+        self.current = None
+
+    def render(self):
+        """Return the panel lines and the whole-run estimate text."""
+        with self.lock:
+            planned, done = self.planned, self.done
+            first, last, current = self.first_start, self.last_finish, self.current
+        if planned is not None and done > planned:
+            planned = None  # A plan that was exceeded is not a denominator.
+        if planned is None and not done and current is None:
+            return [], "unavailable"
+        if planned:
+            # A Keras-style text bar: plain characters render in notebooks, terminals and logs.
+            filled = _BAR_WIDTH * done // planned
+            bar = ("=" * filled + (">" if filled < _BAR_WIDTH else "")).ljust(_BAR_WIDTH, ".")
+            line = f"Model fits: {done}/{planned} [{bar}] {done * 100 // planned}%"
+        else:
+            line = f"Model fits: {done} done; total=unknown"
+        if planned and done >= planned:
+            estimate = "all planned model fits done; later steps are not estimated"
+        elif planned and done and last is not None:
+            rate = (last - first) / done
+            left = _approximate(rate * (planned - done))
+            line += f" | about {left} left at {_approximate(rate)} per fit, measured"
+            estimate = (f"about {left} (model fits left at the measured rate; excludes "
+                        "steps after the last fit, such as the MLflow export)")
+        elif planned:
+            estimate = "unavailable until the first model fit finishes"
+        else:
+            estimate = "unavailable"
+        return [line] + ([f"Now fitting: {current}"] if current else []), estimate
+
+
 class Execution:
     """A finite parent-stage plan. Nested work never changes its denominator."""
 
@@ -375,6 +437,9 @@ class Execution:
         self.receipt = {}
         self.audit_error = None
         self.uploader = None
+        # Model fits this run counts; a run that starts one workflow shares that workflow's.
+        self.fits = None
+        self.sharing = None
 
     def write_event(self, path, event):
         """Keep one writer and ordered, retry-stable event bytes for each remote audit.
@@ -507,6 +572,9 @@ class Execution:
         for name in running:
             lines.append(f"Stage {self.stages.index(name) + 1}/{total}: {name} | "
                          f"elapsed={now - self.starts[name]:.1f}s")
+        fit_lines, estimate = (self.fits.render() if self.fits is not None
+                               else ([], "unavailable"))
+        lines += fit_lines
         for op in self.operations.values():
             done, amount, unit = op.get("completed"), op.get("total"), op.get("unit")
             elapsed = op.get("_frozen_elapsed", now - op["start"])
@@ -531,7 +599,7 @@ class Execution:
                   f"Resolved: {len(completed) + len(skipped)}/{total}; skipped={len(skipped)}; "
                   f"unfinished={len(remaining)}; running={len(running)}; "
                   f"waiting={sum(v == 'WAITING' for v in self.states.values())}",
-                  f"Elapsed run: {now - self.started:.1f}s; whole-run ETA: unavailable",
+                  f"Elapsed run: {now - self.started:.1f}s; whole-run ETA: {estimate}",
                   "Completed: " + names(completed), "Skipped: " + names(skipped),
                   "Remaining (not completed): " + names(remaining)]
         if self.result != "RUNNING":
@@ -568,6 +636,8 @@ class Execution:
             self.identity.setdefault("parent_attempt", parent.identity["attempt_id"])
         if self.display is None:
             self.display = parent.display if parent else resolve_display()
+        if parent is not None and parent.sharing is not None:
+            self.fits = parent.sharing
         # Allocate before installing any context, so a failure here leaves nothing to undo.
         self.uploader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autoforecast-audit")
         self.token = _CURRENT.set(self)
@@ -862,7 +932,10 @@ def operation(name, **facts):
 
 
 def progress(*, completed, total=None, unit="items", **facts):
-    """Update existing counters without adding reads, audit writes or an invented ETA."""
+    """Update existing counters without adding reads or audit writes.
+
+    Operation counters show no time estimate; only model fits, measured, carry one.
+    """
     execution, key = _CURRENT.get(), _OPERATION.get()
     if execution is not None and key is not None and not _AUDITING.get():
         # The existing integrity check diagnoses changed data. Do not invent a percentage
@@ -873,6 +946,68 @@ def progress(*, completed, total=None, unit="items", **facts):
             execution.operations[key].update(completed=completed, total=total,
                                              unit=unit, **_safe(facts))
             execution.refresh()
+
+
+def _fit_count():
+    execution = _CURRENT.get()
+    if execution is None or _AUDITING.get():
+        return None, None
+    with execution.lock:
+        if execution.fits is None:
+            execution.fits = _ModelFits()
+        return execution, execution.fits
+
+
+def plan_model_fits(total):
+    """Declare how many model fits this run will make; the first plan in a run stays."""
+    _execution, fits = _fit_count()
+    if fits is not None:
+        with fits.lock:
+            if fits.planned is None:
+                fits.planned = total
+
+
+@contextmanager
+def model_fit(label, **facts):
+    """Count one model fit and show what it trains on; a failed fit is not counted."""
+    execution, fits = _fit_count()
+    if fits is None:
+        yield
+        return
+    with fits.lock:
+        number, planned = fits.done + 1, fits.planned
+        fits.current = label
+        if fits.first_start is None:
+            fits.first_start = time.monotonic()
+    note("Model fit", fit=number, planned_fits=planned, label=label, **facts)
+    finished = False
+    try:
+        yield
+        finished = True
+    finally:
+        with fits.lock:
+            fits.current = None
+            if finished:
+                fits.done += 1
+                fits.last_finish = time.monotonic()
+        with execution.lock:
+            execution.refresh()
+
+
+@contextmanager
+def share_model_fits():
+    """Show the model fits of the single workflow this run starts on the run's panel."""
+    execution = _CURRENT.get()
+    if execution is None:
+        yield
+        return
+    with execution.lock:
+        execution.fits = execution.sharing = _ModelFits()
+    try:
+        yield
+    finally:
+        with execution.lock:
+            execution.sharing = None
 
 
 def reported(name, *, dataset=False):

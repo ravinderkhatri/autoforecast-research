@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import errno
 import hashlib
+import itertools
 import json
 import math
 import pathlib
@@ -28,7 +29,14 @@ from pyspark.sql import functions as F
 
 from autoforecast._exact_json import loads_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
-from autoforecast._execution import _stage, callable_name, note, reported
+from autoforecast._execution import (
+    _stage,
+    callable_name,
+    model_fit,
+    note,
+    plan_model_fits,
+    reported,
+)
 from autoforecast.benchmark import (
     MISSING_COLUMN,
     NATIVE_SCHEMA,
@@ -48,6 +56,8 @@ from autoforecast.experiments import (
 from autoforecast.frequency import (
     TimePoint,
     canonical_origin,
+    parse_frequency,
+    parse_origin,
     period_points,
 )
 from autoforecast.hpo import HPOError, HPOStudySpec, TrialOutcome, TrialRequest, run_hpo_study
@@ -533,6 +543,38 @@ class _WindowInput:
         return context
 
 
+_PERIOD_UNITS = {"H": "hour", "D": "day", "W": "week", "M": "month", "Y": "year"}
+_ACTUALS = {"pending_actuals": "no actuals yet, not scored", "partial": "actuals partly available"}
+
+
+def _fit_periods(
+    study: Study, stage: str, origin: str, horizon: int, report: Mapping | None = None,
+) -> str:
+    """Name a fit's training and forecast periods in the study's own frequency.
+
+    The dates are labels from the data's time column, cut by the rule the fit's inputs
+    use: training runs from the study start through the cut-off, and the forecast covers
+    the next ``horizon`` periods. Only a test fit forecasts the test period.
+    """
+    recipe = study.recipe
+    cadence = parse_frequency(recipe["frequency"])
+
+    def label(point: TimePoint) -> str:
+        return point.strftime("%Y-%m-%d %H:%M") if cadence.key_kind == "timestamp" else str(point)
+
+    points = period_points(origin, cadence, horizon)
+    unit = _PERIOD_UNITS[cadence.unit] + ("" if horizon == 1 else "s")
+    if cadence.multiplier > 1:
+        unit = f"{'period' if horizon == 1 else 'periods'} of {cadence.multiplier} days"
+    status = ((report or {}).get("windows", {})
+              .get(boundary(stage, origin, horizon, cadence.code), {}).get("status"))
+    count = f"{horizon} {unit}" + (f"; {_ACTUALS[status]}" if status in _ACTUALS else "")
+    forecast = label(points[0]) + ("" if horizon == 1 else f" to {label(points[-1])}")
+    return (f"Training period {label(parse_origin(recipe['training_start'], cadence))} to "
+            f"{label(parse_origin(origin, cadence))} · "
+            f"{'Test' if stage == 'test' else 'Validation'} period {forecast} ({count})")
+
+
 @reported("Prepare training window and verify inputs")
 def _prepare_window(
     study: Study, stage: str, origin: str, horizon: int, root: pathlib.Path
@@ -778,10 +820,17 @@ class _ExternalTrialBridge:
     profile_bytes: bytes
     report_bytes: bytes
     implementation_capture: CapturedImplementation | None = None
+    # Each window's training and validation periods, for the progress display.
+    periods: tuple[str, ...] = ()
+    # Optuna runs this search's trials one at a time, so calls count the trials.
+    trials: itertools.count = dataclasses.field(
+        default_factory=lambda: itertools.count(1), compare=False, repr=False,
+    )
 
     def __call__(self, request: TrialRequest) -> TrialOutcome:
         context = json.loads(self.context_bytes)
         records = []
+        trial = next(self.trials)
         if self.implementation_capture is not None:
             self.implementation_capture.retain(request.attempt.path)
         request.attempt.write_bytes("metadata/external-profile.yaml", self.profile_bytes)
@@ -809,24 +858,28 @@ class _ExternalTrialBridge:
 
         try:
             for index, inputs in enumerate(self.inputs):
-                note("CV window", window_index=index + 1, window_total=len(self.inputs),
-                     search_id=request.study.id, trial_id=request.trial_id)
                 prefix = "" if len(self.inputs) == 1 else f"windows/{index:04d}"
                 directory = request.attempt.path / prefix
-                record = _fit_window(
-                    self.spark,
-                    self.callback,
-                    inputs,
-                    directory,
-                    model_id=context["model_id"],
-                    model_parameters=request.model_parameters,
-                    training_parameters=request.training_parameters,
-                    seed=context["seed"],
-                    metrics=context["options"]["metrics"],
-                    breakdown=context["options"]["breakdown"],
-                    run_id=request.study.id, trial_id=request.trial_id,
-                    implementation_capture=self.implementation_capture,
-                )
+                label = (f"Parameter search · trial {trial} of {context['max_trials']} · "
+                         f"window {index + 1} of {len(self.inputs)}")
+                if self.periods:
+                    label += " · " + self.periods[index]
+                with model_fit(label, window_index=index + 1, window_total=len(self.inputs),
+                               search_id=request.study.id, trial_id=request.trial_id):
+                    record = _fit_window(
+                        self.spark,
+                        self.callback,
+                        inputs,
+                        directory,
+                        model_id=context["model_id"],
+                        model_parameters=request.model_parameters,
+                        training_parameters=request.training_parameters,
+                        seed=context["seed"],
+                        metrics=context["options"]["metrics"],
+                        breakdown=context["options"]["breakdown"],
+                        run_id=request.study.id, trial_id=request.trial_id,
+                        implementation_capture=self.implementation_capture,
+                    )
                 value = record["score"].get(context["metric"])
                 if type(value) not in (int, float) or not math.isfinite(value):
                     raise HPOError(
@@ -995,6 +1048,8 @@ def tune_study(
         note("Tuning work", trial_budget=budget, windows=len(options["windows"]),
              maximum_callback_fits=budget * len(options["windows"]),
              retained_series=study.n_series, objective=study.recipe["metric"])
+        # A workflow that runs this search has already planned its own, larger total.
+        plan_model_fits(budget * len(options["windows"]))
         temporary = pathlib.Path(
             stack.enter_context(tempfile.TemporaryDirectory(
                 prefix="autoforecast-inputs-", dir=study._snapshots.name,
@@ -1074,6 +1129,10 @@ def tune_study(
         bridge = _ExternalTrialBridge(
             study._spark, fit_predict, inputs, context_bytes, raw, _json_bytes(preflight.report),
             capture,
+            periods=tuple(
+                _fit_periods(study, options["stage"], w["origin"], w["horizon"], preflight.report)
+                for w in options["windows"]
+            ),
         )
         search_path = root / "studies" / identifier
         try:

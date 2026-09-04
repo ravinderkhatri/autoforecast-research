@@ -266,6 +266,31 @@ def test_workflow_counts_and_saved_configuration_future_reuse(
         else ["selection", "selection", "refit"]
     )
     assert result.provenance["work_estimate"]["total_callback_fits"] == expected_calls
+    # Every fit is announced with its trial, window and periods, against the planned total.
+    # The search only ever validates; the test period appears once, on the final fit.
+    fits = [event for audit in (tmp_path / "runs").glob("execution-attempts/*.jsonl")
+            for event in map(json.loads, audit.read_text().splitlines())
+            if event["stage"] == "Model fit"]
+    assert [event["fit"] for event in fits] == list(range(1, expected_calls + 1))
+    assert {event["planned_fits"] for event in fits} == {expected_calls}
+    labels = [event["label"] for event in fits]
+    if selection_stage == "tuning":
+        assert labels[0] == ("Parameter search · trial 1 of 2 · window 1 of 3 · "
+                             "Training period 2024-01-01 to 2024-01-03 · "
+                             "Validation period 2024-01-04 to 2024-01-05 (2 days)")
+        assert labels[5].startswith("Parameter search · trial 2 of 2 · window 3 of 3 · "
+                                    "Training period 2024-01-01 to 2024-01-05 · ")
+        assert labels[6] == ("Validation fit · Training period 2024-01-01 to 2024-01-07 · "
+                             "Validation period 2024-01-08 to 2024-01-09 (2 days)")
+    else:
+        assert labels[:2] == [
+            f"Parameter search · trial {trial} of 2 · window 1 of 1 · "
+            "Training period 2024-01-01 to 2024-01-07 · "
+            "Validation period 2024-01-08 to 2024-01-09 (2 days)" for trial in (1, 2)
+        ]
+    assert not any("Test period" in label for label in labels[:-1])
+    assert labels[-1] == ("Test fit · Training period 2024-01-01 to 2024-01-09 · "
+                          "Test period 2024-01-10 to 2024-01-11 (2 days)")
     assert result.status == "completed"
     assert result.provenance["study"]["path"] == str(complete.resolve())
     assert seen[-1][0] == "2024-01-09"
@@ -539,6 +564,12 @@ def test_optional_undefined_scale_and_pending_testing(spark, tmp_path):
     assert result.validation["score"]["mae"] is not None
     assert result.validation["score"]["wrmsse"] is None
     assert result.status == "pending_actuals"
+    # The test fit says, before training, that its period has no actuals yet.
+    labels = [event["label"] for audit in (tmp_path / "runs").glob("execution-attempts/*.jsonl")
+              for event in map(json.loads, audit.read_text().splitlines())
+              if event["stage"] == "Model fit"]
+    assert labels[-1].startswith("Test fit · ")
+    assert labels[-1].endswith(" (2 days; no actuals yet, not scored)")
     assert result.testing["score"]["mae"] is None
     assert result.testing["score"]["population"]["observed_cells"] == 0
     assert result.testing["forecasts"].n_series == 2

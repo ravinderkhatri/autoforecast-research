@@ -1433,6 +1433,7 @@ def test_workflow_seal_failure_never_announces_workflow_pass(tmp_path, monkeypat
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     recipe = {
+        "training_start": "2024-01-01",
         "metric": "mae",
         "frequency": "D",
         "validation_origins": ["2024-01-05"],
@@ -1752,6 +1753,7 @@ def test_failure_sidecar_error_does_not_skip_terminal_stage_or_failed_seal(
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     recipe = {
+        "training_start": "2024-01-01",
         "metric": "mae",
         "frequency": "D",
         "validation_origins": ["2024-01-05"],

@@ -286,6 +286,89 @@ def test_display_error_is_harmless_and_plain_output_has_no_ansi(tmp_path):
     assert "Completed: Stage 1: read (pass)" in stream.getvalue()
 
 
+def test_model_fits_show_a_bar_and_a_measured_estimate(tmp_path, monkeypatch):
+    # Without a run, counting fits does nothing and fails nothing.
+    events.plan_model_fits(3)
+    with events.model_fit("outside"):
+        pass
+    now = [100.0]
+    monkeypatch.setattr(events.time, "monotonic", lambda: now[0])
+    path = tmp_path / "audit.jsonl"
+    with events.Execution(path, ["fit"]) as run:
+        with events._stage(path, "fit"):
+            assert "Model fits" not in run.render()
+            assert "whole-run ETA: unavailable\n" in run.render() + "\n"
+            events.plan_model_fits(3)
+            events.plan_model_fits(5)  # A nested search keeps the run's own total.
+            assert "Model fits: 0/3 [>...................] 0%" in run.render()
+            assert "whole-run ETA: unavailable until the first model fit finishes" in run.render()
+            with events.model_fit("first window", window_index=1):
+                assert "Now fitting: first window" in run.render()
+                now[0] += 120
+            panel = run.render()
+            assert "Model fits: 1/3 [======>.............] 33% | about 4 min left at 2 min " \
+                   "per fit, measured" in panel
+            assert "Now fitting" not in panel
+            assert "whole-run ETA: about 4 min (model fits left at the measured rate" in panel
+            # A failed fit is not counted, and the next fit takes its number.
+            with pytest.raises(RuntimeError), events.model_fit("broken"):
+                now[0] += 30
+                raise RuntimeError("fit failed")
+            assert "Model fits: 1/3" in run.render()
+            with events.model_fit("second window"):
+                now[0] += 105
+            # 255 s from the first start to the second finish, over two fits: the failed
+            # attempt's time is spread over the counted fits.
+            assert "Model fits: 2/3 [=============>......] 66% | about 2 min left at 2 min " \
+                   "per fit, measured" in run.render()
+            with events.model_fit("test window"):
+                now[0] += 105
+            panel = run.render()
+            assert "Model fits: 3/3 [====================] 100%" in panel
+            assert "whole-run ETA: all planned model fits done; later steps are not " \
+                   "estimated" in panel
+            # More fits than planned make the plan unusable as a denominator.
+            with events.model_fit("extra"):
+                now[0] += 1
+            assert "Model fits: 4 done; total=unknown" in run.render()
+            assert "whole-run ETA: unavailable\n" in run.render() + "\n"
+    announced = [(r["fit"], r["planned_fits"], r["label"]) for r in records(path)
+                 if r["stage"] == "Model fit"]
+    assert announced == [(1, 3, "first window"), (2, 3, "broken"), (2, 3, "second window"),
+                         (3, 3, "test window"), (4, 3, "extra")]
+
+
+def test_a_run_shows_the_model_fits_of_the_workflow_it_starts(tmp_path):
+    outer = tmp_path / "run.jsonl"
+    with events.Execution(outer, ["workflow"]) as run:
+        with events._stage(outer, "workflow"), events.share_model_fits():
+            inner = tmp_path / "workflow.jsonl"
+            with events.Execution(inner, ["workflow"]) as workflow:
+                with events._stage(inner, "workflow"):
+                    events.plan_model_fits(2)
+                    with events.model_fit("only fit"):
+                        assert "Now fitting: only fit" in run.render()
+                assert "Model fits: 1/2" in run.render() and "Model fits: 1/2" in workflow.render()
+        # Sharing covers only the workflow started inside it.
+        later = tmp_path / "later.jsonl"
+        with events.Execution(later, ["publish"]) as publication:
+            assert publication.fits is None
+
+
+def test_plain_job_logs_keep_the_model_fit_lines(tmp_path):
+    stream = io.StringIO()
+    configure_logging(stream=stream, progress="plain")
+    path = tmp_path / "audit.jsonl"
+    with events.Execution(path, ["fit"]) as run:
+        with events._stage(path, "fit"):
+            events.plan_model_fits(2)
+            with events.model_fit("window 1"):
+                events._console().panel(run, run.render())
+    periodic = [line for line in stream.getvalue().splitlines()
+                if line.startswith(("Model fits:", "Now fitting:"))]
+    assert periodic[:2] == ["Model fits: 0/2 [>...................] 0%", "Now fitting: window 1"]
+
+
 @pytest.mark.parametrize("interval", [0, -1, float('nan'), float('inf'), True, '10'])
 def test_bad_interval_refused(interval):
     with pytest.raises(ValueError):

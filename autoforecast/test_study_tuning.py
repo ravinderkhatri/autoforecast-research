@@ -490,3 +490,48 @@ def test_malformed_external_profile_raises_tuning_error_before_study_access(tmp_
         profile.write_text(yaml.safe_dump(record))
     with pytest.raises(TuningError):
         Study.tune(object(), fit_predict=predict, config=profile, implementation=implementation())
+
+
+@pytest.mark.parametrize("frequency,start,stage,origin,horizon,expected", [
+    ("D", "2023-01-02", "tuning", "2026-08-30", 14,
+     "Training period 2023-01-02 to 2026-08-30 · Validation period 2026-08-31 to 2026-09-13 "
+     "(14 days)"),
+    ("W", "2023-01-02", "test", "2026-07-06", 13,
+     "Training period 2023-01-02 to 2026-07-06 · Test period 2026-07-13 to 2026-10-05 (13 weeks)"),
+    ("M", "2023-01-31", "validation", "2026-06-30", 6,
+     "Training period 2023-01-31 to 2026-06-30 · Validation period 2026-07-31 to 2026-12-31 "
+     "(6 months)"),
+    ("MS", "2023-01-01", "test", "2026-06-01", 1,
+     "Training period 2023-01-01 to 2026-06-01 · Test period 2026-07-01 (1 month)"),
+    ("H", "2026-08-01T00:00:00", "validation", "2026-08-31T00:00:00", 24,
+     "Training period 2026-08-01 00:00 to 2026-08-31 00:00 · "
+     "Validation period 2026-08-31 01:00 to 2026-09-01 00:00 (24 hours)"),
+    ("7D", "2023-01-02", "test", "2026-06-29", 13,
+     "Training period 2023-01-02 to 2026-06-29 · Test period 2026-07-06 to 2026-09-28 "
+     "(13 periods of 7 days)"),
+])
+def test_fit_periods_follow_the_study_frequency(frequency, start, stage, origin, horizon,
+                                                expected):
+    from types import SimpleNamespace
+
+    from autoforecast.study_tuning import _fit_periods
+
+    study = SimpleNamespace(recipe={"frequency": frequency, "training_start": start})
+    assert _fit_periods(study, stage, origin, horizon) == expected
+
+
+@pytest.mark.parametrize("status,suffix", [
+    ("pending_actuals", " (2 days; no actuals yet, not scored)"),
+    ("partial", " (2 days; actuals partly available)"),
+    ("ready", " (2 days)"),
+])
+def test_fit_periods_say_when_actuals_are_missing(status, suffix):
+    from types import SimpleNamespace
+
+    from autoforecast.study_tuning import _fit_periods
+
+    study = SimpleNamespace(recipe={"frequency": "D", "training_start": "2024-01-01"})
+    report = {"windows": {benchmark.boundary("test", "2024-01-09", 2, "D"): {"status": status},
+                          benchmark.boundary("validation", "2024-01-09", 2, "D"): {
+                              "status": "pending_actuals"}}}
+    assert _fit_periods(study, "test", "2024-01-09", 2, report).endswith(suffix)

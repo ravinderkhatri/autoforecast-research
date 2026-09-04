@@ -13,6 +13,7 @@ import pytest
 import yaml
 from pyspark.sql import functions as F
 
+from autoforecast import _execution as events
 from autoforecast.study_registration import StudyRegistry, register_study
 from autoforecast.test_study_tuning import config as model_profile
 from autoforecast.test_study_tuning import implementation, predict
@@ -117,10 +118,17 @@ def test_study_info_creates_once_then_reuses_frozen_data(
         return result
 
     monkeypatch.setattr(registration, "register_study", register)
+    runs = []
+    enter = events.Execution.__enter__
+    monkeypatch.setattr(events.Execution, "__enter__",
+                        lambda run: runs.append(run) or enter(run))
     result = run_study(study_info=choice, config=path,
                        registry=None if automatic_registry else registry, model=predict,
                        model_config=profile, implementation=implementation())
     assert calls == [result.study_id]
+    # The run's own panel shows its workflow's model fits: a validation and a test fit.
+    run_panel = next(run for run in runs if "load_and_verify" in run.stages).render()
+    assert "Model fits: 2/2 [====================] 100%" in run_panel
     assert choice == {"study_id": None, "create_study": True, "publish_results": False}
     assert result.tuning_path is None
     assert result.publication["status"] == "not_requested"
@@ -1142,7 +1150,7 @@ def test_secondary_audit_and_trial_retention_errors_preserve_primary(tmp_path, m
     monkeypatch.setattr(study_tuning, "_fit_window", bad_fit)
     bridge = study_tuning._ExternalTrialBridge(
         object(), lambda _: None, (object(),),
-        json.dumps({"model_id": "synthetic", "seed": 1,
+        json.dumps({"model_id": "synthetic", "seed": 1, "max_trials": 1,
                     "options": {"metrics": [], "breakdown": "none"}}).encode(),
         b"{}", b"{}",
     )
