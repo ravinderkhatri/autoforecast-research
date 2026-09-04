@@ -841,7 +841,7 @@ def test_simultaneous_initial_table_provisioning_is_retryable(spark, tmp_path):
         spark.sql(f"DROP SCHEMA IF EXISTS `{namespace}` CASCADE")
 
 
-def test_registry_tables_are_described_once_in_the_catalog(spark, tmp_path):
+def test_registry_tables_are_described_once_in_the_catalog(spark, tmp_path, monkeypatch):
     from autoforecast.integrations.delta import DESCRIPTIONS, SCHEMAS, latest_delta_version
 
     namespace = "described_" + tmp_path.name.replace("-", "_")
@@ -851,6 +851,26 @@ def test_registry_tables_are_described_once_in_the_catalog(spark, tmp_path):
         for kind, schema in SCHEMAS.items():
             spark.sql(f"CREATE TABLE `{namespace}`.`{kind}` ({schema}) USING DELTA")
         store = DeltaStudyStore(spark, namespace=namespace)
+        # A catalog that refuses comments is noted per table and never stops provisioning.
+        sql = spark.sql
+
+        def refuse_comments(statement, *args, **kwargs):
+            if "COMMENT" in statement:
+                raise PermissionError("comments are not allowed here")
+            return sql(statement, *args, **kwargs)
+
+        audit = tmp_path / "describe-events.jsonl"
+        with monkeypatch.context() as patch:
+            patch.setattr(spark, "sql", refuse_comments)
+            with events.Execution(audit, ["host"], attempt_id="coverage-attempt"):
+                with events._stage(audit, "host"):
+                    store.prepare(lock_path=tmp_path / "provision.lock")
+        refused = [json.loads(line) for line in audit.read_text().splitlines()]
+        refused = [row for row in refused if row["stage"] == "Table descriptions not written"]
+        assert sorted(row["table"] for row in refused) == sorted(store.tables.values())
+        assert {row["error_type"] for row in refused} == {"PermissionError"}
+        assert not any(spark.catalog.getTable(name).description
+                       for name in store.tables.values())
         store.prepare(lock_path=tmp_path / "provision.lock")
         for kind, (comment, columns) in DESCRIPTIONS.items():
             name = store.tables[kind]

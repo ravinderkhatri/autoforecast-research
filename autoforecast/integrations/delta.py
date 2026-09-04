@@ -410,16 +410,22 @@ class DeltaStudyStore:
             self.validate_destinations()
 
     def _describe(self, kind: str) -> None:
-        """Set the table and column comments that differ; a described table is unchanged."""
+        """Set the table and column comments that differ; a described table is unchanged.
+
+        Comments are documentation, so a catalog that refuses them is noted, never fatal.
+        """
         name, (comment, columns) = self.tables[kind], DESCRIPTIONS[kind]
-        if (self.spark.catalog.getTable(name).description or "") != comment:
-            self.spark.sql(f"COMMENT ON TABLE {quote_table(name)} IS {_sql_text(comment)}")
-        current = {column.name: column.description or ""
-                   for column in self.spark.catalog.listColumns(name)}
-        for column, text in columns.items():
-            if current.get(column) != text:
-                self.spark.sql(f"ALTER TABLE {quote_table(name)} ALTER COLUMN `{column}` "
-                               f"COMMENT {_sql_text(text)}")
+        try:
+            if (self.spark.catalog.getTable(name).description or "") != comment:
+                self.spark.sql(f"COMMENT ON TABLE {quote_table(name)} IS {_sql_text(comment)}")
+            current = {column.name: column.description or ""
+                       for column in self.spark.catalog.listColumns(name)}
+            for column, text in columns.items():
+                if current.get(column) != text:
+                    self.spark.sql(f"ALTER TABLE {quote_table(name)} ALTER COLUMN `{column}` "
+                                   f"COMMENT {_sql_text(text)}")
+        except Exception as error:
+            note("Table descriptions not written", table=name, error_type=type(error).__name__)
 
     def validate_destinations(self) -> None:
         """Read-only precheck; a model run never silently provisions tables."""
