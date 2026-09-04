@@ -149,12 +149,13 @@ def test_custom_model_tunes_scores_reloads_and_keeps_outer_labels_out(frozen, sp
     with open_study(frozen, spark) as study:
         result = study.tune(fit_predict=fit, config=profile, implementation=identity)
     assert input_paths and all(not path.exists() for path in input_paths)
-    assert len(seen) == 4 and set(seen) == {0.0, 10.0}
+    # Two levels fit the budget of four, so each level is tried once.
+    assert len(seen) == 2 and set(seen) == {0.0, 10.0}
     assert result.parameters == {"model.level": 0.0, "training.offset": 0}
     assert result.tuning_score == pytest.approx(math.sqrt((4**2 + 5**2) / 2))
     assert result.provenance["implementation"] == implementation()
     assert result.provenance["evaluation_contract"]["boundary"].startswith("tuning/")
-    assert len(result.trial_history) == 4 and result.model_id == "custom-constant"
+    assert len(result.trial_history) == 2 and result.model_id == "custom-constant"
     reloaded = load_tuning_result(result.path)
     assert reloaded.parameters == result.parameters
     assert reloaded.tuning_score == result.tuning_score

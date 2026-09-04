@@ -367,6 +367,57 @@ The existing `run_study(study_id, model, ...)` call still works. Choose either t
 form or `study_info`; do not supply both. Use `register_study()` alone when you
 want to save data without training.
 
+## Built-in models
+
+`run_study` also trains these library models by name, with no model code:
+
+| Name | Forecast | Needs |
+|---|---|---|
+| `seasonal_naive` | The value one season earlier: for daily data with a 7-day season, the same weekday last week | nothing extra |
+| `window_average` | The mean of the last `window` periods (one season by default), for every forecast period | nothing extra |
+| `croston` | Croston's method for intermittent demand | `statsforecast` |
+| `auto_ets` | Exponential smoothing, with its form chosen for each series | `statsforecast` |
+| `auto_theta` | The Theta method, fitted for each series | `statsforecast` |
+| `shallow_global` | One LightGBM model for all series, trained on earlier origins of the same history | `lightgbm` (`autoforecast[shallow]`) |
+
+```python
+study_info = {"study_id": study_id, "create_study": False, "publish_results": False}
+result = run_study(study_info=study_info, registry=registry, model="auto_ets")
+print(result.parameters)
+```
+
+- **Settings.** Without `model_config`, each setting stays at its default and no search runs;
+  `result.parameters` shows the values used. The season length comes from the study.
+  `shallow_global` uses `model.num_leaves`, `model.learning_rate`, `model.min_data_in_leaf` and
+  `model.num_boost_round`.
+- **History.** `croston`, `auto_ets` and `auto_theta` need daily data. AutoETS and AutoTheta need
+  at least two seasons and 12 days of history per series, and Croston two days. They run a Python
+  function per series on Spark, so `PYSPARK_PYTHON` must name an interpreter that has
+  `statsforecast` and `fugue` installed.
+- **Saved model.** The history-based models keep the fit's history in `model/history`, with
+  `panel.json`; fitting that history again gives the same forecast. `shallow_global` keeps its
+  two LightGBM files.
+
+To search a built-in model's settings, give it a profile with an `hpo` block, as for your own
+model. For example, the window of `window_average`:
+
+```yaml
+schema_version: 2
+model: {id: window_average, adapter: external}
+hyperparameters:
+  model.window:
+    default: 7
+    valid: {kind: categorical, values: [7, 14, 21, 28]}
+    search: {kind: categorical, values: [7, 14, 21, 28]}
+hpo: {backend: optuna, max_trials: 4, seed: 42}
+```
+
+When every searched setting is a list of values (or a whole-number range with an upper bound)
+and all their combinations fit in `max_trials`, the search tries each combination exactly once,
+and the budget becomes the number of combinations. Otherwise trials are drawn at random from
+the seed, which can repeat some values and miss others. This applies to every model run by
+`run_study`.
+
 ## Progress and logs
 
 Registration and model runs show progress automatically. At the default INFO level,

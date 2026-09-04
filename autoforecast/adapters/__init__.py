@@ -32,6 +32,7 @@ from autoforecast.tracking_plan import tracking_plan
 
 __all__ = [
     "adapter_capabilities",
+    "fit_on_retained_history",
     "known_adapter_names",
     "register_defaults",
     "register_isolated",
@@ -69,6 +70,39 @@ def _validate_span(panel: Panel, origin: str, horizon: int, *, adapter: str):
             f"origin={origin!r}, horizon={horizon!r}"
         ) from exc
     return origin_point
+
+
+def fit_on_retained_history(request, panel: Panel, forecast_with, model_format: str, **settings):
+    """Run a panel adapter on a study fit's history and keep that history as the fitted model.
+
+    For these models the history is the learned state: fitting it again gives the same forecast.
+    It is copied to ``model/history`` (checked against its SHA-256) with ``panel.json``, which
+    also records ``settings``, and the adapter reads only that copy.
+    """
+    import dataclasses
+    import json
+    import pathlib
+
+    from autoforecast.study_tuning import FitPredictResult
+    from provenance.lineage import directory_digest, snapshot_parquet_directory
+
+    model = request.output_dir / "model"
+    model.mkdir()
+    snapshot_parquet_directory(
+        pathlib.Path(panel.path), model / "history",
+        expected_sha256=directory_digest(panel.path, suffixes=(".parquet",)),
+        label=f"{request.model_id} fitted history",
+    )
+    (model / "panel.json").write_text(json.dumps(
+        {**dataclasses.asdict(panel), "path": "history", "origin": request.origin, **settings},
+        sort_keys=True,
+    ))
+    forecast = forecast_with(
+        dataclasses.replace(panel, path=str(model / "history")), request.origin,
+        len(request.forecast_dates), spark=request.training_data.sparkSession,
+        out_dir=request.output_dir / "forecasts",
+    )
+    return FitPredictResult(dataclasses.replace(forecast, adapter=request.model_id), model_format)
 
 
 def _validate_daily_span(panel: Panel, origin: str, horizon: int, *, adapter: str):
