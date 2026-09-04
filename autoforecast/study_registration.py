@@ -1212,10 +1212,13 @@ class StudyRegistry:
         elif (definition["schema"] == "autoforecast.registration.v4"
               or definition["source"].get("kind") == "supplied_stages"):
             raise ValueError("supplied stage provenance is missing its frozen identity")
-        elif binding.get("schema") == "autoforecast.source-version-identity.v1":
+        elif (binding.get("schema") == "autoforecast.source-version-identity.v1"
+              or ("source_version" in definition["source"]
+                  and "admission_evidence" not in definition)):
             if ("source_version" not in definition["source"]
                     or "admission_evidence" in definition
-                    or binding["sha256"] != digest(definition["source"])):
+                    or binding != {"schema": "autoforecast.source-version-identity.v1",
+                                   "sha256": digest(definition["source"])}):
                 raise ValueError("source version provenance differs from the frozen identity")
         elif "admission_evidence" in definition:
             admission = _verify_admission(

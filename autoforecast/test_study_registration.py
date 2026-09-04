@@ -643,6 +643,28 @@ def test_input_identity_setting_is_checked_before_source_access(tmp_path, identi
     assert validate_study_config(path).input_storage["input_identity"] == "rows"
 
 
+def test_source_version_claim_requires_its_frozen_identity(spark, tmp_path):
+    """A saved definition cannot claim a source identity the frozen study never bound."""
+    from autoforecast.benchmark import digest
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    study_id = register_study(path, registry=registry)
+    saved = registry._registration_path(study_id)
+    envelope = json.loads(saved.read_bytes())
+    # Older source-version writers could save this claim without a frozen binding.
+    envelope["definition"]["source"]["source_version"] = {
+        "schema": "autoforecast.source-version.v1", "sql": "SELECT * FROM measurements",
+        "tables": {"measurements": {"table": "synthetic.measurements", "version": 0,
+                                     "table_id": "source-table-id"}},
+        "rows": envelope["definition"]["source"]["rows"],
+    }
+    envelope["sha256"] = digest(envelope["definition"])
+    saved.write_text(json.dumps(envelope))
+    with pytest.raises(ValueError, match="source version provenance"):
+        registry.load_study(study_id)
+
+
 def test_outputs_are_written_in_few_files(spark, tmp_path, monkeypatch):
     """Each file costs a request on every later check, so outputs use as few as fit."""
     from autoforecast import benchmark
