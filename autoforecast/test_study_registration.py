@@ -641,6 +641,41 @@ def test_outputs_are_written_in_few_files(spark, tmp_path, monkeypatch):
     assert sorted(spark.read.parquet(str(tmp_path / "frozen")).toPandas()["id"]) == list(range(10))
 
 
+def test_each_use_checks_every_frozen_file_once_and_every_use_checks_again(
+    spark, tmp_path, monkeypatch,
+):
+    """A registration or a load checks each frozen file once; a later load checks again."""
+    from autoforecast import _logical_hash, benchmark
+
+    verify, checked = _logical_hash.verify_files, []
+
+    def counted(target, **kwargs):
+        checked.append((str(pathlib.Path(target).absolute()), kwargs["trusted"]))
+        return verify(target, **kwargs)
+
+    monkeypatch.setattr(_logical_hash, "verify_files", counted)
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    study_id = register_study(path, registry=registry)
+    frozen = str(registry.root / "benchmarks" / study_id)
+    registration = [item for item in checked if item[0].startswith(frozen)]
+    # The freeze's final check and the publication check share one result per file.
+    assert registration and len(registration) == len(set(registration))
+    for _ in range(2):
+        checked.clear()
+        with registry.load_study(study_id):
+            pass
+        assert checked and len(checked) == len(set(checked))
+    # A trusted result never stands in for a full check asked for in the same use.
+    manifest = registry.root / "benchmarks" / study_id / "benchmark.json"
+    sha = registry.definition(study_id)[0]["library_sha256"]
+    checked.clear()
+    with benchmark.one_use():
+        benchmark.verify_benchmark(manifest, sha, _reuse_verified=True)
+        benchmark.verify_benchmark(manifest)
+    assert {trusted for _, trusted in checked} == {True, False}
+
+
 def test_registered_load_preserves_primary_hash_error_when_close_fails(tmp_path, monkeypatch):
     import autoforecast.study_registration as registration
     registry = StudyRegistry(tmp_path, spark=object())

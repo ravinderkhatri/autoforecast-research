@@ -61,6 +61,7 @@ from autoforecast.benchmark import (
     _reference_boundaries,
     artifact_path,
     digest,
+    one_use,
     read_benchmark_manifest,
     study_source_roles,
     study_windows,
@@ -1223,11 +1224,13 @@ class StudyRegistry:
 
     def load_study(self, study_id):
         """Return the existing Study context manager after all registry checks pass."""
-        definition, sha = self.definition(study_id)
-        self.scratch_root.mkdir(parents=True, exist_ok=True)
-        study = load_study(study_id, registry_root=self.root / "benchmarks", spark=self.spark,
-                           scratch_root=self.scratch_root, connections=self.connections,
-                           _expected_sha256=definition["library_sha256"])
+        with one_use():
+            definition, sha = self.definition(study_id)
+            self.scratch_root.mkdir(parents=True, exist_ok=True)
+            study = load_study(study_id, registry_root=self.root / "benchmarks",
+                               spark=self.spark, scratch_root=self.scratch_root,
+                               connections=self.connections,
+                               _expected_sha256=definition["library_sha256"])
         if study._sha256 != definition["library_sha256"]:
             with suppress(Exception):
                 study.close()
@@ -2208,10 +2211,11 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             value["source"].update(_retained=record, _manifest_sha256=sha,
                                    population=record["population"],
                                    require_matching_population=record["require_matching_population"])
-        return _register_captured_study(
-            value, registry, prepare, preparation_settings, check_id, issues_root, event,
-            inputs=inputs, native_inputs=native_inputs,
-        )
+        with one_use():
+            return _register_captured_study(
+                value, registry, prepare, preparation_settings, check_id, issues_root, event,
+                inputs=inputs, native_inputs=native_inputs,
+            )
 
 
 def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_tables=False,

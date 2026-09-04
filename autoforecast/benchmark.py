@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import datetime as dt
 import errno
@@ -11,7 +12,7 @@ import json
 import pathlib
 import shutil
 import tempfile
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from functools import partial
 
 from mlops._safe_files import is_regular_file, read_path_bytes
@@ -1640,6 +1641,30 @@ def _validate_native_parent(record, parent):
         raise BenchmarkError("derived native input ownership identity changed")
 
 
+# Results of artifact checks shared by the back-to-back verifications of one use,
+# such as the checks that end a registration or the two passes of one study load.
+_SHARED_CHECKS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "autoforecast_shared_checks", default=None,
+)
+
+
+@contextmanager
+def one_use():
+    """Check each frozen artifact once while one registration or load runs.
+
+    Nothing reads the artifacts between the checks this scope joins. A separate use,
+    such as a later load of the study, opens its own scope and checks them again.
+    """
+    if _SHARED_CHECKS.get() is not None:
+        yield
+        return
+    token = _SHARED_CHECKS.set({})
+    try:
+        yield
+    finally:
+        _SHARED_CHECKS.reset(token)
+
+
 def verify_benchmark(
     path: pathlib.Path, expected_sha256: str | None = None, *, spark=None,
     _reuse_verified: bool = False, _scratch_root=None,
@@ -1693,16 +1718,19 @@ def verify_benchmark(
         for reference in record["snapshots"].values():
             current_inputs().inspect(reference, retained=True)
     else:
-        checked = {}
+        shared = _SHARED_CHECKS.get()
+        checked = shared if shared is not None else {}
+        trusted = _reuse_verified and expected_sha256 is not None
 
         def checked_hash(target, physical, name):
             logical = record.get("logical_hashes", {}).get(name)
-            cache_key = (target, physical, digest(logical))
+            # A trusted result never stands in for a full check that was asked for.
+            cache_key = (str(target.absolute()), physical, digest(logical), trusted)
             if cache_key not in checked:
                 try:
                     checked[cache_key] = _logical_hash.verify_files(
                         target, physical_sha256=physical, logical=logical,
-                        trusted=_reuse_verified and expected_sha256 is not None, spark=spark,
+                        trusted=trusted, spark=spark,
                         _scratch_root=_scratch_root,
                     )
                 except ValueError as error:
