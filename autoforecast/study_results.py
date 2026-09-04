@@ -161,15 +161,17 @@ def _workflow_windows(workflow, *, include_tuning=True):
         chosen_path = (workflow.tuning_path / "trials" / chosen["trial_id"]
                        / "attempts" / chosen["attempt_id"] / "metadata/winner-config.json")
         # Use values already checked by the loader; do not reopen mutable winner files.
-        if (selected.parameters != workflow.parameters
-                or selected.provenance != context
-                or selected.trial_id != chosen["trial_id"]
-                or selected.winner_config != chosen_path
-                or context["profile_sha256"] != saved_config["profile_sha256"]
-                or context["seed"] != saved_config["seed"]
-                or context["study"] != workflow.provenance["study"]
-                or context["implementation"] != workflow.provenance["implementation"]
-                or context["model_id"] != workflow.validation["forecasts"].adapter):
+        if (
+            selected.parameters != workflow.parameters
+            or selected.provenance != context
+            or selected.trial_id != chosen["trial_id"]
+            or selected.winner_config != chosen_path
+            or context["profile_sha256"] != saved_config["profile_sha256"]
+            or context["seed"] != saved_config["seed"]
+            or context["study"] != workflow.provenance["study"]
+            or context["implementation"] != workflow.provenance["implementation"]
+            or context["model_id"] != (workflow.validation or workflow.testing)["forecasts"].adapter
+        ):
             raise ValueError("tuning results belong to a different workflow configuration")
         identities = set()
         for window, trial in windows:
@@ -325,7 +327,7 @@ def _publication(definition, study_sha, workflow_path, *, scratch_root, mlflow_l
     ):
         workflow = load_forecast_workflow(root)
         if workflow.testing is None or completion["task"] != "forecast-workflow":
-            raise ValueError("publication requires both completed workflow stages")
+            raise ValueError("publication requires a completed final workflow")
         if (workflow.study_id != definition["study_id"]
                 or workflow.provenance["study"]["sha256"] != definition["library_sha256"]):
             raise ValueError("workflow belongs to a different registered study")
@@ -339,8 +341,11 @@ def _publication(definition, study_sha, workflow_path, *, scratch_root, mlflow_l
         manifest_sha = hashlib.sha256(
             (root / "artifact_manifest.json").read_bytes(),
         ).hexdigest()
-        if mlflow_links is not None and set(mlflow_links) != {"validation", "test"}:
-            raise ValueError("tracking links must cover both workflow stages")
+        expected_stages = {"test"} | ({"validation"} if workflow.validation is not None else set())
+        if mlflow_links is not None and set(mlflow_links) != expected_stages:
+            requirement = ("both workflow stages" if workflow.validation is not None
+                           else "exactly the configured test stage")
+            raise ValueError(f"tracking links must cover {requirement}")
         forecasts, results = [], []
         windows, _, search_sha = _workflow_windows(workflow)
         for index, (evidence, details) in enumerate(windows):

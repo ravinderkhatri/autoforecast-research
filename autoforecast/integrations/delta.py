@@ -8,6 +8,7 @@ as raw Parquet. Files still require the library's supported filesystem semantics
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import tempfile
 from collections.abc import Mapping
@@ -39,6 +40,19 @@ JSON_OPTIONS = {
 }
 
 
+@dataclasses.dataclass(frozen=True)
+class DeltaTable:
+    """A complete Delta stage table; version=None pins its latest version once."""
+
+    name: str
+    version: int | None = None
+
+    def __post_init__(self):
+        quote_table(self.name)
+        if self.version is not None and (type(self.version) is not int or self.version < 0):
+            raise ValueError("DeltaTable.version must be a nonnegative integer or None")
+
+
 def quote_table(name: str) -> str:
     """Quote a multipart identifier; never accept an expression in its place."""
     if (not isinstance(name, str) or not name or "${" in name
@@ -54,7 +68,7 @@ def latest_delta_version(spark: SparkSession, table: str) -> int:
     return row["version"]
 
 
-def validate_source_queries(spark: SparkSession, *, queries: Mapping[str, str],
+def validate_source_queries(spark: SparkSession | None, *, queries: Mapping[str, str],
                             tables: Mapping[str, str]):
     """Validate every managed query before any source lookup or execution.
 
@@ -161,10 +175,17 @@ def _bound_source_sql(sql: str, bindings: Mapping[str, str]) -> str:
 
 @reported("Resolve source aliases and pinned Delta versions")
 def read_sources(spark: SparkSession, *, queries: Mapping[str, str],
-                 tables: Mapping[str, str]):
+                 tables: Mapping[str, str], versions: Mapping[str, int | None] | None = None):
     """Execute declared queries against one version per physical Delta table."""
     bound_queries = validate_source_queries(spark, queries=queries, tables=tables)
+    versions = dict(versions or {})
+    if set(versions) - set(tables) or any(
+        version is not None and (type(version) is not int or version < 0)
+        for version in versions.values()
+    ):
+        raise ValueError("versions must map declared aliases to nonnegative integers or None")
     physical = {}
+    identities = {}
     resolved = {}
     locations = {}
     for table in dict.fromkeys(tables.values()):
@@ -175,25 +196,36 @@ def read_sources(spark: SparkSession, *, queries: Mapping[str, str],
         target = ".".join([info.catalog or spark.catalog.currentCatalog(),
                            *(info.namespace or [spark.catalog.currentDatabase()]), info.name])
         identity = (detail["id"], detail["location"])
-        if identity not in physical:
-            physical[identity] = latest_delta_version(spark, target)
-        resolved[table] = physical[identity]
+        identities[table] = identity
+        for alias, declared in tables.items():
+            pin = versions.get(alias)
+            if declared == table and pin is not None:
+                if identity in physical and physical[identity] != pin:
+                    raise ValueError("contradictory versions for the same physical Delta table")
+                physical[identity] = pin
         locations[table] = {"id": detail["id"], "location": detail["location"],
                             "read_target": target}
-    versions = {alias: {"table": table, "version": resolved[table]}
+    for table, identity in identities.items():
+        if identity not in physical:
+            physical[identity] = latest_delta_version(spark, locations[table]["read_target"])
+        resolved[table] = physical[identity]
+    pinned_versions = {alias: {"table": table, "version": resolved[table]}
                 for alias, table in tables.items()}
-    note("Resolved sources", aliases=[{"alias": alias, **version}
-                                     for alias, version in versions.items()], queries=list(queries),
-         version_note="Delta table versions; row-date conditions remain in the SQL evidence")
+    note(
+        "Resolved sources",
+        aliases=[{"alias": alias, **version} for alias, version in pinned_versions.items()],
+        queries=list(queries),
+        version_note="Delta table versions; row-date conditions remain in the SQL evidence",
+    )
     # Pass pinned DataFrames through Spark's public SQL API. Spark Connect carries
     # their plans with the query; no caller-owned temporary view is overwritten.
     frames = {
         f"af_source_{index}": spark.read.option("versionAsOf", source["version"]).table(
             quote_table(locations[source["table"]]["read_target"]),
-        ) for index, source in enumerate(versions.values())
+        ) for index, source in enumerate(pinned_versions.values())
     }
     return {name: (spark.sql(bound_queries[name], args=None, **frames),
-                   {"sql": sql, "tables": versions, "resolved_tables": locations})
+                   {"sql": sql, "tables": pinned_versions, "resolved_tables": locations})
             for name, sql in queries.items()}
 
 
@@ -261,16 +293,22 @@ class DeltaStudyStore:
 
     def __init__(self, spark: SparkSession, *, namespace: str,
                  tables: Mapping[str, str] | None = None):
-        quote_table(namespace)
-        if tables is not None and set(tables) - set(SCHEMAS):
-            raise ValueError("unknown study table role")
+        self.tables = self.table_names(namespace, tables)
         self.spark = spark
         self.namespace = namespace
-        self.tables = {kind: (tables or {}).get(kind, namespace + "." + kind) for kind in SCHEMAS}
-        for name in self.tables.values():
+
+    @staticmethod
+    def table_names(namespace: str, tables: Mapping[str, str] | None = None) -> dict[str, str]:
+        """Validate and resolve shared table names without contacting Spark."""
+        quote_table(namespace)
+        if tables is not None and (not isinstance(tables, Mapping) or set(tables) - set(SCHEMAS)):
+            raise ValueError("storage.tables: unknown study table role")
+        names = {kind: (tables or {}).get(kind, namespace + "." + kind) for kind in SCHEMAS}
+        for name in names.values():
             quote_table(name)
-        if len(set(self.tables.values())) != len(self.tables):
-            raise ValueError("study table roles must have distinct names")
+        if len(set(names.values())) != len(names):
+            raise ValueError("storage.tables: study table roles must have distinct names")
+        return names
 
     @reported("Create or validate registry tables")
     def prepare(self, *, lock_path: pathlib.Path) -> None:
@@ -468,7 +506,7 @@ class DeltaStudyStore:
                                         for part in SCHEMAS["forecasts"].split(","))
                 ])
                 forecasts = frame if forecasts is None else forecasts.unionByName(frame)
-            assert forecasts is not None  # A full workflow always has both final stages.
+            assert forecasts is not None  # A completed final workflow includes testing forecasts.
             self.append_once("forecasts", forecasts, scope=publication["scope"])
             self.append_once("study_results", self.spark.createDataFrame(
                 publication["study_results"], SCHEMAS["study_results"],

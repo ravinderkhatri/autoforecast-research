@@ -13,7 +13,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from autoforecast._exact_json import loads_exact_json
-from autoforecast.benchmark import _evaluation_contract_from_record, artifact_path, verify_benchmark
+from autoforecast.benchmark import (
+    _evaluation_contract_from_record,
+    artifact_path,
+    study_source_roles,
+    verify_benchmark,
+)
 from autoforecast.campaign import CampaignStore
 from autoforecast.forecast_campaign import (
     _completed_output,
@@ -181,7 +186,7 @@ def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) ->
                 "actual_snapshots": {
                     role: {"path": str(artifact_path(path, frozen, role)),
                            "sha256": frozen["artifacts"][role]}
-                    for role in ("selection", "final_training", "validation_score", "final_score")
+                    for role in study_source_roles(frozen["recipe"])
                     if role in frozen["artifacts"]
                 },
             }

@@ -168,6 +168,10 @@ def run_study_campaign(
         raise ValueError("tracking_uri and existing experiment_id must be supplied together")
     if final_evaluation not in {"all_models", "validation_winner"}:
         raise ValueError("final_evaluation must be all_models or validation_winner")
+    has_validation = bool(study.recipe["validation_origins"])
+    if not has_validation and final_evaluation == "validation_winner":
+        raise ValueError("validation_winner requires outer validation; use all_models for "
+                         "held-out reporting without model selection")
     if (execution == "cluster") != (ray_address is not None):
         raise ValueError("only cluster execution requires an explicit ray_address")
     for label, value in (
@@ -247,7 +251,8 @@ def run_study_campaign(
 
             materialize_manual_parameters(spec, dict(model.fixed_parameters))
             selection_controls = _validation_controls(controls)
-        options.append(_resolve_options(study, selection_controls, None))
+        options.append(_resolve_options(study, selection_controls, None,
+                                        select=model.fixed_parameters is None))
         resolved.append(
             {
                 "id": spec.model_id,
@@ -303,6 +308,7 @@ def run_study_campaign(
         "timeout_seconds": timeout_seconds,
         "max_attempts": max_attempts,
         "runtime": _runtime_identity(),
+        **({"validation_configured": False} if not has_validation else {}),
     }
     root.mkdir(parents=True, exist_ok=True)
     request_dir = root / ("request-" + digest(request)[:20])
@@ -324,7 +330,8 @@ def run_study_campaign(
         "min_free_disk_gib": 0.0,
     }
     stages = []
-    for phase, needs in (("validation", []), ("final", ["validation"])):
+    phases = (("validation", []), ("final", ["validation"])) if has_validation else (("final", []),)
+    for phase, needs in phases:
         stages.append(
             {
                 "id": phase,
@@ -378,7 +385,7 @@ def run_study_campaign(
             summary["phases"][phase] = load_exact_json(reports[-1])
     final_state = next(row for row in cast(list[dict], state["stages"]) if row["id"] == "final")
     if final_state["status"] == "completed":
-        validation_records = _validation_results(store.root, request)
+        validation_records = _validation_results(store.root, request) if has_validation else {}
         # Stage outputs were authenticated by CampaignSupervisor before this read.
         attempts = sorted((store.root / "stages/final").glob("*/summary.json"))
         summary["results"] = cast(dict, load_exact_json(attempts[-1]))
@@ -388,7 +395,7 @@ def run_study_campaign(
                 request,
                 resolved[int(key)],
                 "final",
-                validation_record=validation_records[key],
+                validation_record=validation_records.get(key),
             )
             if retained != recorded:
                 raise ValueError("model result differs from the completed campaign stage")
@@ -439,7 +446,9 @@ def _load_model_result(
         raise ValueError("model workflow identity differs from campaign")
     if (workflow.testing is None) != (phase == "validation"):
         raise ValueError("model result has the wrong execution phase")
-    if phase == "final" and (
+    if (workflow.validation is not None) != request.get("validation_configured", True):
+        raise ValueError("workflow validation stage differs from the campaign request")
+    if phase == "final" and request.get("validation_configured", True) and (
         validation_record is None
         or workflow.provenance.get("validation_run") != {
             "path": validation_record["workflow_path"],
@@ -613,13 +622,13 @@ def _model_job(
                 with load_study(
                     path.parent.name, registry_root=path.parent.parent, spark=spark
                 ) as study:
-                    if phase == "validation":
+                    if phase == "validation" or not request.get("validation_configured", True):
                         run = study.run_forecast_workflow(
                             fit_predict=callback,
                             implementation=implementation,
                             config=config_path,
                             fixed_parameters=model["fixed_parameters"],
-                            validation_only=True,
+                            validation_only=phase == "validation",
                             output_dir=folder / "runs",
                         )
                     else:
@@ -667,13 +676,19 @@ def _run_phase(
     candidates = list(range(len(request["models"])))
     selected = None
     validation_records = {}
-    if phase == "final":
+    if not request.get("validation_configured", True) and (
+        phase != "final" or request["final_evaluation"] != "all_models"
+    ):
+        raise ValueError("campaign without validation supports only final all-model reporting")
+    if phase == "final" and request.get("validation_configured", True):
         validation_records = _validation_results(pathlib.Path(campaign_root), request)
         comparisons = []
         contracts = set()
         for index in candidates:
             record = validation_records[str(index)]
             run = load_forecast_workflow(record["workflow_path"])
+            if run.validation is None:
+                raise ValueError("candidate has no outer validation result")
             contracts.add(digest(run.validation["evaluation_contract"]))
             value = run.validation["score"].get(request["metric"])
             if type(value) not in (int, float) or not math.isfinite(value):
@@ -836,6 +851,8 @@ def _run_phase(
                         else _load_model_result(validation_file, request, model, "validation")
                     )
                     validation = load_forecast_workflow(record["workflow_path"])
+                    if validation.validation is None:
+                        raise ValueError("candidate has no outer validation result")
                     row.update(validation=validation.validation["score"],
                                parameters=validation.parameters)
                     if str(index) not in failures:

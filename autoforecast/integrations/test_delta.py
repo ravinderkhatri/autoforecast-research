@@ -1275,3 +1275,44 @@ def test_managed_select_syntax_keeps_pinned_rows(store):
         assert sorted(row.item for row in frame.collect()) == [1, 2], name
         assert provenance["sql"] == queries[name]
         assert provenance["tables"]["observations"]["version"] == 0
+
+
+def test_explicit_versions_share_one_physical_pin_and_refuse_conflicts(store, monkeypatch):
+    from autoforecast.integrations import delta
+
+    table = store.namespace + ".explicit_versions"
+    store.spark.createDataFrame([(1,)], "item long").write.format("delta").saveAsTable(table)
+    store.spark.createDataFrame([(2,)], "item long").write.format("delta").mode(
+        "append"
+    ).saveAsTable(table)
+    tables = {"training": table, "audit": "spark_catalog." + table}
+    queries = {"training": "SELECT * FROM training", "audit": "SELECT * FROM audit"}
+    monkeypatch.setattr(
+        delta, "latest_delta_version", lambda *a: pytest.fail("explicit pin was ignored")
+    )
+    result = delta.read_sources(store.spark, tables=tables, queries=queries, versions={"audit": 0})
+    for frame, record in result.values():
+        assert [row.item for row in frame.collect()] == [1]
+        assert {entry["version"] for entry in record["tables"].values()} == {0}
+    with pytest.raises(ValueError, match="contradictory versions"):
+        delta.read_sources(store.spark, tables=tables, queries=queries,
+                           versions={"training": 0, "audit": 1})
+
+
+def test_explicit_delta_stage_registration_retains_version_provenance(store, tmp_path):
+    from autoforecast import DeltaTable, register_study
+    from autoforecast.study_registration import StudyRegistry
+    from autoforecast.test_explicit_study import stages
+
+    args = stages(store.spark, validation=False)
+    table = store.namespace + ".explicit_testing"
+    args["testing_data"].write.format("delta").saveAsTable(table)
+    args["testing_data"] = DeltaTable(table, version=0)
+    registry = StudyRegistry(tmp_path / "registry", spark=store.spark, namespace=store.namespace)
+    study_id = register_study(registry=registry, **args)
+    definition, _ = registry.definition(study_id)
+    stage = definition["source"]["stages"]["testing"]
+    assert stage["kind"] == "delta" and stage["source"]["tables"]["testing"]["version"] == 0
+    with registry.load_study(study_id) as study:
+        assert study.testing_data.count() == 4
+        assert study.validation_data is None

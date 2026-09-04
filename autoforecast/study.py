@@ -25,6 +25,7 @@ from autoforecast.benchmark import (
     evaluation_contract,
     read_benchmark_manifest,
     resolve_study,
+    training_cutoff,
     verify_benchmark,
 )
 from autoforecast.data_admission import _load_dataset_contract_bytes
@@ -81,8 +82,8 @@ def load_study(
     _, record = verify_benchmark(path, sha)
     if record["study_id"] != study_id:
         raise BenchmarkError("study identity changed while loading")
-    if len(record["recipe"]["validation_origins"]) != 1:
-        raise BenchmarkError("load_study requires exactly one validation origin")
+    if len(record["recipe"]["validation_origins"]) > 1:
+        raise BenchmarkError("load_study supports at most one outer validation origin")
     session = spark if spark is not None else SparkSession.getActiveSession()
     if session is None:
         raise ValueError("Supply a supported Spark session or activate one before load_study")
@@ -172,7 +173,7 @@ class Study:
     def _range(self, stage: str) -> tuple[TimePoint, TimePoint]:
         recipe = self.recipe
         frequency = recipe["frequency"]
-        origin = (recipe["validation_origins"][0] if stage in {"training", "validation"}
+        origin = (training_cutoff(recipe) if stage in {"training", "validation"}
                   else recipe["final_train_cutoff"])
         end = parse_origin(origin, frequency)
         if stage in {"training", "refit"}:
@@ -185,8 +186,9 @@ class Study:
         return self._range("training")
 
     @property
-    def validation_date_range(self) -> tuple[TimePoint, TimePoint]:
-        return self._range("validation")
+    def validation_date_range(self) -> tuple[TimePoint, TimePoint] | None:
+        """The declared outer validation range, or None when no validation was supplied."""
+        return self._range("validation") if self.recipe["validation_origins"] else None
 
     @property
     def refit_date_range(self) -> tuple[TimePoint, TimePoint]:
@@ -204,7 +206,7 @@ class Study:
         record = self._record(data=True)
         # Keep operation-owned bytes alive for Spark's deferred reads. Never return a
         # dataframe whose plan points at a mutable registry artifact.
-        destination = pathlib.Path(self._snapshots.name) / role
+        destination = pathlib.Path(self._snapshots.name) / record["role_paths"][role]
         expected = record["artifacts"][role]
         if destination.exists():
             if directory_digest(destination, suffixes=(".parquet",)) != expected:
@@ -235,11 +237,16 @@ class Study:
 
     @property
     def training_data(self) -> DataFrame:
-        return self._fit_data("selection", "training", self.recipe["validation_origins"][0])
+        return self._fit_data("selection", "training", training_cutoff(self.recipe))
 
     @property
-    def validation_data(self) -> DataFrame:
-        return self._frame("validation_score", "validation")
+    def validation_data(self) -> DataFrame | None:
+        """Frozen outer validation actuals, or None; no split is created."""
+        return (
+            self._frame("validation_score", "validation")
+            if self.recipe["validation_origins"]
+            else None
+        )
 
     @property
     def refit_data(self) -> DataFrame:
@@ -323,7 +330,8 @@ class Study:
         reuse_tuning reopens an identical search. selected_config applies verified
         winning settings to a new study. Both modes retain provenance and artifacts.
         fixed_parameters={} uses profile defaults; overrides use full parameter names.
-        Fixed mode requires config, performs two fits and no search. The profile's
+        Fixed mode requires config and performs no search. A fresh full run fits once for testing,
+        plus one validation fit when validation is configured. The profile's
         hpo block is optional in this mode; without it the recorded seed is 42.
         """
         from autoforecast.study_workflow import run_forecast_workflow
@@ -343,7 +351,11 @@ class Study:
         return run_study_campaign(self, models=models, output_dir=output_dir, **execution)
 
     def evaluate_forecasts(
-        self, *, validation_forecasts: Forecast, testing_forecasts: Forecast, model_id: str,
+        self,
+        *,
+        validation_forecasts: Forecast | None = None,
+        testing_forecasts: Forecast,
+        model_id: str,
         forecast_accuracy_breakdown: ForecastAccuracyBreakdown = "per_step",
         output_dir: str | pathlib.Path | None = None,
     ) -> dict:
@@ -365,10 +377,13 @@ class Study:
             raise ValueError("model_id must be a non-blank string")
         record = self._record(data=True)
         recipe = record["recipe"]
+        if bool(recipe["validation_origins"]) != (validation_forecasts is not None):
+            raise ValueError("validation_forecasts: supply predictions only when outer validation "
+                             "is configured, and include them when it is configured")
         # Capture both inputs before invoking either scorer or the caller's Spark runtime.
         forecasts = {stage: Forecast.from_record(value.as_record()) for stage, value in (
             ("validation", validation_forecasts), ("test", testing_forecasts),
-        )}
+        ) if value is not None}
         from autoforecast.study_tuning import _output_root
 
         runs = _output_root(self, output_dir, "study-runs")

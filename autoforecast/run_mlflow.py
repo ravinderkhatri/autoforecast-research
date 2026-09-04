@@ -490,7 +490,7 @@ def export_forecast_workflow(
 
     The immutable workflow remains authoritative. A single local publisher holds
     a lock outside it; remote identity tags recover an upload interrupted after run
-    creation. Retries reuse the same two run IDs and never fit or score. This is a
+    creation. Retries reuse one run ID per configured stage and never fit or score. This is a
     completed-workflow exporter, not live tracking of partially fitted workflows.
     """
     import math
@@ -530,6 +530,8 @@ def export_forecast_workflow(
                 ("validation", workflow.validation),
                 ("test", workflow.testing),
             ):
+                if evidence is None:
+                    continue
                 key = identity + "-" + stage
                 matches = client.search_runs(
                     [experiment_id],

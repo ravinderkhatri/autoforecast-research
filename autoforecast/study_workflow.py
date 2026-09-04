@@ -79,7 +79,7 @@ class ForecastWorkflowResult:
     path: pathlib.Path
     status: str
     parameters: dict
-    validation: dict
+    validation: dict | None
     testing: dict | None
     provenance: dict
     tuning_path: pathlib.Path | None
@@ -101,8 +101,8 @@ class ForecastWorkflowResult:
         return self.path.name
 
     @property
-    def validation_metrics(self) -> dict:
-        return self._metrics(self.validation)
+    def validation_metrics(self) -> dict | None:
+        return self._metrics(self.validation) if self.validation is not None else None
 
     @property
     def testing_metrics(self) -> dict | None:
@@ -126,14 +126,16 @@ class ForecastWorkflowResult:
                 if evidence is not None}
 
     def summary(self) -> dict:
-        population = self.validation["score"]["population"]
+        evidence = self.testing if self.validation is None else self.validation
+        assert evidence is not None
+        population = evidence["score"]["population"]
         original = population["original_series"]
-        retained = self.validation["score"].get("availability", {}).get(
+        retained = evidence["score"].get("availability", {}).get(
             "retained_series", original,
         )
         return {"study_id": self.study_id, "parent_study_id": self.parent_study_id,
                 "run_id": self.run_id, "status": self.status,
-                "model_id": self.validation["forecasts"].adapter,
+                "model_id": evidence["forecasts"].adapter,
                 "original_series": original, "retained_series": retained,
                 "excluded_series": original - retained,
                 "forecasted_series": {
@@ -161,14 +163,18 @@ def load_forecast_workflow(path: str | pathlib.Path) -> ForecastWorkflowResult:
         raise HPOError("workflow did not finish successfully")
     record = _retained_json(root, "result.json", manifest)
     expected_schema = "autoforecast." + completion["task"] + ".v1"
-    if record["schema"] != expected_schema:
+    allowed_schemas = {expected_schema}
+    if completion["task"] == "forecast-workflow":
+        allowed_schemas.add("autoforecast.forecast-workflow.v2")
+    if record["schema"] not in allowed_schemas:
         raise HPOError("unsupported forecast workflow result")
     _validate_workflow_configuration(
         root, record, _retained_json(root, "metadata/winner-config.json", manifest), manifest
     )
     verify_retained(root, record["provenance"]["implementation"],
                     record["provenance"].get("implementation_evidence"))
-    stages = {"validation": _window_result(root, record["validation"])}
+    stages = {"validation": (_window_result(root, record["validation"])
+                             if record["validation"] is not None else None)}
     testing = _window_result(root, record["testing"]) if "testing" in record else None
     return ForecastWorkflowResult(
         root,
@@ -465,6 +471,9 @@ def run_forecast_workflow(
     """
     from autoforecast.study import load_study
 
+    has_validation = bool(study.recipe["validation_origins"])
+    if not has_validation and (validation_only or validation_run is not None):
+        raise ValueError("outer validation is not configured; run the final workflow directly")
     previous = None
     if validation_run is not None:
         previous = load_forecast_workflow(validation_run)
@@ -517,7 +526,9 @@ def run_forecast_workflow(
         materialize_runtime_parameters(spec, saved["parameters"])
         seed = saved["seed"]
         controls = _validation_controls(controls)
-    options = _resolve_options(study, controls, tuning_origin)
+    options = _resolve_options(
+        study, controls, tuning_origin, select=not (saved is not None or fixed)
+    )
     if saved is not None or fixed:
         options["selection_boundaries"] = []
     if previous is not None:
@@ -562,7 +573,11 @@ def run_forecast_workflow(
             if fixed or saved is not None or reuse_tuning is not None
             else budget * len(options["windows"])
         )
-        final_fits = 2 if fixed or saved is not None or options["stage"] == "tuning" else 1
+        final_fits = (2 if fixed or saved is not None or options["stage"] == "tuning" else 1)
+        if not has_validation:
+            final_fits = 1
+            note("Validation: not configured; no split will be created",
+                 final_fit_input="training data")
         if validation_only or previous is not None:
             final_fits -= 1
         estimate = {
@@ -677,12 +692,13 @@ def run_forecast_workflow(
                     prefix="af-workflow-", dir=study._snapshots.name,
                 ))
             )
-            stages = {}
+            stages: dict = {} if has_validation else {"validation": None}
             recipe = study.recipe
-            for stage, origin, horizon in (
-                ("validation", recipe["validation_origins"][0], recipe["validation_horizon"]),
-                ("test", recipe["final_train_cutoff"], recipe["final_test_horizon"]),
-            ):
+            outer_windows = [
+                ("validation", origin, recipe["validation_horizon"])
+                for origin in recipe["validation_origins"]
+            ] + [("test", recipe["final_train_cutoff"], recipe["final_test_horizon"])]
+            for stage, origin, horizon in outer_windows:
                 if stage == "test" and validation_only:
                     continue
                 phase = "validation" if stage == "validation" else "final_refit"
@@ -695,6 +711,8 @@ def run_forecast_workflow(
                     with _stage(bundle.path / "events.jsonl", "artifact_retention",
                                 window=stage, origin=origin, run_id=bundle.path.name):
                         previous = load_forecast_workflow(previous.path)
+                        if previous.validation is None:
+                            raise HPOError("validation checkpoint has no validation stage")
                         if (
                             previous.validation["evaluation_contract"]
                             != inputs.verify()["evaluation_contract"]
@@ -829,7 +847,7 @@ def run_forecast_workflow(
             if capture is not None:
                 capture.verify()
             result = {
-                "schema": "autoforecast." + task + ".v1",
+                "schema": "autoforecast." + task + (".v1" if has_validation else ".v2"),
                 "status": stages["validation" if validation_only else "testing"]["score"][
                     "evaluation_status"
                 ],

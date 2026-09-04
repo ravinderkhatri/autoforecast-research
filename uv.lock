@@ -195,6 +195,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "databricks-sdk" },
+    { name = "jsonschema" },
     { name = "matplotlib" },
     { name = "mlflow-skinny" },
     { name = "numpy" },
@@ -273,6 +274,7 @@ requires-dist = [
     { name = "autogluon-timeseries", marker = "extra == 'autogluon-zoo'", specifier = ">=1.4,<2" },
     { name = "databricks-sdk", specifier = "==0.137.0" },
     { name = "google-cloud-bigquery", marker = "extra == 'bigquery'", specifier = "==3.47.0" },
+    { name = "jsonschema", specifier = "==4.26.0" },
     { name = "kaggle", marker = "extra == 'data'" },
     { name = "lightgbm", marker = "extra == 'shallow'", specifier = ">=4,<5" },
     { name = "lightning", marker = "extra == 'tft'", specifier = ">=2.5,<3" },

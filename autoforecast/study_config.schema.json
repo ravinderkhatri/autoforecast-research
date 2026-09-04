@@ -1,0 +1,1007 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "dataset": {
+      "$ref": "#/$defs/dataset"
+    },
+    "recipe": {
+      "$ref": "#/$defs/recipe"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "storage": {
+      "$ref": "#/$defs/storage"
+    },
+    "references": {
+      "$ref": "#/$defs/references"
+    },
+    "invalid_references": {
+      "enum": [
+        "error",
+        "exclude"
+      ],
+      "default": "error"
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "preparation": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean",
+          "null"
+        ]
+      },
+      "description": "Scalar application settings; requires a preparation hook.",
+      "propertyNames": {
+        "pattern": "\\S"
+      }
+    },
+    "records": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "enum": [
+            "json",
+            "yaml"
+          ],
+          "default": "json"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "dataset",
+    "recipe",
+    "source",
+    "storage"
+  ],
+  "additionalProperties": false,
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autoforecast.invalid/schema/study-config-v1",
+  "title": "Study registration configuration",
+  "description": "Structural contract used by validate_study_config and registration. Scientific checks also validate canonical cadence, range ordering, column roles, reference policies and SQL syntax. No schema validation proves source data or credentials.",
+  "$defs": {
+    "recipe": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "enum": [
+            2,
+            3
+          ],
+          "description": "Use 3 for optional outer validation; version 2 requires it."
+        },
+        "source_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Source column name."
+          },
+          "uniqueItems": true,
+          "minItems": 1,
+          "description": "Columns that together identify one series."
+        },
+        "training_start": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Inclusive first permitted training time point."
+        },
+        "validation_origins": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Last training time point before an outer validation window."
+          },
+          "uniqueItems": true,
+          "description": "Use [] in version 3 to omit validation; no split is created."
+        },
+        "validation_horizon": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Periods in each outer validation window; null only when validation is absent."
+        },
+        "final_train_cutoff": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Last permitted training/refit time point before held-out testing."
+        },
+        "final_test_horizon": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Planned testing periods, even when actual observations are incomplete."
+        },
+        "history_policy": {
+          "enum": [
+            "fixed",
+            "revised_snapshot"
+          ],
+          "description": "Whether overlap must agree exactly or declared revised snapshots are permitted."
+        },
+        "new_series_policy": {
+          "enum": [
+            "error",
+            "exclude_after_first_origin"
+          ],
+          "description": "How to handle keys absent from the original training population."
+        },
+        "target_unit": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unit of the target, for example units or kilograms."
+        },
+        "feature_availability": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Column recording when this future feature was known."
+          },
+          "description": "One entry for every known_future feature."
+        },
+        "metric": {
+          "enum": [
+            "mae",
+            "rmse",
+            "wape",
+            "wrmsse"
+          ],
+          "description": "Frozen comparison objective. WRMSSE needs references."
+        },
+        "frequency": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Supported cadence such as D, H, W, M, MS or a daily stride.",
+          "default": "D"
+        },
+        "history_missing": {
+          "enum": [
+            "preserve",
+            "zero"
+          ],
+          "default": "preserve",
+          "description": "Keep missing training targets, or explicitly fill them with zero."
+        },
+        "actual_missing": {
+          "enum": [
+            "error",
+            "mask",
+            "zero"
+          ],
+          "default": "error",
+          "description": "Reject, mask or explicitly zero-fill missing actuals within configured stages."
+        },
+        "series_starts": {
+          "type": "object",
+          "properties": {
+            "rule": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Name of the history-start rule."
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "keys": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": [
+                        "string",
+                        "integer"
+                      ]
+                    }
+                  },
+                  "start": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "First permitted observation for this series."
+                  }
+                },
+                "required": [
+                  "keys",
+                  "start"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "rule",
+            "values"
+          ],
+          "additionalProperties": false,
+          "default": {
+            "rule": "study_lower_bound",
+            "values": []
+          }
+        },
+        "tuning_windows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "origin": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Last time point allowed in fit history."
+              },
+              "horizon": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Number of forecast periods."
+              }
+            },
+            "required": [
+              "origin",
+              "horizon"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "description": "Explicit inner windows wholly inside permitted selection history."
+        },
+        "tuning_schedule": {
+          "type": "object",
+          "properties": {
+            "horizon": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Forecast periods per inner window."
+            },
+            "stride": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Periods between inner origins."
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of inner windows.",
+              "default": 3
+            }
+          },
+          "required": [
+            "horizon",
+            "stride"
+          ],
+          "additionalProperties": false
+        },
+        "resolved_tuning_schedule": {
+          "type": "object",
+          "properties": {
+            "horizon": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Frozen horizon."
+            },
+            "stride": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Frozen stride."
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Frozen window count."
+            }
+          },
+          "required": [
+            "horizon",
+            "stride",
+            "count"
+          ],
+          "additionalProperties": false
+        },
+        "reference_metrics": {
+          "const": [
+            "wrmsse"
+          ],
+          "description": "Prepare WRMSSE references when it is an additional reporting metric."
+        }
+      },
+      "required": [
+        "schema_version",
+        "source_keys",
+        "training_start",
+        "validation_origins",
+        "validation_horizon",
+        "final_train_cutoff",
+        "final_test_horizon",
+        "history_policy",
+        "new_series_policy",
+        "target_unit",
+        "feature_availability",
+        "metric"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "schema_version": {
+                "const": 2
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "validation_origins": {
+                "minItems": 1
+              },
+              "validation_horizon": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "validation_origins": {
+                "maxItems": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "schema_version": {
+                "const": 3
+              },
+              "validation_horizon": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "validation_horizon": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "tuning_schedule"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "tuning_windows"
+                  ]
+                },
+                {
+                  "required": [
+                    "resolved_tuning_schedule"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "resolved_tuning_schedule"
+            ]
+          },
+          "then": {
+            "required": [
+              "tuning_windows"
+            ]
+          }
+        }
+      ]
+    },
+    "dataset": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "enum": [
+            1,
+            2
+          ],
+          "type": "integer"
+        },
+        "dataset": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Generic dataset name."
+            },
+            "panel": {
+              "type": "object",
+              "properties": {
+                "series_col": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "One series identifier column; source_keys may contain multiple columns."
+                },
+                "time_col": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Date or timestamp column."
+                },
+                "target_col": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Numeric observation column."
+                },
+                "exposure_col": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "description": "Explicit exposure_col role; null when not used.",
+                  "default": null
+                },
+                "oos_col": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "description": "Explicit oos_col role; null when not used.",
+                  "default": null
+                },
+                "price_col": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "description": "Explicit price_col role; null when not used.",
+                  "default": null
+                },
+                "promo_col": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "description": "Explicit promo_col role; null when not used.",
+                  "default": null
+                },
+                "factor_group": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "description": "Explicit factor_group role; null when not used.",
+                  "default": null
+                },
+                "product_col": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "description": "Explicit product_col role; null when not used.",
+                  "default": null
+                },
+                "store_col": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "description": "Explicit store_col role; null when not used.",
+                  "default": null
+                },
+                "category_col": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "description": "Explicit category_col role; null when not used.",
+                  "default": null
+                },
+                "known_future": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Source column name."
+                  },
+                  "uniqueItems": true,
+                  "default": [],
+                  "description": "Columns assigned to the known_future role."
+                },
+                "static": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Source column name."
+                  },
+                  "uniqueItems": true,
+                  "default": [],
+                  "description": "Columns assigned to the static role."
+                },
+                "static_reals": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Source column name."
+                  },
+                  "uniqueItems": true,
+                  "default": [],
+                  "description": "Columns assigned to the static_reals role."
+                },
+                "past_only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Source column name."
+                  },
+                  "uniqueItems": true,
+                  "default": [],
+                  "description": "Columns assigned to the past_only role."
+                },
+                "shared_known_future": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Source column name."
+                  },
+                  "uniqueItems": true,
+                  "default": [],
+                  "description": "Columns assigned to the shared_known_future role."
+                },
+                "season_length": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Periods in the declared seasonal cycle; daily default is 7."
+                },
+                "frequency": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Cadence matching the recipe.",
+                  "default": "D"
+                },
+                "target_estimand": {
+                  "enum": [
+                    "sales_given_availability",
+                    "observed_nonnegative"
+                  ],
+                  "default": "sales_given_availability"
+                },
+                "negative_target_policy": {
+                  "const": "refuse",
+                  "default": "refuse"
+                },
+                "status_prob_cols": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "maxProperties": 0,
+                  "description": "Absent or empty; soft observation states are unsupported for frozen observed studies."
+                },
+                "plan": {
+                  "type": "null",
+                  "description": "Separate plan sources are unsupported for these studies."
+                },
+                "covariate_families": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Source column name."
+                    },
+                    "uniqueItems": true
+                  },
+                  "default": []
+                }
+              },
+              "required": [
+                "series_col",
+                "time_col",
+                "target_col"
+              ],
+              "additionalProperties": false
+            },
+            "required_series_count": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Expected cohort size before declared exclusions."
+            }
+          },
+          "required": [
+            "id",
+            "panel"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "schema_version",
+        "dataset"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "schema_version": {
+                "const": 2
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "dataset": {
+                "required": [
+                  "required_series_count"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "dataset": {
+                "not": {
+                  "required": [
+                    "required_series_count"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "parquet"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Complete Parquet input, relative to the configuration file."
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "delta"
+            },
+            "sql": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Local file containing a read-only SELECT over declared aliases."
+            },
+            "tables": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Managed Delta table name."
+              }
+            },
+            "audit_queries": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Local SELECT file for the preparation hook."
+              }
+            },
+            "population": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Query supplying starting keys.",
+              "default": "primary"
+            },
+            "require_matching_population": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "required": [
+            "kind",
+            "sql",
+            "tables"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "parquet",
+            "delta"
+          ]
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "root": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Durable filesystem directory accessible to Spark workers.",
+          "pattern": "^(?!.*://).*\\S.*$"
+        },
+        "scratch_root": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shared temporary workspace; defaults to root/scratch.",
+          "pattern": "^(?!.*://).*\\S.*$"
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional shared Delta table namespace."
+        },
+        "tables": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Existing shared-table name override."
+          },
+          "propertyNames": {
+            "enum": [
+              "studies",
+              "frozen_observations",
+              "study_data_issues",
+              "forecasts",
+              "study_results"
+            ]
+          },
+          "description": "Known shared-table role overrides; runtime validation also requires distinct effective table names."
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "additionalProperties": false,
+      "dependentRequired": {
+        "tables": [
+          "namespace"
+        ]
+      }
+    },
+    "references": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Parquet weight/scale references, relative to the configuration file."
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "prepared": {
+              "const": true,
+              "description": "The explicit preparation hook returns checked references."
+            }
+          },
+          "required": [
+            "prepared"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "weight_col": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Column used by the existing weight calculation."
+            },
+            "missing_history": {
+              "enum": [
+                "na",
+                "zero"
+              ]
+            },
+            "duplicate_policy": {
+              "enum": [
+                "error",
+                "sum"
+              ]
+            },
+            "weight_window_days": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Allowed history length for weights.",
+              "default": 28
+            },
+            "scale_lag": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Lag for scale differences.",
+              "default": 1
+            },
+            "scale_start": {
+              "enum": [
+                "first_positive",
+                "history_start"
+              ],
+              "default": "first_positive",
+              "description": "Existing scale-history start rule."
+            }
+          },
+          "required": [
+            "weight_col",
+            "missing_history",
+            "duplicate_policy"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "tracking": {
+          "enum": [
+            "none",
+            "mlflow"
+          ],
+          "default": "none"
+        },
+        "publish": {
+          "type": "boolean",
+          "default": false
+        },
+        "log_level": {
+          "enum": [
+            "NOTSET",
+            "DEBUG",
+            "INFO",
+            "WARN",
+            "WARNING",
+            "ERROR",
+            "FATAL",
+            "CRITICAL"
+          ],
+          "default": "INFO"
+        },
+        "tracking_uri": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "mlflow_experiment": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "implementation": {
+          "type": "object",
+          "description": "Explicit local source scope; this does not capture files during configuration validation.",
+          "properties": {
+            "source_roots": {
+              "type": "object",
+              "minProperties": 1,
+              "propertyNames": {
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "pattern": "^(?!.*://).*\\S.*$"
+              }
+            },
+            "include": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).*$"
+              }
+            },
+            "exclude": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).*$"
+              }
+            }
+          },
+          "required": [
+            "source_roots"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "recipe": {
+            "anyOf": [
+              {
+                "properties": {
+                  "metric": {
+                    "const": "wrmsse"
+                  }
+                },
+                "required": [
+                  "metric"
+                ]
+              },
+              {
+                "required": [
+                  "reference_metrics"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "references"
+        ]
+      }
+    }
+  ]
+}

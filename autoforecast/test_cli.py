@@ -192,3 +192,59 @@ def test_run_study_id_rejects_obsolete_schema_before_compilation(tmp_path):
     }))
     assert_input_error(cli("run", "--project-root", project, "--study-id", identity),
                        "unsupported benchmark schema")
+
+
+def test_no_validation_recipe_rejects_explicit_validation_source_before_runtime(tmp_path):
+    project = tmp_path / "project"
+    create_example(project)
+    path = project / "recipe.json"
+    recipe = json.loads(path.read_text())
+    recipe.update(schema_version=3, validation_origins=[], validation_horizon=None)
+    path.write_text(json.dumps(recipe))
+    assert_input_error(cli("freeze", "--project-root", project, "--source", "data",
+                           "--validation-score", "validation.parquet"),
+                       "--validation-score requires configured validation")
+    assert not (project / ".autoforecast").exists()
+
+
+@pytest.mark.parametrize("validation", [False, True])
+def test_freeze_passes_exact_configured_role_paths(tmp_path, monkeypatch, validation):
+    from autoforecast import cli as commands
+
+    tmp_path = tmp_path / "project"
+    create_example(tmp_path)
+    recipe_path = tmp_path / "recipe.json"
+    if not validation:
+        recipe = json.loads(recipe_path.read_text())
+        recipe.update(schema_version=3, validation_origins=[], validation_horizon=None)
+        recipe_path.write_text(json.dumps(recipe))
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(args[3])
+        return "frozen-study"
+
+    monkeypatch.setattr(commands, "prepare", capture)
+    monkeypatch.setattr(sys, "argv", ["autoforecast", "freeze", "--project-root", str(tmp_path),
+                                     "--source", "common"] +
+                        (["--validation-score", "validation"] if validation else []))
+    assert commands.main() == 0
+    expected = {role: tmp_path / "common" for role in
+                ("selection", "final_training", "final_score")}
+    if validation:
+        expected["validation_score"] = tmp_path / "validation"
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("explicit_validation", [False, True])
+def test_freeze_requires_validation_declaration_before_role_dispatch(tmp_path, explicit_validation):
+    project = tmp_path / "project"
+    create_example(project)
+    path = project / "recipe.json"
+    recipe = json.loads(path.read_text())
+    del recipe["validation_origins"]
+    path.write_text(json.dumps(recipe))
+    options = ["--validation-score", "validation.parquet"] if explicit_validation else []
+    assert_input_error(cli("freeze", "--project-root", project, "--source", "data", *options),
+                       "validation_origins")
+    assert not (project / ".autoforecast").exists()

@@ -32,6 +32,8 @@ from autoforecast.frequency import (
 from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
 
 STUDY_SCHEMA = "autoforecast.frozen-benchmark.v4"
+OPTIONAL_STAGE_SCHEMA = "autoforecast.frozen-benchmark.v5"
+STUDY_SCHEMAS = (STUDY_SCHEMA, OPTIONAL_STAGE_SCHEMA)
 MISSING_COLUMN = "__af_original_missing"
 START_COLUMN = "__af_history_start"
 
@@ -270,6 +272,19 @@ def _identity(record: dict) -> dict:
     return identity
 
 
+def training_cutoff(recipe: dict, *, last: bool = False) -> str:
+    """The permitted selection history ends before validation, or at final training."""
+    origins = recipe["validation_origins"]
+    return origins[-1 if last else 0] if origins else recipe["final_train_cutoff"]
+
+
+def study_source_roles(recipe: dict) -> tuple[str, ...]:
+    """Configured source roles in their established preflight order."""
+    return ("selection", "final_training", *(
+        ("validation_score",) if recipe["validation_origins"] else ()
+    ), "final_score")
+
+
 def _normalise_recipe(recipe: dict) -> dict:
     """Freeze the current study defaults before computing its identity."""
     validate_recipe(recipe)
@@ -302,7 +317,7 @@ def resolve_tuning_schedule(recipe: dict, schedule: dict) -> list[dict]:
     if any(type(value) is not int or value < 1 for value in (count, horizon, stride)):
         raise BenchmarkError("tuning schedule count, horizon and stride must be positive integers")
     cadence = _recipe_cadence(recipe)
-    end = _recipe_point(recipe["validation_origins"][0], cadence)
+    end = _recipe_point(training_cutoff(recipe), cadence)
     start = _recipe_point(recipe["training_start"], cadence)
     try:
         first = advance(end, cadence, -horizon - stride * (count - 1))
@@ -356,7 +371,7 @@ def resolve_study(output_root: pathlib.Path, study_id: str) -> tuple[pathlib.Pat
             or any(character not in "0123456789abcdef" for character in study_id)):
         raise BenchmarkError("study_id must be a lowercase SHA-256 identity")
     path, record = verify_benchmark(output_root / study_id / "benchmark.json")
-    if (record["schema"] != STUDY_SCHEMA or record.get("study_id") != study_id
+    if (record["schema"] not in STUDY_SCHEMAS or record.get("study_id") != study_id
             or record["benchmark_id"] != study_id):
         raise BenchmarkError("study_id must resolve to the matching current-format study")
     return path, record
@@ -364,28 +379,12 @@ def resolve_study(output_root: pathlib.Path, study_id: str) -> tuple[pathlib.Pat
 
 def validate_recipe(recipe: dict) -> None:
     """Validate exact preparation fields before acquiring a runtime."""
-    expected = {
-        "schema_version",
-        "source_keys",
-        "training_start",
-        "validation_origins",
-        "validation_horizon",
-        "final_train_cutoff",
-        "final_test_horizon",
-        "history_policy",
-        "new_series_policy",
-        "target_unit",
-        "feature_availability",
-    }
-    if type(recipe) is not dict or type(recipe.get("schema_version")) is not int:
-        raise BenchmarkError("preparation recipe requires documented versioned fields")
-    if recipe["schema_version"] != 2:
-        raise BenchmarkError("preparation recipe schema_version must be 2")
-    required = expected | {"metric"}
-    optional = {"frequency", "history_missing", "actual_missing", "series_starts", "tuning_windows",
-                "tuning_schedule", "resolved_tuning_schedule", "reference_metrics"}
-    if not required <= set(recipe) or set(recipe) - required - optional:
-        raise BenchmarkError("preparation recipe requires documented study fields")
+    from autoforecast._study_config import validate_shape
+
+    try:
+        validate_shape(recipe, "recipe")
+    except ValueError as error:
+        raise BenchmarkError(str(error)) from error
     if "tuning_schedule" in recipe:
         if "tuning_windows" in recipe or "resolved_tuning_schedule" in recipe:
             raise BenchmarkError("tuning_schedule conflicts with explicit or resolved windows")
@@ -447,11 +446,14 @@ def validate_recipe(recipe: dict) -> None:
     horizon, test_horizon = recipe["validation_horizon"], recipe["final_test_horizon"]
     try:
         invalid = (
-            not origins
-            or origins != sorted(set(origins))
-            or start > origins[0]
-            or any(type(h) is not int or h < 1 for h in (horizon, test_horizon))
-            or advance(origins[-1], cadence, horizon) > cutoff
+            type(test_horizon) is not int or test_horizon < 1
+            or start > cutoff
+            or (not origins and (recipe["schema_version"] != 3 or horizon is not None))
+            or (bool(origins) and (
+                origins != sorted(set(origins)) or start > origins[0]
+                or type(horizon) is not int or horizon < 1
+                or advance(origins[-1], cadence, horizon) > cutoff
+            ))
         )
         advance(cutoff, cadence, test_horizon)
     except (FrequencyError, OverflowError):
@@ -469,7 +471,12 @@ def validate_recipe(recipe: dict) -> None:
                 raise BenchmarkError("each tuning window requires an origin and positive horizon")
             origin = _recipe_point(window["origin"], cadence)
             try:
-                if not start <= origin < advance(origin, cadence, window["horizon"]) <= origins[0]:
+                if (
+                    not start
+                    <= origin
+                    < advance(origin, cadence, window["horizon"])
+                    <= _recipe_point(training_cutoff(recipe), cadence)
+                ):
                     raise BenchmarkError("tuning targets must precede all outer validation targets")
             except (FrequencyError, OverflowError) as error:
                 raise BenchmarkError("invalid tuning window boundary") from error
@@ -501,7 +508,7 @@ def validate_recipe(recipe: dict) -> None:
                 raise BenchmarkError("duplicate declared series start")
             seen.add(values)
             first = _recipe_point(entry["start"], cadence)
-            if not start <= first <= origins[0]:
+            if not start <= first <= _recipe_point(training_cutoff(recipe), cadence):
                 raise BenchmarkError("series starts must lie within history and the first origin")
             _inclusive_period_count(start, first, cadence, label="series history start")
 
@@ -620,7 +627,7 @@ def _freeze_benchmark(
         recipe.setdefault("reference_metrics", ["wrmsse"])
     recipe = _normalise_recipe(recipe)
     cadence = _recipe_cadence(recipe)
-    source_roles = {"selection", "final_training", "validation_score", "final_score"}
+    source_roles = set(study_source_roles(recipe))
     if set(sources) != source_roles:
         raise BenchmarkError(f"provide exactly these source roles: {sorted(source_roles)}")
     if ((recipe["metric"] == "wrmsse" or recipe.get("reference_metrics"))
@@ -630,7 +637,6 @@ def _freeze_benchmark(
         resolve_study(output_root, study_id)
     keys = recipe["source_keys"]
     start = _recipe_point(recipe["training_start"], cadence)
-    origins = [_recipe_point(day, cadence) for day in recipe["validation_origins"]]
     cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
     test_horizon = recipe["final_test_horizon"]
     end = advance(cutoff, cadence, test_horizon)
@@ -707,9 +713,14 @@ def _freeze_benchmark(
             raise BenchmarkError("duplicate source observations")
         frames[name] = frame
     selection = frames["selection"]
-    cohort = selection.filter(
-        F.col(panel.time_col) <= grid.time_literal(origins[0], cadence)
-    ).select(internal).distinct()
+    cohort = (
+        selection.filter(
+            F.col(panel.time_col)
+            <= grid.time_literal(_recipe_point(training_cutoff(recipe), cadence), cadence)
+        )
+        .select(internal)
+        .distinct()
+    )
     all_keys = frames["selection"].select(internal)
     for name, frame in frames.items():
         if name == "selection":
@@ -750,7 +761,12 @@ def _freeze_benchmark(
         low, high = (
             (advance(cutoff, cadence, 1), end)
             if name == "final_score"
-            else (start, origins[-1] if name == "selection" else cutoff)
+            else (
+                start,
+                _recipe_point(training_cutoff(recipe, last=True), cadence)
+                if name == "selection"
+                else cutoff,
+            )
         )
         upper = end if panel.known_future and name in {"selection", "final_training"} else high
         window = retained.filter(
@@ -829,7 +845,9 @@ def _freeze_benchmark(
         missing_count = required.filter(F.col(MISSING_COLUMN)).count()
         counts[name].update(originally_missing=missing_count, zero_filled=0)
     if recipe["history_policy"] == "fixed":
-        last_origin = grid.time_literal(origins[-1], cadence)
+        last_origin = grid.time_literal(
+            _recipe_point(training_cutoff(recipe, last=True), cadence), cadence
+        )
         left = frames["selection"].filter(F.col(panel.time_col) <= last_origin)
         right = frames["final_training"].filter(F.col(panel.time_col) <= last_origin)
         if (
@@ -843,7 +861,7 @@ def _freeze_benchmark(
                 "conflicting overlapping history between selection and final training"
             )
     identity = {
-        "schema": STUDY_SCHEMA,
+        "schema": OPTIONAL_STAGE_SCHEMA if recipe["schema_version"] == 3 else STUDY_SCHEMA,
         "recipe": recipe,
         "key_types": key_types,
         "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
@@ -1115,7 +1133,8 @@ def _publish_frozen_benchmark(
 
 def _validate_admission_identity(value):
     if (not isinstance(value, dict) or set(value) != {"schema", "sha256"}
-            or value["schema"] != "autoforecast.admission-identity.v1"
+            or value["schema"] not in {"autoforecast.admission-identity.v1",
+                                       "autoforecast.supplied-stage-identity.v1"}
             or not isinstance(value["sha256"], str) or len(value["sha256"]) != 64
             or any(c not in "0123456789abcdef" for c in value["sha256"])):
         raise BenchmarkError("invalid admission identity binding")
@@ -1139,7 +1158,7 @@ def _validate_manifest(record: object) -> dict:
 
     if type(record) is not dict:
         raise BenchmarkError("benchmark manifest must be an object")
-    if record.get("schema") != STUDY_SCHEMA:
+    if record.get("schema") not in STUDY_SCHEMAS:
         raise BenchmarkError("unsupported benchmark schema; prepare a current study")
     fields = {
         "schema", "recipe", "key_types", "contract_sha256", "logical_snapshots",
@@ -1156,6 +1175,9 @@ def _validate_manifest(record: object) -> dict:
     mapping(record, fields, "manifest")
     recipe = record["recipe"]
     validate_recipe(recipe)
+    expected_schema = OPTIONAL_STAGE_SCHEMA if recipe["schema_version"] == 3 else STUDY_SCHEMA
+    if record["schema"] != expected_schema:
+        raise BenchmarkError("recipe version differs from the frozen study schema")
     if (recipe != _normalise_recipe(recipe)
             or record["study_id"] != record["benchmark_id"]
             or record["metric_definition"] != _metric_definition(recipe)):
@@ -1227,7 +1249,7 @@ def _validate_manifest(record: object) -> dict:
             raise BenchmarkError("invalid inherited role inventory")
     if record["source_series_count"] - cohort != record["excluded_new_series"]:
         raise BenchmarkError("benchmark population counts do not reconcile")
-    source_roles = {"selection", "final_training", "validation_score", "final_score"}
+    source_roles = set(study_source_roles(recipe))
     if recipe["metric"] == "wrmsse" or recipe.get("reference_metrics"):
         source_roles.add("scoring_references")
     roles = source_roles | {"source-keys"}
@@ -1252,7 +1274,7 @@ def _validate_manifest(record: object) -> dict:
     cadence = _recipe_cadence(recipe)
     start = _recipe_point(recipe["training_start"], cadence)
     cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
-    selection_end = _recipe_point(recipe["validation_origins"][-1], cadence)
+    selection_end = _recipe_point(training_cutoff(recipe, last=True), cadence)
     role_periods = {
         "selection": _inclusive_period_count(
             start, selection_end, cadence, label="selection role"
@@ -1262,7 +1284,8 @@ def _validate_manifest(record: object) -> dict:
         ),
         "final_score": recipe["final_test_horizon"],
     }
-    role_periods["validation_score"] = role_periods["final_training"]
+    if recipe["validation_origins"]:
+        role_periods["validation_score"] = role_periods["final_training"]
     for role, values in mapping(record["counts"], role_periods, "counts").items():
         fields = {"required_observations", "written_rows", "originally_missing", "zero_filled"}
         mapping(values, fields, f"counts.{role}")
@@ -1410,6 +1433,8 @@ def _evaluation_contract_from_record(
     path: pathlib.Path, record: dict, *, stage: str, origin: str, horizon: int, metric: str,
 ) -> dict:
     """Derive a boundary from the record authenticated by the current compilation."""
+    if stage == "validation" and not record["recipe"]["validation_origins"]:
+        raise BenchmarkError("outer validation is not configured; use a study with validation data")
     cadence = _recipe_cadence(record["recipe"])
     key = boundary(stage, origin, horizon, cadence.code)
     if key not in record["grids"]:

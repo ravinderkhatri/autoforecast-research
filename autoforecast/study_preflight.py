@@ -34,7 +34,9 @@ from autoforecast.benchmark import (
     boundary,
     digest,
     parquet_content_hash,
+    study_source_roles,
     study_windows,
+    training_cutoff,
     verify_benchmark,
 )
 from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin, period_points
@@ -228,7 +230,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             "extra_ids": None,
             "status": "not_checked",
         }
-        for role in ("selection", "final_training", "validation_score", "final_score")
+        for role in study_source_roles(recipe)
     }
     for role in report["roles"]:
         issue_start = len(report["issues"])
@@ -292,7 +294,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             test_points[-1]
             if role == "final_score"
             else parse_origin(
-                recipe["validation_origins"][-1]
+                training_cutoff(recipe, last=True)
                 if role == "selection"
                 else recipe["final_train_cutoff"],
                 frequency,

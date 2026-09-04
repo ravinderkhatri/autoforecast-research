@@ -19,6 +19,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from spec.forecast_spec import STATE_CODES
 
+from autoforecast.benchmark import training_cutoff
 from autoforecast.column_names import fresh_internal_names
 from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin
 from autoforecast.grid import canonical_key, read_time_parquet, time_literal
@@ -277,7 +278,7 @@ def report_source_issues(frame: DataFrame, *, contract, recipe: dict) -> DataFra
             for entry in declarations
         ], schema)
     else:
-        first_origin = parse_origin(recipe["validation_origins"][0], cadence)
+        first_origin = parse_origin(training_cutoff(recipe), cadence)
         cohort = valid.filter(F.col(time_col) <= time_literal(first_origin, cadence)).groupBy(
             *keys,
         ).agg(F.min(time_col).alias(START_COLUMN))

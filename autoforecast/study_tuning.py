@@ -29,9 +29,11 @@ from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast._execution import _stage, callable_name, note, reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
+    _evaluation_contract_from_record,
     boundary,
     digest,
     evaluation_contract,
+    read_benchmark_manifest,
     verify_benchmark,
 )
 from autoforecast.data_admission import _load_dataset_contract_bytes
@@ -249,7 +251,8 @@ def _validation_controls(controls: dict) -> dict:
     }
 
 
-def _resolve_options(study: Study, controls: dict, tuning_origin: str | None) -> dict:
+def _resolve_options(study: Study, controls: dict, tuning_origin: str | None,
+                     *, select: bool = True) -> dict:
     recipe = study.recipe
     if tuning_origin is not None and (type(tuning_origin) is not str or not tuning_origin.strip()):
         raise ValueError("tuning_origin must be a nonblank frozen origin string")
@@ -275,7 +278,11 @@ def _resolve_options(study: Study, controls: dict, tuning_origin: str | None) ->
         raise TuningError("selection uses equal-weight mean and the metric's minimize direction")
     if tuning_origin is not None and ("origins" in selection or stage != "tuning"):
         raise TuningError("tuning_origin conflicts with the selection policy")
-    if stage == "validation":
+    if not select:
+        windows = []
+    elif stage == "validation":
+        if not recipe["validation_origins"]:
+            raise HPOError("outer validation is not configured; declare inner tuning windows")
         if "origins" in selection:
             raise TuningError("validation selection uses the existing outer boundary")
         windows = [
@@ -1009,9 +1016,16 @@ def tune_study(
 def _validate_workflow_configuration(
     root: pathlib.Path, record: dict, saved: dict, manifest: dict,
 ) -> None:
-    """Require the summary and both fits to refer to the retained winner settings."""
+    """Require the summary and configured fits to refer to the retained winner settings."""
     validation_only = record.get("schema") == "autoforecast.forecast-validation.v1"
+    no_validation = record.get("schema") == "autoforecast.forecast-workflow.v2"
+    source = record["provenance"]["study"]
+    study_path, frozen = read_benchmark_manifest(pathlib.Path(source["path"]), source["sha256"])
+    if (no_validation == bool(frozen["recipe"]["validation_origins"])
+            or (no_validation and record.get("validation", False) is not None)):
+        raise HPOError("workflow validation absence differs from the frozen study")
     labels = (
+        (("testing", "test"),) if no_validation else
         (("validation", "validation"),)
         if validation_only
         else (
@@ -1026,8 +1040,10 @@ def _validate_workflow_configuration(
         "provenance",
         "tuning_path",
         *[label for label, _ in labels],
+        *( ["validation"] if no_validation else []),
     } or record["schema"] not in {
         "autoforecast.forecast-workflow.v1",
+        "autoforecast.forecast-workflow.v2",
         "autoforecast.forecast-validation.v1",
     }:
         raise HPOError("unsupported workflow configuration record")
@@ -1059,6 +1075,16 @@ def _validate_workflow_configuration(
     for label, stage in labels:
         window = record[label]
         contract = window["evaluation_contract"]
+        try:
+            _, origin, horizon, _ = window["boundary"].split("/")
+            expected = _evaluation_contract_from_record(
+                study_path, frozen, stage=stage, origin=origin, horizon=int(horizon),
+                metric=frozen["recipe"]["metric"],
+            )
+        except ValueError as error:
+            raise HPOError("workflow stage configuration differs from its frozen study") from error
+        if contract != expected:
+            raise HPOError("workflow stage configuration differs from its frozen study")
         if (
             window != _retained_json(root, stage + "/result.json", manifest)
             or not window["boundary"].startswith(stage + "/")
@@ -1114,7 +1140,10 @@ def load_selected_configuration(path: str | pathlib.Path) -> dict:
             if completion["task"] == "forecast-validation"
             else "autoforecast.forecast-workflow.v1"
         )
-        if result.get("schema") != expected_schema:
+        allowed_schemas = {expected_schema}
+        if completion["task"] == "forecast-workflow":
+            allowed_schemas.add("autoforecast.forecast-workflow.v2")
+        if result.get("schema") not in allowed_schemas:
             raise HPOError("workflow task and configuration schema differ")
         _validate_workflow_configuration(attempt, result, saved, manifest)
         metadata = {

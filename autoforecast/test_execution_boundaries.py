@@ -279,6 +279,7 @@ def test_registration_config_quiet_level_applies_to_preparation_message(tmp_path
         "dataset": {},
         "recipe": {
             "source_keys": ["sku"],
+            "frequency": "D", "metric": "mae", "target_unit": "units",
             "training_start": "2024-01-01",
             "validation_origins": ["2024-02-01"],
             "history_missing": "error",
@@ -287,7 +288,7 @@ def test_registration_config_quiet_level_applies_to_preparation_message(tmp_path
         "runtime": {"log_level": "ERROR"},
     }
     monkeypatch.setattr(registration, "_configuration", lambda _: (config, tmp_path))
-    monkeypatch.setattr(registration, "_register_study", lambda *a: "study-id")
+    monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "study-id")
     assert registration.register_study("settings.json", registry=registry) == "study-id"
     assert stream.getvalue() == ""
 
@@ -365,7 +366,7 @@ def test_registration_summary_names_real_source_target_and_boundaries(tmp_path, 
     registry = SimpleNamespace(
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
-    monkeypatch.setattr(registration, "_register_study", lambda *a: "study-id")
+    monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "study-id")
     registration.register_study(config_path, registry=registry)
     audit = next((registry.root / "checks").glob("*/audit.jsonl"))
     rows = [json.loads(x) for x in audit.read_text().splitlines()]
@@ -976,6 +977,7 @@ def test_registration_query_hash_names_are_not_redacted(tmp_path, monkeypatch, a
         "dataset": {},
         "recipe": {
             "source_keys": ["sku"],
+            "frequency": "D", "metric": "mae", "target_unit": "units",
             "training_start": "2024-01-01",
             "validation_origins": ["2024-02-01"],
             "history_missing": "error",
@@ -989,7 +991,7 @@ def test_registration_query_hash_names_are_not_redacted(tmp_path, monkeypatch, a
         "runtime": {},
     }
     monkeypatch.setattr(registration, "_configuration", lambda _: (data, tmp_path))
-    monkeypatch.setattr(registration, "_register_study", lambda *a: "study-id")
+    monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "study-id")
     registry = SimpleNamespace(
         root=tmp_path / "registry",
         scratch_root=tmp_path / "scratch",
@@ -997,7 +999,7 @@ def test_registration_query_hash_names_are_not_redacted(tmp_path, monkeypatch, a
         store=None,
         spark=None,
     )
-    prepare = SimpleNamespace(validate=lambda _: None)
+    prepare = SimpleNamespace(validate=lambda _: None, prepare=lambda _: None)
     assert (
         registration.register_study("config.json", registry=registry, prepare=prepare) == "study-id"
     )
@@ -1107,6 +1109,7 @@ def test_independent_nested_registration_has_no_parent_trial_identity(tmp_path, 
         "dataset": {},
         "recipe": {
             "source_keys": ["sku"],
+            "frequency": "D", "metric": "mae", "target_unit": "units",
             "training_start": "2024-01-01",
             "validation_origins": ["2024-02-01"],
             "history_missing": "error",
@@ -1115,7 +1118,7 @@ def test_independent_nested_registration_has_no_parent_trial_identity(tmp_path, 
         "runtime": {},
     }
     monkeypatch.setattr(registration, "_configuration", lambda _: (data, tmp_path))
-    monkeypatch.setattr(registration, "_register_study", lambda *a: "new-study")
+    monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "new-study")
     registry = SimpleNamespace(
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
@@ -1294,7 +1297,7 @@ def test_url_derived_path_is_not_copied_by_public_receipts(tmp_path, monkeypatch
         registry = SimpleNamespace(
             root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
         )
-        monkeypatch.setattr(study_registration, "_register_study", lambda *a: "study-id")
+        monkeypatch.setattr(study_registration, "_register_study", lambda *a, **k: "study-id")
         study_registration.register_study(path, registry=registry)
         audit = next((registry.root / "checks").glob("*/audit.jsonl"))
     elif kind in {"model_config", "model_output"}:
@@ -1377,7 +1380,7 @@ def test_invalid_uri_registration_never_logs_credentials(tmp_path, monkeypatch, 
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise FileNotFoundError("unsupported local path")
 
     monkeypatch.setattr(study_registration, "_register_study", fail)
@@ -1486,7 +1489,7 @@ def test_failure_audit_does_not_copy_exception_secrets(tmp_path, monkeypatch, me
     )
     monkeypatch.setattr(study_workflow, "_implementation_record", lambda *_: {})
     monkeypatch.setattr(study_workflow, "resolve_implementation", lambda *a: {})
-    monkeypatch.setattr(study_workflow, "_resolve_options", lambda *a: {})
+    monkeypatch.setattr(study_workflow, "_resolve_options", lambda *a, **k: {})
     monkeypatch.setattr(study_workflow, "_output_root", lambda *a: tmp_path)
     monkeypatch.setattr(study_tuning, "_output_root", lambda *a: tmp_path)
     monkeypatch.setattr(study_workflow, "preflight_study", fail)
@@ -1494,7 +1497,7 @@ def test_failure_audit_does_not_copy_exception_secrets(tmp_path, monkeypatch, me
     events.configure_logging(stream=stream, progress="off")
     with pytest.raises(error_type) as caught:
         study_workflow.run_forecast_workflow(
-            SimpleNamespace(study_id="study-id"),
+            SimpleNamespace(recipe={"validation_origins": ["2024-01-05"]}, study_id="study-id"),
             fit_predict=lambda _: None,
             implementation={},
             config="profile",
@@ -1552,7 +1555,7 @@ def test_registration_failure_after_configuration_belongs_to_sources(
     )
     error = error_type("source initialization stopped")
 
-    def fail_before_source_work(*args):
+    def fail_before_source_work(*args, **kwargs):
         raise error
 
     monkeypatch.setattr(registration, "_register_study", fail_before_source_work)
@@ -1632,7 +1635,7 @@ def test_later_registration_failure_preserves_completed_stages(
         if moment == "append" and row["stage"] == "publication" and row["status"] == "PASS":
             raise error
 
-    def body(value, registry, prepare, settings, check_id, issues_root, event):
+    def body(value, registry, prepare, settings, check_id, issues_root, event, *, inputs=None):
         for stage in ("sources", "admission", "freeze", "publication"):
             if stage != "sources":
                 event(stage, "START")
@@ -1694,7 +1697,7 @@ def test_workflow_completion_audit_uncertainty_has_no_second_terminal(
     monkeypatch.setattr(study_workflow, "_implementation_record", lambda *_: {})
     monkeypatch.setattr(study_workflow, "resolve_implementation", lambda *a: {})
     monkeypatch.setattr(
-        study_workflow, "_resolve_options", lambda *a: {"windows": [{}], "stage": "tuning"}
+        study_workflow, "_resolve_options", lambda *a, **k: {"windows": [{}], "stage": "tuning"}
     )
     monkeypatch.setattr(study_workflow, "_output_root", lambda *a: tmp_path)
     monkeypatch.setattr(study_tuning, "_output_root", lambda *a: tmp_path)
@@ -1709,7 +1712,7 @@ def test_workflow_completion_audit_uncertainty_has_no_second_terminal(
     )
     with pytest.raises(OSError) as caught:
         study_workflow.run_forecast_workflow(
-            SimpleNamespace(study_id="study-1"),
+            SimpleNamespace(recipe={"validation_origins": ["2024-01-05"]}, study_id="study-1"),
             fit_predict=lambda _: None,
             implementation={},
             config="profile",
@@ -2078,7 +2081,7 @@ def test_workflow_failure_audit_secondary_cancellation_does_not_replace_primary(
     )
     monkeypatch.setattr(study_workflow, "_implementation_record", lambda *_: {})
     monkeypatch.setattr(study_workflow, "resolve_implementation", lambda *a: {})
-    monkeypatch.setattr(study_workflow, "_resolve_options", lambda *a: {})
+    monkeypatch.setattr(study_workflow, "_resolve_options", lambda *a, **k: {})
     monkeypatch.setattr(study_workflow, "_output_root", lambda *a: tmp_path)
     monkeypatch.setattr(study_tuning, "_output_root", lambda *a: tmp_path)
     monkeypatch.setattr(study_workflow, "preflight_study", fail)
@@ -2098,7 +2101,7 @@ def test_workflow_failure_audit_secondary_cancellation_does_not_replace_primary(
     caught = None
     try:
         study_workflow.run_forecast_workflow(
-            SimpleNamespace(study_id="study-1"),
+            SimpleNamespace(recipe={"validation_origins": ["2024-01-05"]}, study_id="study-1"),
             fit_predict=lambda _: None,
             implementation={},
             config="profile",
@@ -2821,7 +2824,7 @@ def test_public_workflow_does_not_append_through_replaced_audit_leaf(tmp_path, m
     original = b'{"frozen":true}\n'
     target.write_bytes(original)
     output = tmp_path / "out"
-    study = SimpleNamespace(study_id="s", _path=target, _record=lambda: {"sources": {}})
+    study = SimpleNamespace(recipe={"validation_origins": ["2024-01-05"]}, study_id="s", _path=target, _record=lambda: {"sources": {}})
     primary = RuntimeError("stop after audit leaf swap")
 
     def config(*args, **kwargs):
@@ -3176,7 +3179,7 @@ def test_registration_directory_links_cannot_create_inside_saved_data(tmp_path, 
     else:
         scratch = alias / "new-scratch"
     registry = SimpleNamespace(root=root, scratch_root=scratch, runtime={}, store=None)
-    monkeypatch.setattr(registration, "_register_study", lambda *a: pytest.fail("unexpected data work"))
+    monkeypatch.setattr(registration, "_register_study", lambda *a, **k: pytest.fail("unexpected data work"))
     with pytest.raises(OSError):
         registration.register_study(config, registry=registry)
     assert list(protected.iterdir()) == []
@@ -3204,7 +3207,7 @@ def test_registration_claims_fresh_attempt_without_reusing_evidence(
     monkeypatch.setattr(registration.uuid, "uuid4", lambda: SimpleNamespace(hex=identity))
     calls, writes = [], []
 
-    def body(*args):
+    def body(*args, **kwargs):
         calls.append(True)
         return "study-id"
 

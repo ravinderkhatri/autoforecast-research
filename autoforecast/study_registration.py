@@ -46,8 +46,10 @@ from autoforecast._execution import (
     resolve_level,
     standalone_attempt,
 )
+from autoforecast._study_config import validate_shape
 from autoforecast.benchmark import (
     START_COLUMN,
+    _inclusive_period_count,
     _normalise_recipe,
     _normalise_reference_frame,
     _reference_boundaries,
@@ -55,14 +57,17 @@ from autoforecast.benchmark import (
     digest,
     freeze_benchmark,
     parquet_content_hash,
+    study_source_roles,
     study_windows,
+    training_cutoff,
     validate_study_panel,
     verify_benchmark,
 )
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.data_observability import report_source_issues
-from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin
+from autoforecast.frequency import advance, canonical_origin, parse_frequency, parse_origin
 from autoforecast.grid import time_literal
+from autoforecast.integrations.delta import DeltaTable
 from autoforecast.study import load_study
 from autoforecast.study_references import (
     check_wrmsse_references,
@@ -152,25 +157,34 @@ def _fields(value, required, optional=(), *, label) -> dict:
     if not isinstance(value, dict) or not set(required) <= value.keys() or (
         value.keys() - set(required) - set(optional)
     ):
-        raise ValueError(f"{label} requires {sorted(required)}; optional: {sorted(optional)}")
+        if isinstance(value, dict):
+            missing = set(required) - value.keys()
+            if missing:
+                field = sorted(missing)[0]
+                raise ValueError(f"{label}.{field}: required; add {field} to {label}")
+            unknown = value.keys() - set(required) - set(optional)
+            raise ValueError(f"{label}: unknown fields {sorted(unknown)}")
+        raise ValueError(f"{label}: expected a mapping with fields {sorted(required)}")
     return value
 
 
 def _configuration(path):
     path = pathlib.Path(path).absolute()
-    value = read_record(path)
-    value = _fields(value, {"schema_version", "dataset", "recipe", "source", "storage"},
-                    {"references", "invalid_references", "runtime", "preparation", "records"},
-                    label="study config")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
-        raise ValueError("study config requires schema_version: 1")
+    return _configuration_value(read_record(path), path)
+
+
+def _configuration_value(value, path, *, supplied_stages=False):
+    validate_shape({**value, "source": {"kind": "parquet", "path": "captured-stage-input"}}
+                   if supplied_stages else value)
     # All scientific validation happens before acquiring source data or provisioning tables.
     value["recipe"] = _normalise_recipe(value["recipe"])
     contract = _load_dataset_contract_bytes(_bytes(value["dataset"]), path)
     panel = contract.panel(".")
     validate_study_panel(panel, value["recipe"])
     source = value["source"]
-    if isinstance(source, dict) and source.get("kind") == "parquet":
+    if supplied_stages and source == {"kind": "supplied_stages"}:
+        pass
+    elif isinstance(source, dict) and source.get("kind") == "parquet":
         _fields(source, {"kind", "path"}, label="Parquet source")
         source["path"] = str((path.parent / source["path"]).absolute())
     elif isinstance(source, dict) and source.get("kind") == "delta":
@@ -221,8 +235,66 @@ def _configuration(path):
     if value.get("records", {}).get("format", "json") not in {"json", "yaml"}:
         raise ValueError("records.format must be json or yaml")
     _scalar_settings(value.get("preparation", {}), "preparation")
-    _fields(value["storage"], {"root"}, {"scratch_root", "namespace", "tables"}, label="storage")
+    _validate_storage(value["storage"])
     return value, path.parent
+
+
+def _validate_storage(storage):
+    _fields(storage, {"root"}, {"scratch_root", "namespace", "tables"}, label="storage")
+    for key in ("root", "scratch_root"):
+        if key in storage and (not isinstance(storage[key], str)
+                               or not storage[key].strip() or "://" in storage[key]):
+            raise ValueError(f"storage.{key}: supply a nonempty POSIX filesystem path")
+    if "namespace" in storage:
+        from autoforecast.integrations.delta import DeltaStudyStore
+
+        try:
+            DeltaStudyStore.table_names(storage["namespace"], storage.get("tables"))
+        except ValueError as error:
+            raise ValueError(f"storage.namespace/tables: {error}") from error
+    elif "tables" in storage:
+        raise ValueError("storage.tables: table overrides require storage.namespace")
+
+
+@dataclasses.dataclass(frozen=True)
+class StudyConfigValidation:
+    """Local configuration checks; this is not verification of source data."""
+
+    path: pathlib.Path
+    _payload: bytes = dataclasses.field(repr=False)
+    checked: tuple[str, ...] = ("field names and types", "scientific settings", "storage settings")
+    not_checked: tuple[str, ...] = (
+        "credentials",
+        "source table or data-file existence",
+        "source schemas",
+        "data quality",
+        "storage permissions",
+    )
+
+    @property
+    def configuration(self) -> dict:
+        """Return fresh normalized settings, leaving the validated result unchanged."""
+        return json.loads(self._payload)
+
+
+def validate_study_config(path: str | pathlib.Path) -> StudyConfigValidation:
+    """Validate YAML/JSON and local SQL files without Spark queries or storage writes.
+
+    This checks settings and SQL syntax, not credentials, table existence, source
+    schemas or data quality. A preparation hook is checked when register_study is
+    called. Relative paths are resolved beside the configuration file.
+    """
+    value, _ = _configuration(path)
+    if value["source"]["kind"] == "delta":
+        from autoforecast.integrations.delta import validate_source_queries
+
+        validate_source_queries(None, queries={"primary": value["source"]["sql"],
+                                               **value["source"]["audit_queries"]},
+                                tables=value["source"]["tables"])
+    checked = StudyConfigValidation.checked
+    if value["source"]["kind"] == "delta":
+        checked += ("source SQL syntax",)
+    return StudyConfigValidation(pathlib.Path(path).absolute(), _bytes(value), checked=checked)
 
 
 def _scalar_settings(value, label):
@@ -552,7 +624,7 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
     cadence = parse_frequency(value["recipe"]["frequency"])
     panel = value["dataset"]["dataset"]["panel"]
     lower = time_literal(parse_origin(value["recipe"]["training_start"], cadence), cadence)
-    upper = time_literal(parse_origin(value["recipe"]["validation_origins"][0], cadence), cadence)
+    upper = time_literal(parse_origin(training_cutoff(value["recipe"]), cadence), cadence)
     history_keys = captured["prepared"].filter(
         F.col(panel["time_col"]).between(lower, upper),
     ).select(*keys).distinct()
@@ -650,12 +722,10 @@ class StudyRegistry:
                         )
                     storage[key] = (str(pathlib.Path(value).expanduser().absolute())
                                     if key != "namespace" else value)
-        _fields(storage, {"root"}, {"scratch_root", "namespace", "tables"}, label="storage")
+        _validate_storage(storage)
         settings = dict(storage)
         for key in ("root", "scratch_root"):
             if key in settings:
-                if not str(settings[key]).strip() or "://" in str(settings[key]):
-                    raise ValueError("storage roots require nonempty POSIX filesystem paths")
                 settings[key] = base / settings[key]
         runtime = _runtime(runtime)
         if "implementation" in runtime:
@@ -696,7 +766,10 @@ class StudyRegistry:
         definition = envelope["definition"]
         if envelope["sha256"] != digest(definition) or definition["study_id"] != study_id:
             raise ValueError("registered definition identity differs from its baseline")
-        if definition["schema"] != "autoforecast.registration.v1":
+        if definition["schema"] not in {
+            "autoforecast.registration.v1",
+            "autoforecast.registration.v2",
+        }:
             raise ValueError("unsupported registration format")
         if bool(definition["snapshot"]) != (self.store is not None):
             raise ValueError("registry storage does not match the registered definition")
@@ -712,7 +785,17 @@ class StudyRegistry:
         _, record = verify_benchmark(manifest, definition["library_sha256"])
         if record["study_id"] != study_id:
             raise ValueError("registered library study identity differs")
-        if "admission_evidence" in definition:
+        binding = record.get("admission_identity", {})
+        if binding.get("schema") == "autoforecast.supplied-stage-identity.v1":
+            if (definition["schema"] != "autoforecast.registration.v2"
+                    or definition["source"].get("kind") != "supplied_stages"
+                    or "admission_evidence" in definition
+                    or binding["sha256"] != digest(definition["source"])):
+                raise ValueError("supplied stage provenance differs from the frozen identity")
+        elif (definition["schema"] == "autoforecast.registration.v2"
+              or definition["source"].get("kind") == "supplied_stages"):
+            raise ValueError("supplied stage provenance is missing its frozen identity")
+        elif "admission_evidence" in definition:
             admission = _verify_admission(self.root, definition["admission_evidence"])
             if (record.get("admission_identity") != {
                 "schema": "autoforecast.admission-identity.v1",
@@ -795,14 +878,310 @@ class StudyRegistry:
             return result
 
 
-def register_study(config, *, registry=None, spark=None,
-                   prepare: StudyPreparation | None = None, log_level=None) -> str:
-    """Validate, report and freeze one study; never fit a model or start tracking."""
+StageInput = DataFrame | DeltaTable
+DateRange = tuple[str, str]
+
+
+def _direct_configuration(registry, arguments):
+    if registry is None:
+        raise ValueError("registry: supply a StudyRegistry for direct stage inputs")
+    required = ("training_data", "testing_data", "series_id", "date_col", "target_col",
+                "target_unit", "frequency", "training_date_range", "testing_date_range", "metric")
+    for name in required:
+        if arguments[name] is None:
+            raise ValueError(f"{name}: required for direct study registration")
+    if (arguments["validation_data"] is None) != (arguments["validation_date_range"] is None):
+        raise ValueError("validation_date_range and validation_data: supply both, or omit both "
+                         "to run without outer validation")
+    inputs = {name: arguments[name + "_data"] for name in ("training", "validation", "testing")
+              if arguments[name + "_data"] is not None}
+    for name, frame in inputs.items():
+        if not isinstance(frame, DataFrame | DeltaTable):
+            raise TypeError(f"{name}_data: supply a Spark DataFrame or DeltaTable reference")
+    try:
+        cadence = parse_frequency(arguments["frequency"])
+    except ValueError as error:
+        raise ValueError(f"frequency: {error}") from error
+    ranges = {}
+    for name in inputs:
+        value = arguments[name + "_date_range"]
+        if not isinstance(value, tuple | list) or len(value) != 2:
+            raise ValueError(f"{name}_date_range: supply inclusive (start, end)")
+        start, end = (parse_origin(point, cadence) for point in value)
+        count = _inclusive_period_count(start, end, cadence, label=name + "_date_range")
+        ranges[name] = (canonical_origin(start, cadence), canonical_origin(end, cadence), count)
+    previous = "training"
+    for name in ("validation", "testing"):
+        if name not in ranges:
+            continue
+        if advance(parse_origin(ranges[previous][1], cadence), cadence, 1) != parse_origin(
+            ranges[name][0], cadence,
+        ):
+            raise ValueError(f"{name}_date_range: must start one period after {previous} ends; "
+                             "correct gaps or overlaps explicitly")
+        previous = name
+    keys = arguments["series_id"]
+    if (not isinstance(keys, list) or not keys
+            or any(not isinstance(key, str) or not key.strip() for key in keys)):
+        raise ValueError("series_id: supply a nonempty list of column names")
+    for name in ("feature_roles", "feature_availability"):
+        if arguments[name] is not None and not isinstance(arguments[name], dict):
+            raise ValueError(f"{name}: supply a mapping of declared feature settings")
+    roles = dict(arguments["feature_roles"] or {})
+    allowed = {"known_future", "static", "static_reals", "past_only", "shared_known_future",
+               "covariate_families", "exposure_col", "season_length", "oos_col", "price_col",
+               "promo_col", "factor_group", "product_col", "store_col", "category_col"}
+    if set(roles) - allowed:
+        raise ValueError("feature_roles: use declared Panel feature roles or season_length")
+    panel = {"series_col": arguments["series_id"][0], "time_col": arguments["date_col"],
+             "target_col": arguments["target_col"], "frequency": cadence.code,
+             "season_length": 1, "target_estimand": "observed_nonnegative", **roles}
+    recipe = {
+        "schema_version": 3,
+        "source_keys": arguments["series_id"],
+        "training_start": ranges["training"][0],
+        "frequency": cadence.code,
+        "validation_origins": [ranges["training"][1]] if "validation" in inputs else [],
+        "validation_horizon": ranges["validation"][2] if "validation" in inputs else None,
+        "final_train_cutoff": ranges["validation" if "validation" in inputs else "training"][1],
+        "final_test_horizon": ranges["testing"][2],
+        "history_policy": "fixed",
+        "new_series_policy": "error",
+        "target_unit": arguments["target_unit"],
+        "feature_availability": arguments["feature_availability"] or {},
+        "metric": arguments["metric"],
+        "history_missing": "preserve"
+        if arguments["history_missing"] is None
+        else arguments["history_missing"],
+        "actual_missing": "error"
+        if arguments["actual_missing"] is None
+        else arguments["actual_missing"],
+    }
+    for name in ("tuning_windows", "tuning_schedule"):
+        if arguments[name] is not None:
+            recipe[name] = arguments[name]
+    value = {"schema_version": 1, "dataset": {"schema_version": 1, "dataset": {
+        "id": "supplied-stages", "panel": panel}}, "recipe": recipe,
+        "source": {"kind": "supplied_stages"}, "storage": {"root": str(registry.root)},
+        "runtime": dict(registry.runtime)}
+    if arguments["references"] is not None:
+        value["references"] = arguments["references"]
+    value, _ = _configuration_value(value, pathlib.Path.cwd() / "study.yaml", supplied_stages=True)
+    return value, inputs
+
+
+def _capture_stages(inputs, value, registry, root):
+    """Evaluate each lazy input once, then check and use only its owned snapshot."""
+    from autoforecast.integrations.delta import read_sources
+
+    recipe = value["recipe"]
+    panel = _load_dataset_contract_bytes(_bytes(value["dataset"]), root / "dataset.yaml").panel(".")
+    cadence = parse_frequency(recipe["frequency"])
+    training_end = training_cutoff(recipe)
+    ranges = {
+        "training": (recipe["training_start"], training_end),
+        "testing": (
+            canonical_origin(
+                advance(parse_origin(recipe["final_train_cutoff"], cadence), cadence, 1), cadence
+            ),
+            canonical_origin(
+                advance(
+                    parse_origin(recipe["final_train_cutoff"], cadence),
+                    cadence,
+                    recipe["final_test_horizon"],
+                ),
+                cadence,
+            ),
+        ),
+    }
+    if recipe["validation_origins"]:
+        ranges["validation"] = (
+            canonical_origin(advance(parse_origin(training_end, cadence), cadence, 1), cadence),
+            recipe["final_train_cutoff"],
+        )
+    table_inputs = {name: item for name, item in inputs.items() if isinstance(item, DeltaTable)}
+    pinned = read_sources(registry.spark,
+                          queries={name: f"SELECT * FROM {name}" for name in table_inputs},
+                          tables={name: item.name for name, item in table_inputs.items()},
+                          versions={name: item.version for name, item in table_inputs.items()}
+                          ) if table_inputs else {}
+    selected: list[str] = list(
+        dict.fromkeys(
+            [
+                *recipe["source_keys"],
+                panel.time_col,
+                panel.target_col,
+                *panel.known_future,
+                *panel.static,
+                *panel.static_reals,
+                *panel.past_only,
+                *recipe["feature_availability"].values(),
+                *[
+                    column
+                    for column in (
+                        panel.exposure_col,
+                        panel.oos_col,
+                        panel.price_col,
+                        panel.promo_col,
+                        panel.factor_group,
+                        panel.product_col,
+                        panel.store_col,
+                        panel.category_col,
+                    )
+                    if column
+                ],
+                *(
+                    [value["references"]["weight_col"]]
+                    if "weight_col" in value.get("references", {})
+                    else []
+                ),
+            ]
+        )
+    )
+    frames, evidence = {}, {}
+    schema = None
+    for name, item in inputs.items():
+        frame = pinned[name][0] if name in pinned else item
+        path = root / ("input-" + name)
+        note("Stage input", window=name, input_kind="delta" if name in pinned else "dataframe",
+             date_range=ranges[name], selected_columns=selected)
+        with operation("Capture supplied stage", window=name, engine="Spark"):
+            frame.write.parquet(str(path))
+        captured = registry.spark.read.parquet(str(path))
+        captured_schema = captured.schema.jsonValue()
+        missing = set(selected) - set(captured.columns)
+        if missing:
+            raise ValueError(f"{name}_data: missing declared columns {sorted(missing)}")
+        captured = captured.select(*selected)
+        # Spark union coercions could otherwise silently change decimal precision.
+        if schema is not None and [(f.name, f.dataType) for f in captured.schema] != schema:
+            raise ValueError(f"{name}_data: declared column storage types must match training")
+        schema = [(f.name, f.dataType) for f in captured.schema]
+        observed = captured.agg(F.count("*").alias("rows"),
+                                F.min(panel.time_col).alias("first"),
+                                F.max(panel.time_col).alias("last")).first()
+        count = observed["rows"]
+        if not count:
+            note("Stage input rejected", window=name, reason="empty stage", rows=0)
+            remedy = ("provide nonempty validation data, or omit both validation_data and "
+                      "validation_date_range" if name == "validation"
+                      else f"provide nonempty {name} data")
+            raise ValueError(f"{name}_data: supplied stage is empty; {remedy}")
+        start, end = (parse_origin(point, cadence) for point in ranges[name])
+        outside = captured.filter(~F.col(panel.time_col).between(time_literal(start, cadence),
+                                                                time_literal(end, cadence))).count()
+        if outside:
+            note("Stage input rejected", window=name, reason="outside declared range",
+                 rows_outside=outside)
+            raise ValueError(f"{name}_data: {outside} rows fall outside declared range "
+                             f"{ranges[name]}; filter explicitly or correct the range")
+        keys = recipe["source_keys"]
+        duplicate_keys = (
+            captured.groupBy(*keys, panel.time_col)
+            .count()
+            .filter(F.col("count") > 1)
+            .count()
+        )
+        if duplicate_keys:
+            note("Stage input rejected", window=name, reason="duplicate series/date keys",
+                 duplicate_keys=duplicate_keys)
+            raise ValueError(f"{name}_data: {duplicate_keys} duplicate series/date keys; "
+                             "correct the input")
+        if name != "training":
+            expected = frames["training"].select(*keys).distinct()
+            present = captured.select(*keys).distinct()
+            missing_keys = expected.join(present, keys, "left_anti").count()
+            extra_keys = present.join(expected, keys, "left_anti").count()
+            note("Stage population", window=name, missing_series=missing_keys,
+                 unexpected_series=extra_keys, actual_missing=recipe["actual_missing"])
+            if extra_keys or (missing_keys and recipe["actual_missing"] == "error"):
+                raise ValueError(f"{name}_data: training population differs; "
+                                 f"missing series={missing_keys}, unexpected series={extra_keys}")
+        else:
+            note("Starting population", definition="distinct keys in supplied training data",
+                 series_count=captured.select(*keys).distinct().count())
+        frames[name] = captured
+        evidence[name] = {"kind": "delta" if name in pinned else "dataframe",
+                          "planned_range": list(ranges[name]), "columns": selected,
+                          "schema": captured.schema.jsonValue(), "rows": count,
+                          "captured_schema": captured_schema,
+                          "observed_range": [str(observed["first"]), str(observed["last"])],
+                          "frozen_role": {"training": "selection", "validation": "validation_score",
+                                          "testing": "final_score"}[name],
+                          "snapshot_sha256": parquet_content_hash(path),
+                          **({"source": pinned[name][1]} if name in pinned else {})}
+    combined = frames["training"]
+    for name in ("validation", "testing"):
+        if name in frames:
+            combined = combined.unionByName(frames[name])
+    return combined, {"kind": "supplied_stages", "stages": {
+        name: evidence.get(name) for name in ("training", "validation", "testing")}}
+
+
+def register_study(
+    config: str | pathlib.Path | None = None, *, registry: StudyRegistry | None = None,
+    spark: SparkSession | None = None, prepare: StudyPreparation | None = None,
+    log_level: str | None = None,
+    training_data: StageInput | None = None, testing_data: StageInput | None = None,
+    validation_data: StageInput | None = None, series_id: list[str] | None = None,
+    date_col: str | None = None, target_col: str | None = None, target_unit: str | None = None,
+    frequency: str | None = None, training_date_range: DateRange | None = None,
+    testing_date_range: DateRange | None = None, validation_date_range: DateRange | None = None,
+    metric: str | None = None, history_missing: str | None = None,
+    actual_missing: str | None = None, feature_roles: dict | None = None,
+    feature_availability: dict | None = None, references: dict | None = None,
+    tuning_windows: list[dict] | None = None, tuning_schedule: dict | None = None,
+) -> str:
+    """Freeze a configured source or caller-supplied training/testing stages.
+
+    Direct inputs require a registry, key/date/target columns, target unit, frequency,
+    inclusive planned training/testing ranges and metric. Supply validation data and
+    its range together, or omit both: no validation split is created. Inputs are Spark
+    DataFrames (classic or Connect) or DeltaTable references. Each lazy DataFrame is
+    captured once. Tables are version-pinned; their whole input must fit its range.
+
+    history_missing defaults to preserve; actual_missing defaults to error. Optional
+    feature_roles declares existing Panel roles; extra columns are not inferred as
+    predictors. references uses the configured-source weight/scale settings or path.
+    Tuning windows/schedule are used only when a later run explicitly requests tuning.
+    prepare is available only for the configured-source route.
+    """
+    direct = dict(
+        training_data=training_data,
+        testing_data=testing_data,
+        validation_data=validation_data,
+        series_id=series_id,
+        date_col=date_col,
+        target_col=target_col,
+        target_unit=target_unit,
+        frequency=frequency,
+        training_date_range=training_date_range,
+        testing_date_range=testing_date_range,
+        validation_date_range=validation_date_range,
+        metric=metric,
+        history_missing=history_missing,
+        actual_missing=actual_missing,
+        feature_roles=feature_roles,
+        feature_availability=feature_availability,
+        references=references,
+        tuning_windows=tuning_windows,
+        tuning_schedule=tuning_schedule,
+    )
+    if config is not None and any(item is not None for item in direct.values()):
+        raise ValueError("config: cannot combine with direct data or scientific arguments")
+    if config is None and prepare is not None:
+        raise ValueError("prepare: direct stages must already be prepared; use configured sources "
+                         "for a preparation hook")
+    inputs = None
     check_id = uuid.uuid4().hex
     check_start = time.monotonic()
     initial_level = resolve_level(log_level, getattr(registry, "runtime", {}))
     try:
-        value, base = _configuration(config)
+        if config is None:
+            value, inputs = _direct_configuration(registry, direct)
+            base = pathlib.Path.cwd()
+        else:
+            value, base = _configuration(config)
         initial_level = resolve_level(log_level, value.get("runtime", {}))
         _emit({"stage": "Preparing execution plan", "status": "START",
                "attempt_id": check_id}, initial_level)
@@ -811,6 +1190,9 @@ def register_study(config, *, registry=None, spark=None,
             "parameters": value.get("preparation", {}),
         }))
         if prepare is not None:
+            if not all(callable(getattr(prepare, name, None)) for name in ("validate", "prepare")):
+                raise TypeError("prepare: supply callable validate(settings) and prepare(context) "
+                                "methods; see the preparation tutorial")
             settings_baseline = settings._payload
             prepare.validate(settings)
             if settings._payload != settings_baseline:
@@ -856,12 +1238,17 @@ def register_study(config, *, registry=None, spark=None,
                    level=level, attempt_id=check_id) as execution:
         event("configuration", "START")
         source, recipe = value["source"], value["recipe"]
+        if not recipe["validation_origins"]:
+            note("Validation: not configured; no split will be created",
+                 final_fit_input="training data")
         note("Registration inputs", configuration=str(config) if not isinstance(config, dict)
              else "supplied mapping", source_kind=source["kind"],
              configuration_sha256=hashlib.sha256(_bytes(value)).hexdigest(),
              source_aliases=list(source.get("tables", {})),
              primary_path=source.get("path"),
              target=value["dataset"].get("dataset", {}).get("panel", {}).get("target_col"),
+             frequency=recipe["frequency"], metric=recipe["metric"],
+             target_unit=recipe["target_unit"],
              actual_missing=recipe.get("actual_missing"),
              final_train_cutoff=recipe.get("final_train_cutoff"),
              validation_horizon=recipe.get("validation_horizon"),
@@ -881,19 +1268,36 @@ def register_study(config, *, registry=None, spark=None,
              log_level=logging.getLevelName(level), registry=str(registry.root),
              registry_tables=dict(getattr(registry.store, "tables", {})),
              registration_writes="frozen data and registry records even when runtime.publish=false")
+        if inputs is not None:
+            note("Supplied stage plan", stages={name: (
+                {"kind": "delta" if isinstance(inputs[name], DeltaTable) else "dataframe",
+                 "planned_range": direct[name + "_date_range"],
+                 **({"table": inputs[name].name, "version": inputs[name].version,
+                     "version_resolution": "explicit" if inputs[name].version is not None
+                     else "pin latest before capture"}
+                    if isinstance(inputs[name], DeltaTable) else {})}
+                if name in inputs else None
+            ) for name in ("training", "validation", "testing")},
+                 series_keys=recipe["source_keys"], date_column=date_col, target_column=target_col,
+                 target_unit=recipe["target_unit"], frequency=recipe["frequency"],
+                 metric=recipe["metric"], history_missing=recipe["history_missing"],
+                 actual_missing=recipe["actual_missing"], preparation="none",
+                 registry=str(registry.root), registry_tables=dict(getattr(registry.store,
+                                                                          "tables", {})))
         starts["configuration"] = check_start
         format = value.get("records", {}).get("format", "json")
         event("configuration", "PASS")
         try:
             event("sources", "START")
             study_id = _register_study(
-                value, registry, prepare, settings, check_id, issues_root, event,
+                value, registry, prepare, settings, check_id, issues_root, event, inputs=inputs,
             )
             record_result(study_id=study_id, evidence=str(issues_root))
             note("Study registered", study_id=study_id, evidence=str(issues_root))
             return study_id
         except BaseException as error:
             status = "FAIL" if isinstance(error, Exception) else "CANCELLED"
+            error.add_note(f"Registration attempt evidence: {issues_root}")
             try:
                 failed_stage = phase if execution.states[phase] == "START" else "registration"
                 _stage_event(audit, failed_stage, status, exception=type(error).__name__,
@@ -914,7 +1318,8 @@ def register_study(config, *, registry=None, spark=None,
             raise
 
 
-def _register_study(value, registry, prepare, preparation_settings, check_id, issues_root, event):
+def _register_study(value, registry, prepare, preparation_settings, check_id, issues_root, event,
+                    *, inputs=None):
     configuration_baseline = preparation_settings._payload
     session = registry.spark
     if registry.store is not None:
@@ -930,7 +1335,9 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         source_record: dict[str, Any]
         audits = {}
         query_records = {}
-        if source["kind"] == "delta":
+        if inputs is not None:
+            frame, source_record = _capture_stages(inputs, value, registry, root)
+        elif source["kind"] == "delta":
             from autoforecast.integrations.delta import read_sources
 
             managed = read_sources(session, queries={"primary": source["sql"],
@@ -962,12 +1369,12 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         event("admission", "START")
         cadence = parse_frequency(recipe["frequency"])
         start = time_literal(parse_origin(recipe["training_start"], cadence), cadence)
-        origin = time_literal(parse_origin(recipe["validation_origins"][0], cadence), cadence)
+        origin = time_literal(parse_origin(training_cutoff(recipe), cadence), cadence)
         findings = report_source_issues(frame, contract=contract, recipe=recipe)
         findings = _save_findings(registry, findings, issues_root, "source", check_id)
         if findings.filter(F.col("status") == "failed").limit(1).count():
             raise ValueError(f"structural source issues block registration: {issues_root}")
-        admission_identity = None
+        admission_identity = (source_record if inputs is not None else None)
         captured = {}
         staging = issues_root / "admission-staging"
         preparation_metadata = None
@@ -1149,11 +1556,13 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         event("freeze", "START")
         manifest = freeze_benchmark(
             contract_path=contract_path, sources=dict.fromkeys(
-                ("selection", "final_training", "validation_score", "final_score"),
+                sorted(study_source_roles(recipe)),
                 root / "admitted",
             ), recipe=recipe, output_root=registry.root / "benchmarks", spark=session,
             scoring_references=references, scratch_root=registry.scratch_root,
-            admission_identity=({"schema": "autoforecast.admission-identity.v1",
+            admission_identity=({"schema": ("autoforecast.supplied-stage-identity.v1"
+                                            if inputs is not None
+                                            else "autoforecast.admission-identity.v1"),
                                  "sha256": digest(admission_identity)}
                                 if admission_identity is not None else None),
         )
@@ -1166,7 +1575,8 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         event("freeze", "PASS", study_id=frozen["study_id"])
         event("publication", "START", study_id=frozen["study_id"])
         definition = {
-            "schema": "autoforecast.registration.v1", "study_id": manifest.parent.name,
+            "schema": "autoforecast.registration.v2" if inputs is not None else
+                      "autoforecast.registration.v1", "study_id": manifest.parent.name,
             "library_sha256": library_sha,
             "source": source_record, "snapshot": snapshot, "recipe": frozen["recipe"],
             "references": reference_definition,
@@ -1178,7 +1588,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                           "retained_series": retained},
         }
         format = value.get("records", {}).get("format", "json")
-        if admission_identity is not None:
+        if prepare is not None:
             # Source/preparation hashes attest to captured inputs. Frozen model rows
             # live in the existing benchmark; do not retain duplicate raw inputs.
             for name in ("prepared", "declared_starting", "reference_input", "scoring_references"):

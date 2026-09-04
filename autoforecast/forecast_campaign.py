@@ -1288,7 +1288,7 @@ def compile_forecast_campaign(
 ) -> CompiledForecastCampaign:
     """Resolve and freeze a high-level request into idempotent durable stage commands."""
     from autoforecast.benchmark import (
-        STUDY_SCHEMA,
+        STUDY_SCHEMAS,
         _evaluation_contract_from_record,
         artifact_path,
         verify_benchmark,
@@ -1305,7 +1305,10 @@ def compile_forecast_campaign(
         benchmark_path, benchmark = verify_benchmark(benchmark_path, benchmark_sha256)
         if benchmark["dataset_sha256"] != contract_sha256:
             raise ForecastCampaignError("dataset contract differs from the frozen benchmark")
-    study = benchmark is not None and benchmark["schema"] == STUDY_SCHEMA
+    study = benchmark is not None and benchmark["schema"] in STUDY_SCHEMAS
+    if study and benchmark is not None and not benchmark["recipe"]["validation_origins"]:
+        raise ForecastCampaignError("native forecast campaigns require outer validation; "
+                                    "use Study.run_campaign with all_models for final-only studies")
     hierarchy_wrmsse = request.metric == "wrmsse" and not study
     template_path = (
         None if request.template is None else _source_path(request.template, "run template")

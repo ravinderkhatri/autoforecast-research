@@ -41,6 +41,8 @@ README_IMAGES = {
     "assets/04-run-outputs.svg",
 }
 TUTORIALS = {
+    "tutorials/10-supply-your-own-stages.ipynb",
+    "tutorials/11-prepare-and-check-data.ipynb",
     "tutorials/06-reload-and-reuse.ipynb",
     "tutorials/09-publish-bigquery.ipynb",
     "tutorials/03-custom-model.ipynb",
@@ -89,7 +91,7 @@ def tracked_inventory(root: pathlib.Path) -> tuple[set[str], dict]:
             or (path.parts[0] in roots and path.suffix == ".py")
             or (path.parts[0] == "configs" and path.suffix in {".json", ".yaml", ".yml"})
             or (path.parent.as_posix() == ".github/workflows" and path.suffix in {".yaml", ".yml"})
-            or name == "observability/sources.json"
+            or name in {"observability/sources.json", "autoforecast/study_config.schema.json"}
         )
         if (
             not allowed

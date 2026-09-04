@@ -16,6 +16,7 @@ requires-python = ">=3.12,<3.14"
 # Extra model libraries remain opt-in below.
 dependencies = [
     "PyYAML==6.0.3",
+    "jsonschema==4.26.0",
     "sqlglot==30.27.0",
     "databricks-sdk==0.137.0",
     "pyspark==4.2.0",
@@ -88,6 +89,7 @@ include = [
 namespaces = true
 
 [tool.setuptools.package-data]
+autoforecast = ["study_config.schema.json"]
 
 observability = ["sources.json"]
 

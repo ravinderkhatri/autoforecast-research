@@ -53,3 +53,5 @@ mlflow.db
 !/tutorials/07-publish-delta.ipynb
 !/tutorials/08-publish-postgresql.ipynb
 !/tutorials/09-publish-bigquery.ipynb
+!/tutorials/10-supply-your-own-stages.ipynb
+!/tutorials/11-prepare-and-check-data.ipynb

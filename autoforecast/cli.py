@@ -357,7 +357,13 @@ def main() -> int:
                 recipe = load_exact_json(project / args.recipe)
                 if type(recipe) is not dict:
                     raise ValueError("preparation recipe must be an object")
-                roles = ["selection", "final_training", "validation_score", "final_score"]
+                from autoforecast.benchmark import study_source_roles, validate_recipe
+
+                validate_recipe(recipe)
+                roles = sorted(study_source_roles(recipe))
+                if "validation_score" not in roles and args.validation_score is not None:
+                    parser.error("--validation-score requires configured validation; omit the "
+                                 "argument or declare validation in the recipe")
                 sources = {
                     role: getattr(args, role) or args.source
                     for role in roles

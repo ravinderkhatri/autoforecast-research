@@ -12,7 +12,7 @@ from typing import cast
 
 from pyspark.sql import SparkSession
 
-from autoforecast.benchmark import STUDY_SCHEMA, evaluation_contract, verify_benchmark
+from autoforecast.benchmark import STUDY_SCHEMAS, evaluation_contract, verify_benchmark
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.forecast_campaign import _load_json_with_identity, _verified_forecast
 from autoforecast.results import read_results
@@ -29,7 +29,7 @@ def rescore_campaign(
     original = read_results(campaign_root)
     study_sha = hashlib.sha256(study_path.read_bytes()).hexdigest()
     study_path, study = verify_benchmark(study_path, study_sha)
-    if study["schema"] != STUDY_SCHEMA:
+    if study["schema"] not in STUDY_SCHEMAS:
         raise ValueError("rescoring requires an explicitly frozen version-3 study")
     dataset_path = study_path.parent / "dataset.yaml"
     dataset_bytes = dataset_path.read_bytes()
@@ -44,6 +44,11 @@ def rescore_campaign(
             if run["status"] == "completed" and run["stage"] in {"validation", "test"}]
     if not runs:
         raise ValueError("campaign has no verified validation or test forecasts")
+    if not study["recipe"]["validation_origins"] and any(
+        run["stage"] == "validation" for run in runs
+    ):
+        raise ValueError("rescoring validation forecasts requires outer validation; "
+                         "use a scoring study with validation data")
     output_dir.mkdir(parents=True, exist_ok=False)
     try:
         records = []

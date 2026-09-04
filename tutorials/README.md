@@ -30,8 +30,11 @@ The published notebooks contain no saved outputs or credentials.
 | 7 | [Delta](07-publish-delta.ipynb) | Publish through Spark | 4, Delta runtime, fresh kernel |
 | 8 | [PostgreSQL](08-publish-postgresql.ipynb) | Publish with a database transaction | 4, postgres extra, database |
 | 9 | [BigQuery](09-publish-bigquery.ipynb) | Publish with cloud jobs | 4, bigquery extra, cloud project |
+| 10 | [Supply your own stages](10-supply-your-own-stages.ipynb) | Register DataFrames with optional validation | Package and Java 17; standalone |
+| 11 | [Prepare and check data](11-prepare-and-check-data.ipynb) | Validate settings and explain exclusions | Package and Java 17; standalone |
 
-Notebook 1 is a standalone command-line introduction. Notebooks 2 through 6 follow one Python
+Notebook 1 is a standalone command-line introduction. If you already have split DataFrames,
+start with notebook 10. Use notebook 11 when your application needs a preparation rule. Notebooks 2 through 6 follow one Python
 example. Choose any destination notebook after 4; there is no need to run all three.
 Restart the kernel between notebooks that start Spark, especially before the Delta notebook.
 All examples use synthetic data. Database examples create persistent destination tables.
