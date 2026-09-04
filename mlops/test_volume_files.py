@@ -2022,14 +2022,14 @@ def test_upload_failure_found_at_close_marks_the_run_unverified(volume, monkeypa
     assert not any(p.endswith("closed.json") for p in client.values)
 
 
-def _fail_upload(monkeypatch, stage, status):
+def _fail_upload(monkeypatch, stage, status, error=OSError):
     """Fail every upload of one event, which is saved in the background; others save."""
     publish = _volume_files.publish_audit_segment
 
     def unavailable(path, payload, **kwargs):
         event = json.loads(payload)
         if (event["stage"], event["status"]) == (stage, status):
-            raise OSError(f"{stage} event unavailable")
+            raise error(f"{stage} event unavailable")
         return publish(path, payload, **kwargs)
 
     monkeypatch.setattr(_volume_files, "publish_audit_segment", unavailable)
@@ -2051,17 +2051,20 @@ def test_upload_failure_found_at_close_is_shown_for_every_display(volume, monkey
     events.configure_logging(stream=stream, **options)
     _fail_upload(monkeypatch, "work", "PASS")
     with pytest.raises(OSError, match="unacknowledged"):
-        with events.Execution(root / "events.jsonl", ["work"], level=level):
+        with events.Execution(root / "events.jsonl", ["work"], level=level, study_id="input"):
             events._stage_event(root / "events.jsonl", "work", "START")
             events.record_result(study_id="saved", workflow_path="saved-workflow")
             events._stage_event(root / "events.jsonl", "work", "PASS")
     # The saved result stays visible, as the failed event line showed it before.
     assert "UNVERIFIED" in stream.getvalue()
     assert "saved-workflow" in stream.getvalue()
+    assert "input_study_id" in stream.getvalue()  # The run's input study keeps its own name.
 
 
+# An interruption while waiting for the last upload keeps the details, as a failure does.
+@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
 def test_completed_run_keeps_its_recovery_fields_when_the_last_upload_fails(volume,
-                                                                            monkeypatch):
+                                                                            monkeypatch, error):
     import contextlib
     import dataclasses
 
@@ -2087,8 +2090,8 @@ def test_completed_run_keeps_its_recovery_fields_when_the_last_upload_fails(volu
     registry = SimpleNamespace(root=root, runtime={}, store=None, load_study=load_study,
                                _registration_path=lambda _: None)
     monkeypatch.setattr(study_workflow, "run_forecast_workflow", lambda *a, **k: Result(workflow))
-    _fail_upload(monkeypatch, "run", "PASS")
-    with pytest.raises(OSError, match="run event unavailable") as caught:
+    _fail_upload(monkeypatch, "run", "PASS", error)
+    with pytest.raises(error, match="run event unavailable") as caught:
         study_workflow.run_study("registered", cast(Any, lambda _: None), registry=registry,
                                  model_config=root / "model.json", implementation={})
     recovery = vars(caught.value)
@@ -2098,8 +2101,9 @@ def test_completed_run_keeps_its_recovery_fields_when_the_last_upload_fails(volu
     assert not any(p.endswith("closed.json") for p in client.values)
 
 
+@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
 def test_completed_registration_keeps_its_evidence_note_when_the_last_upload_fails(
-        volume, monkeypatch):
+        volume, monkeypatch, error):
     from autoforecast import study_registration as registration
     from autoforecast.test_execution_boundaries import _Registry
     from autoforecast.test_study_registration import configuration
@@ -2108,8 +2112,8 @@ def test_completed_registration_keeps_its_evidence_note_when_the_last_upload_fai
     registry = _Registry(root=root / "registry", scratch_root=root / "scratch", runtime={},
                          store=None)
     monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "a" * 64)
-    _fail_upload(monkeypatch, "Study registered", "INFO")
-    with pytest.raises(OSError, match="Study registered event unavailable") as caught:
+    _fail_upload(monkeypatch, "Study registered", "INFO", error)
+    with pytest.raises(error, match="Study registered event unavailable") as caught:
         registration.register_study(configuration(root / "input"), registry=cast(Any, registry))
     assert any(note.startswith("Registration attempt evidence: ")
                for note in getattr(caught.value, "__notes__", []))
