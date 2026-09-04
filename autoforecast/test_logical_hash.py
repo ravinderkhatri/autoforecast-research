@@ -174,6 +174,59 @@ def test_rejects_malformed_bucket_summaries(summaries, rows):
         logical._finish([["x", "i64"]], summaries, rows)
 
 
+def _row_by_row_summaries(batches):
+    """The per-row combine that run-wise hashing replaced; the output must not change."""
+    current, count, hashed, output = None, 0, hashlib.sha256(logical._BUCKET_DOMAIN), []
+    for batch in batches:
+        for key, value in zip(batch.column(0).to_pylist(), batch.column(1).to_pylist(),
+                              strict=True):
+            if key != current:
+                if current is not None:
+                    output.append((current, count, hashed.hexdigest()))
+                current, count, hashed = key, 0, hashlib.sha256(logical._BUCKET_DOMAIN)
+            hashed.update(value)
+            count += 1
+    return output + ([(current, count, hashed.hexdigest())] if current is not None else [])
+
+
+def _digest_batches(digests, size, kind):
+    keys = [digest[0] for digest in digests]
+    return [pa.RecordBatch.from_arrays(
+        [pa.array(keys, pa.int32()), pa.array(digests, kind)], names=["bucket", "digest"],
+    ).slice(start, size) for start in range(0, len(digests), size)]
+
+
+@pytest.mark.parametrize("kind", [pa.binary(), pa.large_binary(), pa.binary_view()])
+@pytest.mark.parametrize("size", [1, 7, 1000])
+def test_run_wise_bucket_combine_matches_row_by_row(kind, size):
+    """Sliced batches, runs crossing batch edges and every binary layout hash the same."""
+    digests = sorted(hashlib.sha256(str(i).encode()).digest() for i in range(2000))
+    digests[10:10] = [digests[10]] * 3  # Equal rows count once each.
+    batches = _digest_batches(digests, size, kind)
+    combined = [row for batch in logical._bucket_summaries(iter(batches))
+                for row in zip(*batch.to_pydict().values(), strict=True)]
+    assert combined == _row_by_row_summaries(batches)
+    assert sum(row[1] for row in combined) == len(digests)
+
+
+@pytest.mark.parametrize("bad", ["short", "long", "bucket", "null"])
+def test_run_wise_bucket_combine_rejects_malformed_digests(bad):
+    digests = sorted(hashlib.sha256(str(i).encode()).digest() for i in range(40))
+    keys = [digest[0] for digest in digests]
+    if bad == "short":
+        digests[5] = digests[5][:31]
+    elif bad == "long":
+        digests[5] += b"\0"
+    elif bad == "bucket":
+        keys[5] = (keys[5] + 1) % 256
+    else:
+        digests[5] = None
+    batch = pa.RecordBatch.from_arrays(
+        [pa.array(keys, pa.int32()), pa.array(digests, pa.binary())], names=["bucket", "digest"])
+    with pytest.raises(ValueError, match="invalid logical row digest"):
+        list(logical._bucket_summaries(iter([batch])))
+
+
 def test_trusted_bytes_reuse_and_untrusted_full_verification(tmp_path, monkeypatch):
     path = tmp_path / "data"
     path.mkdir()

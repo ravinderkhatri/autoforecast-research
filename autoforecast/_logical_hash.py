@@ -302,22 +302,42 @@ def _expression(column, spec):
 
 def _bucket_summaries(batches):
     """Stream sorted Arrow batches; memory is bounded by the batch and 256 summaries."""
+    import numpy as np
     import pyarrow as pa
 
     current, count, hashed = None, 0, hashlib.sha256(_BUCKET_DOMAIN)
     output = []
     for batch in batches:
-        for key, value in zip(
-            batch.column(0).to_pylist(), batch.column(1).to_pylist(), strict=False
+        if not batch.num_rows:
+            continue
+        keys, values = batch.column(0), batch.column(1)
+        if keys.null_count or values.null_count:
+            raise ValueError("invalid logical row digest")
+        # Fixed-width digests sit back to back, so a run of one bucket is hashed in one
+        # update: the same bytes, in the same order, as one update per row. The cast
+        # refuses any value that is not exactly 32 bytes.
+        try:
+            fixed = values.cast(pa.binary(32))
+        except pa.ArrowInvalid as error:
+            raise ValueError("invalid logical row digest") from error
+        start = fixed.offset * 32
+        data = np.frombuffer(fixed.buffers()[1], dtype=np.uint8)[
+            start:start + 32 * len(fixed)
+        ]
+        keys = keys.to_numpy(zero_copy_only=False)
+        if (data[::32] != keys).any():
+            raise ValueError("invalid logical row digest")
+        edges = np.flatnonzero(keys[1:] != keys[:-1]) + 1
+        for first, end in zip(
+            np.concatenate(([0], edges)), np.concatenate((edges, [len(keys)])), strict=True
         ):
+            key = int(keys[first])
             if key != current:
                 if current is not None:
                     output.append((current, count, hashed.hexdigest()))
                 current, count, hashed = key, 0, hashlib.sha256(_BUCKET_DOMAIN)
-            if len(value) != 32 or value[0] != key:
-                raise ValueError("invalid logical row digest")
-            hashed.update(value)
-            count += 1
+            hashed.update(data[32 * first:32 * end])
+            count += int(end - first)
     if current is not None:
         output.append((current, count, hashed.hexdigest()))
     if output:
