@@ -6,9 +6,12 @@ import copy
 import dataclasses
 import hashlib
 import math
+import os
 import pathlib
 import tempfile
+import uuid
 
+from mlops import _volume_files
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
@@ -134,7 +137,8 @@ def score_study(
         root = pathlib.Path(temporary)
         try:
             snapshots = {
-                name: snapshot_bound_input(binding, root / name)
+                name: snapshot_bound_input(binding, root / name) if name == "forecast"
+                else _scoring_input(binding, root / name, scratch_root)
                 for name, binding in inputs.items()
             }
         except LineageError as error:
@@ -149,6 +153,37 @@ def score_study(
         )
     # The score used only the authenticated copies above, so later source changes cannot reach it.
     return score
+
+
+def _scoring_input(binding: dict, destination: pathlib.Path, scratch_root) -> pathlib.Path:
+    """Copy an unchanging scoring input once per run and scratch folder.
+
+    Inside a run, every later score of the same window reads the checked copy made by
+    the first; the stage's final check (``verify_owned_copies``) reads it again. Outside
+    a run, each score gets its own copy.
+    """
+    if "snapshot" in binding or scratch_root is None:
+        return snapshot_bound_input(binding, destination)
+    key = (os.path.abspath(bound_input_path(binding)), binding["sha256"],
+           os.path.abspath(scratch_root))
+    reused = _volume_files.owned_copy(key)
+    if reused is not None:
+        return reused
+    kept = pathlib.Path(scratch_root) / "scoring-inputs" / uuid.uuid4().hex
+    if not _volume_files.remember_owned_copy(key, kept):
+        return snapshot_bound_input(binding, destination)
+    kept.parent.mkdir(exist_ok=True)
+    return snapshot_bound_input(binding, kept)
+
+
+def verify_owned_copies() -> None:
+    """A stage's final check of the scoring copies it reused: each must keep its bytes."""
+    from mlops._safe_files import path_exists
+
+    for kept, sha256 in _volume_files.owned_copies():
+        # A finished stage's scratch folder is gone, and nothing can read its copies.
+        if path_exists(kept) and directory_digest(kept, suffixes=(".parquet",)) != sha256:
+            raise ScoreError(f"scoring input changed after it was copied: {kept}")
 
 
 def _score_study_snapshot(
@@ -311,6 +346,8 @@ def _score_study_snapshot(
     )
     series_path = output_dir / "series-scores"
     per_series.write.parquet(str(series_path))
+    # Written once: the attempt's seal reuses this download.
+    _volume_files.mark_frozen(series_path)
     score["series_scores"] = {
         "path": str(series_path), "sha256": directory_digest(series_path, suffixes=(".parquet",)),
     }

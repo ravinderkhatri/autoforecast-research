@@ -11,8 +11,9 @@ import pathlib
 import tempfile
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, suppress
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
+from mlops import _volume_files
 from mlops._safe_files import SafeFileError, read_regular_bytes
 from mlops.provenance import ProvenanceError
 from mlops.run_bundle import load_completed_run_bundle, open_run_bundle
@@ -48,7 +49,7 @@ from autoforecast.implementation import (
 from autoforecast.project import library_revision
 from autoforecast.snapshots import study_inputs, worker_inputs
 from autoforecast.study_preflight import preflight_study
-from autoforecast.study_scoring import score_study
+from autoforecast.study_scoring import score_study, verify_owned_copies
 from autoforecast.study_tuning import (
     FitPredictRequest,
     FitPredictResult,
@@ -245,11 +246,16 @@ class StudyInfo(TypedDict):
     Use study_id=None with create_study=True to register supplied inputs first.
     Use an existing study_id with create_study=False to reuse frozen data.
     publish_results controls result tables; registration always saves its data.
+    Optional file_checks: "once" (default) downloads and checks each saved file once per
+    run and trusts that nothing changes it while the run lasts; "every_stage" also ends
+    each stage with a fresh download and check, so a change made during the run, for
+    example by model code, stops the run. Registration keeps its own checks either way.
     """
 
     study_id: str | None
     create_study: bool
     publish_results: bool
+    file_checks: NotRequired[Literal["once", "every_stage"]]
 
 
 def _study_choice(study_id, study_info, publish):
@@ -264,11 +270,11 @@ def _study_choice(study_id, study_info, publish):
         if not isinstance(study_info, Mapping):
             raise ValueError("study_info must be a mapping")
         choice = dict(study_info)
-        if set(choice) != {
-            "study_id", "create_study", "publish_results",
-        }:
+        required = {"study_id", "create_study", "publish_results"}
+        if not required <= set(choice) or set(choice) - required - {"file_checks"}:
             raise ValueError(
-                "study_info requires exactly study_id, create_study and publish_results",
+                "study_info requires exactly study_id, create_study and publish_results, "
+                "and accepts only file_checks besides them",
             )
         if any(type(choice[key]) is not bool for key in ("create_study", "publish_results")):
             raise ValueError("create_study and publish_results must be booleans")
@@ -285,6 +291,14 @@ def _study_choice(study_id, study_info, publish):
           or study_id in {".", ".."} or pathlib.Path(study_id).name != study_id):
         raise ValueError("reuse requires a nonblank existing study_id")
     return study_id, create, publish
+
+
+def _file_checks(study_info) -> str:
+    """The run's file checks: "once" unless study_info asks for "every_stage"."""
+    mode = "once" if study_info is _UNSET else dict(study_info).get("file_checks", "once")
+    if type(mode) is not str or mode not in _volume_files.FILE_CHECKS:
+        raise ValueError('study_info file_checks must be "once" or "every_stage"')
+    return mode
 
 
 def run_study(
@@ -309,7 +323,8 @@ def run_study(
 ) -> ForecastWorkflowResult:
     """Create or reuse a study, then run a callback, StudyModel, or seasonal_naive.
 
-    Supply study_info with exactly study_id, create_study and publish_results.
+    Supply study_info with exactly study_id, create_study and publish_results, and
+    optionally file_checks ("once" by default, or "every_stage"; see StudyInfo).
     Creation requires study_id=None and config (with optional prepare), or the
     direct-stage inputs accepted by register_study. Reuse requires an existing ID
     and rejects registration inputs. The mapping is never changed. The older
@@ -336,6 +351,7 @@ def run_study(
         from autoforecast.study_registration import StudyRegistry, _runtime, register_study
 
         study_id, create, publish = _study_choice(study_id, study_info, publish)
+        file_checks = _file_checks(study_info)
         registration = dict(registration_inputs)
         if config is not _UNSET:
             registration["config"] = config
@@ -385,6 +401,7 @@ def run_study(
             "log_level": "INFO",
             **registry.runtime,
             **configured_runtime,
+            "file_checks": file_checks,
         }
         for name, explicit in (
             ("tracking", tracking),
@@ -434,13 +451,16 @@ def run_study(
             study_action="create" if create else "reuse",
             publish_results=settings["publish"],
             **({"model_label": model_label} if model_label is not None else {}),
-        ) as execution:
+        ) as execution, _volume_files.frozen_reads(), _volume_files.file_checks(file_checks):
+            # Frozen files (the study, sealed outputs) are downloaded and hashed once in this
+            # run; with every-stage checks, each stage also ends with a fresh check.
             result = None
             try:
                 with _stage(audit, "configuration", study_id=study_id) as outcome:
                     outcome["study_action"] = "create" if create else "reuse"
                     outcome.update(
-                        {key: settings[key] for key in ("tracking", "publish", "log_level")}
+                        {key: settings[key]
+                         for key in ("tracking", "publish", "log_level", "file_checks")}
                     )
                     if settings["publish"]:
                         if registry.store is None:
@@ -673,11 +693,14 @@ def run_study(
                         run_id=result.run_id,
                         retry="same retained workflow; writes may be partial",
                     ) as outcome:
-                        publication = registry.publish_results(
-                            result.study_id,
-                            result.path,
-                            mlflow_links=links,
-                        )
+                        # Publication checks what it publishes once, fresh: each trial and
+                        # file is read once however many steps consult it.
+                        with _volume_files.fresh_reads(), attempts_checked_once():
+                            publication = registry.publish_results(
+                                result.study_id,
+                                result.path,
+                                mlflow_links=links,
+                            )
                         outcome["publication"] = publication
                 else:
                     _stage_event(
@@ -904,6 +927,8 @@ def run_forecast_workflow(
             raise HPOError("validation_run must be a validation checkpoint for this exact study")
         bundle.write_json("metadata/preflight.json", preflight.report)
         retained_config = bundle.write_bytes("metadata/config.yaml", raw)
+        # The search reads this create-only copy: it reuses the one this write checked.
+        _volume_files.mark_frozen(retained_config)
         trial_fits = (
             0
             if fixed or saved is not None or reuse_tuning is not None
@@ -982,6 +1007,8 @@ def run_forecast_workflow(
                             tuning_origin=tuning_origin,
                             output_dir=root / "hpo",
                             reuse_tuning=reuse_tuning,
+                            # The search answers the same coverage question; hand it on.
+                            _preflight=(preflight, options),
                         )
                     phase = "artifact_retention"
                     tuning_path = selection.path
@@ -1039,12 +1066,15 @@ def run_forecast_workflow(
                 ("validation", origin, recipe["validation_horizon"])
                 for origin in recipe["validation_origins"]
             ] + [("test", recipe["final_train_cutoff"], recipe["final_test_horizon"])]
+            final_inputs: list = []
             for stage, origin, horizon in outer_windows:
                 if stage == "test" and validation_only:
                     continue
                 phase = "validation" if stage == "validation" else "final_refit"
                 directory = bundle.path / stage
                 inputs = _prepare_window(study, stage, origin, horizon, temporary / stage)
+                # The final check below reads these inputs again.
+                final_inputs.append(inputs)
                 if stage == "validation" and previous is not None:
                     _stage_event(bundle.path / "events.jsonl", "fit_predict", "SKIP",
                                  reason="verified validation checkpoint", window=stage,
@@ -1192,7 +1222,12 @@ def run_forecast_workflow(
                 stages["testing" if stage == "test" else stage] = result
                 bundle.write_json(stage + "/result.json", result)
                 inputs.verify()
-            study._record(data=True)
+            # The workflow's final check reads the frozen study once more, fresh.
+            with _volume_files.fresh_reads():
+                study._record(data=True)
+                for item in final_inputs:
+                    item.verify()
+                verify_owned_copies()
             if capture is not None:
                 capture.verify()
             result = {
@@ -1208,6 +1243,8 @@ def run_forecast_workflow(
             phase = "workflow"
             bundle.write_json("result.json", result)
             bundle.finalize(status="completed", summary={"evaluation_status": result["status"]})
+            # The sealed bundle is downloaded once for the reloads that follow in this run.
+            _volume_files.mark_frozen(bundle.path)
     except Exception as error:
         if phase == "tuning":
             tuning_path = getattr(error, "tuning_path", tuning_path)

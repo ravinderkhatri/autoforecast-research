@@ -657,82 +657,96 @@ def verify_files(
     """
     from mlops import _volume_files
 
-    from provenance.lineage import directory_digest
-
     path = pathlib.Path(path)
     if logical is not None:
         validate_metadata(logical)
+    with (
+        _volume_files.local_snapshot(path, parquet_only=True)
+        if _volume_files.is_volume(path)
+        else nullcontext(path)
+    ) as local:
+        # Inside a run, the run's read-only copy is verified once for the same expectation.
+        return _volume_files.checked_once(
+            local,
+            ("verify files", physical_sha256, json.dumps(logical, sort_keys=True), trusted),
+            lambda: _verify_local_files(
+                path, local, physical_sha256=physical_sha256, logical=logical,
+                trusted=trusted, spark=spark, _scratch_root=_scratch_root,
+            ),
+        )
+
+
+def _verify_local_files(path, local, *, physical_sha256, logical, trusted, spark, _scratch_root):
+    from mlops import _volume_files
+
+    from provenance.lineage import directory_digest
+
     with operation("Verify frozen file bytes", engine="driver", dataset=str(path)):
-        with (
-            _volume_files.local_snapshot(path, parquet_only=True)
-            if _volume_files.is_volume(path)
-            else nullcontext(path)
-        ) as local:
-            from provenance.lineage import parquet_files
+        from provenance.lineage import parquet_files
 
-            files = parquet_files(local)
-            inventory = {"dataset": str(path), "files": len(files),
-                         "bytes": sum(file.stat().st_size for file in files)}
-            if directory_digest(local, suffixes=(".parquet",)) != physical_sha256:
-                raise ValueError("frozen file bytes or inventory changed")
-            if trusted and logical is not None:
-                note(
-                    "Reuse verified logical identity",
-                    algorithm=logical["algorithm"],
-                    rows=logical["rows"],
-                    **inventory,
-                    reason="authenticated manifest and matching file bytes",
+        files = parquet_files(local)
+        inventory = {"dataset": str(path), "files": len(files),
+                     "bytes": sum(file.stat().st_size for file in files)}
+        if directory_digest(local, suffixes=(".parquet",)) != physical_sha256:
+            raise ValueError("frozen file bytes or inventory changed")
+        if trusted and logical is not None:
+            note(
+                "Reuse verified logical identity",
+                algorithm=logical["algorithm"],
+                rows=logical["rows"],
+                **inventory,
+                reason="authenticated manifest and matching file bytes",
+            )
+            return logical["sha256"]
+        note("Full logical verification", reason="no authenticated binding or legacy format")
+        if logical is None:
+            from autoforecast.benchmark import parquet_content_hash
+
+            observed_sha = parquet_content_hash(local)
+        elif spark is not None and _scratch_root is not None:
+            import shutil
+
+            from provenance.lineage import snapshot_parquet_directory
+
+            # Spark may retain cached rows for an existing path. Read a new,
+            # authenticated capture without changing the caller's cache.
+            root = pathlib.Path(tempfile.mkdtemp(prefix="af-verify-hash-", dir=_scratch_root))
+            failure = None
+            try:
+                owned = snapshot_parquet_directory(
+                    local, root / "data", expected_sha256=physical_sha256,
+                    label="logical verification",
                 )
-                return logical["sha256"]
-            note("Full logical verification", reason="no authenticated binding or legacy format")
-            if logical is None:
-                from autoforecast.benchmark import parquet_content_hash
-
-                observed_sha = parquet_content_hash(local)
-            elif spark is not None and _scratch_root is not None:
-                import shutil
-
-                from provenance.lineage import snapshot_parquet_directory
-
-                # Spark may retain cached rows for an existing path. Read a new,
-                # authenticated capture without changing the caller's cache.
-                root = pathlib.Path(tempfile.mkdtemp(prefix="af-verify-hash-", dir=_scratch_root))
-                failure = None
-                try:
-                    owned = snapshot_parquet_directory(
-                        local, root / "data", expected_sha256=physical_sha256,
-                        label="logical verification",
-                    )
-                    observed = fingerprint(owned, spark=spark)
-                    if directory_digest(owned, suffixes=(".parquet",)) != physical_sha256:
-                        raise ValueError("verification snapshot bytes changed")
-                    if observed != logical:
-                        raise ValueError("frozen logical identity changed")
-                    observed_sha = observed["sha256"]
-                except BaseException as error:
-                    failure = error
-                    raise
-                finally:
-                    try:
-                        if _volume_files.is_volume(root):
-                            _volume_files.remove_tree(root)
-                        else:
-                            shutil.rmtree(root)
-                    except Exception as error:
-                        if failure is None:
-                            raise
-                        failure.add_note(f"Verification snapshot cleanup also failed: {error}")
-            else:
-                # Without a declared worker-visible scratch area, decode the
-                # authenticated bytes locally. Never reopen a cached Spark path.
-                observed = fingerprint(local)
+                observed = fingerprint(owned, spark=spark)
+                if directory_digest(owned, suffixes=(".parquet",)) != physical_sha256:
+                    raise ValueError("verification snapshot bytes changed")
                 if observed != logical:
                     raise ValueError("frozen logical identity changed")
                 observed_sha = observed["sha256"]
-            if directory_digest(local, suffixes=(".parquet",)) != physical_sha256:
-                raise ValueError("frozen file bytes changed during logical verification")
-            if _volume_files.is_volume(path) and (
-                directory_digest(path, suffixes=(".parquet",)) != physical_sha256
-            ):
-                raise ValueError("frozen file bytes changed during logical verification")
-            return observed_sha
+            except BaseException as error:
+                failure = error
+                raise
+            finally:
+                try:
+                    if _volume_files.is_volume(root):
+                        _volume_files.remove_tree(root)
+                    else:
+                        shutil.rmtree(root)
+                except Exception as error:
+                    if failure is None:
+                        raise
+                    failure.add_note(f"Verification snapshot cleanup also failed: {error}")
+        else:
+            # Without a declared worker-visible scratch area, decode the
+            # authenticated bytes locally. Never reopen a cached Spark path.
+            observed = fingerprint(local)
+            if observed != logical:
+                raise ValueError("frozen logical identity changed")
+            observed_sha = observed["sha256"]
+        if directory_digest(local, suffixes=(".parquet",)) != physical_sha256:
+            raise ValueError("frozen file bytes changed during logical verification")
+        if _volume_files.is_volume(path) and (
+            directory_digest(path, suffixes=(".parquet",)) != physical_sha256
+        ):
+            raise ValueError("frozen file bytes changed during logical verification")
+        return observed_sha

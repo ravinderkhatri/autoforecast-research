@@ -21,6 +21,8 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
+from mlops import _volume_files
+
 from autoforecast._exact_json import load_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast._numeric import is_finite_real
@@ -1002,12 +1004,21 @@ def _run_hpo_study_locked(
                 mlflow_tracking_uri=mlflow_tracking_uri,
                 mlflow_experiment=mlflow_experiment,
             )
-        seal_study_selection(
-            study_root,
-            top_k=study.top_k,
-            direction=study.direction,
-            required_trial_count=study.max_trials,
-        )
+        # With every-stage checks, the search's final check reads every trial once more,
+        # fresh, before selection: model code ran after the last clear and may have read a
+        # trial and then changed it, so no earlier check of a trial is reused. With checks
+        # once per run, selection keeps the checks this run already made.
+        if _volume_files.every_stage():
+            forget_checked_attempts()
+        with _volume_files.fresh_reads():
+            seal_study_selection(
+                study_root,
+                top_k=study.top_k,
+                direction=study.direction,
+                required_trial_count=study.max_trials,
+            )
+        # The sealed selection never changes; later reads in this run reuse one download.
+        _volume_files.mark_frozen(study_root / "selection.json")
         sync_hpo_selection_to_mlflow(study_root, tracking_uri=mlflow_tracking_uri)
         return render_study_report(study_root, mlflow_url=mlflow_tracking_uri)
     except Exception as error:

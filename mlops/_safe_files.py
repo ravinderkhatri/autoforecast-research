@@ -7,6 +7,7 @@ prevent an external process from replacing a remote directory.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import os
@@ -182,9 +183,16 @@ def _open_regular_fd(path: pathlib.Path) -> int:
 
 
 def _regular_file_identity(path: pathlib.Path) -> tuple[str, int]:
-    """Hash a local regular file or the current bytes of an immutable volume file."""
+    """Hash a local regular file or the current bytes of an immutable volume file.
+
+    Inside a run, the run's read-only copy of a frozen volume file is hashed once.
+    """
     descriptor: int | None = None
     try:
+        local = _volume_files.frozen_copy(path) if _volume_files.is_volume(path) else None
+        if local is not None:
+            return _volume_files.checked_once(
+                local, "sha256", lambda: _regular_file_identity(local))
         if _volume_files.is_volume(path):
             digest = hashlib.sha256()
             size = 0
@@ -222,7 +230,9 @@ def regular_file_identities(paths: Iterable[pathlib.Path]) -> list[tuple[str, in
     with operation("Hash files for the manifest", engine="driver",
                    files_total=len(paths)) as update:
         with ThreadPoolExecutor(max_workers=_volume_files._DOWNLOAD_WORKERS) as pool:
-            futures = [pool.submit(_regular_file_identity, path) for path in paths]
+            # Workers share the caller's run scope, so frozen files are not downloaded again.
+            futures = [pool.submit(contextvars.copy_context().run, _regular_file_identity, path)
+                       for path in paths]
             try:
                 for count, future in enumerate(futures, start=1):
                     future.result()

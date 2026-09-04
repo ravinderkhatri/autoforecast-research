@@ -269,6 +269,9 @@ class LocalAttempt:
             for path, kind in descendants.items()
             if kind == "file" and path not in {artifact_manifest, self.path / "completion.json"}
         )
+        # Nothing changes these files from here on: the hashes below fill the run's one
+        # copy of each, which later reads in this run reuse.
+        _volume_files.mark_frozen(self.path)
         try:
             identities = regular_file_identities(files)
         except SafeFileError as exc:

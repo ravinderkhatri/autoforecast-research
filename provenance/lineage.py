@@ -39,7 +39,7 @@ import stat
 from dataclasses import dataclass, field
 from typing import Literal
 
-from autoforecast._execution import progress, reported
+from autoforecast._execution import operation, progress, reported
 
 __all__ = [
     "Artifact",
@@ -190,7 +190,6 @@ def parquet_files(path: str | pathlib.Path) -> tuple[pathlib.Path, ...]:
     return tuple(member for _relative, member in _digest_files(path, (".parquet",)))
 
 
-@reported("Verify file and manifest SHA (driver)", dataset=True)
 def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()) -> str:
     """Hash relative filenames and contents for a stable directory artifact identity.
 
@@ -200,14 +199,31 @@ def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()
     A ``('.parquet',)`` filter also validates the complete directory inventory:
     reader-visible files must have that exact suffix, hidden markers are ignored, and
     links, special files, and streaming metadata are refused. Other filters select suffixes.
+    Inside a run, the run's read-only copy of a frozen tree is hashed once.
     """
+    return _hashed_once(path, suffixes, "directory", _directory_digest)
+
+
+def _hashed_once(path, suffixes, kind, compute):
+    """Hash a volume tree from its local copy; a run-scope copy is hashed only once."""
     from mlops import _volume_files
 
     if _volume_files.is_volume(pathlib.Path(path)):
         with _volume_files.local_snapshot(
             pathlib.Path(path), parquet_only=suffixes == (".parquet",),
         ) as local:
-            return directory_digest.__wrapped__(local, suffixes=suffixes)
+            return _volume_files.checked_once(
+                local, (kind, suffixes), lambda: compute(local, suffixes, dataset=path))
+    return _volume_files.checked_once(
+        pathlib.Path(path), (kind, suffixes), lambda: compute(path, suffixes, dataset=path))
+
+
+def _directory_digest(path, suffixes, *, dataset) -> str:
+    with operation("Verify file and manifest SHA (driver)", dataset=str(dataset)):
+        return _directory_digest_bytes(path, suffixes)
+
+
+def _directory_digest_bytes(path, suffixes) -> str:
     files = _digest_files(path, suffixes)
     digest = hashlib.sha256()
     digest.update(_DIRECTORY_DIGEST_DOMAIN)
@@ -231,16 +247,20 @@ def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()
     return digest.hexdigest()
 
 
-@reported("Verify content SHA (driver)", dataset=True)
 def directory_content_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()) -> str:
-    """Hash the multiset of file bytes without names, detecting byte-identical renamed copies."""
-    from mlops import _volume_files
+    """Hash the multiset of file bytes without names, detecting byte-identical renamed copies.
 
-    if _volume_files.is_volume(pathlib.Path(path)):
-        with _volume_files.local_snapshot(
-            pathlib.Path(path), parquet_only=suffixes == (".parquet",),
-        ) as local:
-            return directory_content_digest.__wrapped__(local, suffixes=suffixes)
+    Inside a run, the run's read-only copy of a frozen tree is hashed once.
+    """
+    return _hashed_once(path, suffixes, "content", _directory_content_digest)
+
+
+def _directory_content_digest(path, suffixes, *, dataset) -> str:
+    with operation("Verify content SHA (driver)", dataset=str(dataset)):
+        return _directory_content_digest_bytes(path, suffixes)
+
+
+def _directory_content_digest_bytes(path, suffixes) -> str:
     files = _digest_files(path, suffixes)
     payloads: list[tuple[int, bytes]] = []
     for _relative, file_path in files:

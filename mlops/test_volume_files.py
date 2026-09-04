@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import pathlib
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -2609,3 +2610,297 @@ def test_volume_bundle_export_checks_one_owned_copy(volume, monkeypatch):
     with pytest.raises(run_mlflow.RunMLflowError, match="not verified"):
         with run_mlflow._completed_run_snapshot(bundle.path):  # noqa: SLF001
             pass
+
+
+def _counted_downloads(root, client, monkeypatch):
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(Path(path).relative_to(root).as_posix())
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    return downloads
+
+
+def _study_files(root, client):
+    study = root / "study"
+    for name, value in {"manifest.json": b"{}", "data/part-0.parquet": b"rows",
+                        "data/_SUCCESS": b""}.items():
+        client.values[str(study / name)] = value
+    return study
+
+
+def test_frozen_reads_download_each_file_once_per_run_by_default(volume, monkeypatch):
+    root, client = volume
+    study = _study_files(root, client)
+    downloads = _counted_downloads(root, client, monkeypatch)
+
+    def reads():
+        assert _volume_files.read_bytes(study / "manifest.json") == b"{}"
+        with _volume_files.local_snapshot(study / "data") as local:
+            assert (local / "part-0.parquet").read_bytes() == b"rows"
+        return len(downloads)
+
+    # Outside a run every read downloads, so a changed file is always seen.
+    assert reads() == 3 and reads() == 6
+    downloads.clear()
+    with _volume_files.frozen_reads():
+        assert reads() == 3  # Not marked yet: still downloaded.
+        _volume_files.mark_frozen(study)
+        assert reads() == 6 and reads() == 6  # Marked: one download, then reuse.
+        client.values[str(study / "manifest.json")] = b"changed"
+        with _volume_files.fresh_reads():
+            # Checks once per run: a stage's final check keeps the checked copy.
+            assert _volume_files.read_bytes(study / "manifest.json") == b"{}"
+        with _volume_files.frozen_reads():  # A nested scope shares the outer copies.
+            assert _volume_files.read_bytes(study / "manifest.json") == b"{}"
+        assert downloads.count("study/manifest.json") == 2
+    # The scope ended: reads download again.
+    assert _volume_files.read_bytes(study / "manifest.json") == b"changed"
+    assert downloads.count("study/manifest.json") == 3
+
+
+def test_every_stage_checks_download_each_file_once_per_stage(volume, monkeypatch):
+    root, client = volume
+    study = _study_files(root, client)
+    downloads = _counted_downloads(root, client, monkeypatch)
+    with _volume_files.frozen_reads(), _volume_files.file_checks("every_stage"):
+        _volume_files.mark_frozen(study)
+        assert _volume_files.read_bytes(study / "manifest.json") == b"{}"
+        client.values[str(study / "manifest.json")] = b"changed"
+        assert _volume_files.read_bytes(study / "manifest.json") == b"{}"
+        with _volume_files.fresh_reads():
+            # A stage's final check downloads each file again, once, and sees the change.
+            assert _volume_files.read_bytes(study / "manifest.json") == b"changed"
+            assert _volume_files.read_bytes(study / "manifest.json") == b"changed"
+            with _volume_files.fresh_reads():  # A nested check joins the outer one.
+                assert _volume_files.read_bytes(study / "manifest.json") == b"changed"
+        assert _volume_files.read_bytes(study / "manifest.json") == b"changed"
+    assert downloads.count("study/manifest.json") == 2
+
+
+def test_file_checks_accept_two_modes_and_apply_only_inside_their_block():
+    assert not _volume_files.every_stage()  # Nothing chose: checks once per run.
+    with pytest.raises(ValueError, match="once.*every_stage"):
+        with _volume_files.file_checks("each_stage"):
+            pass
+    with _volume_files.file_checks("every_stage"):
+        assert _volume_files.every_stage()
+        with _volume_files.file_checks(None):  # None keeps the caller's choice.
+            assert _volume_files.every_stage()
+        with _volume_files.file_checks("once"):
+            assert not _volume_files.every_stage()
+        assert _volume_files.every_stage()
+    assert not _volume_files.every_stage()
+
+
+def test_run_copies_are_hashed_once_and_read_only(volume, monkeypatch):
+    from provenance import lineage
+
+    root, client = volume
+    study = _study_files(root, client)
+    hashed = []
+    for name in ("_directory_digest_bytes", "_directory_content_digest_bytes"):
+        original = getattr(lineage, name)
+        monkeypatch.setattr(lineage, name, lambda path, suffixes, _original=original, _name=name:
+                            hashed.append(_name) or _original(path, suffixes))
+    identity = _safe_files._regular_file_identity
+
+    def file_identity(path):
+        # A volume path inside a run only finds its local copy; the copy's bytes are hashed.
+        hashed.append("file: " + ("volume" if _volume_files.is_volume(Path(path)) else "local"))
+        return identity(path)
+
+    monkeypatch.setattr(_safe_files, "_regular_file_identity", file_identity)
+
+    def check():
+        return (lineage.directory_digest(study / "data", suffixes=(".parquet",)),
+                lineage.directory_content_digest(study / "data", suffixes=(".parquet",)),
+                _safe_files.regular_file_identities([study / "manifest.json"]))
+
+    expected = check()
+    # Outside a run every call hashes, and a volume file is hashed while it streams.
+    assert hashed == ["_directory_digest_bytes", "_directory_content_digest_bytes",
+                      "file: volume"]
+    hashed.clear()
+    with _volume_files.frozen_reads():
+        _volume_files.mark_frozen(study)
+        assert check() == expected and check() == expected
+        assert [name for name in hashed if name != "file: volume"] == [
+            "_directory_digest_bytes", "_directory_content_digest_bytes", "file: local"]
+        copy = _volume_files.frozen_copy(study / "manifest.json")
+        assert copy is not None and not copy.stat().st_mode & 0o222
+        # A local file or folder that is not one of the run's copies is hashed on every call.
+        with tempfile.TemporaryDirectory() as directory:
+            local = pathlib.Path(directory) / "local.txt"
+            local.write_bytes(b"one")
+            first = (_safe_files.regular_file_identities([local]),
+                     lineage.directory_digest(directory),
+                     lineage.directory_content_digest(directory))
+            local.write_bytes(b"two")
+            second = (_safe_files.regular_file_identities([local]),
+                      lineage.directory_digest(directory),
+                      lineage.directory_content_digest(directory))
+            assert all(old != new for old, new in zip(first, second, strict=True))
+        hashed.clear()
+        with _volume_files.file_checks("every_stage"), _volume_files.fresh_reads():
+            # A fresh check downloads new copies, so it hashes each of them once.
+            assert check() == expected and check() == expected
+        assert [name for name in hashed if name != "file: volume"] == [
+            "_directory_digest_bytes", "_directory_content_digest_bytes", "file: local"]
+    hashed.clear()
+    assert check() == expected  # The scope ended: hashed on every call again.
+    assert len(hashed) == 3
+
+
+def test_run_copies_are_verified_once_per_expectation(volume, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from autoforecast import _logical_hash as logical
+
+    from provenance.lineage import directory_digest
+
+    root, client = volume
+    with tempfile.TemporaryDirectory() as directory:
+        data = pathlib.Path(directory) / "data"
+        data.mkdir()
+        pq.write_table(pa.table({"x": [1, 2]}), data / "part.parquet", compression="NONE")
+        metadata = logical.fingerprint(data)
+        physical = directory_digest(data, suffixes=(".parquet",))
+        remote = root / "study" / "data"
+        client.values[str(remote / "part.parquet")] = (data / "part.parquet").read_bytes()
+    decoded = []
+    fingerprint = logical.fingerprint
+    monkeypatch.setattr(logical, "fingerprint",
+                        lambda *args, **kwargs: decoded.append(1) or fingerprint(*args, **kwargs))
+    with _volume_files.frozen_reads():
+        _volume_files.mark_frozen(root / "study")
+        for _ in range(2):
+            assert logical.verify_files(remote, physical_sha256=physical, logical=metadata,
+                                        trusted=False) == metadata["sha256"]
+        assert len(decoded) == 1  # The same copy and expectation: verified once.
+        # Another expectation is checked again, not answered from the earlier result.
+        with pytest.raises(ValueError, match="bytes or inventory changed"):
+            logical.verify_files(remote, physical_sha256="0" * 64, logical=metadata,
+                                 trusted=True)
+
+
+def test_writes_never_leave_stale_run_copies(volume, monkeypatch):
+    root, client = volume
+    downloads = _counted_downloads(root, client, monkeypatch)
+    owned = root / "owned"
+    with _volume_files.frozen_reads():
+        # A create-only write keeps its verified read-back; it is served once marked.
+        _volume_files.publish_blocks(owned / "result.json", [b"result"])
+        assert downloads == ["owned/result.json"]
+        assert _volume_files.read_bytes(owned / "result.json") == b"result"
+        assert len(downloads) == 2  # Not marked: reads the current bytes.
+        _volume_files.mark_frozen(owned)
+        assert _volume_files.read_bytes(owned / "result.json") == b"result"
+        with _volume_files.local_snapshot(owned) as local:
+            assert (local / "result.json").read_bytes() == b"result"
+        assert len(downloads) == 2  # Marked: the read-back is the one download.
+        # A check of who owns a file reads its current bytes, never the run's copy.
+        client.values[str(owned / "result.json")] = b"replaced"
+        assert _volume_files.read_current_bytes(owned / "result.json") == b"replaced"
+        # Any upload drops older copies of that file and of trees that hold it.
+        _volume_files._put(owned / "result.json", b"rewritten", overwrite=True)
+        assert _volume_files.read_bytes(owned / "result.json") == b"rewritten"
+        with _volume_files.local_snapshot(owned) as local:
+            assert (local / "result.json").read_bytes() == b"rewritten"
+        # Removing a tree drops its copies: a later read sees the file is gone.
+        _volume_files.remove_tree(owned)
+        with pytest.raises(OSError):
+            _volume_files.read_bytes(owned / "result.json")
+
+
+def test_forgetting_after_user_code_drops_copies_and_hashes(volume, monkeypatch):
+    root, client = volume
+    study = _study_files(root, client)
+    downloads = _counted_downloads(root, client, monkeypatch)
+    with _volume_files.frozen_reads():
+        _volume_files.mark_frozen(study)
+        before = _safe_files.regular_file_identities([study / "manifest.json"])
+        _volume_files.publish_blocks(root / "written" / "result.json", [b"result"])
+        # User code changes both files; forgetting drops every copy and read-back.
+        client.values[str(study / "manifest.json")] = b"changed"
+        client.values[str(root / "written" / "result.json")] = b"edited"
+        _volume_files.forget_frozen()
+        _volume_files.mark_frozen(study)
+        _volume_files.mark_frozen(root / "written")
+        after = _safe_files.regular_file_identities([study / "manifest.json"])
+        assert _volume_files.read_bytes(root / "written" / "result.json") == b"edited"
+    assert before != after == [(hashlib.sha256(b"changed").hexdigest(), 7)]
+    assert downloads.count("study/manifest.json") == 2
+
+
+def test_unsealed_guide_cleanup_checks_the_current_bytes(volume):
+    from mlops.run_report import _discard_unsealed_guide
+
+    root, client = volume
+    run = root / "run"
+    with _volume_files.frozen_reads():
+        _volume_files.publish_blocks(run / "RUN.md", [b"guide"])
+        _volume_files.mark_frozen(run)
+        # Another writer replaced the guide: its file is kept, despite the run's copy.
+        client.values[str(run / "RUN.md")] = b"another writer"
+        _discard_unsealed_guide(run, b"guide", RuntimeError("finalize failed"))
+        assert client.values[str(run / "RUN.md")] == b"another writer"
+        client.values[str(run / "RUN.md")] = b"guide"
+        _discard_unsealed_guide(run, b"guide", RuntimeError("finalize failed"))
+        assert str(run / "RUN.md") not in client.values
+
+
+def test_frozen_reads_reuse_a_containing_copy_but_not_missing_marker_bytes(volume, monkeypatch):
+    root, client = volume
+    study = root / "study"
+    values = {"data/part-0.parquet": b"rows", "data/_SUCCESS": b"marker"}
+    for name, value in values.items():
+        client.values[str(study / name)] = value
+    downloads = _counted_downloads(root, client, monkeypatch)
+    with _volume_files.frozen_reads():
+        _volume_files.mark_frozen(study)
+        with _volume_files.local_snapshot(study, parquet_only=True) as local:
+            assert (local / "data/_SUCCESS").read_bytes() == b""
+        assert downloads == ["study/data/part-0.parquet"]
+        # A folder or file inside the copied tree is served from it.
+        with _volume_files.local_snapshot(study / "data", parquet_only=True) as local:
+            assert (local / "part-0.parquet").read_bytes() == b"rows"
+        assert _volume_files.read_bytes(study / "data/part-0.parquet") == b"rows"
+        assert downloads == ["study/data/part-0.parquet"]
+        # The Parquet-only copy kept no marker bytes, so a full read downloads them once;
+        # a full copy of the folder then reuses every file already held.
+        assert _volume_files.read_bytes(study / "data/_SUCCESS") == b"marker"
+        with _volume_files.local_snapshot(study / "data") as local:
+            assert (local / "_SUCCESS").read_bytes() == b"marker"
+            assert (local / "part-0.parquet").read_bytes() == b"rows"
+        assert sorted(downloads) == ["study/data/_SUCCESS", "study/data/part-0.parquet"]
+
+
+def test_frozen_reads_reach_parallel_file_hashing(volume, monkeypatch):
+    root, client = volume
+    paths = [root / "study" / f"file-{index}" for index in range(5)]
+    for index, path in enumerate(paths):
+        client.values[str(path)] = bytes([index])
+    downloads = _counted_downloads(root, client, monkeypatch)
+    expected = [(hashlib.sha256(bytes([index])).hexdigest(), 1) for index in range(5)]
+    with _volume_files.frozen_reads():
+        _volume_files.mark_frozen(root / "study")
+        assert _safe_files.regular_file_identities(paths) == expected
+        assert _safe_files.regular_file_identities(paths) == expected
+    # The hashing workers share the run's copies: each file was downloaded once.
+    assert len(downloads) == 5
+
+
+def test_owned_copies_live_only_in_a_run(volume):
+    root, _client = volume
+    key = (str(root / "source"), "a" * 64, str(root / "scratch"))
+    assert not _volume_files.remember_owned_copy(key, root / "copy")
+    assert _volume_files.owned_copy(key) is None and _volume_files.owned_copies() == []
+    with _volume_files.frozen_reads():
+        assert _volume_files.remember_owned_copy(key, root / "copy")
+        assert _volume_files.owned_copy(key) == root / "copy"
+        assert _volume_files.owned_copies() == [(root / "copy", "a" * 64)]
+    assert _volume_files.owned_copy(key) is None

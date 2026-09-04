@@ -280,6 +280,8 @@ class Study:
             # dataframe whose plan points at a mutable registry artifact. Spark reads only
             # this checked copy, so the registry original is checked once, when copied.
             destination = pathlib.Path(self._snapshots.name) / record["role_paths"][role]
+            # Written once below: later reads in this run reuse one download.
+            _volume_files.mark_frozen(destination)
             if destination.exists():
                 if directory_digest(destination, suffixes=(".parquet",)) != expected:
                     raise BenchmarkError("study snapshot changed")

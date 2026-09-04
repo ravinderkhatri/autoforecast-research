@@ -3776,6 +3776,28 @@ def test_str_subclass_cannot_defeat_id_guard():
         )
 
 
+@pytest.mark.parametrize("value", [None, "once", "every_stage"])
+def test_study_info_file_checks_default_to_once(value):
+    choice = {"study_id": "saved", "create_study": False, "publish_results": False}
+    if value is not None:
+        choice["file_checks"] = value
+    assert study_workflow._study_choice(
+        study_workflow._UNSET, choice, study_workflow._UNSET) == ("saved", False, False)
+    assert study_workflow._file_checks(choice) == (value or "once")
+    assert study_workflow._file_checks(study_workflow._UNSET) == "once"
+
+
+@pytest.mark.parametrize("value", ["each_stage", "", "ONCE", True, None])
+def test_study_info_rejects_unknown_file_checks(value):
+    choice = {"study_id": "saved", "create_study": False, "publish_results": False,
+              "file_checks": value}
+    with pytest.raises(ValueError, match="file_checks must be"):
+        study_workflow._file_checks(choice)
+    with pytest.raises(ValueError, match="requires exactly"):
+        study_workflow._study_choice(
+            study_workflow._UNSET, {**choice, "checks": "once"}, study_workflow._UNSET)
+
+
 def test_readonly_mapping_is_supported_and_copied():
     original = {"study_id": "saved", "create_study": False, "publish_results": True}
     choice = MappingProxyType(original)

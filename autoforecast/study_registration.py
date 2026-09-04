@@ -669,6 +669,8 @@ def _save_admission(registry, staging, identity, frozen, *, format, artifact_bin
             if comparable(old) != comparable(record):
                 raise ValueError("conflicting immutable admission evidence")
             record = old
+        # Checked once below; the definition check that follows reuses these bytes.
+        _volume_files.mark_frozen(destination)
         binding = {"path": str(existing.relative_to(registry.root)), "sha256": digest(record),
                    "physical_sha256": hashlib.sha256(
                        read_regular_bytes(existing.parent, existing.name)).hexdigest()}
@@ -839,6 +841,9 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
         if not isinstance(output, DataFrame):
             raise ValueError(f"preparation {name} must be a Spark DataFrame")
         output.write.parquet(str(staging / name))
+    # The hook's code, including the plans it returned, has finished running. Nothing it
+    # could have read or changed is reused: the checks below read fresh bytes.
+    _volume_files.forget_frozen()
     captured = {name: registry.spark.read.parquet(str(managed_path(staging / name)))
                 for name in frames}
     output_baselines = {staging / name: _artifact_record(staging / name, registry.spark)
@@ -1299,6 +1304,12 @@ class StudyRegistry:
 
     def load_study(self, study_id):
         """Return the existing Study context manager after all registry checks pass."""
+        # Inside a run, the definition check, the load below and the outputs map share
+        # one download of the frozen study and its registration record.
+        _volume_files.mark_frozen(self.root / "benchmarks" / study_id)
+        record = _record_path(self.root / "registrations", study_id)
+        if record is not None:
+            _volume_files.mark_frozen(record)
         with one_use():
             definition, sha = self.definition(study_id)
             self.scratch_root.mkdir(parents=True, exist_ok=True)
@@ -2081,7 +2092,8 @@ def register_study(
             level=level,
             display=None if _CURRENT.get() else resolve_display(value.get("runtime", {})),
             attempt_id=check_id,
-        ) as execution:
+        ) as execution, _volume_files.frozen_reads():
+            # Files written once are downloaded once; see _volume_files.frozen_reads.
             event("configuration", "START")
             source, recipe = value["source"], value["recipe"]
             if not recipe["validation_origins"]:
@@ -2536,6 +2548,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                         origins=origins, validate=False, **settings,
                     ))
             write_few_files(refs, root / "reference-input")
+            _volume_files.mark_frozen(root / "reference-input")
             refs = session.read.parquet(str(managed_path(root / "reference-input")))
             reference_definition = {
                 "preparation": settings if "path" not in settings else {"kind": "parquet"},
@@ -2584,6 +2597,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                     ]
             references = root / "references"
             write_few_files(refs, references)
+            _volume_files.mark_frozen(references)
         retained = frame.filter(F.col(panel.time_col).between(start, origin)).select(
             *keys,
         ).distinct().count()
@@ -2593,6 +2607,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             value["dataset"]["dataset"]["required_series_count"] = retained
             contract_path.write_bytes(_bytes(value["dataset"]))
         frame.write.parquet(str(root / "admitted"))
+        _volume_files.mark_frozen(root / "admitted")
         if prepare is not None:
             # Check prepared as soon as admitted has been written from it, before anything
             # else runs, so a change restored afterwards cannot pass. Then verify every
@@ -2666,6 +2681,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
         )
         manifest = frozen_binding.path
         library_sha = frozen_binding.sha256
+        _volume_files.mark_frozen(manifest.parent)
         _, frozen = verify_benchmark(manifest, library_sha, _reuse_verified=True,
                                      spark=session, _scratch_root=root)
         read_benchmark_manifest(manifest, library_sha)

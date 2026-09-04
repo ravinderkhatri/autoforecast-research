@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+from mlops import _volume_files
 from mlops._safe_files import read_path_bytes
 from pyarrow.compute import field
 from pyspark.sql import DataFrame
@@ -97,6 +98,17 @@ def _source_key_error(frame: DataFrame, record: dict, series_col: str) -> str | 
     if frame.filter(invalid).limit(1).count():
         return "source key mapping differs from canonical series IDs"
     return None
+
+
+# The options a coverage check reads; a check made with the same values can be handed on.
+CHECKED_OPTIONS = ("series_policy", "minimum_history", "metric", "metrics", "selection_boundaries")
+
+
+def reuses(result: PreflightResult, study: Study, options: dict, checked: dict) -> bool:
+    """Whether a coverage check made with ``checked`` options also answers this study's."""
+    return (result.study_id == study.study_id and result.study_sha256 == study._sha256
+            and result.study_path == study._path
+            and all(checked.get(key) == options.get(key) for key in CHECKED_OPTIONS))
 
 
 @study_inputs
@@ -665,10 +677,12 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path,
         )
     effective_sha = (study._sha256 if path == study._path
                      else hashlib.sha256(read_path_bytes(path)).hexdigest())
-    _, effective = verify_benchmark(
-        path, study._sha256 if path == study._path else None, spark=study._spark,
-        _reuse_verified=path == study._path, _scratch_root=study._snapshots.name,
-    )
+    # Spark read the originals above: check them again, fresh, after those reads.
+    with _volume_files.fresh_reads():
+        _, effective = verify_benchmark(
+            path, study._sha256 if path == study._path else None, spark=study._spark,
+            _reuse_verified=path == study._path, _scratch_root=study._snapshots.name,
+        )
     if record["schema"] == NATIVE_SCHEMA and effective["study_id"] != path.parent.name:
         raise BenchmarkError("effective native study identity differs from its selected path")
     read_benchmark_manifest(path, effective_sha)
