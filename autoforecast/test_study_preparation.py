@@ -4,6 +4,8 @@ import dataclasses
 import datetime as dt
 import json
 import os
+import pathlib
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -329,6 +331,29 @@ def test_failed_or_mutating_preparation_retains_evidence_without_publication(
     if case == "native_failure":
         report = spark.read.parquet(str(next((registry.root / "checks").glob("*/prepared"))))
         assert report.filter("issue_code = 'DUPLICATE_DATE' AND status = 'failed'").count() > 0
+
+
+def test_source_change_between_capture_and_preparation_blocks_registration(
+    spark, tmp_path, monkeypatch,
+):
+    from autoforecast import study_registration
+
+    path = configuration(tmp_path)
+    report = study_registration.report_source_issues
+
+    def change_captured_source(frame, **kwargs):
+        # A lasting change after the source was captured and hashed, before preparation:
+        # one more part file. Frames already planned keep their file listing.
+        findings = report(frame, **kwargs)
+        part = pathlib.Path(unquote(urlparse(frame.inputFiles()[0]).path))
+        shutil.copyfile(part, part.with_name("part-99999-added.parquet"))
+        return findings
+
+    monkeypatch.setattr(study_registration, "report_source_issues", change_captured_source)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    with pytest.raises(ValueError, match="changed during preparation"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert not list((registry.root / "registrations").glob("*.*"))
 
 
 def test_evidence_write_failure_and_interrupted_retry_keep_completed_baseline(

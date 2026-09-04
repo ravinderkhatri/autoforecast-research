@@ -685,9 +685,14 @@ def test_each_shared_source_is_validated_and_normalized_once(tmp_path, spark, mo
     from autoforecast import grid
     from autoforecast.panel import Panel
     contract, sources, recipe = inputs(tmp_path)
-    validations, normalizations, hashes, key_unions = [], [], [], []
+    validations, normalizations, hashes, key_unions, copies = [], [], [], [], []
     validate, read = Panel.validate, grid.read_time_parquet
     digest = benchmark.directory_digest
+    snapshot = benchmark.snapshot_parquet_identity
+
+    def copied(path, *args, **kwargs):
+        copies.append(path)
+        return snapshot(path, *args, **kwargs)
     union = DataFrame.unionByName
     def combined(frame, other, *args, **kwargs):
         if frame.columns == other.columns == ["__af_series_id"]:
@@ -707,12 +712,15 @@ def test_each_shared_source_is_validated_and_normalized_once(tmp_path, spark, mo
     monkeypatch.setattr(Panel, "validate", checked)
     monkeypatch.setattr(grid, "read_time_parquet", normalized)
     monkeypatch.setattr(benchmark, "directory_digest", hashed)
+    monkeypatch.setattr(benchmark, "snapshot_parquet_identity", copied)
     monkeypatch.setattr(DataFrame, "unionByName", combined)
     benchmark.freeze_benchmark(contract_path=contract, sources=sources, recipe=recipe,
                                output_root=tmp_path / "frozen", spark=spark)
     assert len(validations) == 1
     assert len(normalizations) == 1
-    assert len(hashes) == 3
+    # One copy identifies the shared source; both later authentications recheck it once.
+    assert copies == [next(iter(sources.values()))]
+    assert len(hashes) == 2
     assert not key_unions
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import functools
 import hashlib
 import json
 import logging
@@ -450,12 +451,15 @@ def _remove_staging_directory(path):
         shutil.rmtree(path)
 
 
-def _logical_record(path, spark):
+def _logical_record(path, spark, physical=None):
+    """Bind a fresh capture. ``physical`` keeps its file SHA in memory, never in the record."""
     capture = current_capture()
     if capture is not None:
         binding = capture.bind(path)
         return {**binding, "rows": binding["snapshot"]["rows"]}
-    logical = _logical_hash.fingerprint(path, spark=spark)
+    logical, physical_sha256 = _logical_hash._capture(path, spark=spark)
+    if physical is not None:
+        physical[path] = physical_sha256
     return {"logical_sha256": logical["sha256"], "logical_hash": logical}
 
 
@@ -674,7 +678,8 @@ def _save_findings(registry, frame, issues_root, name, check_id):
 
 @reported("Business preparation and input verification")
 def _prepare_observations(hook, settings, frame, audits, population, findings, *,
-                          value, root, staging, registry, issues_root, check_id):
+                          value, root, staging, registry, issues_root, check_id,
+                          captured_physical=None):
     """Capture callback outputs, then reconcile against private managed baselines."""
     keys = value["recipe"]["source_keys"]
     _check_key_frame(population, population, keys, label="managed population")
@@ -712,8 +717,12 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
                                            "population_findings", "input_added_keys",
                                            "input_missing_keys"))]
     capture = current_capture()
+    # Source and audit captures keep the file SHA computed when they were captured, so
+    # a lasting change at any time from capture to the end of preparation fails below.
+    captured_physical = captured_physical or {}
     baselines = {p: (capture.bind(p) if capture is not None else
-                     directory_digest(p, suffixes=(".parquet",))) for p in paths}
+                     captured_physical.get(p) or directory_digest(p, suffixes=(".parquet",)))
+                 for p in paths}
     if capture is not None:
         frame = registry.spark.read.parquet(str(managed_path(root / "source")))
         audits = {name: registry.spark.read.parquet(str(managed_path(root / ("audit-" + name))))
@@ -2196,10 +2205,15 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
 
 
 def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_tables=False,
-                           retain_binding=False):
-    """Capture one source read view and reuse it for registration or explicit retention."""
+                           retain_binding=False, physical=None):
+    """Capture one source read view and reuse it for registration or explicit retention.
+
+    ``physical`` receives the file SHA of each source and audit capture, for this
+    attempt's later change checks.
+    """
     session = registry.spark
-    describe = _artifact_record if retain_binding else _logical_record
+    describe = (_artifact_record if retain_binding
+                else functools.partial(_logical_record, physical=physical))
     source = value["source"]
     source_record: dict[str, Any]
     audits = {}
@@ -2307,8 +2321,10 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
         contract = _load_dataset_contract_bytes(read_path_bytes(contract_path), contract_path)
         recipe = value["recipe"]
         source = value["source"]
+        captured_physical = {}
         frame, source_record, audits, query_records = _capture_source_inputs(
             value, registry, root, inputs=inputs, keep_resolved_tables=prepare is not None,
+            physical=captured_physical,
         )
         keys = recipe["source_keys"]
         panel = contract.panel(root / "source")
@@ -2327,7 +2343,6 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
         captured = {}
         staging = issues_root / "admission-staging"
         preparation_metadata = None
-        prepared_baseline = None
         artifact_bindings = {}
         if prepare is not None:
             staging.mkdir()
@@ -2339,11 +2354,10 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                  settings="captured recipe and preparation settings")
             captured, preparation_metadata, artifact_bindings = _prepare_observations(
                 prepare, preparation_settings, frame, audits, population, findings,
-                value=value, root=root,
+                value=value, root=root, captured_physical=captured_physical,
                 staging=staging, registry=registry, issues_root=issues_root, check_id=check_id,
             )
             frame = captured["prepared"]
-            prepared_baseline = artifact_bindings[staging / "prepared"]
             # Apply declared application eligibility before native cohort-count checks.
             if contract.required_series_count is not None:
                 original_candidates = session.read.parquet(
@@ -2477,13 +2491,12 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             value["dataset"]["dataset"]["required_series_count"] = retained
             contract_path.write_bytes(_bytes(value["dataset"]))
         frame.write.parquet(str(root / "admitted"))
-        if (prepared_baseline is not None
-                and not _verify_artifact(staging / "prepared", prepared_baseline)):
-            raise ValueError("prepared observations changed before freezing")
         if prepare is not None:
+            # Verify each staged artefact once against its preparation binding, prepared
+            # included. A bound artefact that has since disappeared fails here too.
             artifact_bindings = {
                 p: _artifact_record(p, session, expected=artifact_bindings.get(p))
-                for p in _staging_directories(staging)
+                for p in dict.fromkeys([*_staging_directories(staging), *artifact_bindings])
             }
             admission_identity = {
                 "schema": "autoforecast.preparation-evidence.v1",

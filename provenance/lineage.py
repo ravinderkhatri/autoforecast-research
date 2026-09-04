@@ -486,6 +486,29 @@ class Graph:
         }
 
 
+def snapshot_parquet_identity(
+    source: pathlib.Path, destination: pathlib.Path, *, label: str,
+) -> tuple[pathlib.Path, str]:
+    """Copy Parquet bytes once and return the owned copy with the digest of those bytes.
+
+    A volume source is downloaded once; the digest describes exactly the bytes copied.
+    Unlike :func:`snapshot_parquet_directory`, the source is not rechecked after the
+    copy. The caller must digest ``source`` again after its last read of it and compare
+    the result with the returned digest.
+    """
+    from mlops import _volume_files
+
+    if _volume_files.is_volume(source):
+        with _volume_files.local_snapshot(source, parquet_only=True) as local:
+            sha256 = directory_digest(local, suffixes=(".parquet",))
+            copy = snapshot_parquet_directory(local, destination, expected_sha256=sha256,
+                                              label=label)
+            return copy, sha256
+    sha256 = directory_digest(source, suffixes=(".parquet",))
+    return (snapshot_parquet_directory(source, destination, expected_sha256=sha256, label=label),
+            sha256)
+
+
 @reported("Copy and verify owned snapshot")
 def snapshot_parquet_directory(
     source: pathlib.Path,
