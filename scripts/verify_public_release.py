@@ -43,6 +43,8 @@ README_IMAGES = {
 TUTORIALS = {
     "tutorials/10-supply-your-own-stages.ipynb",
     "tutorials/11-prepare-and-check-data.ipynb",
+    "tutorials/12-retained-inputs.ipynb",
+    "tutorials/13-reuse-source-captures.ipynb",
     "tutorials/06-reload-and-reuse.ipynb",
     "tutorials/09-publish-bigquery.ipynb",
     "tutorials/03-custom-model.ipynb",

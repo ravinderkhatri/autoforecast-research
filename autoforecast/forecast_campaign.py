@@ -1290,12 +1290,21 @@ def compile_forecast_campaign(
 ) -> CompiledForecastCampaign:
     """Resolve and freeze a high-level request into idempotent durable stage commands."""
     from autoforecast.benchmark import (
+        NATIVE_SCHEMA,
         STUDY_SCHEMAS,
         _evaluation_contract_from_record,
         artifact_path,
+        read_benchmark_manifest,
         verify_benchmark,
     )
 
+    if benchmark_path is not None:
+        _, manifest = read_benchmark_manifest(benchmark_path)
+        if manifest["schema"] == NATIVE_SCHEMA:
+            raise ForecastCampaignError(
+                "the command-line campaign requires file inputs; "
+                "use Study.run_campaign for retained table inputs"
+            )
     request = load_forecast_campaign_request(request_path)
     contract = _source_path(request.contract, "dataset contract")
     contract_bytes = contract.read_bytes()

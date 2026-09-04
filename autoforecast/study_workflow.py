@@ -30,7 +30,7 @@ from autoforecast._execution import (
     resolve_level,
     validate_model_label,
 )
-from autoforecast.benchmark import digest, verify_benchmark
+from autoforecast.benchmark import bound_input_path, digest, verify_benchmark
 from autoforecast.hpo import HPOError
 from autoforecast.hpo_bridge import _copy_run_artifact_directory
 from autoforecast.implementation import (
@@ -40,6 +40,7 @@ from autoforecast.implementation import (
     verify_retained,
 )
 from autoforecast.project import library_revision
+from autoforecast.snapshots import study_inputs, worker_inputs
 from autoforecast.study_preflight import preflight_study
 from autoforecast.study_scoring import score_study
 from autoforecast.study_tuning import (
@@ -150,6 +151,7 @@ class ForecastWorkflowResult:
                 "coverage": self.coverage, "publication": self.publication}
 
 
+@worker_inputs
 def load_forecast_workflow(path: str | pathlib.Path) -> ForecastWorkflowResult:
     """Verify every workflow artifact before returning its saved stage results."""
     root = pathlib.Path(path).absolute()
@@ -248,10 +250,21 @@ def _study_choice(study_id, study_info, publish):
 def run_study(
     study_id=_UNSET,
     model: Callable[[FitPredictRequest], FitPredictResult] | StudyModel | str = _UNSET,
-    *, study_info: StudyInfo = _UNSET, config=_UNSET, prepare=_UNSET,
-    registry=None, model_config=None, implementation=None,
-    fixed_parameters=_UNSET, tracking=_UNSET, publish=_UNSET, log_level=_UNSET,
-    mlflow_experiment=_UNSET, tracking_uri=_UNSET, output_dir=None, model_label=None,
+    *,
+    study_info: StudyInfo = _UNSET,
+    config=_UNSET,
+    prepare=_UNSET,
+    registry=None,
+    model_config=None,
+    implementation=None,
+    fixed_parameters=_UNSET,
+    tracking=_UNSET,
+    publish=_UNSET,
+    log_level=_UNSET,
+    mlflow_experiment=_UNSET,
+    tracking_uri=_UNSET,
+    output_dir=None,
+    model_label=None,
     **registration_inputs,
 ) -> ForecastWorkflowResult:
     """Create or reuse a study, then run a callback, StudyModel, or seasonal_naive.
@@ -276,290 +289,405 @@ def run_study(
     it differs from the completed result. Existing audit evidence is preserved. The returned
     object owns no open Study resources.
     """
-    from autoforecast._exact_yaml import loads_exact_yaml, read_record
-    from autoforecast.study_campaign import StudyModel, _entrypoint
-    from autoforecast.study_registration import StudyRegistry, _runtime, register_study
+    owns_registry = registry is None
+    try:
+        from autoforecast._exact_yaml import loads_exact_yaml, read_record
+        from autoforecast.study_campaign import StudyModel, _entrypoint
+        from autoforecast.study_registration import StudyRegistry, _runtime, register_study
 
-    study_id, create, publish = _study_choice(study_id, study_info, publish)
-    registration = dict(registration_inputs)
-    if config is not _UNSET:
-        registration["config"] = config
-    if prepare is not _UNSET:
-        registration["prepare"] = prepare
-    if not create and registration:
-        raise ValueError("reuse does not accept config, prepare or direct registration inputs")
-    if create:
-        inspect.signature(register_study).bind(**registration, registry=registry)
-        if config is _UNSET or config is None:
-            if registry is None or not registration_inputs:
-                raise ValueError("creation requires config or direct stage inputs with a registry")
-        elif any(value is not None for key, value in registration_inputs.items() if key != "spark"):
-            raise ValueError("config cannot combine with direct registration inputs")
-    model_label = validate_model_label(model_label)
-    configured_runtime = {}
-    if create and config is not _UNSET and config is not None and registry is not None:
-        path = pathlib.Path(config).absolute()
-        configured = read_record(path)
-        if not isinstance(configured, dict):
-            raise ValueError("config must contain a mapping")
-        configured_runtime = _runtime(configured.get("runtime", {}))
-        if "implementation" in configured_runtime:
-            configured_runtime["implementation"] = source_scope(
-                configured_runtime["implementation"], path.parent,
-            )
-    if registry is None:
-        registry = (StudyRegistry.from_config(
-            config, spark=registration_inputs.get("spark"), use_environment=True,
-        ) if create
-                    else StudyRegistry.from_environment())
-    settings = {"tracking": "none", "publish": False, "log_level": "INFO",
-                **registry.runtime, **configured_runtime}
-    for name, explicit in (
-        ("tracking", tracking), ("publish", publish), ("log_level", log_level),
-        ("mlflow_experiment", mlflow_experiment), ("tracking_uri", tracking_uri),
-    ):
-        if explicit is not _UNSET:
-            settings[name] = explicit
-            continue
-        value = os.environ.get("AUTOFORECAST_" + name.upper())
-        if value is not None:
-            if name == "publish":
-                if value.lower() not in {"true", "false"}:
-                    raise ValueError("AUTOFORECAST_PUBLISH must be true or false")
-                value = value.lower() == "true"
-            settings[name] = value
-    if settings["tracking"] not in {"none", "mlflow"} or type(settings["publish"]) is not bool:
-        raise ValueError("tracking must be none/mlflow and publish must be boolean")
-    level = resolve_level(settings["log_level"])
-    if settings["tracking"] == "none" and any(
-        value is not _UNSET and value is not None for value in (mlflow_experiment, tracking_uri)
-    ):
-        raise ValueError("explicit MLflow destinations conflict with tracking=none")
-    # Resolve unknown IDs before creating an audit/output directory.
-    if not create:
-        registry._registration_path(study_id)
-    audit = registry.root / "run-attempts" / (new_run_id("attempt") + ".jsonl")
-    plan = ["configuration"]
-    if settings["tracking"] == "mlflow":
-        plan.append("tracking_setup")
-    if create:
-        plan.append("registration")
-    plan += ["load_and_verify", "workflow"]
-    if settings["tracking"] == "mlflow":
-        plan.append("tracking_publication")
-    if settings["publish"]:
-        plan.append("table_publication")
-    with Execution(audit, plan, level=level, attempt_id=audit.stem, study_id=study_id,
-                   study_action="create" if create else "reuse",
-                   publish_results=settings["publish"],
-                   **({"model_label": model_label} if model_label is not None else {})):
-        result = None
-        try:
-            with _stage(audit, "configuration", study_id=study_id) as outcome:
-                outcome["study_action"] = "create" if create else "reuse"
-                outcome.update({key: settings[key] for key in ("tracking", "publish", "log_level")})
-                if settings["publish"]:
-                    if registry.store is None:
-                        raise ValueError("publish=True requires a configured Delta registry")
-                    registry.store.validate_destinations()
-                    outcome["table_destinations"] = dict(getattr(registry.store, "tables", {}))
-                    bind_identity(table_destinations=outcome["table_destinations"])
-                if isinstance(model, StudyModel):
-                    if implementation is not None or model_config is not None:
-                        raise ValueError("StudyModel already declares implementation and config")
-                    callback, _ = _entrypoint(model.entrypoint)
-                    implementation, model_config = model.implementation, model.config
-                    if fixed_parameters is _UNSET and model.fixed_parameters is not None:
-                        fixed_parameters = model.fixed_parameters
-                elif callable(model):
-                    callback = model
-                    if model_config is None:
-                        raise ValueError("callbacks require model_config=")
-                elif model == "seasonal_naive":
-                    from autoforecast.adapters import naive
-
-                    callback = naive.fit_study_baseline
-                    implementation = {
-                        "name": "seasonal_naive", "version": "1",
-                        "source_sha256": hashlib.sha256(
-                            pathlib.Path(naive.__file__).read_bytes(),
-                        ).hexdigest(),
-                        "dependencies": {},
-                    }
-                else:
-                    raise ValueError("model must be a callback, StudyModel or seasonal_naive")
-                if create and model_config is None and not (
-                    isinstance(model, str) and model == "seasonal_naive"
-                ):
-                    raise ValueError("model_config is required")
-                if (fixed_parameters is not _UNSET and fixed_parameters is not None
-                        and not isinstance(fixed_parameters, Mapping)):
-                    raise ValueError("fixed_parameters must be a mapping or None")
-                if create and model_config is None and fixed_parameters is None:
-                    raise ValueError("parameter search requires an hpo mapping in model_config")
-                if create and model_config is not None:
-                    raw, spec, _, _, controls = _config(
-                        pathlib.Path(model_config), require_hpo=fixed_parameters is None,
+        study_id, create, publish = _study_choice(study_id, study_info, publish)
+        registration = dict(registration_inputs)
+        if config is not _UNSET:
+            registration["config"] = config
+        if prepare is not _UNSET:
+            registration["prepare"] = prepare
+        if not create and registration:
+            raise ValueError("reuse does not accept config, prepare or direct registration inputs")
+        if create:
+            inspect.signature(register_study).bind(**registration, registry=registry)
+            if config is _UNSET or config is None:
+                if registry is None or not registration_inputs:
+                    raise ValueError(
+                        "creation requires config or direct stage inputs with a registry"
                     )
-                    manual = fixed_parameters
-                    if manual is _UNSET:
-                        profile = cast(dict, loads_exact_yaml(raw))
-                        manual = None if "hpo" in profile else {}
-                    if manual is not None:
-                        materialize_manual_parameters(spec, dict(manual))
-                        controls = _validation_controls(controls)
-                    _validate_controls(controls)
-                    implementation = resolve_implementation(
-                        implementation, settings.get("implementation"), callback, spec.model_id,
+            elif any(
+                value is not None
+                for key, value in registration_inputs.items()
+                if key not in {"spark", "snapshot_mode"}
+            ):
+                raise ValueError("config cannot combine with direct registration inputs")
+        model_label = validate_model_label(model_label)
+        configured_runtime = {}
+        if create and config is not _UNSET and config is not None and registry is not None:
+            path = pathlib.Path(config).absolute()
+            configured = read_record(path)
+            if not isinstance(configured, dict):
+                raise ValueError("config must contain a mapping")
+            configured_runtime = _runtime(configured.get("runtime", {}))
+            if "implementation" in configured_runtime:
+                configured_runtime["implementation"] = source_scope(
+                    configured_runtime["implementation"],
+                    path.parent,
+                )
+        if registry is None:
+            registry = (
+                StudyRegistry.from_config(
+                    config,
+                    spark=registration_inputs.get("spark"),
+                    use_environment=True,
+                )
+                if create
+                else StudyRegistry.from_environment()
+            )
+        settings = {
+            "tracking": "none",
+            "publish": False,
+            "log_level": "INFO",
+            **registry.runtime,
+            **configured_runtime,
+        }
+        for name, explicit in (
+            ("tracking", tracking),
+            ("publish", publish),
+            ("log_level", log_level),
+            ("mlflow_experiment", mlflow_experiment),
+            ("tracking_uri", tracking_uri),
+        ):
+            if explicit is not _UNSET:
+                settings[name] = explicit
+                continue
+            value = os.environ.get("AUTOFORECAST_" + name.upper())
+            if value is not None:
+                if name == "publish":
+                    if value.lower() not in {"true", "false"}:
+                        raise ValueError("AUTOFORECAST_PUBLISH must be true or false")
+                    value = value.lower() == "true"
+                settings[name] = value
+        if settings["tracking"] not in {"none", "mlflow"} or type(settings["publish"]) is not bool:
+            raise ValueError("tracking must be none/mlflow and publish must be boolean")
+        level = resolve_level(settings["log_level"])
+        if settings["tracking"] == "none" and any(
+            value is not _UNSET and value is not None for value in (mlflow_experiment, tracking_uri)
+        ):
+            raise ValueError("explicit MLflow destinations conflict with tracking=none")
+        # Resolve unknown IDs before creating an audit/output directory.
+        if not create:
+            registry._registration_path(study_id)
+        audit = registry.root / "run-attempts" / (new_run_id("attempt") + ".jsonl")
+        plan = ["configuration"]
+        if settings["tracking"] == "mlflow":
+            plan.append("tracking_setup")
+        if create:
+            plan.append("registration")
+        plan += ["load_and_verify", "workflow"]
+        if settings["tracking"] == "mlflow":
+            plan.append("tracking_publication")
+        if settings["publish"]:
+            plan.append("table_publication")
+        with Execution(
+            audit,
+            plan,
+            level=level,
+            attempt_id=audit.stem,
+            study_id=study_id,
+            study_action="create" if create else "reuse",
+            publish_results=settings["publish"],
+            **({"model_label": model_label} if model_label is not None else {}),
+        ):
+            result = None
+            try:
+                with _stage(audit, "configuration", study_id=study_id) as outcome:
+                    outcome["study_action"] = "create" if create else "reuse"
+                    outcome.update(
+                        {key: settings[key] for key in ("tracking", "publish", "log_level")}
+                    )
+                    if settings["publish"]:
+                        if registry.store is None:
+                            raise ValueError("publish=True requires a configured Delta registry")
+                        registry.store.validate_destinations()
+                        outcome["table_destinations"] = dict(getattr(registry.store, "tables", {}))
+                        bind_identity(table_destinations=outcome["table_destinations"])
+                    if isinstance(model, StudyModel):
+                        if implementation is not None or model_config is not None:
+                            raise ValueError(
+                                "StudyModel already declares implementation and config"
+                            )
+                        callback, _ = _entrypoint(model.entrypoint)
+                        implementation, model_config = model.implementation, model.config
+                        if fixed_parameters is _UNSET and model.fixed_parameters is not None:
+                            fixed_parameters = model.fixed_parameters
+                    elif callable(model):
+                        callback = model
+                        if model_config is None:
+                            raise ValueError("callbacks require model_config=")
+                    elif model == "seasonal_naive":
+                        from autoforecast.adapters import naive
+
+                        callback = naive.fit_study_baseline
+                        implementation = {
+                            "name": "seasonal_naive",
+                            "version": "1",
+                            "source_sha256": hashlib.sha256(
+                                pathlib.Path(naive.__file__).read_bytes(),
+                            ).hexdigest(),
+                            "dependencies": {},
+                        }
+                    else:
+                        raise ValueError("model must be a callback, StudyModel or seasonal_naive")
+                    if (
+                        create
+                        and model_config is None
+                        and not (isinstance(model, str) and model == "seasonal_naive")
+                    ):
+                        raise ValueError("model_config is required")
+                    if (
+                        fixed_parameters is not _UNSET
+                        and fixed_parameters is not None
+                        and not isinstance(fixed_parameters, Mapping)
+                    ):
+                        raise ValueError("fixed_parameters must be a mapping or None")
+                    if create and model_config is None and fixed_parameters is None:
+                        raise ValueError("parameter search requires an hpo mapping in model_config")
+                    if create and model_config is not None:
+                        raw, spec, _, _, controls = _config(
+                            pathlib.Path(model_config),
+                            require_hpo=fixed_parameters is None,
+                        )
+                        manual = fixed_parameters
+                        if manual is _UNSET:
+                            profile = cast(dict, loads_exact_yaml(raw))
+                            manual = None if "hpo" in profile else {}
+                        if manual is not None:
+                            materialize_manual_parameters(spec, dict(manual))
+                            controls = _validation_controls(controls)
+                        _validate_controls(controls)
+                        implementation = resolve_implementation(
+                            implementation,
+                            settings.get("implementation"),
+                            callback,
+                            spec.model_id,
+                        )
+                    if create:
+                        if implementation is not None:
+                            _implementation_record(implementation)
+                        elif settings.get("implementation") is None:
+                            raise ValueError(
+                                "supply implementation= or configure "
+                                "runtime.implementation.source_roots",
+                            )
+                    outcome["model"] = callable_name(callback)
+                    bind_identity(model=outcome["model"])
+                experiment_id = None
+                if settings["tracking"] == "mlflow":
+                    from mlops import sanitize_web_url
+
+                    from autoforecast.run_mlflow import resolve_study_experiment
+
+                    with _stage(audit, "tracking_setup", study_id=study_id) as outcome:
+                        outcome["tracking_destination"] = (
+                            sanitize_web_url(settings.get("tracking_uri"))
+                            or "non-web tracking store"
+                        )
+                        experiment_id = resolve_study_experiment(
+                            tracking_uri=settings.get("tracking_uri", ""),
+                            experiment=settings.get("mlflow_experiment", ""),
+                        )
+                        outcome["experiment_id"] = experiment_id
+                else:
+                    _stage_event(
+                        audit, "tracking_setup", "SKIP", reason="Not requested: tracking=none"
                     )
                 if create:
-                    if implementation is not None:
-                        _implementation_record(implementation)
-                    elif settings.get("implementation") is None:
-                        raise ValueError(
-                            "supply implementation= or configure "
-                            "runtime.implementation.source_roots",
+                    with _stage(audit, "registration"):
+                        study_id = register_study(
+                            **registration,
+                            registry=registry,
+                            log_level=settings["log_level"],
                         )
-                outcome["model"] = callable_name(callback)
-                bind_identity(model=outcome["model"])
-            experiment_id = None
-            if settings["tracking"] == "mlflow":
-                from mlops import sanitize_web_url
+                        bind_identity(study_id=study_id)
+                        record_result(study_id=study_id)
+                        note("Study registered", study_id=study_id)
+                with ExitStack() as stack:
+                    with _stage(audit, "load_and_verify", study_id=study_id):
+                        study = stack.enter_context(registry.load_study(study_id))
+                        registered = study.registration
+                        if registered is None:
+                            raise ValueError(
+                                "registered loading requires its authenticated binding"
+                            )
+                        registration_sha = registered["sha256"]
+                    if model == "seasonal_naive" and model_config is None:
+                        folder = pathlib.Path(
+                            stack.enter_context(
+                                tempfile.TemporaryDirectory(
+                                    prefix="af-baseline-profile-",
+                                    dir=registry.scratch_root,
+                                )
+                            )
+                        )
+                        model_config = folder / "model.json"
+                        m = study.panel.season_length
+                        domain = {"kind": "int", "low": m, "high": m, "step": 1}
+                        model_config.write_text(
+                            json.dumps(
+                                {
+                                    "schema_version": 2,
+                                    "model": {"id": "seasonal_naive", "adapter": "external"},
+                                    "hyperparameters": {
+                                        "model.season_length": {
+                                            "default": m,
+                                            "valid": domain,
+                                            "search": domain,
+                                        }
+                                    },
+                                }
+                            )
+                        )
+                    if model_config is None:
+                        raise ValueError("model_config is required")
+                    profile = loads_exact_yaml(pathlib.Path(model_config).read_bytes())
+                    if not isinstance(profile, dict):
+                        raise ValueError("model_config must contain a mapping")
+                    note(
+                        "Model configuration",
+                        model_id=profile.get("model", {}).get("id"),
+                        configuration_path=str(model_config),
+                        callback=callable_name(callback),
+                        mode="parameter search" if "hpo" in profile else "fixed configuration",
+                    )
+                    if fixed_parameters is _UNSET:
+                        fixed_parameters = None if "hpo" in profile else {}
+                    if fixed_parameters is not None and not isinstance(fixed_parameters, Mapping):
+                        raise ValueError("fixed_parameters must be a mapping or None")
+                    binding = {
+                        "study_id": study_id,
+                        "sha256": registration_sha,
+                        "tracking": settings["tracking"],
+                        "publish": settings["publish"],
+                        "log_level": settings["log_level"],
+                        "audit_path": str(audit),
+                    }
+                    with _stage(audit, "workflow", study_id=study_id) as outcome:
+                        result = run_forecast_workflow(
+                            study,
+                            fit_predict=cast(
+                                Callable[[FitPredictRequest], FitPredictResult],
+                                callback,
+                            ),
+                            implementation=implementation,
+                            config=model_config,
+                            fixed_parameters=fixed_parameters,
+                            output_dir=output_dir or registry.root / "runs",
+                            registration=binding,
+                            model_label=model_label,
+                        )
+                        record_result(
+                            study_id=result.study_id,
+                            workflow_id=result.run_id,
+                            workflow_path=str(result.path),
+                        )
+                        if result.status == "pending_actuals":
+                            outcome["status"] = "UNAVAILABLE"
+                        outcome["result_study_id"] = result.study_id
+                        outcome["run_id"] = result.run_id
+                        outcome["workflow_path"] = str(result.path)
+                        outcome["manifest_sha256"] = hashlib.sha256(
+                            (result.path / "artifact_manifest.json").read_bytes(),
+                        ).hexdigest()
+                        if result.study_id != study_id:
+                            registry.retain_derived(
+                                study_id,
+                                pathlib.Path(result.provenance["study"]["path"]),
+                            )
+                links = None
+                if experiment_id is not None:
+                    from autoforecast.run_mlflow import export_forecast_workflow
+                    from autoforecast.snapshots import input_scope
 
-                from autoforecast.run_mlflow import resolve_study_experiment
-
-                with _stage(audit, "tracking_setup", study_id=study_id) as outcome:
-                    outcome["tracking_destination"] = (
-                        sanitize_web_url(settings.get("tracking_uri")) or "non-web tracking store"
+                    with input_scope(
+                        connections=registry.connections, scratch_root=registry.scratch_root,
+                        spark=registry.spark,
+                    ), _stage(audit, "tracking_publication", run_id=result.run_id) as outcome:
+                        links = export_forecast_workflow(
+                            result.path,
+                            tracking_uri=settings["tracking_uri"],
+                            experiment_id=experiment_id,
+                        )
+                        outcome["links"] = {
+                            stage: link.as_record() for stage, link in links.items()
+                        }
+                else:
+                    _stage_event(
+                        audit, "tracking_publication", "SKIP", reason="Not requested: tracking=none"
                     )
-                    experiment_id = resolve_study_experiment(
-                        tracking_uri=settings.get("tracking_uri", ""),
-                        experiment=settings.get("mlflow_experiment", ""),
+                if settings["publish"]:
+                    with _stage(
+                        audit,
+                        "table_publication",
+                        run_id=result.run_id,
+                        retry="same retained workflow; writes may be partial",
+                    ) as outcome:
+                        publication = registry.publish_results(
+                            result.study_id,
+                            result.path,
+                            mlflow_links=links,
+                        )
+                        outcome["publication"] = publication
+                else:
+                    _stage_event(
+                        audit, "table_publication", "SKIP", reason="Not requested: publish=false"
                     )
-                    outcome["experiment_id"] = experiment_id
-            else:
-                _stage_event(audit, "tracking_setup", "SKIP", reason="Not requested: tracking=none")
-            if create:
-                with _stage(audit, "registration"):
-                    study_id = register_study(
-                        **registration, registry=registry, log_level=settings["log_level"],
+                    publication = {"status": "not_requested"}
+                _stage_event(
+                    audit,
+                    "run",
+                    "UNAVAILABLE" if result.status == "pending_actuals" else "PASS",
+                    run_id=result.run_id,
+                    evaluation_status=result.status,
+                )
+                return dataclasses.replace(
+                    result,
+                    publication={**publication, "audit_path": str(audit)},
+                )
+            except BaseException as error:
+                with suppress(BaseException):
+                    error.__dict__.setdefault("workflow_path", None)
+                    error.__dict__.setdefault("audit_path", audit)
+                    if result is not None:
+                        prior = error.__dict__.get("workflow_path")
+                        if prior is not None and prior != result.path:
+                            error.__dict__["prior_workflow_path"] = prior
+                        error.__dict__["workflow_path"] = result.path
+                    error.__dict__.update(
+                        study_id=result.study_id if result else study_id,
+                        registered_study_id=study_id,
                     )
-                    bind_identity(study_id=study_id)
-                    record_result(study_id=study_id)
-                    note("Study registered", study_id=study_id)
-            with ExitStack() as stack:
-                with _stage(audit, "load_and_verify", study_id=study_id):
-                    study = stack.enter_context(registry.load_study(study_id))
-                    registered = study.registration
-                    if registered is None:
-                        raise ValueError("registered loading requires its authenticated binding")
-                    registration_sha = registered["sha256"]
-                if model == "seasonal_naive" and model_config is None:
-                    folder = pathlib.Path(stack.enter_context(tempfile.TemporaryDirectory(
-                        prefix="af-baseline-profile-", dir=registry.scratch_root,
-                    )))
-                    model_config = folder / "model.json"
-                    m = study.panel.season_length
-                    domain = {"kind": "int", "low": m, "high": m, "step": 1}
-                    model_config.write_text(json.dumps({
-                        "schema_version": 2,
-                        "model": {"id": "seasonal_naive", "adapter": "external"},
-                        "hyperparameters": {"model.season_length": {
-                            "default": m, "valid": domain, "search": domain,
-                        }},
-                    }))
-                if model_config is None:
-                    raise ValueError("model_config is required")
-                profile = loads_exact_yaml(pathlib.Path(model_config).read_bytes())
-                if not isinstance(profile, dict):
-                    raise ValueError("model_config must contain a mapping")
-                note("Model configuration", model_id=profile.get("model", {}).get("id"),
-                     configuration_path=str(model_config),
-                     callback=callable_name(callback),
-                     mode="parameter search" if "hpo" in profile else "fixed configuration")
-                if fixed_parameters is _UNSET:
-                    fixed_parameters = None if "hpo" in profile else {}
-                if fixed_parameters is not None and not isinstance(fixed_parameters, Mapping):
-                    raise ValueError("fixed_parameters must be a mapping or None")
-                binding = {"study_id": study_id, "sha256": registration_sha,
-                           "tracking": settings["tracking"], "publish": settings["publish"],
-                           "log_level": settings["log_level"], "audit_path": str(audit)}
-                with _stage(audit, "workflow", study_id=study_id) as outcome:
-                    result = run_forecast_workflow(
-                        study, fit_predict=cast(
-                            Callable[[FitPredictRequest], FitPredictResult], callback,
+                with suppress(BaseException):
+                    _stage_event(
+                        audit,
+                        "run_attempt",
+                        "FAIL" if isinstance(error, Exception) else "CANCELLED",
+                        error_type=type(error).__name__,
+                        reason="See retained evidence and the original exception.",
+                        workflow_path=str(result.path) if result else None,
+                        retry=(
+                            "publication only from the retained workflow"
+                            if result
+                            else "no completed workflow; inspect retained evidence "
+                            "before retrying"
                         ),
-                        implementation=implementation,
-                        config=model_config, fixed_parameters=fixed_parameters,
-                        output_dir=output_dir or registry.root / "runs", registration=binding,
-                        model_label=model_label,
                     )
-                    record_result(study_id=result.study_id, workflow_id=result.run_id,
-                                  workflow_path=str(result.path))
-                    if result.status == "pending_actuals":
-                        outcome["status"] = "UNAVAILABLE"
-                    outcome["result_study_id"] = result.study_id
-                    outcome["run_id"] = result.run_id
-                    outcome["workflow_path"] = str(result.path)
-                    outcome["manifest_sha256"] = hashlib.sha256(
-                        (result.path / "artifact_manifest.json").read_bytes(),
-                    ).hexdigest()
-                    if result.study_id != study_id:
-                        registry.retain_derived(
-                            study_id, pathlib.Path(result.provenance["study"]["path"]),
-                        )
-            links = None
-            if experiment_id is not None:
-                from autoforecast.run_mlflow import export_forecast_workflow
+                raise
+    finally:
+        if owns_registry and registry is not None:
+            # Keep a failed operation as the primary error if closing also fails.
+            import sys
 
-                with _stage(audit, "tracking_publication", run_id=result.run_id) as outcome:
-                    links = export_forecast_workflow(
-                        result.path, tracking_uri=settings["tracking_uri"],
-                        experiment_id=experiment_id,
-                    )
-                    outcome["links"] = {stage: link.as_record() for stage, link in links.items()}
+            if sys.exc_info()[0] is None:
+                registry.close()
             else:
-                _stage_event(audit, "tracking_publication", "SKIP",
-                             reason="Not requested: tracking=none")
-            if settings["publish"]:
-                with _stage(audit, "table_publication", run_id=result.run_id,
-                            retry="same retained workflow; writes may be partial") as outcome:
-                    publication = registry.publish_results(
-                        result.study_id, result.path, mlflow_links=links,
-                    )
-                    outcome["publication"] = publication
-            else:
-                _stage_event(audit, "table_publication", "SKIP",
-                             reason="Not requested: publish=false")
-                publication = {"status": "not_requested"}
-            _stage_event(audit, "run",
-                         "UNAVAILABLE" if result.status == "pending_actuals" else "PASS",
-                         run_id=result.run_id,
-                         evaluation_status=result.status)
-            return dataclasses.replace(
-                result, publication={**publication, "audit_path": str(audit)},
-            )
-        except BaseException as error:
-            with suppress(BaseException):
-                error.__dict__.setdefault("workflow_path", None)
-                error.__dict__.setdefault("audit_path", audit)
-                if result is not None:
-                    prior = error.__dict__.get("workflow_path")
-                    if prior is not None and prior != result.path:
-                        error.__dict__["prior_workflow_path"] = prior
-                    error.__dict__["workflow_path"] = result.path
-                error.__dict__.update(study_id=result.study_id if result else study_id,
-                                      registered_study_id=study_id)
-            with suppress(BaseException):
-                _stage_event(audit, "run_attempt",
-                             "FAIL" if isinstance(error, Exception) else "CANCELLED",
-                             error_type=type(error).__name__,
-                             reason="See retained evidence and the original exception.",
-                             workflow_path=str(result.path) if result else None,
-                             retry=("publication only from the retained workflow" if result else
-                                    "no completed workflow; inspect retained evidence "
-                                    "before retrying"))
-            raise
+                with suppress(Exception):
+                    registry.close()
 
 
 def _validate_workflow_arguments(
@@ -600,6 +728,7 @@ def _validate_workflow_arguments(
         raise ValueError("provide config to tune, or selected_config to skip HPO")
 
 
+@study_inputs
 @report_workflow(validate=_validate_workflow_arguments)
 def run_forecast_workflow(
     study: Study,
@@ -961,7 +1090,9 @@ def run_forecast_workflow(
                     with _stage(bundle.path / "events.jsonl", "scoring", window=stage,
                                 origin=origin, run_id=bundle.path.name) as outcome:
                         score = score_study(
-                            dataclasses.replace(inputs.panel, path=fixed["actuals"]["path"]),
+                            dataclasses.replace(
+                                inputs.panel, path=str(bound_input_path(fixed["actuals"])),
+                            ),
                             forecast,
                             study._spark,
                             contract=fixed,

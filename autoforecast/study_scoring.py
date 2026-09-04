@@ -16,8 +16,10 @@ from autoforecast._execution import reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
     _evaluation_contract_from_record,
-    artifact_path,
+    artifact_binding,
+    snapshot_bound_input,
     verify_benchmark,
+    verify_input_binding,
     window_series_count,
 )
 from autoforecast.data_admission import _load_dataset_contract_bytes
@@ -30,7 +32,7 @@ from autoforecast.study_horizon_metrics import (
     score_horizon_metrics,
     validate_forecast_accuracy_breakdown,
 )
-from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
+from provenance.lineage import LineageError, directory_digest
 
 SELECTION_METRICS = ("mae", "rmse", "wape", "wrmsse")
 REPORTING_METRICS = (*SELECTION_METRICS, "bias")
@@ -102,24 +104,23 @@ def score_study(
         raise ScoreError("forecast population or dispositions differ from the frozen cohort")
     forecast_sha = directory_digest(forecast.path, suffixes=(".parquet",))
     inputs = {
-        "actuals": (pathlib.Path(panel.path), actuals["sha256"]),
-        "forecast": (pathlib.Path(forecast.path), forecast_sha),
-        "grid": (pathlib.Path(contract["grid"]["path"]), contract["grid"]["sha256"]),
-        "coverage": (pathlib.Path(contract["coverage"]["path"]), contract["coverage"]["sha256"]),
+        "actuals": actuals,
+        "forecast": {"path": str(forecast.path), "sha256": forecast_sha},
+        "grid": contract["grid"],
+        "coverage": contract["coverage"],
     }
+    verify_input_binding(pathlib.Path(panel.path), actuals)
     if (metrics is not None and "wrmsse" in metrics
             or contract["metric_policy"]["metric"] == "wrmsse"):
         if "scoring_references" not in study["artifacts"]:
             raise ScoreError("requested WRMSSE requires registered scoring references")
-        inputs["references"] = (artifact_path(path, study, "scoring_references"),
-                                study["artifacts"]["scoring_references"])
+        inputs["references"] = artifact_binding(path, study, "scoring_references")
     with tempfile.TemporaryDirectory(prefix="autoforecast-score-", dir=scratch_root) as temporary:
         root = pathlib.Path(temporary)
         try:
             snapshots = {
-                name: snapshot_parquet_directory(source, root / name,
-                                                  expected_sha256=sha, label=name)
-                for name, (source, sha) in inputs.items()
+                name: snapshot_bound_input(binding, root / name)
+                for name, binding in inputs.items()
             }
         except LineageError as error:
             raise ScoreError(str(error)) from error
@@ -131,8 +132,8 @@ def score_study(
             forecast_accuracy_breakdown=forecast_accuracy_breakdown,
             metrics=metrics,
         )
-    if (directory_digest(panel.path, suffixes=(".parquet",)) != actuals["sha256"]
-            or directory_digest(forecast.path, suffixes=(".parquet",)) != forecast_sha):
+    verify_input_binding(pathlib.Path(panel.path), actuals)
+    if directory_digest(forecast.path, suffixes=(".parquet",)) != forecast_sha:
         raise ScoreError("scoring inputs changed during evaluation")
     # The first check authenticated this private contract copy for this operation.
     verify_study_evaluation(contract, _expected_study_sha256=contract["study"]["sha256"])

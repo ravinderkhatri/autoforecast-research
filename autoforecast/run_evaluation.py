@@ -24,7 +24,6 @@ from autoforecast.score import Score
 from autoforecast.score_spark import MissingActual, MissingActualError, ScoreError, score_forecast
 from autoforecast.wrmsse import Wrmsse, WrmsseError
 from autoforecast.wrmsse import score as score_wrmsse
-from provenance.lineage import directory_digest
 
 __all__ = ["EvaluationError", "compare_run_forecasts"]
 
@@ -68,7 +67,9 @@ def _value(score: Score | Wrmsse | dict, metric: Metric) -> float | None:
 def _write_html(path: pathlib.Path, record: Mapping[str, object]) -> None:
     is_wrmsse = record.get("metric") == "wrmsse"
     fixed = record.get("evaluation_contract")
-    flat = isinstance(fixed, dict) and fixed.get("schema") == "autoforecast.fixed-evaluation.v2"
+    flat = isinstance(fixed, dict) and fixed.get("schema") in {
+        "autoforecast.fixed-evaluation.v2", "autoforecast.fixed-evaluation.v3",
+    }
     rows = []
     for item in record["candidates"]:  # type: ignore[index]
         assert isinstance(item, dict)
@@ -157,7 +158,9 @@ def compare_run_forecasts(
     comparison_error: str | None = None
     grid_path = None
     study = (fixed_contract is not None
-             and fixed_contract.get("schema") == "autoforecast.fixed-evaluation.v2")
+             and fixed_contract.get("schema") in {
+                 "autoforecast.fixed-evaluation.v2", "autoforecast.fixed-evaluation.v3",
+             })
     if study:
         assert fixed_contract is not None
         from autoforecast.study_scoring import verify_study_evaluation
@@ -170,13 +173,15 @@ def compare_run_forecasts(
         if not study:
             raise EvaluationError("fixed scoring requires a current frozen study contract")
         grid_record = cast(dict, fixed_contract["grid"])
-        grid_path = grid_record["path"]
-        if directory_digest(grid_path, suffixes=(".parquet",)) != grid_record["sha256"]:
-            raise EvaluationError("frozen scoring grid changed")
+        from autoforecast.benchmark import BenchmarkError, bound_input_path, verify_input_binding
         from autoforecast.grid import content_hash
 
+        grid_path = str(bound_input_path(grid_record))
+        verify_input_binding(pathlib.Path(grid_path), grid_record)
         frequency = parse_frequency(items[0][1].frequency).code
-        if content_hash(grid_path, spark, frequency=frequency) != grid_record["logical_sha256"]:
+        if ("snapshot" not in grid_record
+                and content_hash(grid_path, spark, frequency=frequency)
+                != grid_record["logical_sha256"]):
             raise EvaluationError("frozen scoring grid logical identity changed")
         origin = items[0][1].origin
         forecast = items[0][1]
@@ -282,12 +287,12 @@ def compare_run_forecasts(
         "comparison_error": comparison_error,
         **({"evaluation_contract": dict(fixed_contract)} if fixed_contract is not None else {}),
     }
-    if (
-        fixed_contract is not None
-        and directory_digest(cast(str, grid_path), suffixes=(".parquet",))
-        != cast(dict, fixed_contract["grid"])["sha256"]
-    ):
-        raise EvaluationError("scoring grid changed during evaluation")
+    if fixed_contract is not None:
+        try:
+            verify_input_binding(pathlib.Path(cast(str, grid_path)),
+                                 cast(dict, fixed_contract["grid"]))
+        except BenchmarkError as error:
+            raise EvaluationError("scoring grid changed during evaluation") from error
     json_path = out / "candidate-comparison.json"
     json_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _write_html(out / "candidate-comparison.html", record)

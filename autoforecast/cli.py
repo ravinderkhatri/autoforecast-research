@@ -228,9 +228,10 @@ def run_campaign(
     from mlops._safe_files import publish_bytes_set
 
     from autoforecast._exact_yaml import loads_exact_yaml
-    from autoforecast.benchmark import artifact_path, read_benchmark_manifest
+    from autoforecast.benchmark import NATIVE_SCHEMA, artifact_path, read_benchmark_manifest
     from autoforecast.campaign import CampaignStore, CampaignSupervisor
     from autoforecast.forecast_campaign import (
+        ForecastCampaignError,
         compile_forecast_campaign,
         load_forecast_campaign_request,
     )
@@ -238,6 +239,9 @@ def run_campaign(
 
     parsed = load_forecast_campaign_request(request_path)
     benchmark_path, benchmark = read_benchmark_manifest(benchmark_path)
+    if benchmark["schema"] == NATIVE_SCHEMA:
+        raise ForecastCampaignError("the command-line campaign requires file inputs; "
+                                    "use Study.run_campaign for retained table inputs")
     original = request_path.read_bytes()
     request = loads_exact_yaml(original)
     if type(request) is not dict:

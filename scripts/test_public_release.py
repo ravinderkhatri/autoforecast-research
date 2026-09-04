@@ -370,7 +370,10 @@ def test_standard_dependencies_have_no_compatibility_only_extras():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     extras = project["optional-dependencies"]
     assert set(extras) == {"all-models", "data", "custom-torch", "shallow", "tft",
-                           "autogluon-zoo", "timesfm", "timesfm3", "postgres", "bigquery"}
+                           "autogluon-zoo", "timesfm", "timesfm3", "postgres", "bigquery",
+                           "mysql", "sqlserver"}
+    assert extras["mysql"] == ["PyMySQL[rsa]==1.1.2"]
+    assert extras["sqlserver"] == ["mssql-python==1.17.0"]
     core = {value.split("==")[0] for value in project["dependencies"]}
     assert {"pyspark", "pyarrow", "statsforecast", "optuna", "ray[tune]", "mlflow-skinny"} <= core
 

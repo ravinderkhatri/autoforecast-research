@@ -36,7 +36,8 @@ from provenance.lineage import LineageError, directory_digest, snapshot_parquet_
 STUDY_SCHEMA = "autoforecast.frozen-benchmark.v4"
 OPTIONAL_STAGE_SCHEMA = "autoforecast.frozen-benchmark.v5"
 DISTRIBUTED_SCHEMA = "autoforecast.frozen-benchmark.v6"
-STUDY_SCHEMAS = (STUDY_SCHEMA, OPTIONAL_STAGE_SCHEMA, DISTRIBUTED_SCHEMA)
+NATIVE_SCHEMA = "autoforecast.frozen-benchmark.v7"
+STUDY_SCHEMAS = (STUDY_SCHEMA, OPTIONAL_STAGE_SCHEMA, DISTRIBUTED_SCHEMA, NATIVE_SCHEMA)
 MISSING_COLUMN = "__af_original_missing"
 START_COLUMN = "__af_history_start"
 
@@ -263,7 +264,6 @@ def _identity(record: dict) -> dict:
             "recipe",
             "key_types",
             "contract_sha256",
-            "logical_snapshots",
             "source_series_count",
             "excluded_new_series",
             "cohort_series_count",
@@ -280,6 +280,11 @@ def _identity(record: dict) -> dict:
         )})
     if "admission_identity" in record:
         identity["admission_identity"] = record["admission_identity"]
+    if record["schema"] == NATIVE_SCHEMA:
+        identity.update(snapshot_mode=record["snapshot_mode"], snapshots=record["snapshots"],
+                        owned_snapshots=record["owned_snapshots"])
+    else:
+        identity["logical_snapshots"] = record["logical_snapshots"]
     if "logical_hashes" in record:
         identity["logical_hashes"] = record["logical_hashes"]
     return identity
@@ -362,6 +367,8 @@ def artifact_path(path: pathlib.Path, record: dict, role: str) -> pathlib.Path:
     """Resolve a logical role inside an already authenticated benchmark."""
     if role not in record["artifacts"]:
         raise BenchmarkError(f"unknown benchmark role: {role}")
+    if record["schema"] == NATIVE_SCHEMA:
+        return input_path(path, record, record["role_paths"][role])
     if role in record.get("inherited_roles", []):
         parent_path = pathlib.Path(record["parent"]["path"])
         _, parent = read_benchmark_manifest(parent_path, record["parent"]["sha256"])
@@ -369,6 +376,49 @@ def artifact_path(path: pathlib.Path, record: dict, role: str) -> pathlib.Path:
             raise BenchmarkError("derived studies must reference an original frozen definition")
         return artifact_path(parent_path, parent, role)
     return path.parent / record["role_paths"][role]
+
+
+def input_path(path: pathlib.Path, record: dict, name: str) -> pathlib.Path:
+    """Open an authenticated input through its recorded storage policy."""
+    if record["schema"] == NATIVE_SCHEMA:
+        from autoforecast.snapshots import current_inputs
+
+        return current_inputs().materialize(record["snapshots"][name])
+    return path.parent / name
+
+
+def bound_input_path(binding: dict) -> pathlib.Path:
+    """Resolve an inert file or native binding within the current owned read scope."""
+    if "snapshot" in binding:
+        from autoforecast.snapshots import current_inputs
+
+        return current_inputs().materialize(binding["snapshot"])
+    return pathlib.Path(binding["path"])
+
+
+def verify_input_binding(path: pathlib.Path, binding: dict) -> None:
+    """Reject a caller-supplied path that does not represent the recorded input."""
+    if "snapshot" in binding:
+        if pathlib.Path(path) != bound_input_path(binding):
+            raise BenchmarkError("native transport differs from the recorded input")
+    elif directory_digest(path, suffixes=(".parquet",)) != binding["sha256"]:
+        raise BenchmarkError("input differs from its frozen file binding")
+
+
+def snapshot_bound_input(binding: dict, destination: pathlib.Path) -> pathlib.Path:
+    """Keep native transports in their scope; give file inputs an authenticated copy."""
+    source = bound_input_path(binding)
+    if "snapshot" in binding:
+        return source
+    return snapshot_parquet_directory(
+        source, destination, expected_sha256=binding["sha256"], label=destination.name,
+    )
+
+
+def artifact_binding(path: pathlib.Path, record: dict, role: str) -> dict:
+    if record["schema"] == NATIVE_SCHEMA:
+        return {"snapshot": record["artifacts"][role]}
+    return {"path": str(artifact_path(path, record, role)), "sha256": record["artifacts"][role]}
 
 
 def window_series_count(record: dict, key: str) -> int:
@@ -600,7 +650,10 @@ def freeze_benchmark(
 
 def _freeze_verified(**settings) -> _VerifiedBenchmark:
     """Keep the writer's original binding for the internal registration handoff."""
-    with ExitStack() as inputs:
+    from autoforecast.snapshots import _cleanup_on_exit
+
+    inputs = ExitStack()
+    with _cleanup_on_exit(inputs.close, label="Frozen input cleanup needs recovery"):
         try:
             return _freeze_benchmark(inputs=inputs, **settings)
         except LineageError as error:
@@ -619,6 +672,8 @@ def _freeze_benchmark(
     scoring_references: pathlib.Path | None = None,
     scratch_root: str | pathlib.Path | None = None,
     admission_identity: dict | None = None,
+    native_inputs=None,
+    native_inventory=None,
 ) -> _VerifiedBenchmark:
     """Validate source scope, normalize keys, and publish immutable role snapshots and grids.
 
@@ -672,23 +727,40 @@ def _freeze_benchmark(
     all_sources = dict(sources)
     if scoring_references is not None:
         all_sources["scoring_references"] = scoring_references
-    physical_sources = {
-        path: directory_digest(path, suffixes=(".parquet",))
-        for path in dict.fromkeys(all_sources.values())
-    }
-    before = {name: physical_sources[path] for name, path in all_sources.items()}
-    snapshot_root = pathlib.Path(inputs.enter_context(tempfile.TemporaryDirectory(
-        prefix="autoforecast-freeze-", dir=scratch_root,
-    )))
-    read_paths = {}
-    physical_inputs = {}
-    for name, path in all_sources.items():
-        identity = (path.resolve(), before[name])
-        if identity not in physical_inputs:
-            physical_inputs[identity] = snapshot_parquet_directory(
-                path, snapshot_root / name, expected_sha256=before[name], label=name,
-            )
-        read_paths[name] = physical_inputs[identity]
+    source_references = {}
+    if native_inputs is not None:
+        # Freeze each distinct physical input before Spark or preparation can reread it.
+        read_paths, before, physical_sources = {}, {}, {}
+        opened = {}
+        for name, path in all_sources.items():
+            if path not in opened:
+                reference = native_inputs.capture(path, spark=spark)
+                inputs.callback(native_inputs.store.drop_unretained, reference.record())
+                owned = pathlib.Path(inputs.enter_context(
+                    native_inputs.open(reference, spark=spark),
+                ))
+                opened[path] = reference, owned
+            reference, owned = opened[path]
+            source_references[name] = reference.record()
+            read_paths[name] = owned
+    else:
+        physical_sources = {
+            path: directory_digest(path, suffixes=(".parquet",))
+            for path in dict.fromkeys(all_sources.values())
+        }
+        before = {name: physical_sources[path] for name, path in all_sources.items()}
+        snapshot_root = pathlib.Path(inputs.enter_context(tempfile.TemporaryDirectory(
+            prefix="autoforecast-freeze-", dir=scratch_root,
+        )))
+        read_paths = {}
+        physical_inputs = {}
+        for name, path in all_sources.items():
+            identity = (path.resolve(), before[name])
+            if identity not in physical_inputs:
+                physical_inputs[identity] = snapshot_parquet_directory(
+                    path, snapshot_root / name, expected_sha256=before[name], label=name,
+                )
+            read_paths[name] = physical_inputs[identity]
     frames = {}
     normalized_inputs = {}
     key_types = None
@@ -889,7 +961,7 @@ def _freeze_benchmark(
                 "conflicting overlapping history between selection and final training"
             )
     identity = {
-        "schema": DISTRIBUTED_SCHEMA,
+        "schema": NATIVE_SCHEMA if native_inputs is not None else DISTRIBUTED_SCHEMA,
         "recipe": recipe,
         "key_types": key_types,
         "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
@@ -901,6 +973,9 @@ def _freeze_benchmark(
         identity["admission_identity"] = admission_identity
 
     def authenticate_sources():
+        if native_inputs is not None:
+            for reference in source_references.values():
+                native_inputs.store.inspect(reference)
         if read_path_bytes(contract_path) != contract_bytes or any(
             directory_digest(path, suffixes=(".parquet",)) != expected
             for path, expected in physical_sources.items()
@@ -910,7 +985,21 @@ def _freeze_benchmark(
     authenticate_sources()
     output_root.mkdir(parents=True, exist_ok=True)
     scratch = pathlib.Path(tempfile.mkdtemp(prefix=".freeze-", dir=output_root))
-    try:
+    retained = {}
+    published = False
+    retention_requested = set()
+
+    def cleanup():
+        with ExitStack() as removals:
+            removals.callback(lambda: shutil.rmtree(scratch) if scratch.exists() else None)
+            if not published and native_inputs is not None:
+                for reference in retained.values():
+                    if reference["capture_id"] not in retention_requested:
+                        removals.callback(native_inputs.store.drop_unretained, reference)
+
+    from autoforecast.snapshots import _cleanup_on_exit
+
+    with _cleanup_on_exit(cleanup, label="Frozen artifact cleanup needs recovery"):
         import yaml
 
         roles = {**contract.panel_roles, "series_col": internal}
@@ -933,6 +1022,10 @@ def _freeze_benchmark(
         physical_hashes = {}
 
         def content_hash(path, name):
+            if native_inputs is not None:
+                if name not in retained:
+                    retained[name] = native_inputs.capture(path, spark=spark).record()
+                return retained[name]
             logical_hashes[name], physical_hashes[name] = _logical_hash._capture(path, spark=spark)
             return logical_hashes[name]["sha256"]
 
@@ -956,8 +1049,10 @@ def _freeze_benchmark(
             )
             grids[key] = {
                 "path": relative,
-                "logical_sha256": grid.content_hash(path, spark, frequency=cadence.code),
-                "sha256": directory_digest(path, suffixes=(".parquet",)),
+                **({} if native_inputs is not None else {
+                    "logical_sha256": grid.content_hash(path, spark, frequency=cadence.code),
+                    "sha256": directory_digest(path, suffixes=(".parquet",)),
+                }),
                 "n_cells": final_count * span,
             }
             actuals = frames[_actuals_role(stage)]
@@ -1001,45 +1096,75 @@ def _freeze_benchmark(
             coverage_path = "coverage/" + key
             per_series.write.parquet(str(scratch / coverage_path))
             coverage_identities[key] = {
-                "content_sha256": content_hash(scratch / coverage_path, "coverage/" + key),
+                ("snapshot" if native_inputs is not None else "content_sha256"):
+                    content_hash(scratch / coverage_path, "coverage/" + key),
                 "counts": {name: int(totals[name]) for name in names},
             }
             coverage[key] = {
                 "path": coverage_path,
-                "sha256": physical_hashes["coverage/" + key],
+                **({} if native_inputs is not None else
+                   {"sha256": physical_hashes["coverage/" + key]}),
             }
         authenticate_sources()
-        logical_snapshots = {name: content_hash(scratch / name, name) for name in artifact_roles}
         role_paths = {name: name for name in artifact_roles}
-        # Logical roles remain distinct even when their exact typed rows share storage.
-        written = {}
-        for name in artifact_roles:
-            logical = logical_snapshots[name]
-            if logical in written:
-                role_paths[name] = written[logical]
-                shutil.rmtree(scratch / name)
-            else:
-                written[logical] = name
-        identity.update(
-            logical_hashes=logical_hashes,
-            logical_snapshots=logical_snapshots,
-            dataset_sha256=hashlib.sha256(read_path_bytes(scratch / "dataset.yaml")).hexdigest(),
-            grid_identities={
-                key: {
-                    "content_sha256": content_hash(scratch / item["path"], "grids/" + key),
-                    "logical_sha256": item["logical_sha256"],
-                    "n_cells": item["n_cells"],
-                }
-                for key, item in grids.items()
-            },
-        )
-        identity.update(
-            role_paths=role_paths, metric_definition=_metric_definition(recipe),
-            coverage_identities=coverage_identities, counts=counts,
-        )
-        for key, item in grids.items():
-            if item["sha256"] != physical_hashes["grids/" + key]:
-                raise BenchmarkError("scoring grid changed while establishing its identity")
+        if native_inputs is not None:
+            for name in artifact_roles:
+                content_hash(scratch / name, name)
+            for item in grids.values():
+                content_hash(scratch / item["path"], item["path"])
+            identity.update(
+                snapshot_mode=native_inputs.mode, snapshots=retained,
+                dataset_sha256=hashlib.sha256(
+                    read_path_bytes(scratch / "dataset.yaml"),
+                ).hexdigest(),
+                grid_identities={key: {"snapshot": retained[item["path"]],
+                                       "n_cells": item["n_cells"]}
+                                 for key, item in grids.items()},
+                role_paths=role_paths, metric_definition=_metric_definition(recipe),
+                coverage_identities=coverage_identities, counts=counts,
+            )
+            auxiliaries = (native_inventory(scratch / "source-keys", identity)
+                           if native_inventory is not None else {})
+            identity["owned_snapshots"] = {
+                **auxiliaries, **{item["capture_id"]: item for item in retained.values()},
+            }
+            identity["owned_snapshots"] = dict(sorted(identity["owned_snapshots"].items()))
+        else:
+            logical_snapshots = {
+                name: content_hash(scratch / name, name) for name in artifact_roles
+            }
+            role_paths = {name: name for name in artifact_roles}
+            # Logical roles remain distinct even when their exact typed rows share storage.
+            written = {}
+            for name in artifact_roles:
+                logical = logical_snapshots[name]
+                if logical in written:
+                    role_paths[name] = written[logical]
+                    shutil.rmtree(scratch / name)
+                else:
+                    written[logical] = name
+            identity.update(
+                logical_hashes=logical_hashes,
+                logical_snapshots=logical_snapshots,
+                dataset_sha256=hashlib.sha256(
+                    read_path_bytes(scratch / "dataset.yaml"),
+                ).hexdigest(),
+                grid_identities={
+                    key: {
+                        "content_sha256": content_hash(scratch / item["path"], "grids/" + key),
+                        "logical_sha256": item["logical_sha256"],
+                        "n_cells": item["n_cells"],
+                    }
+                    for key, item in grids.items()
+                },
+            )
+            identity.update(
+                role_paths=role_paths, metric_definition=_metric_definition(recipe),
+                coverage_identities=coverage_identities, counts=counts,
+            )
+            for key, item in grids.items():
+                if item["sha256"] != physical_hashes["grids/" + key]:
+                    raise BenchmarkError("scoring grid changed while establishing its identity")
         benchmark_id = digest(identity)
         if study_id is not None and study_id != benchmark_id:
             raise BenchmarkError(
@@ -1059,21 +1184,28 @@ def _freeze_benchmark(
                 "missing_definition": "absent_row_or_null_target",
                 "confirmed_zero": "observed", "missing_indicator": MISSING_COLUMN,
             },
-            "sources": {
+            "sources": (source_references if native_inputs is not None else {
                 name: {"path": str(path.resolve()), "sha256": before[name]}
                 for name, path in all_sources.items()
-            },
+            }),
             "artifacts": {
-                name: physical_hashes[role_paths[name]]
+                name: (retained[name] if native_inputs is not None
+                       else physical_hashes[role_paths[name]])
                 for name in artifact_roles
             },
             "dataset_sha256": hashlib.sha256(read_path_bytes(scratch / "dataset.yaml")).hexdigest(),
         }
+        if native_inputs is not None:
+            for reference in retained.values():
+                retention_requested.add(reference["capture_id"])
+                native_inputs.store.retain(reference)
         (scratch / "benchmark.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        if native_inputs is not None:
+            # Only metadata is published locally. Native tables remain authoritative.
+            for directory in (p for p in scratch.iterdir() if p.is_dir()):
+                shutil.rmtree(directory)
         published_sha = _publish_frozen_benchmark(scratch, destination, benchmark_id, spark=spark)
-    finally:
-        if scratch.exists():
-            shutil.rmtree(scratch)
+        published = True
     return _VerifiedBenchmark(destination / "benchmark.json", published_sha)
 
 
@@ -1207,13 +1339,15 @@ def _validate_manifest(record: object) -> dict:
         raise BenchmarkError("benchmark manifest must be an object")
     if record.get("schema") not in STUDY_SCHEMAS:
         raise BenchmarkError("unsupported benchmark schema; prepare a current study")
+    native = record["schema"] == NATIVE_SCHEMA
     fields = {
-        "schema", "recipe", "key_types", "contract_sha256", "logical_snapshots",
+        "schema", "recipe", "key_types", "contract_sha256",
         "source_series_count", "excluded_new_series", "cohort_series_count",
         "dataset_sha256", "grid_identities", "benchmark_id", "grids", "counts",
         "policies", "sources", "artifacts",
         "study_id", "role_paths", "metric_definition", "coverage", "coverage_identities",
     }
+    fields |= {"snapshot_mode", "snapshots", "owned_snapshots"} if native else {"logical_snapshots"}
     if "execution_policy" in record:
         fields |= {"execution_policy", "parent", "inherited_roles"}
     if "admission_identity" in record:
@@ -1225,7 +1359,7 @@ def _validate_manifest(record: object) -> dict:
     recipe = record["recipe"]
     validate_recipe(recipe)
     expected_schema = OPTIONAL_STAGE_SCHEMA if recipe["schema_version"] == 3 else STUDY_SCHEMA
-    if record["schema"] not in (expected_schema, DISTRIBUTED_SCHEMA):
+    if record["schema"] not in (expected_schema, DISTRIBUTED_SCHEMA, NATIVE_SCHEMA):
         raise BenchmarkError("recipe version differs from the frozen study schema")
     if (recipe != _normalise_recipe(recipe)
             or record["study_id"] != record["benchmark_id"]
@@ -1302,13 +1436,49 @@ def _validate_manifest(record: object) -> dict:
     if recipe["metric"] == "wrmsse" or recipe.get("reference_metrics"):
         source_roles.add("scoring_references")
     roles = source_roles | {"source-keys"}
-    for name in ("artifacts", "logical_snapshots"):
-        for role, value in mapping(record[name], roles, name).items():
-            sha256(value, f"{name}.{role}")
     paths = mapping(record["role_paths"], roles, "role_paths")
     if any(type(value) is not str or value not in roles for value in paths.values()):
         raise BenchmarkError("study role paths must name frozen artifact directories")
+    if native:
+        from autoforecast.snapshots import SnapshotReference
+
+        if (type(record["snapshot_mode"]) is not str
+                or record["snapshot_mode"] not in {"table", "table+hash"}):
+            raise BenchmarkError("native benchmark requires a native snapshot mode")
+        boundaries = {boundary(stage, origin, span, recipe["frequency"])
+                      for stage, origin, span in study_windows(recipe)}
+        expected = roles | {"grids/" + key for key in boundaries} | {
+            "coverage/" + key for key in boundaries}
+        for reference in mapping(record["snapshots"], expected, "snapshots").values():
+            SnapshotReference.from_record(reference)
+            if reference["mode"] != record["snapshot_mode"]:
+                raise BenchmarkError("input mode differs from the frozen study")
+        owned = record["owned_snapshots"]
+        if type(owned) is not dict:
+            raise BenchmarkError("native input ownership identity requires a mapping")
+        for capture_id, reference in owned.items():
+            SnapshotReference.from_record(reference)
+            if (reference["capture_id"] != capture_id
+                    or reference["mode"] != record["snapshot_mode"]):
+                raise BenchmarkError("native input ownership identity changed")
+        if "parent" not in record and any(
+            owned.get(reference["capture_id"]) != reference
+            for reference in record["snapshots"].values()
+        ):
+            raise BenchmarkError("native input ownership identity is incomplete")
+        for role, reference in mapping(record["artifacts"], roles, "artifacts").items():
+            if reference != record["snapshots"][record["role_paths"][role]]:
+                raise BenchmarkError("native role differs from its frozen input")
+    else:
+        for name in ("artifacts", "logical_snapshots"):
+            for role, value in mapping(record[name], roles, name).items():
+                sha256(value, f"{name}.{role}")
     for role, value in mapping(record["sources"], source_roles, "sources").items():
+        if native:
+            SnapshotReference.from_record(value)
+            if value["mode"] != record["snapshot_mode"]:
+                raise BenchmarkError("source mode differs from the frozen study")
+            continue
         mapping(value, {"path", "sha256"}, f"sources.{role}")
         if type(value["path"]) is not str or not value["path"].strip():
             raise BenchmarkError("benchmark source path must be a nonblank string")
@@ -1354,32 +1524,48 @@ def _validate_manifest(record: object) -> dict:
     grids = mapping(record["grids"], boundaries, "grid inventory")
     identities = mapping(record["grid_identities"], boundaries, "grid identity inventory")
     for key, horizon in boundaries.items():
-        item = mapping(grids[key], {"path", "sha256", "logical_sha256", "n_cells"}, "grid")
-        identity = mapping(
-            identities[key], {"content_sha256", "logical_sha256", "n_cells"}, "grid identity",
-        )
-        if item["path"] != "grids/" + key:
-            raise BenchmarkError("benchmark grid path changed")
-        for name in ("sha256", "logical_sha256"):
-            sha256(item[name], f"grid.{name}")
-        for name in ("content_sha256", "logical_sha256"):
-            sha256(identity[name], f"grid identity.{name}")
+        if native:
+            item = mapping(grids[key], {"path", "n_cells"}, "native grid")
+            identity = mapping(identities[key], {"snapshot", "n_cells"}, "native grid identity")
+            if (item["path"] != "grids/" + key
+                    or identity["snapshot"] != record["snapshots"][item["path"]]
+                    or identity["snapshot"]["rows"] != item["n_cells"]):
+                raise BenchmarkError("native grid identity changed")
+        else:
+            item = mapping(grids[key], {"path", "sha256", "logical_sha256", "n_cells"}, "grid")
+            identity = mapping(
+                identities[key], {"content_sha256", "logical_sha256", "n_cells"}, "grid identity",
+            )
+            if item["path"] != "grids/" + key:
+                raise BenchmarkError("benchmark grid path changed")
+            for name in ("sha256", "logical_sha256"):
+                sha256(item[name], f"grid.{name}")
+            for name in ("content_sha256", "logical_sha256"):
+                sha256(identity[name], f"grid identity.{name}")
         for value in (item["n_cells"], identity["n_cells"]):
             count(value, "grid n_cells", 1)
             if value != window_series_count(record, key) * horizon:
                 raise BenchmarkError("benchmark grid population count changed")
-        if item["logical_sha256"] != identity["logical_sha256"]:
+        if not native and item["logical_sha256"] != identity["logical_sha256"]:
             raise BenchmarkError("benchmark grid logical identity changed")
     coverage = mapping(record["coverage"], boundaries, "coverage")
     identities = mapping(record["coverage_identities"], boundaries, "coverage_identities")
     names = {"expected", "originally_missing", "zero_filled", "excluded", "scored"}
     for key, horizon in boundaries.items():
-        item = mapping(coverage[key], {"path", "sha256"}, "coverage artifact")
-        identity = mapping(identities[key], {"content_sha256", "counts"}, "coverage identity")
-        if item["path"] != "coverage/" + key:
-            raise BenchmarkError("study coverage path changed")
-        sha256(item["sha256"], "coverage sha256")
-        sha256(identity["content_sha256"], "coverage content_sha256")
+        if native:
+            item = mapping(coverage[key], {"path"}, "native coverage")
+            identity = mapping(identities[key], {"snapshot", "counts"}, "native coverage identity")
+            if (item["path"] != "coverage/" + key
+                    or identity["snapshot"] != record["snapshots"][item["path"]]
+                    or identity["snapshot"]["rows"] != window_series_count(record, key)):
+                raise BenchmarkError("native coverage identity changed")
+        else:
+            item = mapping(coverage[key], {"path", "sha256"}, "coverage artifact")
+            identity = mapping(identities[key], {"content_sha256", "counts"}, "coverage identity")
+            if item["path"] != "coverage/" + key:
+                raise BenchmarkError("study coverage path changed")
+            sha256(item["sha256"], "coverage sha256")
+            sha256(identity["content_sha256"], "coverage content_sha256")
         totals = mapping(identity["counts"], names, "coverage counts")
         for name, value in totals.items():
             count(value, f"coverage.{name}")
@@ -1429,6 +1615,15 @@ def read_benchmark_manifest(
     return path, record
 
 
+def _validate_native_parent(record, parent):
+    """A derived study owns new captures and borrows unchanged parent inputs."""
+    if (set(record["owned_snapshots"]) & set(parent["owned_snapshots"])
+            or any(record["owned_snapshots"].get(reference["capture_id"]) != reference
+                   for name, reference in record["snapshots"].items()
+                   if reference != parent["snapshots"][name])):
+        raise BenchmarkError("derived native input ownership identity changed")
+
+
 def verify_benchmark(
     path: pathlib.Path, expected_sha256: str | None = None, *, spark=None,
     _reuse_verified: bool = False, _scratch_root=None,
@@ -1454,56 +1649,73 @@ def verify_benchmark(
         if ("parent" in parent or parent["study_id"] != record["parent"]["study_id"]
                 or parent["study_id"] == record["study_id"]):
             raise BenchmarkError("invalid derived study parent")
+        if record["schema"] == NATIVE_SCHEMA:
+            if parent["schema"] != NATIVE_SCHEMA:
+                raise BenchmarkError("derived study changed its input storage mode")
+            _validate_native_parent(record, parent)
         verify_benchmark(
             parent_path, record["parent"]["sha256"] if expected_sha256 else None,
             spark=spark, _reuse_verified=_reuse_verified and expected_sha256 is not None,
             _scratch_root=_scratch_root,
         )
         for role in record["inherited_roles"]:
-            if (record["artifacts"][role] != parent["artifacts"][role]
-                    or record["logical_snapshots"][role] != parent["logical_snapshots"][role]
-                    or record.get("logical_hashes", {}).get(role)
-                    != parent.get("logical_hashes", {}).get(role)):
+            if record["artifacts"][role] != parent["artifacts"][role]:
                 raise BenchmarkError("inherited artifact identity changed")
-    checked = {}
+            if record["schema"] == NATIVE_SCHEMA:
+                if (parent["schema"] != NATIVE_SCHEMA
+                        or record["snapshot_mode"] != parent["snapshot_mode"]):
+                    raise BenchmarkError("derived study changed its input storage mode")
+            elif (record["logical_snapshots"][role] != parent["logical_snapshots"][role]
+                  or record.get("logical_hashes", {}).get(role)
+                  != parent.get("logical_hashes", {}).get(role)):
+                raise BenchmarkError("inherited artifact identity changed")
+    if record["schema"] == NATIVE_SCHEMA:
+        from autoforecast.snapshots import current_inputs
 
-    def checked_hash(target, physical, name):
-        logical = record.get("logical_hashes", {}).get(name)
-        cache_key = (target, physical, digest(logical))
-        if cache_key not in checked:
-            try:
-                checked[cache_key] = _logical_hash.verify_files(
-                    target, physical_sha256=physical, logical=logical,
-                    trusted=_reuse_verified and expected_sha256 is not None, spark=spark,
-                    _scratch_root=_scratch_root,
-                )
-            except ValueError as error:
-                raise BenchmarkError(f"benchmark artifact changed: {name}: {error}") from error
-        return checked[cache_key]
+        if path.parent.name == record["study_id"]:
+            current_inputs().hold_study(path, pinned_manifest)
+        for reference in record["snapshots"].values():
+            current_inputs().inspect(reference, retained=True)
+    else:
+        checked = {}
 
-    for name, expected in record["artifacts"].items():
-        target = artifact_path(path, record, name)
-        if (name not in record.get("inherited_roles", [])
-                and not target.resolve().is_relative_to(path.parent.resolve())):
-            raise BenchmarkError(f"benchmark artifact escaped its directory: {name}")
-        if checked_hash(target, expected, name) != record["logical_snapshots"][name]:
-            raise BenchmarkError(f"benchmark artifact changed: {name}")
-    for key, item in record["grids"].items():
-        target = path.parent / item["path"]
-        if (
-            not target.resolve().is_relative_to(path.parent.resolve())
-            or checked_hash(target, item["sha256"], "grids/" + key)
-            != record["grid_identities"][key]["content_sha256"]
-            or item["logical_sha256"] != record["grid_identities"][key]["logical_sha256"]
-            or item["n_cells"] != record["grid_identities"][key]["n_cells"]
-        ):
-            raise BenchmarkError("benchmark scoring grid changed")
-    for key, item in record.get("coverage", {}).items():
-        target = path.parent / item["path"]
-        if (not target.resolve().is_relative_to(path.parent.resolve())
-                or checked_hash(target, item["sha256"], "coverage/" + key)
-                != record["coverage_identities"][key]["content_sha256"]):
-            raise BenchmarkError("study scoring coverage changed")
+        def checked_hash(target, physical, name):
+            logical = record.get("logical_hashes", {}).get(name)
+            cache_key = (target, physical, digest(logical))
+            if cache_key not in checked:
+                try:
+                    checked[cache_key] = _logical_hash.verify_files(
+                        target, physical_sha256=physical, logical=logical,
+                        trusted=_reuse_verified and expected_sha256 is not None, spark=spark,
+                        _scratch_root=_scratch_root,
+                    )
+                except ValueError as error:
+                    raise BenchmarkError(f"benchmark artifact changed: {name}: {error}") from error
+            return checked[cache_key]
+
+        for name, expected in record["artifacts"].items():
+            target = artifact_path(path, record, name)
+            if (name not in record.get("inherited_roles", [])
+                    and not target.resolve().is_relative_to(path.parent.resolve())):
+                raise BenchmarkError(f"benchmark artifact escaped its directory: {name}")
+            if checked_hash(target, expected, name) != record["logical_snapshots"][name]:
+                raise BenchmarkError(f"benchmark artifact changed: {name}")
+        for key, item in record["grids"].items():
+            target = path.parent / item["path"]
+            if (
+                not target.resolve().is_relative_to(path.parent.resolve())
+                or checked_hash(target, item["sha256"], "grids/" + key)
+                != record["grid_identities"][key]["content_sha256"]
+                or item["logical_sha256"] != record["grid_identities"][key]["logical_sha256"]
+                or item["n_cells"] != record["grid_identities"][key]["n_cells"]
+            ):
+                raise BenchmarkError("benchmark scoring grid changed")
+        for key, item in record.get("coverage", {}).items():
+            target = path.parent / item["path"]
+            if (not target.resolve().is_relative_to(path.parent.resolve())
+                    or checked_hash(target, item["sha256"], "coverage/" + key)
+                    != record["coverage_identities"][key]["content_sha256"]):
+                raise BenchmarkError("study scoring coverage changed")
     if (
         hashlib.sha256(read_path_bytes(path.parent / "dataset.yaml")).hexdigest()
         != record["dataset_sha256"]
@@ -1546,12 +1758,20 @@ def _evaluation_contract_from_record(
         "grid": {**record["grids"][key],
                  "path": str(path.parent / record["grids"][key]["path"])},
         "metric_policy": record["metric_definition"],
-        "actuals": {"role": role, "path": str(artifact_path(path, record, role)),
-                    "sha256": record["artifacts"][role]},
+        "actuals": {"role": role, **artifact_binding(path, record, role)},
         "coverage": {**record["coverage"][key],
                      **record["coverage_identities"][key],
                      "path": str(path.parent / record["coverage"][key]["path"])},
     }
+    if record["schema"] == NATIVE_SCHEMA:
+        contract.update(
+            schema="autoforecast.fixed-evaluation.v3",
+            actuals={"role": role, **artifact_binding(path, record, role)},
+            grid={"snapshot": record["snapshots"][record["grids"][key]["path"]],
+                  "n_cells": record["grids"][key]["n_cells"]},
+            coverage={"snapshot": record["snapshots"][record["coverage"][key]["path"]],
+                      "counts": record["coverage_identities"][key]["counts"]},
+        )
     if "execution_policy" in record:
         policy = record["execution_policy"]
         contract["availability"] = {

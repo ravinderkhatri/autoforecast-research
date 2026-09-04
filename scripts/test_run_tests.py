@@ -272,6 +272,26 @@ def test_ci_keeps_required_checks_and_acceptance_variants():
     assert checkout["with"]["fetch-depth"] == 0
     for step in preflight:
         assert step.get("if") is None and not step.get("continue-on-error", False)
+    database_step = next(
+        step for step in jobs["database-inputs"]["steps"]
+        if step.get("name") == "Check source capture and retained inputs on real engines")
+    for backend in ("POSTGRES", "MYSQL", "SQLSERVER"):
+        assert database_step["env"]["AUTOFORECAST_TEST_INPUT_" + backend + "_DSN"]
+        assert database_step["env"]["AUTOFORECAST_REQUIRE_INPUT_" + backend] == "1"
+    assert database_step["env"]["RAY_DEFAULT_OBJECT_STORE_MAX_MEMORY_BYTES"] == "134217728"
+    database_groups = jobs["database-inputs"]["strategy"]["matrix"]["include"]
+    assert jobs["database-inputs"]["strategy"]["fail-fast"] is False
+    assert {row["filter"] for row in database_groups} == {
+        "postgres or release", "not (postgres or release)",
+    }
+    assert len(database_groups) == 2
+    assert sum(row["minimum"] for row in database_groups) == 603
+    assert '-k "not bigquery and (${{ matrix.filter }})"' in database_step["run"]
+    regression_step = next(step for step in jobs["regressions"]["steps"]
+                           if step.get("name") == "Unit and workflow regressions")
+    assert regression_step["env"]["AUTOFORECAST_TEST_POSTGRES_DSN"]
+    assert not any(name.startswith("AUTOFORECAST_TEST_INPUT_")
+                   for name in regression_step["env"])
     required = {
         ("preflight", "Install checked CI tools"): (
             "uv lock --check", "uv export --frozen", '--constraint "$RUNNER_TEMP/constraints.txt"',
@@ -375,7 +395,9 @@ def test_ci_orders_stages_and_requires_every_result():
     assert not step.get("continue-on-error", False)
     assert step["shell"] == "bash"
     assert step.get("env", {}) == {}
-    for values in itertools.product(("success", "failure", "cancelled", "skipped"), repeat=4):
+    for values in itertools.product(
+        ("success", "failure", "cancelled", "skipped"), repeat=len(gate["env"]),
+    ):
         result = subprocess.run(
             ["bash", "-c", step["run"]],
             env={**os.environ, **dict(zip(gate["env"], values, strict=True))},

@@ -59,6 +59,9 @@ Already have training and testing DataFrames? Follow [supply your own stages](tu
 Validation is optional; leaving it out creates no extra split. For application data rules, see
 [prepare and check data](tutorials/11-prepare-and-check-data.ipynb).
 You can also [create or reuse a study in one call](tutorials/README.md#create-or-reuse-a-study-in-one-call).
+To save a source read and build several studies from it, follow
+[reuse raw source data](tutorials/13-reuse-source-captures.ipynb). Each study still makes
+its own decisions about dates, eligible series and scoring.
 
 Choose an optional destination: [Delta](tutorials/07-publish-delta.ipynb),
 [PostgreSQL](tutorials/08-publish-postgresql.ipynb), or [BigQuery](tutorials/09-publish-bigquery.ipynb).
@@ -66,24 +69,10 @@ The default saves results to files and needs none of these databases.
 
 ## Databricks and shared storage
 
-Managed Delta source queries work with Spark Connect, including Serverless. Queries read
-only their declared aliases, with one pinned Delta version per physical source table.
-Script transforms and Spark `${...}` substitution are not accepted in managed source SQL.
+For setup instructions and current limits, see the
+[Databricks tutorial guide](tutorials/README.md#databricks-and-shared-storage).
 
-A storage root under `/Volumes/catalog/schema/volume/...` uses the Databricks Files API
-for immutable files and shared locks. The SDK must authenticate to the same workspace as
-Spark and have read/write access to the volume. Other paths keep the local POSIX behavior.
-Hash checks read fresh remote bytes into temporary local storage, so allow local disk space
-for the checked artifact. Individual files published through Files API 2.0 are limited to 5 GiB.
-
-Execution logs on volumes save each event separately, so progress does not rewrite the growing log.
-Use `read_execution_events(path)` to read these logs or ordinary local logs.
-
-A stopped process can leave a volume lock behind. A later run stops instead of stealing it.
-Confirm that the owning run has stopped before removing that lock; do not remove an active
-writer's lock. Existing study files and SHA mismatches are never silently replaced.
-
-### Keep saved runs safe
+## Keep saved runs safe
 
 Give each run its own folder and leave saved data and results unchanged.
 
@@ -110,10 +99,13 @@ Your model can use the supplied training data, dates, parameters and random seed
 Source retention records files; it cannot prove which notebook cells or hidden state were used.
 Keep relevant helper code in the configured source roots and settings in the model profile.
 
-New studies use Spark workers to fingerprint large datasets and local hashing for small
-evidence tables. Both produce the same identity. When a protected study is reopened,
-AutoForecast checks its frozen files and reuses the verified fingerprint. Changing
-a frozen file still fails the check. Existing studies keep their original hash format.
+By default, registration saves files and records their checksums. Reopening a study
+checks those files before using them. Large datasets use Spark for hashing; small
+evidence tables use local hashing.
+
+Registration can also keep inputs in a protected database archive. Correcting today's
+source does not change an older study. See [keep experiment inputs](tutorials/12-retained-inputs.ipynb)
+for the available modes, setup and limits.
 
 ## Install other models
 
@@ -145,7 +137,7 @@ job logs and failure details.
 
 Tests live beside the code. Install the `ci` dependency group and required extras,
 then run `python scripts/run_tests.py`. Each test module runs in a separate process.
-CI checks linting, types, regressions, installed wheels and model extras.
+CI checks linting, types, regressions, installed wheels, model extras and real database engines.
 Local Linux containers give useful feedback; ARM containers do not replace Linux x86_64 checks.
 
 [Study API](autoforecast/study.py) · [Callback types](autoforecast/study_tuning.py) ·

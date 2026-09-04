@@ -1467,3 +1467,31 @@ def test_registration_upgrade_requires_fresh_definition_tables(store, tmp_path, 
         second._publish_definition(current)
     rows, _ = store.read("studies", {"study_id": study_id})
     assert rows.count() == 1
+
+
+def test_reused_file_capture_publishes_its_study_binding_and_survives_capture_release(
+    store, tmp_path,
+):
+    import yaml
+
+    from autoforecast.benchmark import digest
+    from autoforecast.study_registration import StudyRegistry, register_study
+    from autoforecast.test_study_registration import configuration
+
+    config = configuration(tmp_path)
+    with StudyRegistry(tmp_path / "registry", spark=store.spark,
+                       namespace=store.namespace) as registry:
+        capture_id = registry.capture_sources(config)
+        settings = yaml.safe_load(config.read_text())
+        settings["source"] = {"kind": "capture", "capture_id": capture_id}
+        config.write_text(yaml.safe_dump(settings))
+        study_id = register_study(config, registry=registry)
+        definition, binding = registry.definition(study_id)
+        saved = store.read("studies", {"study_id": study_id})[0].collect()
+        assert len(saved) == 1
+        assert saved[0][1] == binding == digest(definition)
+        assert saved[0][1] != definition["source"]["capture_sha256"]
+        registry.release(capture_id)
+        with registry.load_study(study_id) as study:
+            assert study.n_series == 2
+            assert study.testing_data.count() == 4

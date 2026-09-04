@@ -1120,6 +1120,9 @@ def run_request(
         parsed_contract = loads_exact_json(raw_contract)
         if type(parsed_contract) is not dict:
             raise TrainWorkflowError("evaluation contract must be an object")
+        if parsed_contract.get("schema") == "autoforecast.fixed-evaluation.v3":
+            raise TrainWorkflowError("the command-line runner requires file inputs; "
+                                     "use run_study for retained table inputs")
         fixed_contract = parsed_contract
     resources._require_fresh_spark_runtime(SparkSession, SparkContext)
     if type(seed) is not int or seed < 0:

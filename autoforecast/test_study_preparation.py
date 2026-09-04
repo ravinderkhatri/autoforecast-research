@@ -1061,7 +1061,8 @@ def test_admission_manifest_replacement_during_verification_is_rejected(tmp_path
 
     from autoforecast import study_registration as registration
 
-    folder = tmp_path / "admissions" / "study"
+    study_id = "a" * 64
+    folder = tmp_path / "admissions" / study_id
     names = ("starting_keys", "retained_keys", "exclusions", "final_keys", "native_exclusions")
     artifacts = {}
     for name in names:
@@ -1069,7 +1070,8 @@ def test_admission_manifest_replacement_during_verification_is_rejected(tmp_path
         path.mkdir(parents=True)
         pq.write_table(pa.table({"item": ["sensor-001"]}), path / "part.parquet")
         artifacts[name] = registration._artifact_record(path)
-    record = {"schema": "autoforecast.admission.v1", "artifacts": artifacts}
+    record = {"schema": "autoforecast.admission.v1", "study_id": study_id,
+              "identity": {}, "outcome": {}, "artifacts": artifacts}
     path = folder / "admission.json"
     payload = registration.record_bytes(record, format="json")
     path.write_bytes(payload)

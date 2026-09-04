@@ -105,18 +105,22 @@ def read_results(campaign_root: str | pathlib.Path) -> CampaignResults:
 
 def read_workflow_results(
     path: str | pathlib.Path, *, include_tuning: bool = True,
+    connections=None, scratch_root=None,
 ) -> CampaignResults:
     """Read verified custom-model workflow forecasts, scores and optional tuning windows."""
     from autoforecast.study_results import read_workflow_results as read
 
-    return read(path, include_tuning=include_tuning)
+    return read(path, include_tuning=include_tuning, connections=connections,
+                scratch_root=scratch_root)
 
 
-def read_tuning_results(path: str | pathlib.Path) -> CampaignResults:
+def read_tuning_results(
+    path: str | pathlib.Path, *, connections=None, scratch_root=None,
+) -> CampaignResults:
     """Read verified custom-model tuning attempts, including every retained window."""
     from autoforecast.study_results import read_tuning_results as read
 
-    return read(path)
+    return read(path, connections=connections, scratch_root=scratch_root)
 
 
 def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) -> CampaignResults:

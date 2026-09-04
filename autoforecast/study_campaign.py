@@ -46,6 +46,7 @@ from autoforecast.implementation import (
     verify_retained,
     worker_implementation,
 )
+from autoforecast.snapshots import study_inputs, worker_inputs
 from autoforecast.study_tuning import (
     FitPredictRequest,
     FitPredictResult,
@@ -137,6 +138,7 @@ def _entrypoint(
     return cast(Callable[[FitPredictRequest], FitPredictResult], function), sha
 
 
+@study_inputs
 def run_study_campaign(
     study,
     *,
@@ -532,6 +534,7 @@ def _watch_memory(stop: threading.Event, folder: pathlib.Path, limit_gib: float)
             return
 
 
+@worker_inputs
 def _model_job(
     request_path: str, request_sha: str, index: int, phase: str, campaign_root: str,
     validation_record: dict | None, parent_attempt: str | None = None,

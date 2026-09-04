@@ -64,6 +64,9 @@
     "autoforecast/integrations/delta.py",
     "autoforecast/integrations/postgres.py",
     "autoforecast/integrations/bigquery.py",
+    "autoforecast/integrations/mysql.py",
+    "autoforecast/integrations/sqlserver.py",
+    "autoforecast/snapshots.py",
     "autoforecast/data_observability.py"
   ]
 }

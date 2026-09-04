@@ -10,6 +10,7 @@ import math
 import pathlib
 import shutil
 import tempfile
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -24,6 +25,7 @@ from autoforecast import grid
 from autoforecast._execution import reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
+    NATIVE_SCHEMA,
     START_COLUMN,
     BenchmarkError,
     _actuals_role,
@@ -33,6 +35,7 @@ from autoforecast.benchmark import (
     artifact_path,
     boundary,
     digest,
+    input_path,
     parquet_content_hash,
     read_benchmark_manifest,
     study_source_roles,
@@ -41,6 +44,7 @@ from autoforecast.benchmark import (
     verify_benchmark,
 )
 from autoforecast.frequency import canonical_origin, parse_frequency, parse_origin, period_points
+from autoforecast.snapshots import study_inputs
 from provenance.lineage import directory_digest
 
 if TYPE_CHECKING:
@@ -95,6 +99,7 @@ def _source_key_error(frame: DataFrame, record: dict, series_col: str) -> str | 
     return None
 
 
+@study_inputs
 @reported("Check window coverage and cohort")
 def preflight_study(
     study: Study, options: dict, *, output_dir: str | pathlib.Path | None = None,
@@ -148,7 +153,8 @@ def preflight_study(
     return result
 
 
-def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) -> PreflightResult:
+def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path,
+               *, reuse=None) -> PreflightResult:
     record = study._record(data=True)
     if "execution_policy" in record:
         frozen = record["execution_policy"]
@@ -167,8 +173,14 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             spark=study._spark,
             scratch_root=study._snapshots.name,
             _expected_sha256=record["parent"]["sha256"],
+            connections=(study._native_inputs.connections
+                         if study._native_inputs is not None else None),
         ) as parent:
-            result = _preflight(parent, options, report, output)
+            scope = parent._native_inputs
+            with scope.active() if scope is not None else nullcontext():
+                result = _preflight(parent, options, report, output,
+                                    reuse=(study._path, record) if record["schema"] == NATIVE_SCHEMA
+                                    else None)
         if result.study_id != record["study_id"]:
             raise BenchmarkError("derived availability contract changed")
         return result
@@ -426,7 +438,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         )
     for key, (_stage, _origin, _horizon) in by_key.items():
         report["current_check"] = {"stage": _stage, "origin": _origin}
-        grid_path = study._path.parent / record["grids"][key]["path"]
+        grid_path = input_path(study._path, record, record["grids"][key]["path"])
         expected = {(sid, point) for sid in ids for point in points[key]}
         seen_grid = set()
         for row in _rows(grid_path, ["series_id", "date"]):
@@ -436,7 +448,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             seen_grid.add(cell)
         if seen_grid != expected:
             raise BenchmarkError(f"{key}: forecast grid is missing required series/date cells")
-        coverage_path = study._path.parent / record["coverage"][key]["path"]
+        coverage_path = input_path(study._path, record, record["coverage"][key]["path"])
         coverage = list(_rows(coverage_path))
         expected_coverage = []
         for sid in ids:
@@ -648,7 +660,8 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
     path = study._path
     if policy == "use_available" or policy == "exclude_unavailable" and retained != ids:
         path = _derive(
-            study, record, retained, resolved, coverage_rows, role_counts, minimum, policy
+            study, record, retained, resolved, coverage_rows, role_counts, minimum, policy,
+            reuse=reuse,
         )
     effective_sha = (study._sha256 if path == study._path
                      else hashlib.sha256(read_path_bytes(path)).hexdigest())
@@ -656,6 +669,8 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         path, study._sha256 if path == study._path else None, spark=study._spark,
         _reuse_verified=path == study._path, _scratch_root=study._snapshots.name,
     )
+    if record["schema"] == NATIVE_SCHEMA and effective["study_id"] != path.parent.name:
+        raise BenchmarkError("effective native study identity differs from its selected path")
     read_benchmark_manifest(path, effective_sha)
     report.update(
         status="passed",
@@ -667,13 +682,146 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
     )
 
 
-def _derive(study, original, retained, windows, coverage_rows, role_counts, minimum, policy):
+def _derive(study, original, retained, windows, coverage_rows, role_counts, minimum, policy,
+            *, reuse=None):
+    if reuse is not None:
+        return _derive_owned(study, original, retained, windows, coverage_rows,
+                             role_counts, minimum, policy, reuse=reuse)
+    if original["schema"] == NATIVE_SCHEMA:
+        from mlops._safe_files import path_exists, publish_bytes
+
+        from autoforecast.snapshots import CaptureAttempt, RetainedInputs, current_inputs
+        from autoforecast.study_registration import (
+            _bytes,
+            _fields,
+            _publication_lock,
+            _read_saved,
+            _staging_directories,
+        )
+
+        registry_root = study._path.parent.parent.parent
+        parent = {"path": str(study._path.resolve()), "sha256": study._sha256,
+                  "study_id": original["study_id"]}
+        decision = {"parent": parent, "execution_policy": {
+            "series_policy": policy, "minimum_history": minimum,
+            "retained_ids": retained, "windows": windows,
+        }}
+        directory = registry_root / "derivations" / digest(decision)
+
+        def matches(saved):
+            return (saved["schema"] == NATIVE_SCHEMA and saved.get("parent") == parent
+                    and all(saved.get("execution_policy", {}).get(key) == value
+                            for key, value in decision["execution_policy"].items()))
+
+        with _publication_lock(directory):
+            lookup = directory / "derivation.json"
+            existing = path_exists(lookup)
+            selected = None
+            if existing:
+                binding = _fields(_read_saved(lookup), {
+                    "schema", "decision", "study_id", "manifest_sha256",
+                }, label="native derivation lookup")
+                if (binding["schema"] != "autoforecast.native-derivation.v1"
+                        or binding["decision"] != decision or any(
+                            not isinstance(binding[key], str) or len(binding[key]) != 64
+                            or any(character not in "0123456789abcdef"
+                                   for character in binding[key])
+                            for key in ("study_id", "manifest_sha256")
+                        )):
+                    raise BenchmarkError("native derivation lookup identity changed")
+                path = study._path.parent.parent / binding["study_id"] / "benchmark.json"
+                _, saved = read_benchmark_manifest(path, binding["manifest_sha256"])
+                if saved["study_id"] != binding["study_id"] or not matches(saved):
+                    raise BenchmarkError("native derivation lookup selects a different decision")
+                selected = path, saved, binding["manifest_sha256"]
+            else:
+                # Recover publication interrupted before its small lookup was saved.
+                # Normal repeats authenticate one lookup instead of scanning all studies.
+                for candidate in _staging_directories(study._path.parent.parent):
+                    if (len(candidate.name) != 64
+                            or any(c not in "0123456789abcdef" for c in candidate.name)):
+                        continue
+                    path = candidate / "benchmark.json"
+                    pinned = hashlib.sha256(read_path_bytes(path)).hexdigest()
+                    _, saved = read_benchmark_manifest(path, pinned)
+                    if saved["study_id"] != candidate.name or candidate.is_symlink():
+                        raise BenchmarkError("published derivation identity differs from its path")
+                    if matches(saved):
+                        if selected is not None:
+                            raise BenchmarkError("multiple native derivations match this decision")
+                        selected = path, saved, pinned
+            if selected is not None:
+                path, saved, pinned = selected
+                if path_exists(registry_root / "released" / (saved["study_id"] + ".json")):
+                    raise BenchmarkError("native derivation has been released or is being released")
+                # Verification obtains a reader lease before the selection lock is released.
+                verify_benchmark(path, pinned, spark=study._spark)
+                result = _derive_owned(study, original, retained, windows, coverage_rows,
+                                       role_counts, minimum, policy, reuse=(path, saved))
+            else:
+                reference = next(iter(original["snapshots"].values()))
+                scope = current_inputs()
+                store = scope.connections.snapshot_store({
+                    "connection": reference["connection"],
+                    "namespace": reference["object"].rsplit(".", 1)[0],
+                })
+                for original_reference in original["snapshots"].values():
+                    if (store.backend != original_reference["backend"]
+                            or store.namespace != original_reference["object"].rsplit(".", 1)[0]):
+                        raise BenchmarkError(
+                            "native derivation destination differs from its parent",
+                        )
+                    store.inspect(original_reference, retained=True)
+                manager = RetainedInputs(
+                    mode=original["snapshot_mode"], connection=reference["connection"],
+                    store=store, scratch_root=scope.scratch_root,
+                    journal_root=registry_root / "capture-journal",
+                )
+                with CaptureAttempt(manager, spark=study._spark).active() as attempt:
+                    result = _derive_owned(study, original, retained, windows, coverage_rows,
+                                           role_counts, minimum, policy, attempt=attempt)
+                    attempt.published()
+                pinned = hashlib.sha256(read_path_bytes(result)).hexdigest()
+                _, saved = verify_benchmark(result, pinned, spark=study._spark)
+                if saved["study_id"] != result.parent.name or not matches(saved):
+                    raise BenchmarkError("published native derivation decision changed")
+            if not existing:
+                publish_bytes(directory, lookup.name, _bytes({
+                    "schema": "autoforecast.native-derivation.v1", "decision": decision,
+                    "study_id": saved["study_id"], "manifest_sha256": pinned,
+                }))
+            return result
+    return _derive_owned(study, original, retained, windows, coverage_rows,
+                         role_counts, minimum, policy)
+
+
+def _derive_owned(study, original, retained, windows, coverage_rows, role_counts, minimum, policy,
+                  *, attempt=None, reuse=None):
     """Publish one content-addressed definition; unchanged role Parquet stays in the parent."""
     from autoforecast import _logical_hash
 
     record = copy.deepcopy(original)
+    native = original["schema"] == NATIVE_SCHEMA
 
     def content_hash(path, name):
+        if native:
+            if reuse is not None:
+                from autoforecast.snapshots import current_inputs
+
+                reference = reuse[1]["snapshots"][name]
+                expected = study._spark.read.parquet(str(path))
+                saved = study._spark.read.parquet(str(current_inputs().materialize(reference)))
+                if (expected.schema != saved.schema
+                        or expected.exceptAll(saved).limit(1).count()
+                        or saved.exceptAll(expected).limit(1).count()):
+                    raise BenchmarkError("derived native input differs from its parent decisions")
+            else:
+                if attempt is None:
+                    raise BenchmarkError("native derivation requires an owned capture attempt")
+                reference = attempt.bind(path)["snapshot"]
+                attempt.retain(reference)
+            record["snapshots"][name] = reference
+            return reference
         if "logical_hashes" not in record:
             return parquet_content_hash(path)
         record["logical_hashes"][name] = _logical_hash.fingerprint(path, spark=study._spark)
@@ -731,8 +879,13 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
                 (scratch / role).mkdir()
                 pq.write_table(table, scratch / role / "part.parquet")
                 record["role_paths"][role] = role
-                record["artifacts"][role] = directory_digest(scratch / role, suffixes=(".parquet",))
-                record["logical_snapshots"][role] = content_hash(scratch / role, role)
+                if native:
+                    record["artifacts"][role] = content_hash(scratch / role, role)
+                else:
+                    record["artifacts"][role] = directory_digest(
+                        scratch / role, suffixes=(".parquet",),
+                    )
+                    record["logical_snapshots"][role] = content_hash(scratch / role, role)
                 record["inherited_roles"].remove(role)
             for role, counts in role_counts.items():
                 record["counts"][role] = {
@@ -750,27 +903,34 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
             path = scratch / "grids" / key
             path.mkdir(parents=True)
             table = ds.dataset(
-                study._path.parent / original["grids"][key]["path"], format="parquet"
+                input_path(study._path, original, original["grids"][key]["path"]), format="parquet"
             ).to_table()
             table = table.filter(field("series_id").isin(window["eligible_ids"]))
             pq.write_table(table, path / "part.parquet")
-            logical = grid.content_hash(path, study._spark, frequency=study.panel.frequency)
-            record["grids"][key].update(
-                sha256=directory_digest(path, suffixes=(".parquet",)),
-                logical_sha256=logical,
-                n_cells=len(table),
-            )
-            record["grid_identities"][key] = {
-                "content_sha256": content_hash(path, "grids/" + key),
-                "logical_sha256": logical,
-                "n_cells": len(table),
-            }
+            record["grids"][key]["n_cells"] = len(table)
+            if native:
+                record["grid_identities"][key] = {
+                    "snapshot": content_hash(path, "grids/" + key), "n_cells": len(table),
+                }
+            else:
+                logical = grid.content_hash(path, study._spark, frequency=study.panel.frequency)
+                record["grids"][key].update(
+                    sha256=directory_digest(path, suffixes=(".parquet",)),
+                    logical_sha256=logical,
+                )
+                record["grid_identities"][key] = {
+                    "content_sha256": content_hash(path, "grids/" + key),
+                    "logical_sha256": logical,
+                    "n_cells": len(table),
+                }
             path = scratch / "coverage" / key
             path.mkdir(parents=True)
             pq.write_table(pa.Table.from_pylist(coverage_rows[key]), path / "part.parquet")
-            record["coverage"][key]["sha256"] = directory_digest(path, suffixes=(".parquet",))
+            if not native:
+                record["coverage"][key]["sha256"] = directory_digest(path, suffixes=(".parquet",))
             record["coverage_identities"][key] = {
-                "content_sha256": content_hash(path, "coverage/" + key),
+                ("snapshot" if native else "content_sha256"):
+                    content_hash(path, "coverage/" + key),
                 "counts": {
                     name: sum(row[name] for row in coverage_rows[key])
                     for name in (
@@ -782,8 +942,22 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
                     )
                 },
             }
+        if native:
+            if reuse is not None:
+                record["owned_snapshots"] = reuse[1]["owned_snapshots"]
+            else:
+                assert attempt is not None
+                record["owned_snapshots"] = attempt.retained_snapshots()
         identity = digest(_identity(record))
         record.update(study_id=identity, benchmark_id=identity)
+        if reuse is not None:
+            if identity != reuse[1]["study_id"]:
+                raise BenchmarkError("derived availability contract changed")
+            return reuse[0]
+        if native:
+            for directory in scratch.iterdir():
+                if directory.is_dir():
+                    shutil.rmtree(directory)
         _write_json(scratch / "benchmark.json", record)
         destination = study._path.parent.parent / identity
         _publish_frozen_benchmark(scratch, destination, identity, spark=study._spark)

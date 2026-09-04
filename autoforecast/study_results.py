@@ -17,7 +17,12 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from mlops._safe_files import read_regular_bytes
 
-from autoforecast.benchmark import artifact_path, digest, verify_benchmark
+from autoforecast.benchmark import (
+    artifact_binding,
+    digest,
+    snapshot_bound_input,
+    verify_benchmark,
+)
 from autoforecast.experiments import load_completed_attempt
 from autoforecast.frequency import parse_frequency
 from autoforecast.hpo import HPOError
@@ -222,8 +227,9 @@ def _tables(windows: list, runs: list, metadata: dict) -> CampaignResults:
         study_path, frozen = verify_benchmark(
             pathlib.Path(study["path"]), study["sha256"],
         )
-        source_keys = read(artifact_path(study_path, frozen, "source-keys"),
-                           frozen["artifacts"]["source-keys"])
+        source_keys = pq.read_table(snapshot_bound_input(
+            artifact_binding(study_path, frozen, "source-keys"), snapshots / "source-keys",
+        ))
         frequency = frozen["recipe"]["frequency"]
         schema = ROW_SCHEMA
         if parse_frequency(frequency).key_kind == "timestamp":
@@ -282,8 +288,16 @@ def _tables(windows: list, runs: list, metadata: dict) -> CampaignResults:
 
 def read_workflow_results(
     path: str | pathlib.Path, *, include_tuning: bool = True,
+    connections=None, scratch_root=None,
 ) -> CampaignResults:
     """Read completed workflow stages and, by default, its retained search attempts."""
+    from autoforecast.snapshots import input_scope
+
+    with input_scope(connections=connections, scratch_root=scratch_root):
+        return _read_workflow_results(path, include_tuning=include_tuning)
+
+
+def _read_workflow_results(path, *, include_tuning):
     run = load_forecast_workflow(path)
     windows, runs, search_identity = _workflow_windows(run, include_tuning=include_tuning)
     result = _tables(windows, runs, {
@@ -299,8 +313,17 @@ def read_workflow_results(
     return result
 
 
-def read_tuning_results(path: str | pathlib.Path) -> CampaignResults:
+def read_tuning_results(
+    path: str | pathlib.Path, *, connections=None, scratch_root=None,
+) -> CampaignResults:
     """Read a selected or failed search's authenticated completed windows and attempt metadata."""
+    from autoforecast.snapshots import input_scope
+
+    with input_scope(connections=connections, scratch_root=scratch_root):
+        return _read_tuning_results(path)
+
+
+def _read_tuning_results(path):
     root = pathlib.Path(path).absolute()
     windows, runs, info, identity = _search_windows(root)
     result = _tables(windows, runs, {

@@ -12,14 +12,21 @@ from typing import cast
 
 from pyspark.sql import SparkSession
 
-from autoforecast.benchmark import STUDY_SCHEMAS, evaluation_contract, verify_benchmark
+from autoforecast.benchmark import (
+    STUDY_SCHEMAS,
+    bound_input_path,
+    evaluation_contract,
+    verify_benchmark,
+)
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.forecast_campaign import _load_json_with_identity, _verified_forecast
 from autoforecast.results import read_results
 from autoforecast.run_evaluation import compare_run_forecasts
+from autoforecast.snapshots import worker_inputs
 from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 
+@worker_inputs
 def rescore_campaign(
     campaign_root: pathlib.Path, study_path: pathlib.Path, output_dir: pathlib.Path,
     spark: SparkSession,
@@ -64,7 +71,7 @@ def rescore_campaign(
             )
             if fixed["study"]["sha256"] != study_sha:
                 raise ValueError("scoring study changed between retained forecasts")
-            panel = dataset.panel(fixed["actuals"]["path"])
+            panel = dataset.panel(bound_input_path(fixed["actuals"]))
             with tempfile.TemporaryDirectory(prefix="autoforecast-rescore-") as temporary:
                 forecast_snapshot = snapshot_parquet_directory(
                     pathlib.Path(forecast.path), pathlib.Path(temporary) / "forecast",

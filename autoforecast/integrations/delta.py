@@ -19,8 +19,8 @@ from mlops import _volume_files
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
-from sqlglot import exp, parse
-from sqlglot.errors import ParseError
+from sqlglot import Dialect, exp, parse
+from sqlglot.errors import ParseError, TokenError
 from sqlglot.expressions.dml import DML
 
 from autoforecast import _logical_hash
@@ -96,11 +96,11 @@ def validate_source_queries(spark: SparkSession | None, *, queries: Mapping[str,
     return {name: _bound_source_sql(sql, bindings) for name, sql in queries.items()}
 
 
-def _bound_source_sql(sql: str, bindings: Mapping[str, str]) -> str:
+def _bound_source_sql(sql: str, bindings: Mapping[str, str], *, dialect="spark") -> str:
     """Check a SELECT and replace only its parsed source names with DataFrame slots.
 
     Args:
-        sql: Original Spark SQL. Its literals, comments and expressions stay intact.
+        sql: Original SQL. Its literals, ordinary comments and expressions stay intact.
         bindings: Case-folded source aliases mapped to Spark SQL keyword arguments.
 
     Returns:
@@ -113,9 +113,15 @@ def _bound_source_sql(sql: str, bindings: Mapping[str, str]) -> str:
     if "${" in sql:
         raise ValueError("source SQL does not support variable substitution")
     try:
-        statements = [statement for statement in parse(sql, read="spark")
+        if dialect == "mysql" and any(
+            comment.startswith(("!", "M!", "m!"))
+            for token in Dialect.get_or_raise(dialect).tokenize(sql)
+            for comment in token.comments
+        ):
+            raise ValueError("source SQL does not support executable MySQL comments")
+        statements = [statement for statement in parse(sql, read=dialect)
                       if statement is not None and not isinstance(statement, exp.Semicolon)]
-    except ParseError as error:
+    except (ParseError, TokenError) as error:
         raise ValueError("source SQL is not a supported SELECT") from error
     queries = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
     if len(statements) != 1 or not isinstance(statements[0], queries):
@@ -163,7 +169,7 @@ def _bound_source_sql(sql: str, bindings: Mapping[str, str]) -> str:
             raise ValueError("source SQL has an unsupported relation token")
         replacement = "{" + bindings[node.name.casefold()] + "}"
         if not node.alias:
-            replacement += " AS " + quote_table(node.name)
+            replacement += " AS " + exp.to_identifier(node.name, quoted=True).sql(dialect=dialect)
         replacements.append((start, end + 1, replacement))
     parts = []
     cursor = 0

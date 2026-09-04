@@ -55,7 +55,7 @@ def config(root, *, budget=2, backend="optuna", seed=9):
     return path
 
 
-def freeze(root, spark, *, hourly=False, monthly=False, windows=True, missing=False, metric="rmse", zero_targets=False):
+def freeze(root, spark, *, hourly=False, monthly=False, windows=True, missing=False, metric="rmse", zero_targets=False, native_inputs=None):
     # Population: two series A/B, zero exclusions, four cells in the inner window.
     root.mkdir(parents=True, exist_ok=True)
     def point(day):
@@ -89,9 +89,13 @@ def freeze(root, spark, *, hourly=False, monthly=False, windows=True, missing=Fa
             for sid, weight in (("A", 0.8), ("B", 0.2))
             for stage, day in (("tuning", 3), ("validation", 5), ("test", 7))
         ]), refs)
-    return benchmark.freeze_benchmark(contract_path=dataset, sources=dict.fromkeys(
+    freezer = benchmark.freeze_benchmark if native_inputs is None else benchmark._freeze_verified
+    options = {} if native_inputs is None else {"native_inputs": native_inputs}
+    result = freezer(contract_path=dataset, sources=dict.fromkeys(
         ("selection", "final_training", "validation_score", "final_score"), source,
-    ), recipe=recipe, scoring_references=refs, output_root=root / ".autoforecast/benchmarks", spark=spark)
+    ), recipe=recipe, scoring_references=refs, output_root=root / ".autoforecast/benchmarks",
+        spark=spark, **options)
+    return result if native_inputs is None else result.path
 
 
 @pytest.fixture(scope="module")

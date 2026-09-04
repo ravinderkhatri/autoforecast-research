@@ -259,6 +259,9 @@ class ForecastTrialBridge:
         contract = loads_exact_json(raw)
         if type(contract) is not dict:
             raise HPOError("HPO study evaluation contract must be an object")
+        if contract.get("schema") == "autoforecast.fixed-evaluation.v3":
+            raise HPOError("the command-line HPO bridge requires file inputs; "
+                           "use Study.tune for retained table inputs")
         verify_study_evaluation(contract)
         return contract
 

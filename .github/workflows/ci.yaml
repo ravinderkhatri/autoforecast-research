@@ -72,7 +72,7 @@ jobs:
         run: |
           uv lock --check
           uv export --frozen --no-hashes --no-emit-project --group ci \
-            --extra shallow --extra tft --extra custom-torch --extra timesfm3 --extra postgres --extra bigquery --output-file "$RUNNER_TEMP/constraints.txt"
+            --extra shallow --extra tft --extra custom-torch --extra timesfm3 --extra postgres --extra bigquery --extra mysql --extra sqlserver --output-file "$RUNNER_TEMP/constraints.txt"
           uv pip install --system --no-deps --constraint "$RUNNER_TEMP/constraints.txt" \
             torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
@@ -81,7 +81,7 @@ jobs:
           python -m scripts.verify_public_release --wheel "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl"
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
             --build-constraints "$RUNNER_TEMP/constraints.txt" \
-            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[shallow,tft,custom-torch,timesfm3,postgres,bigquery]"
+            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[shallow,tft,custom-torch,timesfm3,postgres,bigquery,mysql,sqlserver]"
           uv pip check --system
           python - <<'PY'
           import importlib.metadata
@@ -286,17 +286,108 @@ jobs:
           assert not any(d.metadata['Name'].startswith('nvidia-') for d in importlib.metadata.distributions())
           print("Selected model libraries and CPU backend are available; weights were not downloaded.")
           PY
+  database-inputs:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      # Group PostgreSQL and release workflows to balance measured test times.
+      # These complementary filters execute each non-cloud case exactly once.
+      matrix:
+        include:
+          - shard: 1
+            filter: postgres or release
+            minimum: 177
+          - shard: 2
+            filter: not (postgres or release)
+            minimum: 426
+    services:
+      postgres:
+        image: postgres@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db
+        env:
+          POSTGRES_PASSWORD: local-ci-only
+          POSTGRES_DB: autoforecast_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d autoforecast_test"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+        env:
+          MYSQL_ROOT_PASSWORD: local-ci-only
+          MYSQL_DATABASE: autoforecast_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot --password=local-ci-only"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server@sha256:49b45a911dc535e9345fbfd7101a1bd8a1e190a5f29b877ef75387a061e5fcf0
+        env:
+          ACCEPT_EULA: 'Y'
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: Local-ci-test-only-2026!
+          MSSQL_MEMORY_LIMIT_MB: '1024'
+        ports:
+          - 1433:1433
+        options: >-
+          --memory 2g
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Local-ci-test-only-2026! -C -Q 'SELECT 1' -b"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          version: '0.11.32'
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install database input dependencies
+        run: uv sync --frozen --extra mysql --extra postgres --extra sqlserver --group ci
+      - name: Check source capture and retained inputs on real engines
+        env:
+          AUTOFORECAST_TEST_INPUT_MYSQL_DSN: mysql://root:local-ci-only@127.0.0.1:3306/autoforecast_test
+          AUTOFORECAST_REQUIRE_INPUT_MYSQL: '1'
+          AUTOFORECAST_TEST_INPUT_POSTGRES_DSN: postgresql://postgres:local-ci-only@127.0.0.1:5432/autoforecast_test
+          AUTOFORECAST_REQUIRE_INPUT_POSTGRES: '1'
+          AUTOFORECAST_TEST_INPUT_SQLSERVER_DSN: 'Server=127.0.0.1,1433;Database=master;UID=sa;PWD=Local-ci-test-only-2026!;Encrypt=yes;TrustServerCertificate=yes'
+          AUTOFORECAST_REQUIRE_INPUT_SQLSERVER: '1'
+          # Test workers exchange small requests and paths through Ray.
+          RAY_DEFAULT_OBJECT_STORE_MAX_MEMORY_BYTES: '134217728'
+          EXPECTED_TEST_CASES: '${{ matrix.minimum }}'
+          SPARK_LOCAL_IP: '127.0.0.1'
+        run: |
+          test "$(uname -m)" = x86_64
+          uv run --no-sync python -m pytest -q -rs -x autoforecast/integrations/test_snapshots.py \
+            -k "not bigquery and (${{ matrix.filter }})" --junitxml="$RUNNER_TEMP/database-inputs.xml"
+          uv run --no-sync python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          report = ET.parse(os.path.join(os.environ["RUNNER_TEMP"], "database-inputs.xml"))
+          cases = list(report.iter("testcase"))
+          assert len(cases) >= int(os.environ["EXPECTED_TEST_CASES"]), "Database gate did not execute its expected cases"
+          assert not any(case.find(tag) is not None for case in cases
+                         for tag in ("failure", "error", "skipped")), "Database gate is incomplete"
+          print(f"Database engine gate: {len(cases)} cases, no skips")
+          PY
   checks:
     if: always()
-    needs: [preflight, regressions, installed-wheel, installed-models]
+    needs: [preflight, regressions, installed-wheel, installed-models, database-inputs]
     runs-on: ubuntu-latest
     env:
       PREFLIGHT_RESULT: ${{ needs.preflight.result }}
       REGRESSION_RESULT: ${{ needs.regressions.result }}
       WHEEL_RESULT: ${{ needs.installed-wheel.result }}
       MODEL_RESULT: ${{ needs.installed-models.result }}
+      DATABASE_RESULT: ${{ needs.database-inputs.result }}
     steps:
       - name: Require every validation stage
         shell: bash
         run: |
-          test "$PREFLIGHT_RESULT $REGRESSION_RESULT $WHEEL_RESULT $MODEL_RESULT" = "success success success success"
+          test "$PREFLIGHT_RESULT $REGRESSION_RESULT $WHEEL_RESULT $MODEL_RESULT $DATABASE_RESULT" = "success success success success success"

@@ -248,3 +248,28 @@ def test_freeze_requires_validation_declaration_before_role_dispatch(tmp_path, e
     assert_input_error(cli("freeze", "--project-root", project, "--source", "data", *options),
                        "validation_origins")
     assert not (project / ".autoforecast").exists()
+
+
+def test_cli_refuses_native_inputs_before_resolving_their_rows(tmp_path, monkeypatch):
+    import hashlib
+
+    from autoforecast import benchmark
+    from autoforecast.cli import run_campaign
+    from autoforecast.forecast_campaign import ForecastCampaignError
+
+    project = tmp_path / 'example'
+    create_example(project)
+    manifest = project / '.autoforecast' / 'benchmarks' / ('a' * 64) / 'benchmark.json'
+    manifest.parent.mkdir(parents=True)
+    record = {
+        'schema': benchmark.NATIVE_SCHEMA, 'study_id': 'a' * 64,
+        'contract_sha256':hashlib.sha256((project/'dataset.yaml').read_bytes()).hexdigest(),
+        'artifacts':{'selection':{}}, 'role_paths':{'selection':'selection'},
+        'snapshots':{'selection':{}},
+    }
+    # This probe isolates refusal ordering after a manifest has already been parsed.
+    monkeypatch.setattr(benchmark, 'read_benchmark_manifest', lambda _: (manifest, record))
+    with pytest.raises(ForecastCampaignError, match='file inputs'):
+        run_campaign(project=project, request_path=project/'campaign.yaml',
+                     benchmark_path=manifest, output_root=project/'runs')
+    assert not (project/'.autoforecast/requests').exists()

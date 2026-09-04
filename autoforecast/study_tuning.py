@@ -8,6 +8,7 @@ import json
 import math
 import pathlib
 import re
+import shutil
 import tempfile
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, suppress
@@ -30,6 +31,7 @@ from autoforecast._execution import _stage, callable_name, note, reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
     _evaluation_contract_from_record,
+    bound_input_path,
     boundary,
     digest,
     read_benchmark_manifest,
@@ -51,6 +53,7 @@ from autoforecast.implementation import (
 )
 from autoforecast.panel import Forecast, Panel
 from autoforecast.project import library_revision
+from autoforecast.snapshots import study_inputs, worker_inputs
 from autoforecast.study_horizon_metrics import (
     ForecastAccuracyBreakdown,
     validate_forecast_accuracy_breakdown,
@@ -398,6 +401,7 @@ def _window_result(attempt: pathlib.Path, evidence: dict) -> dict:
     return {**record, "forecasts": forecast, "model_artifacts": model, **extra}
 
 
+@worker_inputs
 def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
     """Verify all attempts/windows and reload a completed search, without model execution."""
     root = pathlib.Path(path).absolute()
@@ -499,6 +503,12 @@ class _WindowInput:
         identity = context["evaluation_contract"]["study"]
         verify_benchmark(pathlib.Path(identity["path"]), identity["sha256"],
                          _reuse_verified=True)
+        if "native_inputs" in context:
+            from autoforecast.benchmark import verify_input_binding
+
+            for role, path in (("training", self.panel.path), ("mapping", self.mapping_path)):
+                verify_input_binding(pathlib.Path(path), context["native_inputs"][role])
+            return context
         for key, path in (
             ("training_sha256", self.panel.path),
             ("mapping_sha256", self.mapping_path),
@@ -539,9 +549,28 @@ def _prepare_window(
         "horizon": horizon,
         "history_zero_filled": (frame.filter(F.col(MISSING_COLUMN)).count()
                                 if study.recipe["history_missing"] == "zero" else 0),
-        "training_sha256": directory_digest(training, suffixes=(".parquet",)),
-        "mapping_sha256": directory_digest(mapping_path, suffixes=(".parquet",)),
     }
+    if "snapshot" in fixed["actuals"]:
+        from autoforecast.snapshots import current_inputs
+
+        scope = current_inputs()
+        bindings = {
+            role: {"snapshot": scope.capture_temporary(
+                path, template=fixed["actuals"]["snapshot"],
+                journal_root=study._path.parent.parent.parent / "capture-journal",
+            )}
+            for role, path in (("training", training), ("mapping", mapping_path))
+        }
+        # The callback receives only sealed, scope-owned transports. Its writable
+        # output directory is separate from these inputs.
+        shutil.rmtree(training)
+        shutil.rmtree(mapping_path)
+        training = scope.materialize(bindings["training"]["snapshot"])
+        mapping_path = scope.materialize(bindings["mapping"]["snapshot"])
+        context["native_inputs"] = bindings
+    else:
+        context.update(training_sha256=directory_digest(training, suffixes=(".parquet",)),
+                       mapping_sha256=directory_digest(mapping_path, suffixes=(".parquet",)))
     return _WindowInput(
         dataclasses.replace(panel, path=str(training)), mapping_path, _json_bytes(context)
     )
@@ -690,7 +719,7 @@ def _fit_window(
                 study_id=context["evaluation_contract"]["study_id"],
                 run_id=run_id, trial_id=trial_id) as outcome:
         score = score_study(
-            dataclasses.replace(panel, path=fixed["actuals"]["path"]),
+            dataclasses.replace(panel, path=str(bound_input_path(fixed["actuals"]))),
             forecast,
             spark,
             contract=fixed,
@@ -845,7 +874,8 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
     record = study._record()
     protected = [
         study._path.parent,
-        *(pathlib.Path(source["path"]) for source in record["sources"].values()),
+        *(pathlib.Path(source["path"]) for source in record["sources"].values()
+          if "path" in source),
     ]
     if any(root.is_relative_to(path.resolve()) for path in protected) or any(
         any(
@@ -864,6 +894,7 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
     return root
 
 
+@study_inputs
 def tune_study(
     study: Study,
     *,

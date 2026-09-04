@@ -18,7 +18,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from typing import Any, Protocol
 
 from mlops import _volume_files
@@ -73,6 +73,7 @@ from autoforecast.data_observability import report_source_issues
 from autoforecast.frequency import advance, canonical_origin, parse_frequency, parse_origin
 from autoforecast.grid import time_literal
 from autoforecast.integrations.delta import DeltaTable
+from autoforecast.snapshots import current_capture, current_inputs, managed_path
 from autoforecast.study import load_study
 from autoforecast.study_references import (
     check_wrmsse_references,
@@ -173,12 +174,22 @@ def _fields(value, required, optional=(), *, label) -> dict:
     return value
 
 
-def _configuration(path):
+def _configuration(path, *, connections=None):
     path = pathlib.Path(path).absolute()
-    return _configuration_value(read_record(path), path)
+    return _configuration_value(read_record(path), path, connections=connections)
 
 
-def _configuration_value(value, path, *, supplied_stages=False):
+def _configuration_value(value, path, *, supplied_stages=False, connections=None):
+    from autoforecast.snapshots import Connections
+
+    source = value.get("source") if isinstance(value, dict) else None
+    if isinstance(source, dict) and source.get("connection"):
+        resolver = connections or Connections(value.get("connections"))
+        kind = resolver.kind(source["connection"])
+        if "kind" not in source:
+            source["kind"] = kind
+        elif source["kind"] != kind:
+            raise ValueError("source.kind conflicts with its configured connection")
     validate_shape({**value, "source": {"kind": "parquet", "path": "captured-stage-input"}}
                    if supplied_stages else value)
     # All scientific validation happens before acquiring source data or provisioning tables.
@@ -189,16 +200,22 @@ def _configuration_value(value, path, *, supplied_stages=False):
     source = value["source"]
     if supplied_stages and source == {"kind": "supplied_stages"}:
         pass
+    elif isinstance(source, dict) and source.get("kind") == "capture":
+        _fields(source, {"kind", "capture_id"}, label="retained source capture")
     elif isinstance(source, dict) and source.get("kind") == "parquet":
         _fields(source, {"kind", "path"}, label="Parquet source")
         source["path"] = str((path.parent / source["path"]).absolute())
-    elif isinstance(source, dict) and source.get("kind") == "delta":
+    elif isinstance(source, dict) and source.get("kind") in {
+        "delta", "bigquery", "postgresql", "mysql", "sqlserver",
+    }:
         _fields(source, {"kind", "sql", "tables"},
-                {"audit_queries", "population", "require_matching_population"},
-                label="Delta source")
+                {"audit_queries", "population", "require_matching_population", "connection"},
+                label="table source")
+        if source["kind"] != "delta" and not source.get("connection"):
+            raise ValueError("table source requires an explicit connection alias")
         source["sql"] = (path.parent / source["sql"]).read_text()
         if not isinstance(source["tables"], dict) or not source["tables"]:
-            raise ValueError("Delta source requires alias-to-table mappings")
+            raise ValueError("table sources require alias-to-table mappings")
         audits = source.get("audit_queries", {})
         if (not isinstance(audits, dict) or any(not name.isidentifier() or name == "primary"
                                                for name in audits)):
@@ -210,7 +227,9 @@ def _configuration_value(value, path, *, supplied_stages=False):
         if type(source.get("require_matching_population", True)) is not bool:
             raise ValueError("require_matching_population must be boolean")
     else:
-        raise ValueError("source.kind must be parquet or delta")
+        raise ValueError(
+            "source.kind must be parquet, capture, delta, bigquery, postgresql, mysql or sqlserver",
+        )
     if value.get("invalid_references", "error") not in {"error", "exclude"}:
         raise ValueError("invalid_references must be error or exclude")
     if (value["recipe"]["metric"] == "wrmsse" or value["recipe"].get("reference_metrics")) and (
@@ -235,17 +254,37 @@ def _configuration_value(value, path, *, supplied_stages=False):
                 series_id=value["recipe"]["source_keys"], date_col=panel.time_col,
                 target_col=panel.target_col, **refs,
             )
+    Connections(value.get("connections"))
     _runtime(value.get("runtime", {}))
     _fields(value.get("records", {}), (), {"format"}, label="records")
     if value.get("records", {}).get("format", "json") not in {"json", "yaml"}:
         raise ValueError("records.format must be json or yaml")
     _scalar_settings(value.get("preparation", {}), "preparation")
     _validate_storage(value["storage"])
+    if "snapshot_mode" in value:
+        from autoforecast.snapshots import resolve_mode
+
+        if value["snapshot_mode"] is None:
+            raise ValueError("snapshot_mode must name an input storage mode")
+        resolve_mode(value["snapshot_mode"])
     return value, path.parent
 
 
 def _validate_storage(storage):
-    _fields(storage, {"root"}, {"scratch_root", "namespace", "tables"}, label="storage")
+    _fields(storage, {"root"},
+            {"scratch_root", "namespace", "tables", "snapshot_mode", "snapshots"}, label="storage")
+    from autoforecast.snapshots import resolve_mode
+
+    if "snapshot_mode" in storage:
+        if storage["snapshot_mode"] is None:
+            raise ValueError("storage.snapshot_mode must name an input storage mode")
+        resolve_mode(storage["snapshot_mode"])
+    if "snapshots" in storage:
+        destination = storage["snapshots"]
+        if (type(destination) is not dict or set(destination) != {"connection", "namespace"}
+                or any(type(value) is not str or not value.strip()
+                       for value in destination.values())):
+            raise ValueError("storage.snapshots requires a connection alias and namespace")
     for key in ("root", "scratch_root"):
         if key in storage and (not isinstance(storage[key], str)
                                or not storage[key].strip() or "://" in storage[key]):
@@ -281,6 +320,17 @@ class StudyConfigValidation:
         """Return fresh normalized settings, leaving the validated result unchanged."""
         return json.loads(self._payload)
 
+    @property
+    def input_storage(self) -> dict:
+        """Show the effective configured policy without connecting or creating objects."""
+        from autoforecast.snapshots import resolve_mode
+
+        value = self.configuration
+        mode = resolve_mode(value.get("snapshot_mode"), value["storage"].get("snapshot_mode"))
+        return {"snapshot_mode": mode, "source_kind": value["source"]["kind"],
+                "snapshot_destination": value["storage"].get("snapshots")
+                if mode != "hash" else "inactive"}
+
 
 def validate_study_config(path: str | pathlib.Path) -> StudyConfigValidation:
     """Validate YAML/JSON and local SQL files without Spark queries or storage writes.
@@ -296,8 +346,18 @@ def validate_study_config(path: str | pathlib.Path) -> StudyConfigValidation:
         validate_source_queries(None, queries={"primary": value["source"]["sql"],
                                                **value["source"]["audit_queries"]},
                                 tables=value["source"]["tables"])
+    elif value["source"]["kind"] in {"bigquery", "postgresql", "mysql", "sqlserver"}:
+        from autoforecast.snapshots import bind_source_queries
+
+        source = value["source"]
+        bind_source_queries({"primary": source["sql"], **source["audit_queries"]},
+                            source["tables"],
+                            dialect={"postgresql": "postgres", "bigquery": "bigquery",
+                                     "mysql": "mysql", "sqlserver": "tsql"}[source["kind"]],
+                            sources={alias: f"captured_{i}"
+                                     for i, alias in enumerate(source["tables"])})
     checked = StudyConfigValidation.checked
-    if value["source"]["kind"] == "delta":
+    if value["source"]["kind"] not in {"parquet", "capture"}:
         checked += ("source SQL syntax",)
     return StudyConfigValidation(pathlib.Path(path).absolute(), _bytes(value), checked=checked)
 
@@ -356,7 +416,7 @@ def _read_saved(path):
 
 
 @contextmanager
-def _publication_lock(root):
+def _publication_lock(root, *, blocking=True):
     import fcntl
 
     root.mkdir(parents=True, exist_ok=True)
@@ -366,7 +426,10 @@ def _publication_lock(root):
         return
     descriptor = os.open(root / ".registration.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "a") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            raise ValueError("capture still has an active owner") from None
         yield
 
 
@@ -388,6 +451,10 @@ def _remove_staging_directory(path):
 
 
 def _logical_record(path, spark):
+    capture = current_capture()
+    if capture is not None:
+        binding = capture.bind(path)
+        return {**binding, "rows": binding["snapshot"]["rows"]}
     logical = _logical_hash.fingerprint(path, spark=spark)
     return {"logical_sha256": logical["sha256"], "logical_hash": logical}
 
@@ -397,12 +464,18 @@ def _artifact_record(path, spark=None, *, expected=None):
         if not _verify_artifact(path, expected):
             raise ValueError("prepared materialization changed before publication")
         return expected
+    capture = current_capture()
+    if capture is not None:
+        return capture.bind(path)
     logical, physical = _logical_hash._capture(path, spark=spark)
     return {"logical_sha256": logical["sha256"], "logical_hash": logical,
             "physical_sha256": physical}
 
 
 def _verify_artifact(path, expected, *, trusted=True, spark=None, _scratch_root=None):
+    if "snapshot" in expected:
+        current_inputs().inspect(expected["snapshot"])
+        return True
     try:
         observed = _logical_hash.verify_files(
             path, physical_sha256=expected["physical_sha256"],
@@ -414,7 +487,8 @@ def _verify_artifact(path, expected, *, trusted=True, spark=None, _scratch_root=
     return observed == expected["logical_sha256"]
 
 
-def _verify_admission(root, binding, *, trusted=False, spark=None, _scratch_root=None):
+def _verify_admission(root, binding, *, trusted=False, spark=None, _scratch_root=None,
+                      inspect_artifacts=True):
     """Reuse only a protected registration binding or this operation's owned capture."""
     if (not isinstance(binding, dict) or set(binding) != {"path", "sha256", "physical_sha256"}
             or pathlib.Path(binding["path"]).is_absolute()
@@ -429,35 +503,36 @@ def _verify_admission(root, binding, *, trusted=False, spark=None, _scratch_root
     record = _read_saved(path)
     if digest(record) != binding["sha256"]:
         raise ValueError("admission record differs from its baseline")
+    _fields(record, {"schema", "identity", "study_id", "outcome", "artifacts"},
+            label="admission record")
+    if not isinstance(record["identity"], dict) or not isinstance(record["artifacts"], dict):
+        raise ValueError("admission identity and artifacts require mappings")
     required = {"starting_keys", "retained_keys", "exclusions", "final_keys", "native_exclusions"}
     if not required <= set(record["artifacts"]):
         raise ValueError("admission record is missing required cohort evidence")
-    if set(record["artifacts"]) != {p.name for p in _staging_directories(path.parent)}:
+    directories = {p.name for p in _staging_directories(path.parent)}
+    if record["schema"] == "autoforecast.admission.v2":
+        if directories or any(set(item) != {"snapshot"} for item in record["artifacts"].values()):
+            raise ValueError("native admission evidence contains unexpected file artifacts")
+    elif record["schema"] != "autoforecast.admission.v1" or set(record["artifacts"]) != directories:
         raise ValueError("admission artifact directory set differs from its baseline")
     for name, expected in record["artifacts"].items():
-        if not name.isidentifier() or not _verify_artifact(
+        if not name.isidentifier() or (inspect_artifacts and not _verify_artifact(
             path.parent / name, expected, trusted=trusted, spark=spark,
             _scratch_root=_scratch_root,
-        ):
+        )):
             raise ValueError("admission artifact differs from its baseline")
     if read_regular_bytes(path.parent, path.name) != payload:
         raise ValueError("admission record bytes changed during verification")
     return record
 
 
-def _save_admission(registry, staging, identity, frozen, *, format, artifact_bindings=None):
-    """Publish immutable evidence once; retries retain the first bytes and encoding."""
-    study_id = frozen["study_id"]
-    protected_binding = None
-    if _record_path(registry.root / "registrations", study_id) is not None:
-        protected_binding = registry.definition(study_id)[0]["admission_evidence"]
-    final_keys = registry.spark.read.parquet(str(artifact_path(
-        registry.root / "benchmarks" / study_id / "benchmark.json", frozen, "source-keys",
-    ))).select(*frozen["recipe"]["source_keys"])
+def _prepare_admission(registry, staging, identity, final_keys, recipe, *, artifact_bindings=None):
+    """Finish the exact cohort evidence before a native study chooses its identity."""
     final_keys.write.parquet(str(staging / "final_keys"))
-    starting = registry.spark.read.parquet(str(staging / "starting_keys"))
-    retained = registry.spark.read.parquet(str(staging / "retained_keys"))
-    keys = frozen["recipe"]["source_keys"]
+    starting = registry.spark.read.parquet(str(managed_path(staging / "starting_keys")))
+    retained = registry.spark.read.parquet(str(managed_path(staging / "retained_keys")))
+    keys = recipe["source_keys"]
     _same_keys(final_keys, retained.join(final_keys, keys, "inner"), keys, "final cohort")
     native_exclusions = retained.join(final_keys, keys, "left_anti")
     reasons = []
@@ -470,17 +545,38 @@ def _save_admission(registry, staging, identity, frozen, *, format, artifact_bin
     native_reasons = reasons[0].unionByName(reasons[1])
     _same_keys(native_exclusions, native_reasons, keys, "native exclusion reasons")
     native_reasons.write.parquet(str(staging / "native_exclusions"))
-    excluded = registry.spark.read.parquet(str(staging / "exclusions")).select(*keys)
+    excluded = registry.spark.read.parquet(str(managed_path(staging / "exclusions"))).select(*keys)
     _same_keys(starting, final_keys.unionByName(excluded).unionByName(native_exclusions),
                keys, "final population")
-    record = {"schema": "autoforecast.admission.v1", "identity": identity,
-              "study_id": study_id,
+    capture = current_capture()
+    record = {"schema": ("autoforecast.admission.v2" if capture is not None
+                         else "autoforecast.admission.v1"), "identity": identity,
               "outcome": {"starting": starting.count(), "application_retained": retained.count(),
                           "final_retained": final_keys.count(),
-                          "native_admission": frozen["recipe"]},
+                          "native_admission": recipe},
               "artifacts": {p.name: _artifact_record(
                   p, registry.spark, expected=(artifact_bindings or {}).get(p),
               ) for p in _staging_directories(staging)}}
+    return record
+
+
+def _save_admission(registry, staging, identity, frozen, *, format, artifact_bindings=None,
+                    prepared_record=None):
+    """Publish immutable evidence once; retries retain the first bytes and encoding."""
+    study_id = frozen["study_id"]
+    protected_binding = None
+    if _record_path(registry.root / "registrations", study_id) is not None:
+        protected_binding = registry.definition(study_id)[0]["admission_evidence"]
+    if prepared_record is None:
+        final_keys = registry.spark.read.parquet(str(artifact_path(
+            registry.root / "benchmarks" / study_id / "benchmark.json", frozen, "source-keys",
+        ))).select(*frozen["recipe"]["source_keys"])
+        prepared_record = _prepare_admission(
+            registry, staging, identity, final_keys, frozen["recipe"],
+            artifact_bindings=artifact_bindings,
+        )
+    record = {**prepared_record, "study_id": study_id}
+    capture = current_capture()
     destination = registry.root / "admissions" / study_id
     with _publication_lock(registry.root):
         existing = _record_path(destination, "admission")
@@ -489,6 +585,11 @@ def _save_admission(registry, staging, identity, frozen, *, format, artifact_bin
             destination.parent.mkdir(parents=True, exist_ok=True)
             if path_exists(destination):
                 raise ValueError("incomplete admission destination requires explicit recovery")
+            if capture is not None:
+                for binding in record["artifacts"].values():
+                    capture.retain(binding["snapshot"])
+                for directory in _staging_directories(staging):
+                    _remove_staging_directory(directory)
             (staging / ("admission." + format)).write_bytes(record_bytes(record, format=format))
             os.rename(staging, destination)
             existing = destination / ("admission." + format)
@@ -496,7 +597,8 @@ def _save_admission(registry, staging, identity, frozen, *, format, artifact_bin
             old = _read_saved(existing)
             def comparable(item):
                 return {**item, "artifacts": {
-                    name: value["logical_sha256"] for name, value in item["artifacts"].items()
+                    name: value.get("snapshot", value.get("logical_sha256"))
+                    for name, value in item["artifacts"].items()
                 }}
             if comparable(old) != comparable(record):
                 raise ValueError("conflicting immutable admission evidence")
@@ -551,8 +653,17 @@ def _check_key_frame(frame, template, keys, *, extra=(), label):
 
 @reported("Save data-check findings")
 def _save_findings(registry, frame, issues_root, name, check_id):
-    frame.write.parquet(str(issues_root / name))
-    saved = registry.spark.read.parquet(str(issues_root / name))
+    path = issues_root / name
+    frame.write.parquet(str(path))
+    capture = current_capture()
+    if capture is not None:
+        reference = capture.bind(path)["snapshot"]
+        capture.retain_evidence(registry.root, str(path.relative_to(registry.root)) + ".json",
+                                reference)
+        saved = registry.spark.read.parquet(str(managed_path(path)))
+        _remove_staging_directory(path)
+    else:
+        saved = registry.spark.read.parquet(str(path))
     if registry.store is not None:
         registry.store.append_once("study_data_issues", saved.select(
             F.lit(check_id).alias("check_id"), F.lit(None).cast("string").alias("study_id"),
@@ -600,14 +711,21 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
              *(staging / name for name in ("starting_keys", "input_keys", "source_findings",
                                            "population_findings", "input_added_keys",
                                            "input_missing_keys"))]
-    baselines = {p: directory_digest(p, suffixes=(".parquet",)) for p in paths}
+    capture = current_capture()
+    baselines = {p: (capture.bind(p) if capture is not None else
+                     directory_digest(p, suffixes=(".parquet",))) for p in paths}
+    if capture is not None:
+        frame = registry.spark.read.parquet(str(managed_path(root / "source")))
+        audits = {name: registry.spark.read.parquet(str(managed_path(root / ("audit-" + name))))
+                  for name in audits}
+        population = registry.spark.read.parquet(str(managed_path(staging / "starting_keys")))
     scratch = root / "application"
     scratch.mkdir()
     parameters = settings.parameters
     settings_baseline = settings._payload
     result = hook.prepare(PreparationContext(
         settings, frame, dict(audits), population,
-        registry.spark.read.parquet(str(staging / "source_findings")), scratch,
+        registry.spark.read.parquet(str(managed_path(staging / "source_findings"))), scratch,
     ))
     if not isinstance(result, PreparationResult):
         raise ValueError("preparation must return PreparationResult")
@@ -648,11 +766,14 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
         if not isinstance(output, DataFrame):
             raise ValueError(f"preparation {name} must be a Spark DataFrame")
         output.write.parquet(str(staging / name))
-    captured = {name: registry.spark.read.parquet(str(staging / name)) for name in frames}
+    captured = {name: registry.spark.read.parquet(str(managed_path(staging / name)))
+                for name in frames}
     output_baselines = {staging / name: _artifact_record(staging / name, registry.spark)
                         for name in frames}
     if settings._payload != settings_baseline or any(
-        directory_digest(p, suffixes=(".parquet",)) != sha for p, sha in baselines.items()
+        (not _verify_artifact(p, baseline) if capture is not None else
+         directory_digest(p, suffixes=(".parquet",)) != baseline)
+        for p, baseline in baselines.items()
     ):
         raise ValueError("managed source or population changed during preparation")
     for name in ("declared_starting", "retained_keys", "exclusions"):
@@ -705,6 +826,19 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
     return captured, metadata, output_baselines
 
 
+def _registry_inputs(method):
+    from functools import wraps
+
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        from autoforecast.snapshots import input_scope
+
+        with input_scope(connections=self.connections, scratch_root=self.scratch_root,
+                         spark=self.spark):
+            return method(self, *args, **kwargs)
+    return call
+
+
 class StudyRegistry:
     """One configured artifact root, optionally bound to five shared Delta tables.
 
@@ -715,7 +849,8 @@ class StudyRegistry:
 
     def __init__(self, root, *, spark: SparkSession | None = None, scratch_root=None,
                  namespace=None, tables=None,
-                 runtime=None):
+                 runtime=None, connections=None, connection_settings=None,
+                 snapshot_mode="hash", snapshots=None):
         for location in (root, scratch_root):
             if location is not None and (not str(location).strip() or "://" in str(location)):
                 raise ValueError("registry/scratch roots require nonempty POSIX filesystem paths")
@@ -725,6 +860,11 @@ class StudyRegistry:
             raise ValueError("provide or activate a Spark session")
         self.spark: SparkSession = session
         self.scratch_root = pathlib.Path(scratch_root or self.root / "scratch").absolute()
+        from autoforecast.snapshots import Connections, resolve_mode
+
+        self.snapshot_mode = resolve_mode(snapshot_mode)
+        self.snapshots = json.loads(_bytes(snapshots)) if snapshots is not None else None
+        self.connections = Connections(connection_settings, connections, spark=self.spark)
         self.runtime = _runtime(runtime or {})
         if "implementation" in self.runtime:
             from autoforecast.implementation import source_scope
@@ -740,6 +880,20 @@ class StudyRegistry:
         elif tables is not None:
             raise ValueError("table overrides require a Delta namespace")
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, _error, _traceback):
+        if exc_type is None:
+            self.close()
+        else:
+            with suppress(Exception):
+                self.close()
+
+    def close(self):
+        """Close connections opened from config; supplied clients remain caller-owned."""
+        self.connections.close()
+
     @classmethod
     def from_config(cls, config, *, spark=None, use_environment: bool = False):
         """Read storage/runtime settings, optionally applying storage environment overrides."""
@@ -748,14 +902,24 @@ class StudyRegistry:
         path = pathlib.Path(config).absolute()
         value = _fields(read_record(path), {"storage"},
                         {"schema_version", "dataset", "recipe", "source", "references",
-                         "invalid_references", "runtime", "preparation", "records"},
+                         "invalid_references", "runtime", "preparation", "records", "connections",
+                         "snapshot_mode"},
                         label="registry config")
-        return cls._from_storage(value["storage"], value.get("runtime", {}), path.parent, spark,
-                                 use_environment=use_environment)
+        from autoforecast.snapshots import resolve_mode
+
+        storage = dict(value["storage"])
+        storage["snapshot_mode"] = resolve_mode(value.get("snapshot_mode"),
+                                                storage.get("snapshot_mode"))
+        return cls._from_storage(storage, value.get("runtime", {}), path.parent, spark,
+                                 use_environment=use_environment,
+                                 connections=value.get("connections"))
 
     @classmethod
-    def _from_storage(cls, storage, runtime, base, spark, *, use_environment=False):
-        _fields(storage, set(), {"root", "scratch_root", "namespace", "tables"}, label="storage")
+    def _from_storage(cls, storage, runtime, base, spark, *, use_environment=False,
+                      connections=None):
+        _fields(storage, set(),
+                {"root", "scratch_root", "namespace", "tables", "snapshot_mode", "snapshots"},
+                label="storage")
         storage = dict(storage)
         if use_environment:
             for name, key in (("REGISTRY_ROOT", "root"), ("SCRATCH_ROOT", "scratch_root"),
@@ -778,24 +942,152 @@ class StudyRegistry:
             from autoforecast.implementation import source_scope
 
             runtime["implementation"] = source_scope(runtime["implementation"], base)
-        return cls(**settings, runtime=runtime, spark=spark)
+        return cls(**settings, runtime=runtime, spark=spark, connection_settings=connections)
 
     @classmethod
     def from_environment(cls, *, spark=None):
         """Resolve explicit storage environment variables or AUTOFORECAST_CONFIG."""
-        storage, runtime, base = {}, {}, pathlib.Path.cwd()
         if os.environ.get("AUTOFORECAST_CONFIG"):
-            path = pathlib.Path(os.environ["AUTOFORECAST_CONFIG"]).absolute()
-            value = _fields(read_record(path), {"storage"},
-                            {"schema_version", "dataset", "recipe", "source", "references",
-                             "invalid_references", "runtime", "preparation", "records"},
-                            label="registry config")
-            storage, runtime, base = dict(value["storage"]), value.get("runtime", {}), path.parent
-        if "root" not in storage and "AUTOFORECAST_REGISTRY_ROOT" not in os.environ:
+            return cls.from_config(os.environ["AUTOFORECAST_CONFIG"], spark=spark,
+                                   use_environment=True)
+        if "AUTOFORECAST_REGISTRY_ROOT" not in os.environ:
             raise ValueError(
                 "configure AUTOFORECAST_REGISTRY_ROOT or AUTOFORECAST_CONFIG, or registry=",
             )
-        return cls._from_storage(storage, runtime, base, spark, use_environment=True)
+        return cls._from_storage({}, {}, pathlib.Path.cwd(), spark, use_environment=True)
+
+    def _native_inputs(self, mode):
+        from autoforecast.snapshots import RetainedInputs
+
+        if mode == "hash":
+            return None
+        if self.snapshots is None:
+            raise ValueError("table modes require storage.snapshots connection and namespace")
+        store = self.connections.snapshot_store(self.snapshots)
+        return RetainedInputs(mode=mode, connection=self.snapshots["connection"], store=store,
+                              scratch_root=self.scratch_root,
+                              journal_root=self.root / "capture-journal")
+
+    def capture_sources(self, config, *, snapshot_mode=None):
+        """Save raw source inputs for later studies without preparing or training a model."""
+        from autoforecast.snapshots import CaptureAttempt, resolve_mode
+        from provenance.lineage import snapshot_parquet_directory
+
+        value, _ = _configuration(config, connections=self.connections)
+        if value["source"]["kind"] == "capture":
+            raise ValueError("reuse the existing capture ID; do not capture a capture again")
+        mode = resolve_mode(snapshot_mode, value.get("snapshot_mode"),
+                            value["storage"].get("snapshot_mode", self.snapshot_mode))
+        manager = self._native_inputs(mode)
+        capture = (CaptureAttempt(manager, spark=self.spark, connections=self.connections)
+                   if manager is not None else None)
+        generation = uuid.uuid4().hex
+        create_directory(self.scratch_root, exist_ok=True)
+        with (standalone_attempt(self.root, "Capture source inputs", capture_generation=generation),
+              capture.active() if capture is not None else nullcontext(),
+              tempfile.TemporaryDirectory(dir=self.scratch_root, prefix="af-source-") as temporary):
+            root = pathlib.Path(temporary)
+            frame, primary, audits, audit_records = _capture_source_inputs(
+                value, self, root, keep_resolved_tables=True, retain_binding=True,
+            )
+            records = {"primary": primary, **audit_records}
+            bindings = {}
+            for name, evidence in records.items():
+                source = root / ("source" if name == "primary" else "audit-" + name)
+                if capture is not None:
+                    reference = evidence["snapshot"]
+                    capture.retain(reference)
+                    bindings[name] = {"snapshot": reference}
+                else:
+                    physical = evidence["physical_sha256"]
+                    relative = "inputs/" + name
+                    bindings[name] = {"path": relative, "sha256": physical,
+                                      "logical_hash": evidence["logical_hash"]}
+            recipe = value["recipe"]
+            cadence = parse_frequency(recipe["frequency"])
+            end = advance(parse_origin(recipe["final_train_cutoff"], cadence), cadence,
+                          recipe["final_test_horizon"])
+            record = {
+                "schema": "autoforecast.source-capture.v1", "generation": generation,
+                "mode": mode, "dataset": value["dataset"], "inputs": bindings,
+                "provenance": records,
+                "scope": {"start": recipe["training_start"],
+                          "end": canonical_origin(end, cadence), "frequency": cadence.code,
+                          "source_keys": recipe["source_keys"],
+                          "references": value.get("references", {})},
+                "population": value["source"].get("population", "primary"),
+                "require_matching_population": value["source"].get(
+                    "require_matching_population", True),
+                "starting_series": frame.select(*recipe["source_keys"]).distinct().count(),
+            }
+            # The ID binds the complete metadata and saved input identities. Editing
+            # an envelope and recomputing its checksum cannot reuse this capture ID.
+            capture_id = digest(record)
+            record["capture_id"] = capture_id
+            destination = self.root / "captures" / capture_id
+            create_directory(destination)
+            if mode == "hash":
+                create_directory(destination / "inputs")
+                for name, binding in bindings.items():
+                    source = root / ("source" if name == "primary" else "audit-" + name)
+                    snapshot_parquet_directory(source, destination / binding["path"],
+                                               expected_sha256=binding["sha256"], label=name)
+            with _publication_lock(self.root):
+                publish_bytes(destination, "capture.json", _bytes({
+                    "capture": record, "sha256": digest(record),
+                }))
+            if capture is not None:
+                capture.published()
+            note("Source capture saved", capture_id=capture_id, rows=primary["rows"],
+                 starting_series=record["starting_series"], queries=len(audits) + 1)
+        return capture_id
+
+    def _source_capture(self, capture_id, *, allow_released=False):
+        """Read the original capture binding; never re-query its former source."""
+        import re
+
+        from autoforecast.snapshots import MODES, SnapshotReference
+
+        if not isinstance(capture_id, str) or not re.fullmatch(r"[a-f0-9]{64}", capture_id):
+            raise ValueError("source capture requires its exact capture ID")
+        if not allow_released and path_exists(self.root / "released" / (capture_id + ".json")):
+            raise ValueError("source capture has been released or is being released")
+        path = self.root / "captures" / capture_id / "capture.json"
+        raw = read_path_bytes(path)
+        envelope = loads_record(raw, format="json")
+        envelope = _fields(envelope, {"capture", "sha256"}, label="source capture")
+        record = _fields(envelope["capture"], {
+            "schema", "capture_id", "generation", "mode", "dataset", "inputs", "provenance",
+            "scope", "population", "require_matching_population", "starting_series",
+        }, label="source capture record")
+        if (record["schema"] != "autoforecast.source-capture.v1"
+                or record["capture_id"] != capture_id or envelope["sha256"] != digest(record)
+                or capture_id != digest({k: v for k, v in record.items() if k != "capture_id"})
+                or record["mode"] not in MODES):
+            raise ValueError("source capture identity changed")
+        if (not isinstance(record["inputs"], dict) or "primary" not in record["inputs"]
+                or set(record["inputs"]) != set(record["provenance"])
+                or record["population"] not in record["inputs"]):
+            raise ValueError("source capture inputs are incomplete")
+        for name, binding in record["inputs"].items():
+            if not isinstance(name, str) or not name.isidentifier():
+                raise ValueError("invalid captured query name")
+            if record["mode"] == "hash":
+                _fields(binding, {"path", "sha256", "logical_hash"}, label="captured file input")
+                if binding["path"] != "inputs/" + name:
+                    raise ValueError("captured file path is outside its owned input")
+                if not isinstance(binding["sha256"], str) or not re.fullmatch(
+                    r"[a-f0-9]{64}", binding["sha256"],
+                ):
+                    raise ValueError("captured file identity is invalid")
+                _logical_hash.validate_metadata(binding["logical_hash"])
+            else:
+                _fields(binding, {"snapshot"}, label="captured table input")
+                if SnapshotReference.from_record(binding["snapshot"]).record()["mode"] != record[
+                    "mode"
+                ]:
+                    raise ValueError("captured table mode changed")
+        return record, path, hashlib.sha256(raw).hexdigest()
 
     def _registration_path(self, study_id):
         if not isinstance(study_id, str) or not study_id or pathlib.Path(study_id).name != study_id:
@@ -805,9 +1097,12 @@ class StudyRegistry:
             raise FileNotFoundError(f"Unknown study_id: {study_id}")
         return path
 
+    @_registry_inputs
     def definition(self, study_id):
         """Authenticate the saved binding and pinned snapshot without source access."""
         path = self._registration_path(study_id)
+        if path_exists(self.root / "released" / (study_id + ".json")):
+            raise ValueError("study has been released or is being released")
         envelope = _read_saved(path)
         definition = envelope["definition"]
         if envelope["sha256"] != digest(definition) or definition["study_id"] != study_id:
@@ -832,6 +1127,7 @@ class StudyRegistry:
         _, record = verify_benchmark(manifest, definition["library_sha256"], _reuse_verified=True)
         if record["study_id"] != study_id:
             raise ValueError("registered library study identity differs")
+        owner = self._native_evidence_owner(record)
         binding = record.get("admission_identity", {})
         if binding.get("schema") == "autoforecast.supplied-stage-identity.v1":
             if (definition["schema"] != "autoforecast.registration.v4"
@@ -851,16 +1147,70 @@ class StudyRegistry:
                 "sha256": digest(admission["identity"]),
             } or admission["study_id"] != record.get("parent", {}).get("study_id", study_id)):
                 raise ValueError("admission evidence does not belong to the frozen study")
+            if owner is not None:
+                for item in admission["artifacts"].values():
+                    self._owned_snapshot(owner, item["snapshot"])
         elif "admission_identity" in record:
             raise ValueError("registered study is missing required admission evidence")
+        for reference in self._native_findings(definition, owner=owner):
+            current_inputs().inspect(reference, retained=True)
         return definition, envelope["sha256"]
+
+    def _native_evidence_owner(self, record):
+        """Resolve the content-addressed owner of inherited diagnostic evidence."""
+        from autoforecast.benchmark import NATIVE_SCHEMA, _validate_native_parent
+
+        if record["schema"] != NATIVE_SCHEMA:
+            return None
+        if "parent" not in record:
+            return record
+        parent = record["parent"]
+        path = self.root / "benchmarks" / parent["study_id"] / "benchmark.json"
+        if pathlib.Path(parent["path"]).absolute() != path.absolute():
+            raise ValueError("derived study parent is outside its registry")
+        _, owner = read_benchmark_manifest(path, parent["sha256"])
+        if (owner["study_id"] != parent["study_id"] or "parent" in owner
+                or owner["schema"] != NATIVE_SCHEMA):
+            raise ValueError("invalid derived study parent")
+        _validate_native_parent(record, owner)
+        return owner
+
+    @staticmethod
+    def _owned_snapshot(owner, reference):
+        from autoforecast.snapshots import SnapshotReference
+
+        reference = SnapshotReference.from_record(reference).record()
+        if owner["owned_snapshots"].get(reference["capture_id"]) != reference:
+            raise ValueError("native capture does not belong to the frozen study ownership")
+        return reference
+
+    def _native_findings(self, definition, *, owner=None):
+        """Check pinned diagnostic documents without rereading live sources."""
+        from autoforecast.snapshots import SnapshotReference
+
+        references = []
+        for evidence in definition.get("native_findings", []):
+            relative = pathlib.PurePosixPath(evidence["path"])
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                raise ValueError("native findings must remain inside their registry")
+            payload = read_path_bytes(self.root / str(relative))
+            reference = SnapshotReference.from_record(evidence["snapshot"]).record()
+            if (hashlib.sha256(payload).hexdigest() != evidence["sha256"]
+                    or json.loads(payload) != {
+                        "schema": "autoforecast.native-findings.v1", "snapshot": reference,
+                    }):
+                raise ValueError("native findings differ from their registered binding")
+            if owner is not None:
+                self._owned_snapshot(owner, reference)
+            references.append(reference)
+        return references
 
     def load_study(self, study_id):
         """Return the existing Study context manager after all registry checks pass."""
         definition, sha = self.definition(study_id)
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         study = load_study(study_id, registry_root=self.root / "benchmarks", spark=self.spark,
-                           scratch_root=self.scratch_root,
+                           scratch_root=self.scratch_root, connections=self.connections,
                            _expected_sha256=definition["library_sha256"])
         if study._sha256 != definition["library_sha256"]:
             with suppress(Exception):
@@ -878,6 +1228,14 @@ class StudyRegistry:
         baseline.mkdir(parents=True, exist_ok=True)
         envelope = {"definition": definition, "sha256": sha}
         with _publication_lock(self.root):
+            source = definition.get("source", {})
+            if source.get("kind") == "capture":
+                _, _, capture_sha = self._source_capture(source["capture_id"])
+                if source.get("capture_sha256") != capture_sha:
+                    raise ValueError("source capture definition changed before publication")
+            for identifier in (study_id, definition.get("parent", {}).get("study_id")):
+                if identifier and path_exists(self.root / "released" / (identifier + ".json")):
+                    raise ValueError("cannot publish a released study or use a released parent")
             existing = _record_path(baseline, study_id)
             if existing is not None:
                 if _read_saved(existing) != envelope:
@@ -896,6 +1254,268 @@ class StudyRegistry:
                               record_bytes(envelope, format=format))
         return study_id
 
+    def recover_reader(self, study_id, lease_id):
+        """Close a crashed reader after its original process has released ownership."""
+        from autoforecast.snapshots import StudyLease
+
+        return StudyLease.recover(self.root, study_id, lease_id)
+
+    def _capture_journal(self, capture_id):
+        """Authenticate the original sealed identity without consulting live source rows."""
+        from autoforecast.snapshots import SnapshotReference
+
+        directory = self.root / "capture-journal" / capture_id
+        if not path_exists(directory):
+            raise FileNotFoundError("capture ownership journal is missing")
+        intent = json.loads(read_path_bytes(directory / "intent.json"))
+        sealed = directory / "sealed.json"
+        if not path_exists(sealed):
+            raise ValueError("capture has no sealed identity; inspect its intent first")
+        snapshot = SnapshotReference.from_record(json.loads(read_path_bytes(sealed)))
+        reference = snapshot.record()
+        expected = {
+            "schema": "autoforecast.capture-intent.v1", "capture_id": capture_id,
+            "connection": reference["connection"], "backend": reference["backend"],
+            "namespace": reference["object"].rsplit(".", 1)[0], "mode": reference["mode"],
+        }
+        if intent != expected or reference["capture_id"] != capture_id:
+            raise ValueError("capture intent differs from its sealed identity")
+        return directory, reference, snapshot._payload
+
+    def recover_capture(self, capture_id):
+        """Remove an unpublished capture using its saved identity and release credentials.
+
+        Active capture owners and published references block recovery. Missing sealed
+        evidence requires operator investigation; a name alone never authorizes deletion.
+        """
+        import re
+
+        from autoforecast.snapshots import SnapshotReference
+
+        if not isinstance(capture_id, str) or not re.fullmatch(r"[a-f0-9]{32}", capture_id):
+            raise ValueError("capture recovery requires an exact capture ID")
+        directory = self.root / "capture-journal" / capture_id
+        if not path_exists(directory):
+            raise FileNotFoundError("capture ownership journal is missing")
+        with _publication_lock(directory, blocking=False):
+            directory, reference, payload = self._capture_journal(capture_id)
+            removed = directory / "removed.json"
+            if path_exists(removed):
+                if read_path_bytes(removed) != payload:
+                    raise ValueError("capture cleanup record changed")
+                return capture_id
+
+            def mentions(value):
+                if isinstance(value, dict):
+                    if value.get("schema") == "autoforecast.native-input.v1":
+                        saved = SnapshotReference.from_record(value).record()
+                        return (saved["backend"], saved["object"]) == (
+                            reference["backend"], reference["object"],
+                        )
+                    return any(mentions(item) for item in value.values())
+                return isinstance(value, list) and any(mentions(item) for item in value)
+
+            with _publication_lock(self.root):
+                # Benchmarks become readable before their registration envelope. Both
+                # publication surfaces count, including derived studies and findings.
+                for name in ("benchmarks", "registrations", "captures"):
+                    root = self.root / name
+                    if not path_exists(root):
+                        continue
+                    for path, kind in snapshot_tree_types(root).items():
+                        if kind not in {"file", "directory"}:
+                            raise ValueError("publication tree contains a link or special file")
+                        if kind == "file" and path.suffix in {".json", ".yaml", ".yml"}:
+                            if mentions(_read_saved(path)):
+                                raise ValueError("capture is published; use study release")
+                release = directory / "release.json"
+                if path_exists(release):
+                    if read_path_bytes(release) != payload:
+                        raise ValueError("capture recovery identity changed")
+                else:
+                    publish_bytes(directory, release.name, payload)
+            store = self.connections.snapshot_store({
+                "connection": reference["connection"],
+                "namespace": reference["object"].rsplit(".", 1)[0],
+            }, release=True)
+            store.release(reference)
+            publish_bytes(directory, removed.name, payload)
+        return capture_id
+
+    def _release_source_capture(self, capture_id):
+        """Release raw inputs after readers and studies sharing their tables finish."""
+        from autoforecast.snapshots import StudyLease
+
+        with _publication_lock(self.root):
+            record, manifest, sha = self._source_capture(capture_id, allow_released=True)
+            registrations = self.root / "registrations"
+            # Hash children own verified file copies. Only table children still
+            # share the raw capture; their provenance alone is not a dependency.
+            if record["mode"] != "hash" and path_exists(registrations):
+                for path, kind in snapshot_tree_types(registrations).items():
+                    if kind not in {"file", "directory"}:
+                        raise ValueError("registration tree contains a link or special file")
+                    if kind != "file" or path.suffix not in {".json", ".yaml", ".yml"}:
+                        continue
+                    envelope = _read_saved(path)
+                    definition = envelope["definition"]
+                    if digest(definition) != envelope["sha256"]:
+                        raise ValueError("dependent study definition changed")
+                    if (definition.get("source", {}).get("capture_id") == capture_id
+                            and not path_exists(self.root / "released" / (
+                                definition["study_id"] + ".done.json"))):
+                        raise ValueError("source capture still has a dependent study")
+            if StudyLease.active(self.root, capture_id):
+                raise ValueError("source capture still has active readers")
+            removal = {"schema": "autoforecast.source-release.v1", "study_id": capture_id,
+                       "capture_sha256": sha,
+                       "snapshots": [binding["snapshot"] for binding in record["inputs"].values()
+                                     if "snapshot" in binding]}
+            tombstone = self.root / "released" / (capture_id + ".json")
+            if path_exists(tombstone):
+                if read_path_bytes(tombstone) != _bytes(removal):
+                    raise ValueError("source release differs from its original binding")
+            else:
+                publish_bytes(self.root, str(tombstone.relative_to(self.root)), _bytes(removal))
+        if record["mode"] == "hash":
+            # The capture directory is owned and callers have explicitly released it.
+            # Keep its definition and tombstone so future reads cannot use live data.
+            for binding in record["inputs"].values():
+                path = manifest.parent / binding["path"]
+                if path_exists(path):
+                    if directory_digest(path, suffixes=(".parquet",)) != binding["sha256"]:
+                        raise ValueError("captured files changed before release")
+                    _remove_staging_directory(path)
+        return self._finish_release(capture_id, removal)
+
+    def release(self, study_id):
+        """Release owned native inputs after all dependent studies and readers close.
+
+        A tombstone blocks new reads before deletion begins. Retrying this method
+        resumes the recorded deletion; it never rebuilds data from current sources.
+        """
+        import re
+
+        from autoforecast.benchmark import NATIVE_SCHEMA
+        from autoforecast.snapshots import StudyLease
+
+        if not isinstance(study_id, str) or not re.fullmatch(r"[a-f0-9]{64}", study_id):
+            raise ValueError("release requires an exact study or source capture ID")
+
+        if (isinstance(study_id, str) and pathlib.Path(study_id).name == study_id
+                and path_exists(self.root / "captures" / study_id / "capture.json")):
+            return self._release_source_capture(study_id)
+        with ExitStack() as ownership, _publication_lock(self.root):
+            definition: dict[str, Any]
+            try:
+                envelope = _read_saved(self._registration_path(study_id))
+            except FileNotFoundError:
+                manifest = self.root / "benchmarks" / study_id / "benchmark.json"
+                raw = read_path_bytes(manifest)
+                _, frozen = read_benchmark_manifest(manifest, hashlib.sha256(raw).hexdigest())
+                if frozen["study_id"] != study_id:
+                    raise ValueError("unregistered library study identity differs") from None
+                parent = frozen.get("parent", {})
+                if parent:
+                    self._registration_path(parent["study_id"])
+                definition = {"study_id": study_id,
+                              "library_sha256": hashlib.sha256(raw).hexdigest()}
+                if parent:
+                    definition["parent"] = {"study_id": parent["study_id"]}
+                envelope = {"definition": definition, "sha256": digest(definition)}
+            definition = envelope["definition"]
+            if envelope["sha256"] != digest(definition) or definition["study_id"] != study_id:
+                raise ValueError("registered study definition changed")
+            manifest = self.root / "benchmarks" / study_id / "benchmark.json"
+            _, record = read_benchmark_manifest(manifest, definition["library_sha256"])
+            if record["study_id"] != study_id:
+                raise ValueError("registered library study identity differs")
+            if record["schema"] != NATIVE_SCHEMA:
+                raise ValueError("release currently requires a native retained-input study")
+            owner = self._native_evidence_owner(record)
+            assert owner is not None
+            self._native_findings(definition, owner=owner)
+            if "admission_evidence" in definition:
+                admission = _verify_admission(
+                    self.root, definition["admission_evidence"], inspect_artifacts=False,
+                )
+                if (admission["schema"] != "autoforecast.admission.v2"
+                        or admission["study_id"] != owner["study_id"]
+                        or record.get("admission_identity") != {
+                            "schema": "autoforecast.admission-identity.v1",
+                            "sha256": digest(admission["identity"]),
+                        }):
+                    raise ValueError("admission evidence does not belong to the frozen study")
+                for item in admission["artifacts"].values():
+                    self._owned_snapshot(owner, item["snapshot"])
+            # Preflight can create a derived benchmark before its registry entry.
+            # Such a published child already depends on the parent's inputs.
+            for directory in _staging_directories(self.root / "benchmarks"):
+                path = directory / "benchmark.json"
+                if not path_exists(path):
+                    continue
+                _, other = read_benchmark_manifest(path)
+                if other["study_id"] != directory.name:
+                    raise ValueError("dependent library study identity differs from its directory")
+                child = other["study_id"]
+                if (child != study_id and other.get("parent", {}).get("study_id") == study_id
+                        and not path_exists(self.root / "released" / (child + ".done.json"))):
+                    raise ValueError(f"study is still used by dependent study {child}")
+            if StudyLease.active(self.root, study_id):
+                raise ValueError("study still has active readers; close them before release")
+            tombstone = self.root / "released" / (study_id + ".json")
+            references = record["owned_snapshots"]
+            for capture_id, reference in references.items():
+                directory = self.root / "capture-journal" / capture_id
+                if not path_exists(directory):
+                    raise FileNotFoundError("capture ownership journal is missing")
+                ownership.enter_context(_publication_lock(directory, blocking=False))
+                _, original, _ = self._capture_journal(capture_id)
+                if original != reference:
+                    raise ValueError("release capture differs from its original sealed ownership")
+            removal = {"schema": "autoforecast.study-release.v1", "study_id": study_id,
+                       "registration_sha256": envelope["sha256"],
+                       "snapshots": list(references.values())}
+            if path_exists(tombstone):
+                if read_path_bytes(tombstone) != _bytes(removal):
+                    raise ValueError("release record differs from its original study bindings")
+            else:
+                publish_bytes(self.root, str(tombstone.relative_to(self.root)), _bytes(removal))
+        return self._finish_release(study_id, removal)
+
+    def _finish_release(self, study_id, removal):
+        from autoforecast.snapshots import SnapshotReference
+
+        # Provider calls happen after the visibility change, without holding the
+        # registry lock across network operations. Each completed deletion is durable.
+        for reference in removal["snapshots"]:
+            reference = SnapshotReference.from_record(reference).record()
+            marker = self.root / "released" / study_id / (reference["capture_id"] + ".json")
+            expected = _bytes(reference)
+            with _publication_lock(self.root):
+                if path_exists(marker):
+                    if read_path_bytes(marker) != expected:
+                        raise ValueError("release completion belongs to a different input")
+                    continue
+            store = self.connections.snapshot_store({
+                "connection": reference["connection"],
+                "namespace": reference["object"].rsplit(".", 1)[0],
+            }, release=True)
+            store.release(reference)
+            with _publication_lock(self.root):
+                if not path_exists(marker):
+                    publish_bytes(self.root, str(marker.relative_to(self.root)), expected)
+                elif read_path_bytes(marker) != expected:
+                    raise ValueError("release completion belongs to a different input")
+        with _publication_lock(self.root):
+            completed = self.root / "released" / (study_id + ".done.json")
+            if not path_exists(completed):
+                publish_bytes(self.root, str(completed.relative_to(self.root)), _bytes(removal))
+            elif read_path_bytes(completed) != _bytes(removal):
+                raise ValueError("release completion changed")
+        return study_id
+
+    @_registry_inputs
     def retain_derived(self, parent_id, manifest):
         """Register an existing preflight-derived identity, reusing its parent snapshot."""
         parent, parent_sha = self.definition(parent_id)
@@ -917,6 +1537,7 @@ class StudyRegistry:
         format = "json" if self._registration_path(parent_id).suffix == ".json" else "yaml"
         return self._publish_definition(definition, format=format)
 
+    @_registry_inputs
     def publish_results(self, study_id, workflow_path, *, destination=None, mlflow_links=None):
         """Publish already checked evidence; retries never fit or rescore."""
         writer = destination if destination is not None else self.store
@@ -1103,7 +1724,7 @@ def _capture_stages(inputs, value, registry, root):
              date_range=ranges[name], selected_columns=selected)
         with operation("Capture supplied stage", window=name, engine="Spark"):
             frame.write.parquet(str(path))
-        captured = registry.spark.read.parquet(str(path))
+        captured = registry.spark.read.parquet(str(managed_path(path)))
         captured_schema = captured.schema.jsonValue()
         missing = set(selected) - set(captured.columns)
         if missing:
@@ -1157,7 +1778,7 @@ def _capture_stages(inputs, value, registry, root):
             note("Starting population", definition="distinct keys in supplied training data",
                  series_count=captured.select(*keys).distinct().count())
         frames[name] = captured
-        logical = _logical_hash.fingerprint(path, spark=registry.spark)
+        binding = _logical_record(path, registry.spark)
         evidence[name] = {"kind": "delta" if name in pinned else "dataframe",
                           "planned_range": list(ranges[name]), "columns": selected,
                           "schema": captured.schema.jsonValue(), "rows": count,
@@ -1165,8 +1786,10 @@ def _capture_stages(inputs, value, registry, root):
                           "observed_range": [str(observed["first"]), str(observed["last"])],
                           "frozen_role": {"training": "selection", "validation": "validation_score",
                                           "testing": "final_score"}[name],
-                          "snapshot_sha256": logical["sha256"],
-                          "logical_hash": logical,
+                          **({"snapshot": binding["snapshot"]} if "snapshot" in binding else {
+                              "snapshot_sha256": binding["logical_sha256"],
+                              "logical_hash": binding["logical_hash"],
+                          }),
                           **({"source": pinned[name][1]} if name in pinned else {})}
     combined = frames["training"]
     for name in ("validation", "testing"):
@@ -1177,18 +1800,32 @@ def _capture_stages(inputs, value, registry, root):
 
 
 def register_study(
-    config: str | pathlib.Path | None = None, *, registry: StudyRegistry | None = None,
-    spark: SparkSession | None = None, prepare: StudyPreparation | None = None,
+    config: str | pathlib.Path | None = None,
+    *,
+    registry: StudyRegistry | None = None,
+    spark: SparkSession | None = None,
+    prepare: StudyPreparation | None = None,
     log_level: str | None = None,
-    training_data: StageInput | None = None, testing_data: StageInput | None = None,
-    validation_data: StageInput | None = None, series_id: list[str] | None = None,
-    date_col: str | None = None, target_col: str | None = None, target_unit: str | None = None,
-    frequency: str | None = None, training_date_range: DateRange | None = None,
-    testing_date_range: DateRange | None = None, validation_date_range: DateRange | None = None,
-    metric: str | None = None, history_missing: str | None = None,
-    actual_missing: str | None = None, feature_roles: dict | None = None,
-    feature_availability: dict | None = None, references: dict | None = None,
-    tuning_windows: list[dict] | None = None, tuning_schedule: dict | None = None,
+    snapshot_mode: str | None = None,
+    training_data: StageInput | None = None,
+    testing_data: StageInput | None = None,
+    validation_data: StageInput | None = None,
+    series_id: list[str] | None = None,
+    date_col: str | None = None,
+    target_col: str | None = None,
+    target_unit: str | None = None,
+    frequency: str | None = None,
+    training_date_range: DateRange | None = None,
+    testing_date_range: DateRange | None = None,
+    validation_date_range: DateRange | None = None,
+    metric: str | None = None,
+    history_missing: str | None = None,
+    actual_missing: str | None = None,
+    feature_roles: dict | None = None,
+    feature_availability: dict | None = None,
+    references: dict | None = None,
+    tuning_windows: list[dict] | None = None,
+    tuning_schedule: dict | None = None,
 ) -> str:
     """Freeze a configured source or caller-supplied training/testing stages.
 
@@ -1204,182 +1841,460 @@ def register_study(
     Tuning windows/schedule are used only when a later run explicitly requests tuning.
     prepare is available only for the configured-source route.
     """
-    direct = dict(
-        training_data=training_data,
-        testing_data=testing_data,
-        validation_data=validation_data,
-        series_id=series_id,
-        date_col=date_col,
-        target_col=target_col,
-        target_unit=target_unit,
-        frequency=frequency,
-        training_date_range=training_date_range,
-        testing_date_range=testing_date_range,
-        validation_date_range=validation_date_range,
-        metric=metric,
-        history_missing=history_missing,
-        actual_missing=actual_missing,
-        feature_roles=feature_roles,
-        feature_availability=feature_availability,
-        references=references,
-        tuning_windows=tuning_windows,
-        tuning_schedule=tuning_schedule,
-    )
-    if config is not None and any(item is not None for item in direct.values()):
-        raise ValueError("config: cannot combine with direct data or scientific arguments")
-    if config is None and prepare is not None:
-        raise ValueError("prepare: direct stages must already be prepared; use configured sources "
-                         "for a preparation hook")
-    inputs = None
-    check_id = uuid.uuid4().hex
-    check_start = time.monotonic()
-    initial_level = resolve_level(log_level, getattr(registry, "runtime", {}))
+    owns_registry = registry is None
     try:
-        if config is None:
-            value, inputs = _direct_configuration(registry, direct)
-            base = pathlib.Path.cwd()
-        else:
-            value, base = _configuration(config)
-        initial_level = resolve_level(log_level, value.get("runtime", {}))
-        _emit({"stage": "Preparing execution plan", "status": "START",
-               "attempt_id": check_id}, initial_level, announce=True)
-        settings = PreparationSettings(_bytes({
-            "dataset": value["dataset"], "recipe": value["recipe"],
-            "parameters": value.get("preparation", {}),
-        }))
-        if prepare is not None:
-            if not all(callable(getattr(prepare, name, None)) for name in ("validate", "prepare")):
-                raise TypeError("prepare: supply callable validate(settings) and prepare(context) "
-                                "methods; see the preparation tutorial")
-            settings_baseline = settings._payload
-            prepare.validate(settings)
-            if settings._payload != settings_baseline:
-                raise ValueError("preparation validation changed captured settings")
-        elif value.get("preparation") or value.get("references", {}).get("prepared"):
-            raise ValueError("preparation settings require an explicit preparation hook")
-        elif value["source"].get("audit_queries"):
-            raise ValueError("managed audit queries require an explicit preparation hook")
-        registry = registry or StudyRegistry._from_storage(
-            value["storage"], value.get("runtime", {}), base, spark, use_environment=True,
+        direct = dict(
+            training_data=training_data,
+            testing_data=testing_data,
+            validation_data=validation_data,
+            series_id=series_id,
+            date_col=date_col,
+            target_col=target_col,
+            target_unit=target_unit,
+            frequency=frequency,
+            training_date_range=training_date_range,
+            testing_date_range=testing_date_range,
+            validation_date_range=validation_date_range,
+            metric=metric,
+            history_missing=history_missing,
+            actual_missing=actual_missing,
+            feature_roles=feature_roles,
+            feature_availability=feature_availability,
+            references=references,
+            tuning_windows=tuning_windows,
+            tuning_schedule=tuning_schedule,
         )
-        if value["source"]["kind"] == "delta":
-            from autoforecast.integrations.delta import validate_source_queries
-
-            validate_source_queries(registry.spark, queries={
-                "primary": value["source"]["sql"], **value["source"]["audit_queries"],
-            }, tables=value["source"]["tables"])
-    except BaseException as error:
-        with suppress(BaseException):
-            _emit({"stage": "Preparing execution plan",
-                   "status": "FAIL" if isinstance(error, Exception) else "CANCELLED",
-                   "attempt_id": check_id, "error_type": type(error).__name__}, initial_level)
-        raise
-    create_directory(registry.root, exist_ok=True)
-    create_directory(registry.scratch_root, exist_ok=True)
-    issues_root = registry.root / "checks" / check_id
-    create_directory(issues_root)
-    phase = "configuration"
-    starts = {}
-    audit = issues_root / "audit.jsonl"
-
-    def event(stage, status, **facts):
-        nonlocal phase
-        phase = stage
-        if status == "START":
-            starts[stage] = time.monotonic()
-        _stage_event(audit, stage, status, elapsed=(time.monotonic() - starts[stage]
-                     if status != "START" and stage in starts else None),
-                     evidence=str(issues_root), **facts)
-
-    level = resolve_level(log_level, value.get("runtime", {}))
-    with Execution(audit, ("configuration", "sources", "admission", "freeze", "publication"),
-                   level=level, attempt_id=check_id) as execution:
-        event("configuration", "START")
-        source, recipe = value["source"], value["recipe"]
-        if not recipe["validation_origins"]:
-            note("Validation: not configured; no split will be created",
-                 final_fit_input="training data")
-        note("Registration inputs", configuration=str(config) if not isinstance(config, dict)
-             else "supplied mapping", source_kind=source["kind"],
-             configuration_sha256=hashlib.sha256(_bytes(value)).hexdigest(),
-             source_aliases=list(source.get("tables", {})),
-             primary_path=source.get("path"),
-             target=value["dataset"].get("dataset", {}).get("panel", {}).get("target_col"),
-             frequency=recipe["frequency"], metric=recipe["metric"],
-             target_unit=recipe["target_unit"],
-             actual_missing=recipe.get("actual_missing"),
-             final_train_cutoff=recipe.get("final_train_cutoff"),
-             validation_horizon=recipe.get("validation_horizon"),
-             final_test_horizon=recipe.get("final_test_horizon"),
-             query_sha256=[{"query": name, "sha256": hashlib.sha256(sql.encode()).hexdigest()}
-                           for name, sql in {"primary": source.get("sql", ""),
-                                             **source.get("audit_queries", {})}.items()]
-             if source["kind"] == "delta" else [],
-             audit_queries=list(source.get("audit_queries", {})),
-             population_query=source.get("population", "primary"),
-             source_keys=recipe["source_keys"], training_start=recipe["training_start"],
-             validation_origins=recipe["validation_origins"],
-             history_missing=recipe["history_missing"],
-             invalid_references=value.get("invalid_references", "error"),
-             preparation=(f"{type(prepare).__module__}.{type(prepare).__qualname__}.prepare"
-                          if prepare else "none"),
-             log_level=logging.getLevelName(level), registry=str(registry.root),
-             registry_tables=dict(getattr(registry.store, "tables", {})),
-             registration_writes="frozen data and registry records even when runtime.publish=false")
-        if inputs is not None:
-            note("Supplied stage plan", stages={name: (
-                {"kind": "delta" if isinstance(inputs[name], DeltaTable) else "dataframe",
-                 "planned_range": direct[name + "_date_range"],
-                 **({"table": inputs[name].name, "version": inputs[name].version,
-                     "version_resolution": "explicit" if inputs[name].version is not None
-                     else "pin latest before capture"}
-                    if isinstance(inputs[name], DeltaTable) else {})}
-                if name in inputs else None
-            ) for name in ("training", "validation", "testing")},
-                 series_keys=recipe["source_keys"], date_column=date_col, target_column=target_col,
-                 target_unit=recipe["target_unit"], frequency=recipe["frequency"],
-                 metric=recipe["metric"], history_missing=recipe["history_missing"],
-                 actual_missing=recipe["actual_missing"], preparation="none",
-                 registry=str(registry.root), registry_tables=dict(getattr(registry.store,
-                                                                          "tables", {})))
-        starts["configuration"] = check_start
-        format = value.get("records", {}).get("format", "json")
-        event("configuration", "PASS")
-        try:
-            event("sources", "START")
-            study_id = _register_study(
-                value, registry, prepare, settings, check_id, issues_root, event, inputs=inputs,
+        if config is not None and any(item is not None for item in direct.values()):
+            raise ValueError("config: cannot combine with direct data or scientific arguments")
+        if config is None and prepare is not None:
+            raise ValueError(
+                "prepare: direct stages must already be prepared; use configured sources "
+                "for a preparation hook"
             )
-            record_result(study_id=study_id, evidence=str(issues_root))
-            note("Study registered", study_id=study_id, evidence=str(issues_root))
-            return study_id
+        inputs = None
+        check_id = uuid.uuid4().hex
+        check_start = time.monotonic()
+        initial_level = resolve_level(log_level, getattr(registry, "runtime", {}))
+        try:
+            if config is None:
+                value, inputs = _direct_configuration(registry, direct)
+                base = pathlib.Path.cwd()
+            else:
+                value, base = _configuration(
+                    config, connections=(registry.connections if registry is not None else None)
+                )
+            initial_level = resolve_level(log_level, value.get("runtime", {}))
+            _emit(
+                {"stage": "Preparing execution plan", "status": "START", "attempt_id": check_id},
+                initial_level,
+                announce=True,
+            )
+            settings = PreparationSettings(
+                _bytes(
+                    {
+                        "dataset": value["dataset"],
+                        "recipe": value["recipe"],
+                        "parameters": value.get("preparation", {}),
+                    }
+                )
+            )
+            if prepare is not None:
+                if not all(
+                    callable(getattr(prepare, name, None)) for name in ("validate", "prepare")
+                ):
+                    raise TypeError(
+                        "prepare: supply callable validate(settings) and prepare(context) "
+                        "methods; see the preparation tutorial"
+                    )
+                settings_baseline = settings._payload
+                prepare.validate(settings)
+                if settings._payload != settings_baseline:
+                    raise ValueError("preparation validation changed captured settings")
+            elif value.get("preparation") or value.get("references", {}).get("prepared"):
+                raise ValueError("preparation settings require an explicit preparation hook")
+            elif value["source"].get("audit_queries"):
+                raise ValueError("managed audit queries require an explicit preparation hook")
+            registry = registry or StudyRegistry._from_storage(
+                value["storage"],
+                value.get("runtime", {}),
+                base,
+                spark,
+                use_environment=True,
+                connections=value.get("connections"),
+            )
+            from autoforecast.snapshots import resolve_mode
+
+            configured_mode = resolve_mode(
+                value.get("snapshot_mode"),
+                value.get("storage", {}).get("snapshot_mode"),
+                registry.snapshot_mode,
+            )
+            effective_mode = resolve_mode(snapshot_mode, configured_mode)
+            native_inputs = registry._native_inputs(effective_mode)
+            if value["source"]["kind"] == "delta":
+                from autoforecast.integrations.delta import validate_source_queries
+
+                validate_source_queries(
+                    registry.spark,
+                    queries={
+                        "primary": value["source"]["sql"],
+                        **value["source"]["audit_queries"],
+                    },
+                    tables=value["source"]["tables"],
+                )
         except BaseException as error:
-            status = "FAIL" if isinstance(error, Exception) else "CANCELLED"
             with suppress(BaseException):
-                error.add_note(f"Registration attempt evidence: {_text(_safe(str(issues_root)))}")
-            try:
-                failed_stage = phase if execution.states[phase] == "START" else "registration"
-                _stage_event(audit, failed_stage, status, exception=type(error).__name__,
-                             last_stage=phase, evidence=str(issues_root))
-                (issues_root / ("attempt." + format)).write_bytes(record_bytes(
-                    {"status": "failed" if status == "FAIL" else "cancelled",
-                     "stage": failed_stage, "exception": type(error).__name__,
-                     **({"last_stage": phase} if failed_stage != phase else {})},
-                    format=format,
-                ))
-            except BaseException as evidence_error:
-                message = "Registration failure evidence could not be verified."
-                with suppress(BaseException):
-                    error.add_note(message)
-                with suppress(BaseException):
-                    _emit({"stage": "Registration failure evidence", "status": "UNVERIFIED",
-                           "attempt_id": check_id, "error_type": type(evidence_error).__name__,
-                           "reason": message}, level)
+                _emit(
+                    {
+                        "stage": "Preparing execution plan",
+                        "status": "FAIL" if isinstance(error, Exception) else "CANCELLED",
+                        "attempt_id": check_id,
+                        "error_type": type(error).__name__,
+                    },
+                    initial_level,
+                )
             raise
+        create_directory(registry.root, exist_ok=True)
+        create_directory(registry.scratch_root, exist_ok=True)
+        issues_root = registry.root / "checks" / check_id
+        create_directory(issues_root)
+        phase = "configuration"
+        starts = {}
+        audit = issues_root / "audit.jsonl"
+
+        def event(stage, status, **facts):
+            nonlocal phase
+            phase = stage
+            if status == "START":
+                starts[stage] = time.monotonic()
+            _stage_event(
+                audit,
+                stage,
+                status,
+                elapsed=(
+                    time.monotonic() - starts[stage]
+                    if status != "START" and stage in starts
+                    else None
+                ),
+                evidence=str(issues_root),
+                **facts,
+            )
+
+        level = resolve_level(log_level, value.get("runtime", {}))
+        with Execution(
+            audit,
+            ("configuration", "sources", "admission", "freeze", "publication"),
+            level=level,
+            attempt_id=check_id,
+        ) as execution:
+            event("configuration", "START")
+            source, recipe = value["source"], value["recipe"]
+            if not recipe["validation_origins"]:
+                note(
+                    "Validation: not configured; no split will be created",
+                    final_fit_input="training data",
+                )
+            note(
+                "Registration inputs",
+                snapshot_mode=effective_mode,
+                snapshot_destination=registry.snapshots
+                if native_inputs is not None
+                else "inactive",
+                configuration=str(config) if not isinstance(config, dict) else "supplied mapping",
+                source_kind=source["kind"],
+                configuration_sha256=hashlib.sha256(_bytes(value)).hexdigest(),
+                source_aliases=list(source.get("tables", {})),
+                primary_path=source.get("path"),
+                target=value["dataset"].get("dataset", {}).get("panel", {}).get("target_col"),
+                frequency=recipe["frequency"],
+                metric=recipe["metric"],
+                target_unit=recipe["target_unit"],
+                actual_missing=recipe.get("actual_missing"),
+                final_train_cutoff=recipe.get("final_train_cutoff"),
+                validation_horizon=recipe.get("validation_horizon"),
+                final_test_horizon=recipe.get("final_test_horizon"),
+                query_sha256=[
+                    {"query": name, "sha256": hashlib.sha256(sql.encode()).hexdigest()}
+                    for name, sql in {
+                        "primary": source.get("sql", ""),
+                        **source.get("audit_queries", {}),
+                    }.items()
+                ]
+                if source["kind"] == "delta"
+                else [],
+                audit_queries=list(source.get("audit_queries", {})),
+                population_query=source.get("population", "primary"),
+                source_keys=recipe["source_keys"],
+                training_start=recipe["training_start"],
+                validation_origins=recipe["validation_origins"],
+                history_missing=recipe["history_missing"],
+                invalid_references=value.get("invalid_references", "error"),
+                preparation=(
+                    f"{type(prepare).__module__}.{type(prepare).__qualname__}.prepare"
+                    if prepare
+                    else "none"
+                ),
+                log_level=logging.getLevelName(level),
+                registry=str(registry.root),
+                registry_tables=dict(getattr(registry.store, "tables", {})),
+                registration_writes=(
+                    "frozen data and registry records even when runtime.publish=false"
+                ),
+            )
+            if inputs is not None:
+                note(
+                    "Supplied stage plan",
+                    stages={
+                        name: (
+                            {
+                                "kind": "delta"
+                                if isinstance(inputs[name], DeltaTable)
+                                else "dataframe",
+                                "planned_range": direct[name + "_date_range"],
+                                **(
+                                    {
+                                        "table": inputs[name].name,
+                                        "version": inputs[name].version,
+                                        "version_resolution": "explicit"
+                                        if inputs[name].version is not None
+                                        else "pin latest before capture",
+                                    }
+                                    if isinstance(inputs[name], DeltaTable)
+                                    else {}
+                                ),
+                            }
+                            if name in inputs
+                            else None
+                        )
+                        for name in ("training", "validation", "testing")
+                    },
+                    series_keys=recipe["source_keys"],
+                    date_column=date_col,
+                    target_column=target_col,
+                    target_unit=recipe["target_unit"],
+                    frequency=recipe["frequency"],
+                    metric=recipe["metric"],
+                    history_missing=recipe["history_missing"],
+                    actual_missing=recipe["actual_missing"],
+                    preparation="none",
+                    registry=str(registry.root),
+                    registry_tables=dict(getattr(registry.store, "tables", {})),
+                )
+            starts["configuration"] = check_start
+            format = value.get("records", {}).get("format", "json")
+            event("configuration", "PASS")
+            try:
+                event("sources", "START")
+                study_id = _register_study(
+                    value,
+                    registry,
+                    prepare,
+                    settings,
+                    check_id,
+                    issues_root,
+                    event,
+                    inputs=inputs,
+                    native_inputs=native_inputs,
+                )
+                record_result(study_id=study_id, evidence=str(issues_root))
+                note("Study registered", study_id=study_id, evidence=str(issues_root))
+                return study_id
+            except BaseException as error:
+                status = "FAIL" if isinstance(error, Exception) else "CANCELLED"
+                with suppress(BaseException):
+                    error.add_note(
+                        f"Registration attempt evidence: {_text(_safe(str(issues_root)))}"
+                    )
+                try:
+                    failed_stage = phase if execution.states[phase] == "START" else "registration"
+                    _stage_event(
+                        audit,
+                        failed_stage,
+                        status,
+                        exception=type(error).__name__,
+                        last_stage=phase,
+                        evidence=str(issues_root),
+                    )
+                    (issues_root / ("attempt." + format)).write_bytes(
+                        record_bytes(
+                            {
+                                "status": "failed" if status == "FAIL" else "cancelled",
+                                "stage": failed_stage,
+                                "exception": type(error).__name__,
+                                **({"last_stage": phase} if failed_stage != phase else {}),
+                            },
+                            format=format,
+                        )
+                    )
+                except BaseException as evidence_error:
+                    message = "Registration failure evidence could not be verified."
+                    with suppress(BaseException):
+                        error.add_note(message)
+                    with suppress(BaseException):
+                        _emit(
+                            {
+                                "stage": "Registration failure evidence",
+                                "status": "UNVERIFIED",
+                                "attempt_id": check_id,
+                                "error_type": type(evidence_error).__name__,
+                                "reason": message,
+                            },
+                            level,
+                        )
+                raise
+    finally:
+        if owns_registry and registry is not None:
+            # Keep a failed operation as the primary error if closing also fails.
+            import sys
+
+            if sys.exc_info()[0] is None:
+                registry.close()
+            else:
+                with suppress(Exception):
+                    registry.close()
 
 
 def _register_study(value, registry, prepare, preparation_settings, check_id, issues_root, event,
-                    *, inputs=None):
+                    *, inputs=None, native_inputs=None):
+    from autoforecast.snapshots import CaptureAttempt, input_scope
+
+    with ExitStack() as ownership:
+        if native_inputs is not None:
+            capture = CaptureAttempt(native_inputs, spark=registry.spark,
+                                     connections=registry.connections)
+            ownership.enter_context(capture.active())
+        elif value["source"]["kind"] == "capture":
+            ownership.enter_context(input_scope(connections=registry.connections,
+                                                  scratch_root=registry.scratch_root,
+                                                  spark=registry.spark))
+        if value["source"]["kind"] == "capture":
+            record, path, sha = registry._source_capture(value["source"]["capture_id"])
+            if record["mode"] != (native_inputs.mode if native_inputs is not None else "hash"):
+                raise ValueError("source capture and study must use the same snapshot mode")
+            recipe, scope = value["recipe"], record["scope"]
+            cadence = parse_frequency(recipe["frequency"])
+            end = advance(parse_origin(recipe["final_train_cutoff"], cadence), cadence,
+                          recipe["final_test_horizon"])
+            if (record["dataset"] != value["dataset"]
+                    or scope["frequency"] != cadence.code
+                    or scope["source_keys"] != recipe["source_keys"]
+                    or scope["references"] != value.get("references", {})
+                    or parse_origin(recipe["training_start"], cadence)
+                    < parse_origin(scope["start"], cadence)
+                    or end > parse_origin(scope["end"], cadence)):
+                raise ValueError("study settings or dates exceed the saved source capture scope")
+            if len(record["inputs"]) > 1 and prepare is None:
+                raise ValueError("managed audit queries require an explicit preparation hook")
+            current_inputs().hold_study(path, sha)
+            value["source"].update(_retained=record, _manifest_sha256=sha,
+                                   population=record["population"],
+                                   require_matching_population=record["require_matching_population"])
+        return _register_captured_study(
+            value, registry, prepare, preparation_settings, check_id, issues_root, event,
+            inputs=inputs, native_inputs=native_inputs,
+        )
+
+
+def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_tables=False,
+                           retain_binding=False):
+    """Capture one source read view and reuse it for registration or explicit retention."""
+    session = registry.spark
+    describe = _artifact_record if retain_binding else _logical_record
+    source = value["source"]
+    source_record: dict[str, Any]
+    audits = {}
+    query_records = {}
+    captured_primary = None
+    if inputs is not None:
+        frame, source_record = _capture_stages(inputs, value, registry, root)
+    elif source["kind"] == "capture":
+        from provenance.lineage import snapshot_parquet_directory
+
+        record = source["_retained"]
+        capture_root = registry.root / "captures" / record["capture_id"]
+        frames = {}
+        for name, binding in record["inputs"].items():
+            destination = root / ("source" if name == "primary" else "audit-" + name)
+            if "snapshot" in binding:
+                capture = current_capture()
+                if capture is None:
+                    raise ValueError("native source capture requires a native registration")
+                capture.reuse(destination, binding["snapshot"])
+            else:
+                snapshot_parquet_directory(capture_root / binding["path"], destination,
+                                           expected_sha256=binding["sha256"], label=name)
+            frames[name] = session.read.parquet(str(managed_path(destination)))
+        frame = frames.pop("primary")
+        source_record = {
+            **record["provenance"]["primary"], "kind": "capture",
+            "capture_id": record["capture_id"], "capture_sha256": source["_manifest_sha256"],
+        }
+        audits = frames
+        query_records = {name: record["provenance"][name] for name in frames}
+        captured_primary = root / "source"
+    elif source["kind"] == "delta":
+        from autoforecast.integrations.delta import read_sources
+
+        managed = read_sources(session, queries={"primary": source["sql"],
+                               **source["audit_queries"]}, tables=source["tables"])
+        frame, source_record = managed.pop("primary")
+        if not keep_resolved_tables:
+            source_record.pop("resolved_tables")
+        for name, (audit, provenance) in managed.items():
+            path = root / ("audit-" + name)
+            with operation("Save raw audit data", query=name, engine="Spark"):
+                audit.write.parquet(str(path))
+            audits[name] = session.read.parquet(str(managed_path(path)))
+            logical = describe(path, session)
+            query_records[name] = {**provenance, **logical,
+                                   "schema": audits[name].schema.jsonValue(),
+                                   "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
+                                            else logical["logical_hash"]["rows"])}
+    elif source["kind"] in {"bigquery", "postgresql", "mysql", "sqlserver"}:
+        from autoforecast.integrations import bigquery, mysql, postgres, sqlserver
+
+        alias = source.get("connection")
+        if not alias:
+            raise ValueError("table source requires an explicit connection alias")
+        client = registry.connections.client(alias, kind=source["kind"])
+        capture = current_capture()
+        if (capture is not None and source["kind"] in {"postgresql", "mysql", "sqlserver"}
+                and capture.manager.store.backend == source["kind"]):
+            capture.manager.store.check_source(client)
+        reader = {"bigquery": bigquery.read_sources, "postgresql": postgres.read_sources,
+                  "mysql": mysql.read_sources, "sqlserver": sqlserver.read_sources}[source["kind"]]
+        options = ({"location": registry.connections.location(alias)}
+                   if source["kind"] == "bigquery" else {})
+        managed = reader(client, queries={"primary": source["sql"], **source["audit_queries"]},
+                         tables=source["tables"], output_root=root / "captured", **options)
+        primary, source_record = managed.pop("primary")
+        captured_primary = primary.rename(root / "source")
+        frame = session.read.parquet(str(captured_primary))
+        for name, (path, provenance) in managed.items():
+            destination = root / ("audit-" + name)
+            path.rename(destination)
+            audits[name] = session.read.parquet(str(managed_path(destination)))
+            logical = describe(destination, session)
+            query_records[name] = {**provenance, **logical,
+                                   "schema": audits[name].schema.jsonValue(),
+                                   "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
+                                            else logical["logical_hash"]["rows"])}
+    else:
+        frame = session.read.parquet(source["path"])
+        source_record = {"kind": "parquet"}
+    if captured_primary is None:
+        with operation("Save primary data", query="primary", engine="Spark"):
+            frame.write.parquet(str(root / "source"))
+    frame = session.read.parquet(str(managed_path(root / "source")))
+    logical = describe(root / "source", session)
+    source_record.update({**logical, "schema": frame.schema.jsonValue(),
+                          "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
+                                            else logical["logical_hash"]["rows"])})
+    return frame, source_record, audits, query_records
+
+
+def _register_captured_study(value, registry, prepare, preparation_settings, check_id, issues_root,
+                             event, *, inputs=None, native_inputs=None):
     configuration_baseline = preparation_settings._payload
     session = registry.spark
     if registry.store is not None:
@@ -1392,37 +2307,9 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         contract = _load_dataset_contract_bytes(read_path_bytes(contract_path), contract_path)
         recipe = value["recipe"]
         source = value["source"]
-        source_record: dict[str, Any]
-        audits = {}
-        query_records = {}
-        if inputs is not None:
-            frame, source_record = _capture_stages(inputs, value, registry, root)
-        elif source["kind"] == "delta":
-            from autoforecast.integrations.delta import read_sources
-
-            managed = read_sources(session, queries={"primary": source["sql"],
-                                   **source["audit_queries"]}, tables=source["tables"])
-            frame, source_record = managed.pop("primary")
-            if prepare is None:
-                source_record.pop("resolved_tables")
-            for name, (audit, provenance) in managed.items():
-                path = root / ("audit-" + name)
-                with operation("Save raw audit data", query=name, engine="Spark"):
-                    audit.write.parquet(str(path))
-                audits[name] = session.read.parquet(str(path))
-                logical = _logical_record(path, session)
-                query_records[name] = {**provenance, **logical,
-                                       "schema": audits[name].schema.jsonValue(),
-                                       "rows": logical["logical_hash"]["rows"]}
-        else:
-            frame = session.read.parquet(source["path"])
-            source_record = {"kind": "parquet"}
-        with operation("Save primary data", query="primary", engine="Spark"):
-            frame.write.parquet(str(root / "source"))
-        frame = session.read.parquet(str(root / "source"))
-        logical = _logical_record(root / "source", session)
-        source_record.update({**logical, "schema": frame.schema.jsonValue(),
-                              "rows": logical["logical_hash"]["rows"]})
+        frame, source_record, audits, query_records = _capture_source_inputs(
+            value, registry, root, inputs=inputs, keep_resolved_tables=prepare is not None,
+        )
         keys = recipe["source_keys"]
         panel = contract.panel(root / "source")
         source_record["starting_series"] = frame.select(*keys).distinct().count()
@@ -1459,7 +2346,9 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             prepared_baseline = artifact_bindings[staging / "prepared"]
             # Apply declared application eligibility before native cohort-count checks.
             if contract.required_series_count is not None:
-                original_candidates = session.read.parquet(str(root / "source")).filter(
+                original_candidates = session.read.parquet(
+                    str(managed_path(root / "source")),
+                ).filter(
                     F.col(panel.time_col).between(start, origin),
                 ).select(*keys).distinct()
                 if original_candidates.count() != contract.required_series_count:
@@ -1531,7 +2420,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                         origins=origins, validate=False, **settings,
                     ))
             refs.write.parquet(str(root / "reference-input"))
-            refs = session.read.parquet(str(root / "reference-input"))
+            refs = session.read.parquet(str(managed_path(root / "reference-input")))
             reference_definition = {
                 "preparation": settings if "path" not in settings else {"kind": "parquet"},
                 **_logical_record(root / "reference-input", session),
@@ -1547,16 +2436,10 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                 ]))).join(late_ids.withColumnRenamed("series_id", "__af_reference_id"),
                           "__af_reference_id", "left_anti").drop("__af_reference_id")
             _reference_boundaries(normalized, key_map, recipe, session)
-            report = check_wrmsse_references(refs, origins=origins)
-            report.write.parquet(str(issues_root / "references"))
+            report = _save_findings(registry, check_wrmsse_references(refs, origins=origins),
+                                    issues_root, "references", check_id + "-references")
             if prepare is not None:
                 report.write.parquet(str(staging / "reference_findings"))
-            if registry.store is not None:
-                registry.store.append_once("study_data_issues", report.select(
-                    F.lit(check_id + "-references").alias("check_id"),
-                    F.lit(None).cast("string").alias("study_id"),
-                    F.to_json(F.struct("*")).alias("issue_json"),
-                ), scope={"check_id": check_id + "-references"})
             if report.limit(1).count():
                 if value.get("invalid_references", "error") == "error":
                     raise ValueError(f"invalid scoring references; findings: {issues_root}")
@@ -1614,20 +2497,43 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                                   "findings": sorted(exclusion_findings, key=_bytes),
                                   "excluded_new_keys": sorted(new_keys, key=_bytes)},
                 "captured_inputs": {
-                    p.name: {"logical_sha256": binding["logical_sha256"],
-                             "logical_hash": binding["logical_hash"],
-                             "schema": session.read.parquet(str(p)).schema.jsonValue()}
+                    p.name: {**({"snapshot": binding["snapshot"]} if "snapshot" in binding else {
+                        "logical_sha256": binding["logical_sha256"],
+                        "logical_hash": binding["logical_hash"],
+                    }), "schema": session.read.parquet(str(managed_path(p))).schema.jsonValue()}
                     for p, binding in artifact_bindings.items()
                 },
             }
         event("admission", "PASS", retained_series=retained, excluded_references=len(exclusions))
         event("freeze", "START")
+        capture = current_capture()
+        prepared_admission = None
+
+        def native_inventory(final_key_path, frozen):
+            nonlocal prepared_admission
+
+            assert capture is not None
+            if prepare is not None:
+                for name in ("prepared", "declared_starting", "reference_input",
+                             "scoring_references"):
+                    _remove_staging_directory(staging / name)
+                final_keys = session.read.parquet(str(final_key_path)).select(*keys)
+                prepared_admission = _prepare_admission(
+                    registry, staging, admission_identity, final_keys, frozen["recipe"],
+                    artifact_bindings=artifact_bindings,
+                )
+                for binding in prepared_admission["artifacts"].values():
+                    capture.retain(binding["snapshot"])
+            return capture.retained_snapshots()
+
         frozen_binding = freeze_benchmark(
             contract_path=contract_path, sources=dict.fromkeys(
                 sorted(study_source_roles(recipe)),
                 root / "admitted",
             ), recipe=recipe, output_root=registry.root / "benchmarks", spark=session,
             scoring_references=references, scratch_root=registry.scratch_root,
+            native_inputs=native_inputs,
+            native_inventory=native_inventory if capture is not None else None,
             admission_identity=({"schema": ("autoforecast.supplied-stage-identity.v1"
                                             if inputs is not None
                                             else "autoforecast.admission-identity.v1"),
@@ -1639,6 +2545,9 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         _, frozen = verify_benchmark(manifest, library_sha, _reuse_verified=True,
                                      spark=session, _scratch_root=root)
         read_benchmark_manifest(manifest, library_sha)
+        if capture is not None:
+            for reference in frozen["snapshots"].values():
+                capture.retain(reference)
         event("freeze", "PASS", study_id=frozen["study_id"])
         event("publication", "START", study_id=frozen["study_id"])
         definition = {
@@ -1664,7 +2573,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                 _remove_staging_directory(staging / name)
             definition["admission_evidence"] = _save_admission(
                 registry, staging, admission_identity, frozen, format=format,
-                artifact_bindings=artifact_bindings,
+                artifact_bindings=artifact_bindings, prepared_record=prepared_admission,
             )
         if registry.store is not None:
             for report_id in (check_id, check_id + "-references", check_id + "-application",
@@ -1672,7 +2581,11 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                 registry.store.link_issues(report_id, definition["study_id"])
         (issues_root / ("registration." + format)).write_bytes(
             record_bytes({"study_id": definition["study_id"]}, format=format))
+        if capture is not None:
+            definition["native_findings"] = capture.evidence(registry.root)
         study_id = registry._publish_definition(definition, format=format)
+        if capture is not None:
+            capture.published()
         registry.definition(study_id)
         record_result(study_id=study_id, evidence=str(issues_root))
         _remove_staging_directory(staging)

@@ -28,7 +28,7 @@ _RUN_UNSET: Any = object()
 def register_study(
     config: str | pathlib.Path | None = None, *, registry: StudyRegistry | None = None,
     spark: SparkSession | None = None, prepare: StudyPreparation | None = None,
-    log_level: str | None = None,
+    log_level: str | None = None, snapshot_mode: str | None = None,
     training_data: StageInput | None = None, testing_data: StageInput | None = None,
     validation_data: StageInput | None = None, series_id: list[str] | None = None,
     date_col: str | None = None, target_col: str | None = None, target_unit: str | None = None,
@@ -44,6 +44,8 @@ def register_study(
     Choose a YAML/JSON ``config`` path or supply stages directly. Do not mix the
     two modes. ``registry`` sets storage and Spark access; ``spark`` can instead
     provide the session for configured registration. ``log_level`` controls logs.
+    ``snapshot_mode`` overrides the configured input storage: ``hash`` (default),
+    ``table``, or ``table+hash``. Table modes require a protected snapshot destination.
     ``prepare`` is an optional configured-source hook with validate/prepare methods.
 
     Direct inputs:
@@ -79,6 +81,7 @@ def register_study(
                     spark=spark,
                     prepare=prepare,
                     log_level=log_level,
+                    snapshot_mode=snapshot_mode,
                     training_data=training_data,
                     testing_data=testing_data,
                     validation_data=validation_data,

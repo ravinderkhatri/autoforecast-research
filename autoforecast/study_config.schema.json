@@ -58,6 +58,56 @@
       },
       "required": [],
       "additionalProperties": false
+    },
+    "connections": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "enum": [
+              "bigquery",
+              "postgresql",
+              "mysql",
+              "sqlserver",
+              "delta"
+            ]
+          },
+          "project": {
+            "type": "string",
+            "minLength": 1
+          },
+          "location": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dsn_env": {
+            "type": "string",
+            "minLength": 1
+          },
+          "writer_dsn_env": {
+            "type": "string",
+            "minLength": 1
+          },
+          "release_dsn_env": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "snapshot_mode": {
+      "type": "string",
+      "enum": [
+        "hash",
+        "table",
+        "table+hash"
+      ],
+      "default": "hash"
     }
   },
   "required": [
@@ -708,7 +758,13 @@
           "type": "object",
           "properties": {
             "kind": {
-              "const": "delta"
+              "enum": [
+                "delta",
+                "bigquery",
+                "postgresql",
+                "mysql",
+                "sqlserver"
+              ]
             },
             "sql": {
               "type": "string",
@@ -721,7 +777,7 @@
               "additionalProperties": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Managed Delta table name."
+                "description": "Qualified table name in the configured source database."
               }
             },
             "audit_queries": {
@@ -741,12 +797,44 @@
             "require_matching_population": {
               "type": "boolean",
               "default": true
+            },
+            "connection": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "sql",
+            "tables"
+          ],
+          "additionalProperties": false,
+          "anyOf": [
+            {
+              "required": [
+                "kind"
+              ]
+            },
+            {
+              "required": [
+                "connection"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "capture"
+            },
+            "capture_id": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
             }
           },
           "required": [
             "kind",
-            "sql",
-            "tables"
+            "capture_id"
           ],
           "additionalProperties": false
         }
@@ -755,7 +843,12 @@
         "kind": {
           "enum": [
             "parquet",
-            "delta"
+            "delta",
+            "bigquery",
+            "postgresql",
+            "mysql",
+            "capture",
+            "sqlserver"
           ]
         }
       }
@@ -797,6 +890,33 @@
             ]
           },
           "description": "Known shared-table role overrides; runtime validation also requires distinct effective table names."
+        },
+        "snapshot_mode": {
+          "type": "string",
+          "enum": [
+            "hash",
+            "table",
+            "table+hash"
+          ],
+          "default": "hash"
+        },
+        "snapshots": {
+          "type": "object",
+          "properties": {
+            "connection": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]+$"
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "connection",
+            "namespace"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [

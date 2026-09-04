@@ -627,10 +627,7 @@ def test_zero_checkpoint_reader_uses_filled_target_and_factual_mask(spark, tmp_p
 
 def test_registered_load_preserves_primary_hash_error_when_close_fails(tmp_path, monkeypatch):
     import autoforecast.study_registration as registration
-    registry = StudyRegistry.__new__(StudyRegistry)
-    registry.root = tmp_path
-    registry.spark = object()
-    registry.scratch_root = tmp_path
+    registry = StudyRegistry(tmp_path, spark=object())
     monkeypatch.setattr(registry, "definition", lambda _: ({"library_sha256": "a" * 64}, "sha"))
     class ChangedStudy:
         _sha256 = "b" * 64
@@ -1368,9 +1365,7 @@ def test_registration_keeps_freezer_binding_through_publication(spark, tmp_path,
 def test_old_registration_format_is_refused_explicitly(tmp_path, schema):
     from autoforecast.benchmark import digest
 
-    registry = object.__new__(StudyRegistry)
-    registry.root = tmp_path
-    registry.store = None
+    registry = StudyRegistry(tmp_path, spark=object())
     registrations = tmp_path / "registrations"
     registrations.mkdir()
     definition = {"schema": schema, "study_id": "saved"}
@@ -1384,9 +1379,7 @@ def test_old_registration_format_is_refused_explicitly(tmp_path, schema):
 @pytest.mark.parametrize("old,new", [("v1", "v3"), ("v2", "v4")])
 @pytest.mark.parametrize("format", ["json", "yaml"])
 def test_registration_upgrade_names_a_fresh_destination(tmp_path, old, new, format):
-    registry = object.__new__(StudyRegistry)
-    registry.root = tmp_path
-    registry.store = None
+    registry = StudyRegistry(tmp_path, spark=object())
     study_id = "a" * 64
     legacy = {"schema": "autoforecast.registration." + old, "study_id": study_id}
     registry._publish_definition(legacy, format=format)
@@ -1401,9 +1394,7 @@ def test_registration_upgrade_names_a_fresh_destination(tmp_path, old, new, form
 
 @pytest.mark.parametrize("schema", ["v3", "v4"])
 def test_new_root_accepts_reregistration(tmp_path, schema):
-    registry = object.__new__(StudyRegistry)
-    registry.root = tmp_path / "new-root"
-    registry.store = None
+    registry = StudyRegistry(tmp_path / "new-root", spark=object())
     study_id = "a" * 64
     new_definition = {"schema": "autoforecast.registration." + schema,
                       "study_id": study_id, "registry_backend": "files"}

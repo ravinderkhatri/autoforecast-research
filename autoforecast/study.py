@@ -8,7 +8,7 @@ import json
 import pathlib
 import tempfile
 from collections.abc import Callable, Mapping
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING
 
 from mlops import _volume_files
@@ -20,9 +20,11 @@ from pyspark.sql import functions as F
 
 from autoforecast._execution import reported
 from autoforecast.benchmark import (
+    NATIVE_SCHEMA,
     BenchmarkError,
     _evaluation_contract_from_record,
     artifact_path,
+    bound_input_path,
     read_benchmark_manifest,
     training_cutoff,
     verify_benchmark,
@@ -32,6 +34,8 @@ from autoforecast.frequency import TimePoint, advance, parse_frequency, parse_or
 from autoforecast.grid import time_literal
 from autoforecast.panel import Forecast, Panel
 from autoforecast.project import project_root
+from autoforecast.snapshots import _cleanup_on_exit
+from autoforecast.snapshots import study_inputs as _study_inputs
 from autoforecast.study_horizon_metrics import (
     ForecastAccuracyBreakdown,
     validate_forecast_accuracy_breakdown,
@@ -41,6 +45,7 @@ from autoforecast.study_tuning import FitPredictRequest, FitPredictResult, Tunin
 from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 if TYPE_CHECKING:
+    from autoforecast.snapshots import NativeReadScope
     from autoforecast.study_preflight import PreflightResult
     from autoforecast.study_workflow import ForecastWorkflowResult
 
@@ -51,6 +56,7 @@ def load_study(
     spark: SparkSession | None = None,
     scratch_root: str | pathlib.Path | None = None,
     _expected_sha256: str | None = None,
+    connections=None,
 ) -> Study:
     """Load an existing ID from the project's .autoforecast/benchmarks registry.
 
@@ -66,15 +72,41 @@ def load_study(
             or any(c not in "0123456789abcdef" for c in study_id)):
         raise BenchmarkError("study_id must be a lowercase SHA-256 identity")
     candidate = registry / study_id / "benchmark.json"
-    # Pin the manifest before a full check, not after a mutable path was checked.
     pinned = _expected_sha256
     if pinned is None:
         try:
             pinned = hashlib.sha256(read_path_bytes(candidate)).hexdigest()
         except FileNotFoundError:
-            pass  # Verification below supplies the existing unknown-ID diagnostic.
+            pass  # The verifier supplies the normal unknown-ID diagnostic.
         except (OSError, ValueError) as error:
             raise BenchmarkError(f"cannot read benchmark manifest: {error}") from error
+    scope = None
+    if pinned is not None:
+        _, record = read_benchmark_manifest(candidate, pinned)
+        if record["schema"] == NATIVE_SCHEMA:
+            from autoforecast.snapshots import Connections, NativeReadScope
+
+            scope = (NativeReadScope(
+                connections if isinstance(connections, Connections) else
+                Connections(supplied=connections, spark=spark),
+                scratch_root=scratch_root or tempfile.gettempdir(), spark=spark,
+            ) if connections is not None else NativeReadScope.from_environment(
+                scratch_root=scratch_root, spark=spark,
+            ))
+    try:
+        with scope.active() if scope is not None else nullcontext():
+            study = _load_study(study_id, registry, spark, scratch_root, _expected_sha256, pinned)
+        return dataclasses.replace(study, _native_inputs=scope)
+    except BaseException:
+        if scope is not None:
+            with suppress(Exception):
+                scope.close()
+        raise
+
+
+def _load_study(study_id, registry, spark, scratch_root, _expected_sha256, pinned):
+    candidate = registry / study_id / "benchmark.json"
+    # The same original bytes selected the mode and now authorize verification.
     try:
         if _expected_sha256 is None:
             path, _ = verify_benchmark(candidate, pinned)
@@ -127,6 +159,9 @@ class Study:
     _snapshots: tempfile.TemporaryDirectory = dataclasses.field(repr=False, compare=False)
     _registration: bytes | None = dataclasses.field(default=None, repr=False)
     _implementation_scope: bytes | None = dataclasses.field(default=None, repr=False)
+    _native_inputs: NativeReadScope | None = dataclasses.field(
+        default=None, repr=False, compare=False,
+    )
     _closed: bool = dataclasses.field(default=False, init=False, repr=False, compare=False)
 
     def __enter__(self) -> Study:
@@ -149,8 +184,11 @@ class Study:
         """Release study snapshots; returned lazy dataframes must no longer be used."""
         if not self._closed:
             object.__setattr__(self, "_closed", True)
-            self._snapshots.cleanup()
+            with _cleanup_on_exit(self._snapshots.cleanup, label="Study transport cleanup failed"):
+                if self._native_inputs is not None:
+                    self._native_inputs.close()
 
+    @_study_inputs
     def _record(self, *, data: bool = False) -> dict:
         if self._closed or not pathlib.Path(self._snapshots.name).is_dir():
             raise ValueError("Study is closed")
@@ -185,6 +223,7 @@ class Study:
         return self._record()["cohort_series_count"]
 
     @property
+    @_study_inputs
     def panel(self) -> Panel:
         """Frozen column, cadence and target settings; use stage properties for data."""
         record = self._record()
@@ -228,23 +267,28 @@ class Study:
     def forecasting_date_range(self) -> tuple[TimePoint, TimePoint]:
         return self.testing_date_range
 
+    @_study_inputs
     def _frame(self, role: str, stage: str | None = None) -> DataFrame:
         record = self._record()
         source = artifact_path(self._path, record, role)
         expected = record["artifacts"][role]
-        if directory_digest(source, suffixes=(".parquet",)) != expected:
-            raise BenchmarkError(f"benchmark artifact changed: {role}")
-        # Keep operation-owned bytes alive for Spark's deferred reads. Never return a
-        # dataframe whose plan points at a mutable registry artifact.
-        destination = pathlib.Path(self._snapshots.name) / record["role_paths"][role]
-        if destination.exists():
-            if directory_digest(destination, suffixes=(".parquet",)) != expected:
-                raise BenchmarkError("study snapshot changed")
+        native = record["schema"] == NATIVE_SCHEMA
+        if native:
+            destination = source
         else:
-            snapshot_parquet_directory(
-                source, destination,
-                expected_sha256=expected, label=role,
-            )
+            if directory_digest(source, suffixes=(".parquet",)) != expected:
+                raise BenchmarkError(f"benchmark artifact changed: {role}")
+            # Keep operation-owned bytes alive for Spark's deferred reads. Never return a
+            # dataframe whose plan points at a mutable registry artifact.
+            destination = pathlib.Path(self._snapshots.name) / record["role_paths"][role]
+            if destination.exists():
+                if directory_digest(destination, suffixes=(".parquet",)) != expected:
+                    raise BenchmarkError("study snapshot changed")
+            else:
+                snapshot_parquet_directory(
+                    source, destination,
+                    expected_sha256=expected, label=role,
+                )
         frame = self._spark.read.parquet(str(destination))
         if "execution_policy" in record and role in {
             "selection", "final_training", "validation_score", "final_score",
@@ -259,10 +303,14 @@ class Study:
             frame = frame.filter(F.col(panel.time_col).between(
                 time_literal(start, cadence), time_literal(end, cadence),
             ))
-        if directory_digest(destination, suffixes=(".parquet",)) != expected:
-            raise BenchmarkError("study snapshot changed")
-        if directory_digest(source, suffixes=(".parquet",)) != expected:
-            raise BenchmarkError(f"benchmark artifact changed: {role}")
+        if native:
+            assert self._native_inputs is not None
+            self._native_inputs.inspect(expected)
+        else:
+            if directory_digest(destination, suffixes=(".parquet",)) != expected:
+                raise BenchmarkError("study snapshot changed")
+            if directory_digest(source, suffixes=(".parquet",)) != expected:
+                raise BenchmarkError(f"benchmark artifact changed: {role}")
         self._record()
         return frame
 
@@ -310,6 +358,7 @@ class Study:
             return None
         return self._frame("scoring_references")
 
+    @_study_inputs
     def tune(
         self, *, fit_predict: Callable[[FitPredictRequest], FitPredictResult],
         config: str | pathlib.Path, implementation: Mapping[str, object] | None = None,
@@ -331,6 +380,7 @@ class Study:
                           implementation=implementation, tuning_origin=tuning_origin,
                           output_dir=output_dir, reuse_tuning=reuse_tuning)
 
+    @_study_inputs
     def preflight(
         self, *, config: str | pathlib.Path, tuning_origin: str | None = None,
         output_dir: str | pathlib.Path | None = None,
@@ -344,6 +394,7 @@ class Study:
             output_dir=_output_root(self, output_dir, "study-preflight"),
         )
 
+    @_study_inputs
     def run_forecast_workflow(
         self, *, fit_predict: Callable[[FitPredictRequest], FitPredictResult],
         implementation: Mapping[str, object] | None = None,
@@ -372,6 +423,7 @@ class Study:
             fixed_parameters=fixed_parameters, validation_only=validation_only,
             validation_run=validation_run, model_label=model_label)
 
+    @_study_inputs
     def run_campaign(self, *, models, output_dir=None, **execution) -> dict:
         """Compare declared external models through the existing campaign runner.
 
@@ -381,6 +433,7 @@ class Study:
         from autoforecast.study_campaign import run_study_campaign
         return run_study_campaign(self, models=models, output_dir=output_dir, **execution)
 
+    @_study_inputs
     def evaluate_forecasts(
         self,
         *,
@@ -467,7 +520,7 @@ class Study:
                 # The single-forecast scorer snapshots all inputs before its first Spark call.
                 # There is no comparison/ranking prepass that can reread mutable predictions.
                 score = score_study(
-                    dataclasses.replace(self.panel, path=fixed["actuals"]["path"]),
+                    dataclasses.replace(self.panel, path=str(bound_input_path(fixed["actuals"]))),
                     forecast, self._spark, contract=fixed, output_dir=output / stage / "scores",
                     forecast_accuracy_breakdown=forecast_accuracy_breakdown,
                     scratch_root=self._snapshots.name,

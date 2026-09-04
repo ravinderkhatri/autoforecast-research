@@ -14,12 +14,16 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 
 from autoforecast._exact_json import loads_exact_json
-from autoforecast.benchmark import MISSING_COLUMN, artifact_path
+from autoforecast.benchmark import (
+    MISSING_COLUMN,
+    artifact_binding,
+    snapshot_bound_input,
+    verify_input_binding,
+)
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.frequency import canonical_origin, parse_frequency, period_points
 from autoforecast.panel import Panel
 from autoforecast.study_scoring import verify_study_evaluation
-from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 
 @dataclass(frozen=True)
@@ -120,23 +124,14 @@ class StudyValidation:
         dataset = _load_dataset_contract_bytes(dataset_bytes, dataset_path)
         if dataclasses.asdict(panel) != dataclasses.asdict(dataset.panel(panel.path)):
             raise ValueError("study checkpoint panel roles differ from the frozen dataset")
-        if directory_digest(panel.path, suffixes=(".parquet",)) != contract["actuals"]["sha256"]:
-            raise ValueError("study checkpoint validation panel differs from its frozen actuals")
-        inputs = {
-            name: (pathlib.Path(contract[name]["path"]), contract[name]["sha256"])
-            for name in ("actuals", "grid", "coverage")
-        }
+        verify_input_binding(pathlib.Path(panel.path), contract["actuals"])
+        inputs = {name: contract[name] for name in ("actuals", "grid", "coverage")}
         if contract["metric_policy"]["metric"] == "wrmsse":
-            inputs["references"] = (
-                artifact_path(path, record, "scoring_references"),
-                record["artifacts"]["scoring_references"],
-            )
+            inputs["references"] = artifact_binding(path, record, "scoring_references")
         with tempfile.TemporaryDirectory(prefix="autoforecast-validation-") as directory:
             snapshots = {
-                name: snapshot_parquet_directory(
-                    source, pathlib.Path(directory) / name, expected_sha256=sha, label=name,
-                )
-                for name, (source, sha) in inputs.items()
+                name: snapshot_bound_input(binding, pathlib.Path(directory) / name)
+                for name, binding in inputs.items()
             }
             result = _read_window(
                 contract, contract_sha256, snapshots, panel, origin, horizon, series_ids,
