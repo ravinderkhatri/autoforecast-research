@@ -641,7 +641,7 @@ finally:
 def test_example_main_stops_its_owned_session(tmp_path, fail):
     # A separate process starts with no caller runtime and checks the real owned-session boundary.
     process = subprocess.run([sys.executable, "-c", """
-import sys
+import os, sys
 from pyspark import SparkContext
 from pyspark.sql import SparkSession
 from scripts import study_example as example
@@ -649,10 +649,12 @@ from scripts import study_example as example
 assert SparkContext._active_spark_context is None
 assert SparkSession.getActiveSession() is None
 assert SparkSession._instantiatedSession is None
+os.environ.pop('PYSPARK_PYTHON', None)
 fail = sys.argv.pop() == 'True'
 seen = []
 def run(project, session):
     assert session.sparkContext is SparkContext._active_spark_context
+    assert session.sparkContext.pythonExec == sys.executable
     seen.append(session)
     if fail:
         raise RuntimeError('example failure')

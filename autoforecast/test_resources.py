@@ -928,9 +928,16 @@ def test_fresh_spark_acquisition_blocks_a_context_only_creator() -> None:
     assert acquired is owned_spark and state["session"] is owned_spark
 
 
-def test_embedded_spark_acquisition_is_atomic_and_does_not_mutate_caller_config() -> None:
+@pytest.mark.parametrize("worker", [None, "chosen-worker"])
+def test_embedded_spark_acquisition_is_atomic_and_does_not_mutate_caller_config(
+    monkeypatch, worker,
+) -> None:
     import autoforecast.resources as res
 
+    if worker is None:
+        monkeypatch.delenv("PYSPARK_PYTHON", raising=False)
+    else:
+        monkeypatch.setenv("PYSPARK_PYTHON", worker)
     session_lock, context_lock = threading.RLock(), threading.RLock()
     state = {"session": None}
     owned_spark, competing_spark = object(), object()
@@ -976,6 +983,7 @@ def test_embedded_spark_acquisition_is_atomic_and_does_not_mutate_caller_config(
     acquired, owned = res._acquire_embedded_spark_runtime(
         session_type, context_type, app_name="test", profile_factory=profile_factory)
     assert acquired is owned_spark and owned
+    assert os.environ["PYSPARK_PYTHON"] == (worker or sys.executable)
     assert thread is not None
     thread.join(2)
     assert completed.is_set() and state["session"] is owned_spark
@@ -984,11 +992,13 @@ def test_embedded_spark_acquisition_is_atomic_and_does_not_mutate_caller_config(
     # run, because PySpark applies those options to an existing session.
     poisoned_builder = mock.Mock()
     session_type.builder = poisoned_builder
+    monkeypatch.setenv("PYSPARK_PYTHON", "borrowed-worker")
     acquired, owned = res._acquire_embedded_spark_runtime(
         session_type, context_type, app_name="test",
         profile_factory=lambda: (_ for _ in ()).throw(
             AssertionError("profiled a caller-owned runtime")))
     assert acquired is owned_spark and not owned
+    assert os.environ["PYSPARK_PYTHON"] == "borrowed-worker"
     poisoned_builder.master.assert_not_called()
     poisoned_builder.appName.assert_not_called()
     poisoned_builder.config.assert_not_called()

@@ -843,6 +843,9 @@ def _acquire_embedded_spark_runtime(
             profile = profile_factory()
             if not isinstance(profile, SparkProfile):
                 raise ResourceError("embedded Spark profile factory returned no SparkProfile")
+            # An owned local worker needs the same installed packages as its driver.
+            # Preserve an explicitly selected worker interpreter and all borrowed runtimes.
+            os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
             builder = session_type.builder.master(f"local[{profile.cores}]").appName(app_name)
             for key, value in profile.as_config().items():
                 builder = builder.config(key, value)

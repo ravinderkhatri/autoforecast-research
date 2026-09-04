@@ -882,7 +882,7 @@ def _copy_and_corrupt_coverage(
             table.schema.get_field_index("scored"),
             "scored",
             pa.array(table["scored"].to_pylist(), type=pa.float64()),
-        )
+        ).replace_schema_metadata(None)
         rows = table.to_pylist()
     else:
         rows[0]["scored"] += 1
