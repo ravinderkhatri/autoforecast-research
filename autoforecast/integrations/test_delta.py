@@ -831,6 +831,30 @@ def test_simultaneous_initial_table_provisioning_is_retryable(spark, tmp_path):
         spark.sql(f"DROP SCHEMA IF EXISTS `{namespace}` CASCADE")
 
 
+def test_registry_tables_are_described_once_in_the_catalog(spark, tmp_path):
+    from autoforecast.integrations.delta import DESCRIPTIONS, SCHEMAS, latest_delta_version
+
+    namespace = "described_" + tmp_path.name.replace("-", "_")
+    try:
+        # Tables created by an earlier release have no comments; preparing describes them.
+        spark.sql(f"CREATE SCHEMA `{namespace}`")
+        for kind, schema in SCHEMAS.items():
+            spark.sql(f"CREATE TABLE `{namespace}`.`{kind}` ({schema}) USING DELTA")
+        store = DeltaStudyStore(spark, namespace=namespace)
+        store.prepare(lock_path=tmp_path / "provision.lock")
+        for kind, (comment, columns) in DESCRIPTIONS.items():
+            name = store.tables[kind]
+            assert spark.catalog.getTable(name).description == comment
+            assert {c.name: c.description for c in spark.catalog.listColumns(name)} == columns
+        # Described tables are left alone: preparing again adds no table version.
+        versions = {kind: latest_delta_version(spark, name) for kind, name in store.tables.items()}
+        store.prepare(lock_path=tmp_path / "provision.lock")
+        assert {kind: latest_delta_version(spark, name)
+                for kind, name in store.tables.items()} == versions
+    finally:
+        spark.sql(f"DROP SCHEMA IF EXISTS `{namespace}` CASCADE")
+
+
 def test_sql_registration_partial_definition_recovery_and_live_source_changes(store, tmp_path,
                                                                            monkeypatch):
     import yaml
