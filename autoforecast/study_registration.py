@@ -504,6 +504,51 @@ def _source_version_record(path, provenance, physical=None):
     }}
 
 
+# The rows a read returned: their typed fingerprint (column names and types included) and counts.
+_READ_CONTENT = ("logical_hash", "logical_sha256", "rows", "eligible_series", "starting_series")
+# A supplied stage also keeps its declared range, columns and frozen role.
+_STAGE_CONTENT = ("planned_range", "columns", "frozen_role", "observed_range", "rows",
+                  "logical_hash", "snapshot_sha256")
+
+
+def _read_identity(record):
+    """The rows a source read returned: the part of a row-identity record that names the study.
+
+    How, where and when they were read (source kind, query text, table names, Delta versions,
+    table IDs, storage locations, capture times, database snapshots and Spark schema details)
+    stays in the registration record but does not change the study ID: the same rows name the
+    same study, whatever source they came from. Version and archived-snapshot identities are
+    unchanged; there the read itself is the identity.
+    """
+    if not isinstance(record, dict):
+        return record
+    if record.get("kind") == "supplied_stages":
+        return {"kind": "supplied_stages", "stages": {
+            name: (stage if not _named_by_rows(stage)
+                   else {key: stage[key] for key in _STAGE_CONTENT if key in stage})
+            for name, stage in sorted(record["stages"].items())}}
+    if not _named_by_rows(record):
+        return record
+    return {key: record[key] for key in _READ_CONTENT if key in record}
+
+
+def _named_by_rows(record):
+    """A row fingerprint names this read; an archived snapshot or a version never is dropped.
+
+    An archived capture's ``snapshot`` is its reference record; a PostgreSQL read's
+    ``snapshot`` is only the transaction snapshot it was read at, which is provenance.
+    """
+    return (isinstance(record, dict) and "logical_hash" in record
+            and not isinstance(record.get("snapshot"), dict) and "source_version" not in record)
+
+
+def _registration_identity(definition):
+    """A registration without the provenance of its source read (see ``_read_identity``)."""
+    if not isinstance(definition, dict) or "source" not in definition:
+        return definition
+    return {**definition, "source": _read_identity(definition["source"])}
+
+
 def _identity_rows(identity):
     """Row count recorded by a native, row or source version identity."""
     if "snapshot" in identity:
@@ -569,7 +614,7 @@ def _verify_admission(root, binding, *, trusted=False, spark=None, _scratch_root
     record = _read_saved(path)
     if digest(record) != binding["sha256"]:
         raise ValueError("admission record differs from its baseline")
-    _fields(record, {"schema", "identity", "study_id", "outcome", "artifacts"},
+    _fields(record, {"schema", "identity", "study_id", "outcome", "artifacts"}, {"provenance"},
             label="admission record")
     if not isinstance(record["identity"], dict) or not isinstance(record["artifacts"], dict):
         raise ValueError("admission identity and artifacts require mappings")
@@ -593,8 +638,13 @@ def _verify_admission(root, binding, *, trusted=False, spark=None, _scratch_root
     return record
 
 
-def _prepare_admission(registry, staging, identity, final_keys, recipe, *, artifact_bindings=None):
-    """Finish the exact cohort evidence before a native study chooses its identity."""
+def _prepare_admission(registry, staging, identity, final_keys, recipe, *, artifact_bindings=None,
+                       provenance=None):
+    """Finish the exact cohort evidence before a native study chooses its identity.
+
+    ``provenance`` keeps the full record of each source read (how, where and when it was
+    read) beside the identity, which names only the rows each read returned.
+    """
     write_few_files(final_keys, staging / "final_keys")
     starting = registry.spark.read.parquet(str(managed_path(staging / "starting_keys")))
     retained = registry.spark.read.parquet(str(managed_path(staging / "retained_keys")))
@@ -622,12 +672,13 @@ def _prepare_admission(registry, staging, identity, final_keys, recipe, *, artif
                           "native_admission": recipe},
               "artifacts": {p.name: _artifact_record(
                   p, registry.spark, expected=(artifact_bindings or {}).get(p),
-              ) for p in _staging_directories(staging)}}
+              ) for p in _staging_directories(staging)},
+              **({"provenance": provenance} if provenance is not None else {})}
     return record
 
 
 def _save_admission(registry, staging, identity, frozen, *, format, artifact_bindings=None,
-                    prepared_record=None):
+                    prepared_record=None, provenance=None):
     """Publish immutable evidence once; retries retain the first bytes and encoding."""
     study_id = frozen["study_id"]
     protected_binding = None
@@ -639,7 +690,7 @@ def _save_admission(registry, staging, identity, frozen, *, format, artifact_bin
         ))).select(*frozen["recipe"]["source_keys"])
         prepared_record = _prepare_admission(
             registry, staging, identity, final_keys, frozen["recipe"],
-            artifact_bindings=artifact_bindings,
+            artifact_bindings=artifact_bindings, provenance=provenance,
         )
     record = {**prepared_record, "study_id": study_id}
     capture = current_capture()
@@ -662,6 +713,8 @@ def _save_admission(registry, staging, identity, frozen, *, format, artifact_bin
         else:
             old = _read_saved(existing)
             def comparable(item):
+                # How the first registration read its sources stays as its provenance.
+                item = {key: value for key, value in item.items() if key != "provenance"}
                 return {**item, "artifacts": {
                     name: value.get("snapshot", value.get("logical_sha256"))
                     for name, value in item["artifacts"].items()
@@ -1218,11 +1271,12 @@ class StudyRegistry:
             raise ValueError("registered library study identity differs")
         owner = self._native_evidence_owner(record)
         binding = record.get("admission_identity", {})
-        if binding.get("schema") == "autoforecast.supplied-stage-identity.v1":
+        if binding.get("schema") == "autoforecast.supplied-stage-identity.v2":
+            # Supplied stages are named by the rows each stage returned.
             if (definition["schema"] != "autoforecast.registration.v4"
                     or definition["source"].get("kind") != "supplied_stages"
                     or "admission_evidence" in definition
-                    or binding["sha256"] != digest(definition["source"])):
+                    or binding["sha256"] != digest(_read_identity(definition["source"]))):
                 raise ValueError("supplied stage provenance differs from the frozen identity")
         elif (definition["schema"] == "autoforecast.registration.v4"
               or definition["source"].get("kind") == "supplied_stages"):
@@ -1343,11 +1397,18 @@ class StudyRegistry:
                     raise ValueError("cannot publish a released study or use a released parent")
             existing = _record_path(baseline, study_id)
             if existing is not None:
-                if _read_saved(existing) != envelope:
-                    raise ValueError(
-                        "conflicting immutable study registration; use a new registry root "
-                        "and, for Delta, a new registry namespace or new table names",
-                    )
+                saved = _read_saved(existing)
+                if saved != envelope:
+                    if (saved.get("sha256") != digest(saved.get("definition"))
+                            or _registration_identity(saved["definition"])
+                            != _registration_identity(definition)):
+                        raise ValueError(
+                            "conflicting immutable study registration; use a new registry root "
+                            "and, for Delta, a new registry namespace or new table names",
+                        )
+                    # The same rows, read again from a newer table version or snapshot: the
+                    # study is already registered, so keep its first record and provenance.
+                    definition, sha = saved["definition"], saved["sha256"]
             if self.store is not None:
                 from autoforecast.integrations.delta import SCHEMAS
 
@@ -2451,8 +2512,10 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
         findings = _save_findings(registry, findings, issues_root, "source", check_id)
         if findings.filter(F.col("status") == "failed").limit(1).count():
             raise ValueError(f"structural source issues block registration: {issues_root}")
+        # Supplied stages are named by their rows; a source version is named by the read itself.
         admission_identity = (
-            source_record if inputs is not None or "source_version" in source_record else None
+            _read_identity(source_record) if inputs is not None
+            else source_record if "source_version" in source_record else None
         )
         captured = {}
         staging = issues_root / "admission-staging"
@@ -2620,10 +2683,14 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                 else _artifact_record(p, session, expected=artifact_bindings.get(p))
                 for p in dict.fromkeys([*_staging_directories(staging), *artifact_bindings])
             }
+            # The full record of every read is kept with the admission evidence.
+            read_provenance = {"sources": {"primary": source_record, **query_records}}
             admission_identity = {
                 "schema": "autoforecast.preparation-evidence.v1",
                 "configuration": json.loads(configuration_baseline),
-                "sources": {"primary": source_record, **query_records},
+                # Where and when each source was read is provenance, not identity.
+                "sources": {name: _read_identity(record)
+                            for name, record in read_provenance["sources"].items()},
                 "population_query": source.get("population", "primary"),
                 "require_matching_population": source.get("require_matching_population", True),
                 "preparation": preparation_metadata, "references": reference_definition,
@@ -2657,7 +2724,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                 final_keys = session.read.parquet(str(final_key_path)).select(*keys)
                 prepared_admission = _prepare_admission(
                     registry, staging, admission_identity, final_keys, frozen["recipe"],
-                    artifact_bindings=artifact_bindings,
+                    artifact_bindings=artifact_bindings, provenance=read_provenance,
                 )
                 for binding in prepared_admission["artifacts"].values():
                     capture.retain(binding["snapshot"])
@@ -2671,7 +2738,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             scoring_references=references, scratch_root=registry.scratch_root,
             native_inputs=native_inputs,
             native_inventory=native_inventory if capture is not None else None,
-            admission_identity=({"schema": ("autoforecast.supplied-stage-identity.v1"
+            admission_identity=({"schema": ("autoforecast.supplied-stage-identity.v2"
                                             if inputs is not None
                                             else "autoforecast.source-version-identity.v1"
                                             if prepare is None and "source_version" in source_record
@@ -2714,6 +2781,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             definition["admission_evidence"] = _save_admission(
                 registry, staging, admission_identity, frozen, format=format,
                 artifact_bindings=artifact_bindings, prepared_record=prepared_admission,
+                provenance=read_provenance,
             )
         if registry.store is not None:
             for report_id in (check_id, check_id + "-references", check_id + "-application",
