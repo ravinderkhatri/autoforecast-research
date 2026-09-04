@@ -518,8 +518,9 @@ def _capture(path, *, spark=None):
             raise ValueError("logical hashing requires a Parquet schema")
         schema, rows, foreign_int96 = None, 0, False
         # Strict upper bound on one row's decoded bytes. A decoded value is never larger
-        # than its column chunk, dictionary included, and one row of a repeated column
-        # can hold every value of the chunk beyond one per other row.
+        # than its column chunk, dictionary included; Arrow adds at most an 8-byte offset
+        # and a validity bit for each nesting level. One row of a repeated column can hold
+        # every value of the chunk beyond one per other row.
         row_bytes = 0
         for file in files:
             if (
@@ -537,7 +538,8 @@ def _capture(path, *, spark=None):
                 for i in range(footer.metadata.num_row_groups):
                     group = footer.metadata.row_group(i)
                     row_bytes = max(row_bytes, sum(
-                        group.column(j).total_uncompressed_size
+                        (group.column(j).total_uncompressed_size
+                         + 8 * (footer.schema.column(j).max_definition_level + 1))
                         * max(1, group.column(j).num_values - group.num_rows + 1)
                         for j in range(group.num_columns)
                     ))

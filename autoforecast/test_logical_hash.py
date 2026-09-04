@@ -12,7 +12,7 @@ import pytest
 from pyspark.sql import SparkSession
 
 from autoforecast import _logical_hash as logical
-from provenance.lineage import directory_digest
+from provenance.lineage import directory_digest, parquet_files
 
 
 @pytest.fixture(autouse=True)
@@ -1333,3 +1333,32 @@ def test_local_limits_are_independent(tmp_path, spark, monkeypatch, kind):
     monkeypatch.setattr(logical, "_offline", local)
     assert logical.fingerprint(path, spark=spark) == expected
     assert not calls
+
+
+def test_offline_batches_bound_deep_nesting_overhead(tmp_path, monkeypatch):
+    # Each row holds one value under 64 list levels: tiny on disk, about 1 KiB per row
+    # once Arrow materializes the offsets and validity of every level.
+    dtype, value = pa.int64(), 1
+    for _ in range(64):
+        dtype, value = pa.list_(dtype), [value]
+    column = pa.array([value] * 8192, type=dtype)
+    path = tmp_path / "nested.parquet"
+    pq.write_table(pa.table({name: column for name in "abcd"}), path)
+    monkeypatch.setattr(logical, "_LOCAL_MAX_ROWS", 250_000)
+    offline = logical._offline
+    sizes = []
+
+    def measured(path, schema, rows, batch_rows):
+        for file in parquet_files(path):
+            with pq.ParquetFile(file) as reader:
+                sizes.extend(batch.nbytes for batch in reader.iter_batches(batch_size=batch_rows))
+        return offline(path, schema, rows, batch_rows)
+
+    class NoJobs:
+        @property
+        def read(self):
+            raise AssertionError("a capture within the offline bound must not launch Spark")
+
+    monkeypatch.setattr(logical, "_offline", measured)
+    assert logical.fingerprint(path, spark=NoJobs()) == logical.fingerprint(path)
+    assert sizes and max(sizes) <= logical._LOCAL_MAX_BYTES
