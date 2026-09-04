@@ -2286,7 +2286,7 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
     describe = (_artifact_record if retain_binding
                 else functools.partial(_logical_record, physical=physical))
     source = value["source"]
-    by_version = value["storage"].get("input_identity", "rows") == "source_version"
+    by_version = value.get("storage", {}).get("input_identity", "rows") == "source_version"
     if by_version and (retain_binding or current_capture() is not None
                        or inputs is not None or source["kind"] != "delta"):
         raise ValueError("storage.input_identity: source_version applies to an ordinary "
