@@ -1399,3 +1399,33 @@ def test_new_root_accepts_reregistration(tmp_path, schema):
     new_definition = {"schema": "autoforecast.registration." + schema,
                       "study_id": study_id, "registry_backend": "files"}
     assert registry._publish_definition(new_definition) == study_id
+
+
+def test_retained_capture_passes_every_captured_file_identity_to_preparation(spark, tmp_path):
+    from types import SimpleNamespace
+
+    from autoforecast import study_registration as registration
+    from provenance.lineage import directory_digest
+
+    registry_root = tmp_path / "registry"
+    inputs = {}
+    for name, rows in (("primary", [("A", 1.0)]), ("population", [("A",)])):
+        folder = registry_root / "captures" / "c1" / name
+        folder.mkdir(parents=True)
+        columns = ["item", "value"][:len(rows[0])]
+        pq.write_table(pa.Table.from_pylist([dict(zip(columns, row, strict=True)) for row in rows]),
+                       folder / "part.parquet")
+        inputs[name] = {"path": name, "sha256": directory_digest(folder, suffixes=(".parquet",))}
+    value = {"source": {"kind": "capture", "_manifest_sha256": "m" * 64, "_retained": {
+        "capture_id": "c1", "inputs": inputs,
+        "provenance": {"primary": {"kind": "delta"}, "population": {"kind": "delta"}},
+    }}}
+    root = tmp_path / "attempt"
+    root.mkdir()
+    physical = {}
+    registration._capture_source_inputs(
+        value, SimpleNamespace(spark=spark, root=registry_root), root, physical=physical,
+    )
+    # Preparation compares these with the files after its callback, never re-baselining.
+    assert physical == {root / "source": inputs["primary"]["sha256"],
+                        root / "audit-population": inputs["population"]["sha256"]}

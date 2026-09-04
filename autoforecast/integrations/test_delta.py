@@ -434,17 +434,18 @@ def test_prepared_registration_owns_audit_query_evidence_and_links_before_public
 
     from autoforecast import _logical_hash
 
-    fingerprint = _logical_hash.fingerprint
+    capture = _logical_hash._capture
     audit_hashes = []
 
     def captured_hash(path, *, spark=None):
+        # Every logical hash of a capture goes through _capture, with or without fingerprint.
         if path.name == "audit-population":
             assert spark is store.spark
             assert path.exists()
             audit_hashes.append(path)
-        return fingerprint(path, spark=spark)
+        return capture(path, spark=spark)
 
-    monkeypatch.setattr(_logical_hash, "fingerprint", captured_hash)
+    monkeypatch.setattr(_logical_hash, "_capture", captured_hash)
 
     class SensorAudit(SensorPreparation):
         def prepare(self, context):

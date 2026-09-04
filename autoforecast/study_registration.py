@@ -2242,6 +2242,8 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
             else:
                 snapshot_parquet_directory(capture_root / binding["path"], destination,
                                            expected_sha256=binding["sha256"], label=name)
+                if physical is not None:
+                    physical[destination] = binding["sha256"]
             frames[name] = session.read.parquet(str(managed_path(destination)))
         frame = frames.pop("primary")
         source_record = {
