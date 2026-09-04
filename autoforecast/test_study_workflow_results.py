@@ -696,7 +696,9 @@ def test_output_root_rejects_completed_search_namespace(spark, tmp_path):
                         output_dir=selected.path / relative)
 
 
-@pytest.mark.parametrize("marker", ["admission.json", "admission.yaml", "capture.json"])
+# Every admission name the registry reader looks up (study_registration._record_path).
+@pytest.mark.parametrize("marker", ["admission.json", "admission.yaml", "admission.yml",
+                                    "capture.json"])
 def test_output_root_rejects_sealed_admission_and_capture_evidence(spark, tmp_path, marker):
     manifest = register(tmp_path / "output-study", spark, count=1)
     cfg = _one_trial(profile(tmp_path, selection={"stage": "validation"}))

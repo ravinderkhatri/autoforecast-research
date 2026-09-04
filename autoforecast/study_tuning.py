@@ -886,6 +886,7 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
                 "benchmark.json",
                 "admission.json",
                 "admission.yaml",
+                "admission.yml",
                 "capture.json",
                 "selection.json",
                 "artifact_manifest.json",
