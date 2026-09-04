@@ -1,78 +1,78 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="850" viewBox="0 0 1200 850" role="img" aria-labelledby="title desc">
 <title id="title">Evaluate forecasts in time order</title><desc id="desc">Optional tuning uses earlier windows. Validation and final testing remain separate.</desc>
-<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#245DD8"/></marker></defs>
-<rect width="1200" height="850" fill="#F4F7FB"/>
-<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
-<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#172A43" font-weight="700">Evaluate forecasts in time order</text>
-<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#53647A">Optional tuning uses earlier windows. Validation and final testing remain separate.</text>
-<path d="M331 185 L1130 185" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<text x="334" y="168" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Earlier observations</text>
-<text x="1000" y="168" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Later observations</text>
-<text x="40" y="248" font-family="Arial, sans-serif" font-size="22" fill="#172A43" font-weight="700">Tune settings</text>
-<text x="40" y="277" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Earlier window 1</text>
-<rect x="333" y="225" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="398" y="225" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="463" y="225" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="528" y="225" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="593" y="225" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="658" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="723" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="788" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="853" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="918" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="983" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="1048" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="338" y="311" font-family="Arial, sans-serif" font-size="16" fill="#245DD8">History supplied for fitting</text>
-<text x="528" y="311" font-family="Arial, sans-serif" font-size="16" fill="#B46B08">Forecast and score</text>
-<text x="40" y="350" font-family="Arial, sans-serif" font-size="22" fill="#172A43" font-weight="700">Repeat the comparison</text>
-<text x="40" y="379" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Earlier window 2</text>
-<rect x="333" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="398" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="463" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="528" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="593" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="658" y="327" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="723" y="327" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="788" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="853" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="918" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="983" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="1048" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="338" y="413" font-family="Arial, sans-serif" font-size="16" fill="#245DD8">History supplied for fitting</text>
-<text x="658" y="413" font-family="Arial, sans-serif" font-size="16" fill="#B46B08">Forecast and score</text>
-<text x="40" y="472" font-family="Arial, sans-serif" font-size="22" fill="#172A43" font-weight="700">Validate the choice</text>
-<text x="40" y="501" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Evaluate chosen settings</text>
-<rect x="333" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="398" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="463" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="528" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="593" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="658" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="723" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="788" y="449" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="853" y="449" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="918" y="449" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="983" y="449" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="1048" y="449" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="338" y="535" font-family="Arial, sans-serif" font-size="16" fill="#245DD8">History supplied for fitting</text>
-<text x="788" y="535" font-family="Arial, sans-serif" font-size="16" fill="#B46B08">Forecast and score</text>
-<text x="40" y="594" font-family="Arial, sans-serif" font-size="22" fill="#172A43" font-weight="700">Refit and test</text>
-<text x="40" y="623" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Use more recent history</text>
-<rect x="333" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="398" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="463" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="528" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="593" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="658" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="723" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="788" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="853" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="918" y="571" width="55" height="58" rx="6" fill="#D8F1E9" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="983" y="571" width="55" height="58" rx="6" fill="#D8F1E9" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="1048" y="571" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="338" y="657" font-family="Arial, sans-serif" font-size="16" fill="#245DD8">History supplied for fitting</text>
-<text x="918" y="657" font-family="Arial, sans-serif" font-size="16" fill="#087F82">Forecast and score</text>
-<rect x="40" y="738" width="1120" height="72" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="60" y="768" font-family="Arial, sans-serif" font-size="18" fill="#172A43" font-weight="700">Future target values are held back from fitting.</text>
-<text x="60" y="795" font-family="Arial, sans-serif" font-size="17" fill="#53647A">Final test scores never select the model settings. Window lengths come from the study configuration.</text>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#79b8ff"/></marker></defs>
+<rect width="1200" height="850" fill="#0d1117"/>
+<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#79b8ff" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
+<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#e6edf3" font-weight="700">Evaluate forecasts in time order</text>
+<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#a7b6c8">Optional tuning uses earlier windows. Validation and final testing remain separate.</text>
+<path d="M331 185 L1130 185" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<text x="334" y="168" font-family="Arial, sans-serif" font-size="16" fill="#a7b6c8">Earlier observations</text>
+<text x="1000" y="168" font-family="Arial, sans-serif" font-size="16" fill="#a7b6c8">Later observations</text>
+<text x="40" y="248" font-family="Arial, sans-serif" font-size="22" fill="#e6edf3" font-weight="700">Tune settings</text>
+<text x="40" y="277" font-family="Arial, sans-serif" font-size="16" fill="#a7b6c8">Earlier window 1</text>
+<rect x="333" y="225" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="398" y="225" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="463" y="225" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="528" y="225" width="55" height="58" rx="6" fill="#71501d" stroke="#43546b" stroke-width="1.5"/>
+<rect x="593" y="225" width="55" height="58" rx="6" fill="#71501d" stroke="#43546b" stroke-width="1.5"/>
+<rect x="658" y="225" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="723" y="225" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="788" y="225" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="853" y="225" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="918" y="225" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="983" y="225" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="1048" y="225" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<text x="338" y="311" font-family="Arial, sans-serif" font-size="16" fill="#79b8ff">History supplied for fitting</text>
+<text x="528" y="311" font-family="Arial, sans-serif" font-size="16" fill="#f4c16d">Forecast and score</text>
+<text x="40" y="350" font-family="Arial, sans-serif" font-size="22" fill="#e6edf3" font-weight="700">Repeat the comparison</text>
+<text x="40" y="379" font-family="Arial, sans-serif" font-size="16" fill="#a7b6c8">Earlier window 2</text>
+<rect x="333" y="327" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="398" y="327" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="463" y="327" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="528" y="327" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="593" y="327" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="658" y="327" width="55" height="58" rx="6" fill="#71501d" stroke="#43546b" stroke-width="1.5"/>
+<rect x="723" y="327" width="55" height="58" rx="6" fill="#71501d" stroke="#43546b" stroke-width="1.5"/>
+<rect x="788" y="327" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="853" y="327" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="918" y="327" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="983" y="327" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="1048" y="327" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<text x="338" y="413" font-family="Arial, sans-serif" font-size="16" fill="#79b8ff">History supplied for fitting</text>
+<text x="658" y="413" font-family="Arial, sans-serif" font-size="16" fill="#f4c16d">Forecast and score</text>
+<text x="40" y="472" font-family="Arial, sans-serif" font-size="22" fill="#e6edf3" font-weight="700">Validate the choice</text>
+<text x="40" y="501" font-family="Arial, sans-serif" font-size="16" fill="#a7b6c8">Evaluate chosen settings</text>
+<rect x="333" y="449" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="398" y="449" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="463" y="449" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="528" y="449" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="593" y="449" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="658" y="449" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="723" y="449" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="788" y="449" width="55" height="58" rx="6" fill="#71501d" stroke="#43546b" stroke-width="1.5"/>
+<rect x="853" y="449" width="55" height="58" rx="6" fill="#71501d" stroke="#43546b" stroke-width="1.5"/>
+<rect x="918" y="449" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="983" y="449" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<rect x="1048" y="449" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<text x="338" y="535" font-family="Arial, sans-serif" font-size="16" fill="#79b8ff">History supplied for fitting</text>
+<text x="788" y="535" font-family="Arial, sans-serif" font-size="16" fill="#f4c16d">Forecast and score</text>
+<text x="40" y="594" font-family="Arial, sans-serif" font-size="22" fill="#e6edf3" font-weight="700">Refit and test</text>
+<text x="40" y="623" font-family="Arial, sans-serif" font-size="16" fill="#a7b6c8">Use more recent history</text>
+<rect x="333" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="398" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="463" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="528" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="593" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="658" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="723" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="788" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="853" y="571" width="55" height="58" rx="6" fill="#254b78" stroke="#43546b" stroke-width="1.5"/>
+<rect x="918" y="571" width="55" height="58" rx="6" fill="#226053" stroke="#43546b" stroke-width="1.5"/>
+<rect x="983" y="571" width="55" height="58" rx="6" fill="#226053" stroke="#43546b" stroke-width="1.5"/>
+<rect x="1048" y="571" width="55" height="58" rx="6" fill="#171f2b" stroke="#43546b" stroke-width="1.5"/>
+<text x="338" y="657" font-family="Arial, sans-serif" font-size="16" fill="#79b8ff">History supplied for fitting</text>
+<text x="918" y="657" font-family="Arial, sans-serif" font-size="16" fill="#6edbc6">Forecast and score</text>
+<rect x="40" y="738" width="1120" height="72" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="60" y="768" font-family="Arial, sans-serif" font-size="18" fill="#e6edf3" font-weight="700">Future target values are held back from fitting.</text>
+<text x="60" y="795" font-family="Arial, sans-serif" font-size="17" fill="#a7b6c8">Final test scores never select the model settings. Window lengths come from the study configuration.</text>
 </svg>

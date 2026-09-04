@@ -1,38 +1,38 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
 <title id="title">Results you can inspect and reuse</title><desc id="desc">Each run keeps its own evidence, with checks before loading and analysis.</desc>
-<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#245DD8"/></marker></defs>
-<rect width="1200" height="760" fill="#F4F7FB"/>
-<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
-<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#172A43" font-weight="700">Results you can inspect and reuse</text>
-<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#53647A">Each run keeps its own evidence, with checks before loading and analysis.</text>
-<rect x="40" y="165" width="1120" height="111" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="60" y="199" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">A reusable frozen study</text>
-<text x="60" y="234" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Population, preparation decisions, data snapshots and evaluation boundaries stay bound together.</text>
-<path d="M600 276 V300 M215 300 H985" stroke="#245DD8" stroke-width="2.5" fill="none"/>
-<path d="M215 300 L215 320" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<path d="M600 300 L600 320" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<path d="M985 300 L985 320" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<rect x="40" y="328" width="350" height="185" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="60" y="362" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">Forecasts and scores</text>
-<text x="60" y="397" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Predictions for each stage</text>
-<text x="60" y="424" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Metrics and coverage</text>
-<text x="60" y="451" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Comparable analysis tables</text>
-<rect x="425" y="328" width="350" height="185" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="445" y="362" font-family="Arial, sans-serif" font-size="21" fill="#087F82" font-weight="700">Fitted models</text>
-<text x="445" y="397" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Validation and refit models</text>
-<text x="445" y="424" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Native model files</text>
-<text x="445" y="451" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Optional diagnostics</text>
-<rect x="810" y="328" width="350" height="185" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="830" y="362" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">Execution evidence</text>
-<text x="830" y="397" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Effective settings and identities</text>
-<text x="830" y="424" font-family="Arial, sans-serif" font-size="17" fill="#172A43">File integrity checks</text>
-<text x="830" y="451" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Status and failure details</text>
-<path d="M215 513 L215 554" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<path d="M600 513 L600 554" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<path d="M985 513 L985 554" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<rect x="40" y="568" width="1120" height="132" rx="14" fill="#E8F5F3" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="60" y="604" font-family="Arial, sans-serif" font-size="24" fill="#087F82" font-weight="700">Verify, then reuse</text>
-<text x="60" y="641" font-family="Arial, sans-serif" font-size="18" fill="#172A43">Inspect saved results, export analysis tables, or publish checked results without retraining.</text>
-<text x="60" y="673" font-family="Arial, sans-serif" font-size="17" fill="#53647A">Keep referenced study and search artifacts. Check completion and coverage before drawing conclusions.</text>
-<text x="40" y="737" font-family="Arial, sans-serif" font-size="17" fill="#53647A">A separate run identity keeps repeated and concurrent executions apart.</text>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#79b8ff"/></marker></defs>
+<rect width="1200" height="760" fill="#0d1117"/>
+<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#79b8ff" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
+<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#e6edf3" font-weight="700">Results you can inspect and reuse</text>
+<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#a7b6c8">Each run keeps its own evidence, with checks before loading and analysis.</text>
+<rect x="40" y="165" width="1120" height="111" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="60" y="199" font-family="Arial, sans-serif" font-size="21" fill="#79b8ff" font-weight="700">A reusable frozen study</text>
+<text x="60" y="234" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Population, preparation decisions, data snapshots and evaluation boundaries stay bound together.</text>
+<path d="M600 276 V300 M215 300 H985" stroke="#79b8ff" stroke-width="2.5" fill="none"/>
+<path d="M215 300 L215 320" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M600 300 L600 320" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M985 300 L985 320" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="40" y="328" width="350" height="185" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="60" y="362" font-family="Arial, sans-serif" font-size="21" fill="#79b8ff" font-weight="700">Forecasts and scores</text>
+<text x="60" y="397" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Predictions for each stage</text>
+<text x="60" y="424" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Metrics and coverage</text>
+<text x="60" y="451" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Comparable analysis tables</text>
+<rect x="425" y="328" width="350" height="185" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="445" y="362" font-family="Arial, sans-serif" font-size="21" fill="#6edbc6" font-weight="700">Fitted models</text>
+<text x="445" y="397" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Validation and refit models</text>
+<text x="445" y="424" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Native model files</text>
+<text x="445" y="451" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Optional diagnostics</text>
+<rect x="810" y="328" width="350" height="185" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="830" y="362" font-family="Arial, sans-serif" font-size="21" fill="#79b8ff" font-weight="700">Execution evidence</text>
+<text x="830" y="397" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Effective settings and identities</text>
+<text x="830" y="424" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">File integrity checks</text>
+<text x="830" y="451" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Status and failure details</text>
+<path d="M215 513 L215 554" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M600 513 L600 554" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M985 513 L985 554" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="40" y="568" width="1120" height="132" rx="14" fill="#142d2d" stroke="#43546b" stroke-width="1.5"/>
+<text x="60" y="604" font-family="Arial, sans-serif" font-size="24" fill="#6edbc6" font-weight="700">Verify, then reuse</text>
+<text x="60" y="641" font-family="Arial, sans-serif" font-size="18" fill="#e6edf3">Inspect saved results, export analysis tables, or publish checked results without retraining.</text>
+<text x="60" y="673" font-family="Arial, sans-serif" font-size="17" fill="#a7b6c8">Keep referenced study and search artifacts. Check completion and coverage before drawing conclusions.</text>
+<text x="40" y="737" font-family="Arial, sans-serif" font-size="17" fill="#a7b6c8">A separate run identity keeps repeated and concurrent executions apart.</text>
 </svg>

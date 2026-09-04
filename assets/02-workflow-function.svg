@@ -1,41 +1,41 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800" role="img" aria-labelledby="title desc">
 <title id="title">A clear division of responsibility</title><desc id="desc">Bring your preparation decisions and model. AutoForecast manages the checked lifecycle.</desc>
-<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#245DD8"/></marker></defs>
-<rect width="1200" height="800" fill="#F4F7FB"/>
-<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
-<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#172A43" font-weight="700">A clear division of responsibility</text>
-<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#53647A">Bring your preparation decisions and model. AutoForecast manages the checked lifecycle.</text>
-<rect x="40" y="157" width="335" height="170" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="60" y="191" font-family="Arial, sans-serif" font-size="21" fill="#087F82" font-weight="700">Your application</text>
-<text x="60" y="226" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Choose the population and eligibility.</text>
-<text x="60" y="253" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Declare preparation rules and reasons.</text>
-<text x="60" y="280" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Provide the model fitting function.</text>
-<rect x="425" y="157" width="735" height="170" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="445" y="191" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">1  Register the study</text>
-<text x="445" y="226" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Validate settings and pin the managed sources.</text>
-<text x="445" y="253" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Check exact membership and retain preparation evidence.</text>
-<text x="445" y="280" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Freeze the model inputs and return a reusable study identity.</text>
-<path d="M375 242 L418 242" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<rect x="425" y="368" width="735" height="153" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="445" y="402" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">2  Run one or several models</text>
-<text x="445" y="437" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Supply only the history available at each forecast boundary.</text>
-<text x="445" y="464" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Tune when requested, validate, then refit for final testing.</text>
-<path d="M791 327 L791 361" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<rect x="40" y="368" width="335" height="153" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="60" y="402" font-family="Arial, sans-serif" font-size="21" fill="#087F82" font-weight="700">Your model</text>
-<text x="60" y="437" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Fit the supplied history.</text>
-<text x="60" y="464" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Predict the requested horizon.</text>
-<text x="60" y="491" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Save the fitted model and forecasts.</text>
-<path d="M425 445 L382 445" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<path d="M375 480 L418 480" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<rect x="425" y="563" width="735" height="147" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="445" y="597" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">3  Keep checked results</text>
-<text x="445" y="632" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Verify forecasts and calculate comparable scores.</text>
-<text x="445" y="659" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Retain models, predictions, coverage and failure evidence.</text>
-<path d="M791 521 L791 556" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
-<rect x="40" y="563" width="335" height="147" rx="14" fill="#E8F5F3" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="60" y="597" font-family="Arial, sans-serif" font-size="22" fill="#087F82" font-weight="700">Reuse the study</text>
-<text x="60" y="632" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Compare models against the same</text>
-<text x="60" y="659" font-family="Arial, sans-serif" font-size="17" fill="#172A43">frozen data and evaluation rules.</text>
-<text x="40" y="757" font-family="Arial, sans-serif" font-size="19" fill="#53647A">Data decisions stay explicit. Tracking and table publication are independent options.</text>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#79b8ff"/></marker></defs>
+<rect width="1200" height="800" fill="#0d1117"/>
+<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#79b8ff" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
+<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#e6edf3" font-weight="700">A clear division of responsibility</text>
+<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#a7b6c8">Bring your preparation decisions and model. AutoForecast manages the checked lifecycle.</text>
+<rect x="40" y="157" width="335" height="170" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="60" y="191" font-family="Arial, sans-serif" font-size="21" fill="#6edbc6" font-weight="700">Your application</text>
+<text x="60" y="226" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Choose the population and eligibility.</text>
+<text x="60" y="253" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Declare preparation rules and reasons.</text>
+<text x="60" y="280" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Provide the model fitting function.</text>
+<rect x="425" y="157" width="735" height="170" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="445" y="191" font-family="Arial, sans-serif" font-size="21" fill="#79b8ff" font-weight="700">1  Register the study</text>
+<text x="445" y="226" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Validate settings and pin the managed sources.</text>
+<text x="445" y="253" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Check exact membership and retain preparation evidence.</text>
+<text x="445" y="280" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Freeze the model inputs and return a reusable study identity.</text>
+<path d="M375 242 L418 242" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="425" y="368" width="735" height="153" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="445" y="402" font-family="Arial, sans-serif" font-size="21" fill="#79b8ff" font-weight="700">2  Run one or several models</text>
+<text x="445" y="437" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Supply only the history available at each forecast boundary.</text>
+<text x="445" y="464" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Tune when requested, validate, then refit for final testing.</text>
+<path d="M791 327 L791 361" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="40" y="368" width="335" height="153" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="60" y="402" font-family="Arial, sans-serif" font-size="21" fill="#6edbc6" font-weight="700">Your model</text>
+<text x="60" y="437" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Fit the supplied history.</text>
+<text x="60" y="464" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Predict the requested horizon.</text>
+<text x="60" y="491" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Save the fitted model and forecasts.</text>
+<path d="M425 445 L382 445" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M375 480 L418 480" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="425" y="563" width="735" height="147" rx="14" fill="#161f2c" stroke="#43546b" stroke-width="1.5"/>
+<text x="445" y="597" font-family="Arial, sans-serif" font-size="21" fill="#79b8ff" font-weight="700">3  Keep checked results</text>
+<text x="445" y="632" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Verify forecasts and calculate comparable scores.</text>
+<text x="445" y="659" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Retain models, predictions, coverage and failure evidence.</text>
+<path d="M791 521 L791 556" fill="none" stroke="#79b8ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="40" y="563" width="335" height="147" rx="14" fill="#142d2d" stroke="#43546b" stroke-width="1.5"/>
+<text x="60" y="597" font-family="Arial, sans-serif" font-size="22" fill="#6edbc6" font-weight="700">Reuse the study</text>
+<text x="60" y="632" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">Compare models against the same</text>
+<text x="60" y="659" font-family="Arial, sans-serif" font-size="17" fill="#e6edf3">frozen data and evaluation rules.</text>
+<text x="40" y="757" font-family="Arial, sans-serif" font-size="19" fill="#a7b6c8">Data decisions stay explicit. Tracking and table publication are independent options.</text>
 </svg>
