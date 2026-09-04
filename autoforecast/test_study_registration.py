@@ -54,6 +54,117 @@ def configuration(root, *, actual_missing="mask"):
     return path
 
 
+@pytest.mark.parametrize("choice, message", [
+    (None, "must be a mapping"), ([], "must be a mapping"),
+    ({}, "requires exactly"),
+    ({"study_id": None, "create_study": True}, "requires exactly"),
+    ({"study_id": "saved", "create_study": True, "publish_results": False}, "requires study_id=None"),
+    ({"study_id": None, "create_study": False, "publish_results": False}, "reuse requires"),
+    *(({"study_id": value, "create_study": False, "publish_results": False}, "reuse requires")
+      for value in ("", " ", " saved", "../saved", ".", 1, "x\ny", "x\ry", "x\x00y",
+                    "x\x1by", "x\ty")),
+    ({"study_id": None, "create_study": 1, "publish_results": False}, "must be booleans"),
+    ({"study_id": None, "create_study": True, "publish_results": "false"}, "must be booleans"),
+    ({"study_id": None, "create_study": True, "publish_results": False, "extra": 1}, "requires exactly"),
+])
+def test_study_info_rejects_invalid_choices_before_registry(choice, message, monkeypatch):
+    from autoforecast import run_study
+
+    monkeypatch.setattr(StudyRegistry, "from_environment",
+                        lambda: pytest.fail("invalid choices must not open a registry"))
+    with pytest.raises(ValueError, match=message):
+        run_study(study_info=choice, model="seasonal_naive")
+
+
+@pytest.mark.parametrize("options, message", [
+    ({"study_id": "saved"}, "cannot combine"), ({"publish": False}, "cannot combine"),
+    ({"study_id": None}, "cannot combine"), ({"publish": None}, "cannot combine"),
+    ({"config": "unused.yaml"}, "reuse does not accept"),
+    ({"prepare": None}, "reuse does not accept"),
+    ({"training_data": object()}, "reuse does not accept"),
+])
+def test_study_info_rejects_mixed_controls_and_reuse_sources(options, message):
+    from autoforecast import run_study
+
+    with pytest.raises(ValueError, match=message):
+        run_study(study_info={"study_id": "saved", "create_study": False,
+                              "publish_results": False}, model="seasonal_naive", **options)
+
+
+@pytest.mark.parametrize("automatic_registry", [False, True])
+def test_study_info_creates_once_then_reuses_frozen_data(
+    spark, tmp_path, monkeypatch, automatic_registry,
+):
+    from autoforecast import run_study
+    from autoforecast import study_registration as registration
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    if automatic_registry:
+        monkeypatch.setenv("AUTOFORECAST_REGISTRY_ROOT", str(tmp_path / "environment-registry"))
+        registry = StudyRegistry.from_config(path, spark=spark, use_environment=True)
+    profile = model_profile(tmp_path)
+    settings = yaml.safe_load(profile.read_text())
+    settings.pop("hpo")
+    profile.write_text(yaml.safe_dump(settings))
+    choice = {"study_id": None, "create_study": True, "publish_results": False}
+    calls = []
+    original = registration.register_study
+
+    def register(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(registration, "register_study", register)
+    result = run_study(study_info=choice, config=path,
+                       registry=None if automatic_registry else registry, model=predict,
+                       model_config=profile, implementation=implementation())
+    assert calls == [result.study_id]
+    assert choice == {"study_id": None, "create_study": True, "publish_results": False}
+    assert result.tuning_path is None
+    assert result.publication["status"] == "not_requested"
+    assert (result.path / "completion.json").is_file()
+    assert result.path.is_relative_to(registry.root)
+    audit = [json.loads(line) for line in pathlib.Path(
+        result.publication["audit_path"],
+    ).read_text().splitlines()]
+    registered = next(i for i, event in enumerate(audit)
+                      if event["stage"] == "registration" and event["status"] == "PASS")
+    fitting = next(i for i, event in enumerate(audit) if event["stage"] == "workflow")
+    assert registered < fitting
+    (tmp_path / "source.parquet").unlink()
+    path.unlink()
+    reused = run_study(study_info={"study_id": result.study_id, "create_study": False,
+                                  "publish_results": False}, registry=registry, model=predict,
+                       model_config=profile, implementation=implementation())
+    assert calls == [result.study_id] and reused.study_id == result.study_id
+    assert reused.testing_metrics == result.testing_metrics
+
+
+def test_study_info_fit_failure_retains_registered_id(spark, tmp_path):
+    from autoforecast import run_study
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    failure = RuntimeError("model failed")
+
+    def fail(_request):
+        raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        run_study(study_info={"study_id": None, "create_study": True,
+                              "publish_results": False}, config=path, registry=registry,
+                  model=fail, model_config=model_profile(tmp_path), implementation=implementation())
+    assert caught.value is failure
+    saved_id = caught.value.study_id
+    assert caught.value.registered_study_id == saved_id
+    assert saved_id
+    with registry.load_study(saved_id) as study:
+        assert study.training_data.count() > 0
+    assert pathlib.Path(caught.value.audit_path).is_file()
+
+
 @pytest.mark.parametrize("policy", ["mask", "zero"])
 def test_registration_retries_and_raw_actuals_remain_distinct_from_fit(
     spark, tmp_path, policy, monkeypatch,

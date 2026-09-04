@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -19,6 +19,10 @@ if TYPE_CHECKING:
         StudyPreparation,
         StudyRegistry,
     )
+    from autoforecast.study_workflow import ForecastWorkflowResult, StudyInfo
+
+
+_RUN_UNSET: Any = object()
 
 
 def register_study(
@@ -111,15 +115,27 @@ def study_config_schema() -> dict:
     return schema()
 
 
-def run_study(study_id, model, **options):
-    """Run one model against an existing registered study; see study_workflow."""
+def run_study(
+    study_id: str = _RUN_UNSET, model=_RUN_UNSET,
+    *, study_info: StudyInfo = _RUN_UNSET, **options,
+) -> ForecastWorkflowResult:
+    """Create or reuse a study and run a model; see study_workflow.run_study.
+
+    For creation, pass study_info={"study_id": None, "create_study": True,
+    "publish_results": False}, config=your_config and model=your_model. For reuse,
+    set create_study=False and supply the saved study_id in that mapping. Read
+    result.study_id to keep the resolved ID. Existing positional calls also work.
+    """
     from autoforecast.study_workflow import run_study as run
 
-    return run(study_id, model, **options)
+    supplied = {key: value for key, value in {
+        "study_id": study_id, "model": model, "study_info": study_info,
+    }.items() if value is not _RUN_UNSET}
+    return run(**supplied, **options)
 
 
 def configure_logging(*, stream=None, progress="auto", interval=10.0):
-    """Enable readable library progress; see tutorials/README.md for examples."""
+    """Customize automatic progress; see tutorials/README.md for examples."""
     from autoforecast._execution import configure_logging as configure
 
     return configure(stream=stream, progress=progress, interval=interval)
@@ -131,6 +147,7 @@ __all__ = [
     "StudyConfigValidation",
     "register_study",
     "run_study",
+    "StudyInfo",
     "configure_logging",
     "DeltaTable",
     "StudyRegistry",
@@ -142,6 +159,9 @@ __all__ = [
 
 
 def __getattr__(name):
+    if name == "StudyInfo":
+        from autoforecast.study_workflow import StudyInfo
+        return StudyInfo
     if name == "DeltaTable":
         from autoforecast.integrations.delta import DeltaTable
         return DeltaTable

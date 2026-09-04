@@ -39,7 +39,9 @@ from autoforecast._exact_yaml import loads_record, read_record, record_bytes
 from autoforecast._execution import (
     Execution,
     _emit,
+    _safe,
     _stage_event,
+    _text,
     note,
     operation,
     record_result,
@@ -737,14 +739,17 @@ class StudyRegistry:
             raise ValueError("table overrides require a Delta namespace")
 
     @classmethod
-    def from_config(cls, config, *, spark=None):
-        """Read only storage/runtime settings; never read the source SQL file."""
+    def from_config(cls, config, *, spark=None, use_environment: bool = False):
+        """Read storage/runtime settings, optionally applying storage environment overrides."""
+        if type(use_environment) is not bool:
+            raise ValueError("use_environment must be a boolean")
         path = pathlib.Path(config).absolute()
         value = _fields(read_record(path), {"storage"},
                         {"schema_version", "dataset", "recipe", "source", "references",
                          "invalid_references", "runtime", "preparation", "records"},
                         label="registry config")
-        return cls._from_storage(value["storage"], value.get("runtime", {}), path.parent, spark)
+        return cls._from_storage(value["storage"], value.get("runtime", {}), path.parent, spark,
+                                 use_environment=use_environment)
 
     @classmethod
     def _from_storage(cls, storage, runtime, base, spark, *, use_environment=False):
@@ -1231,7 +1236,7 @@ def register_study(
             value, base = _configuration(config)
         initial_level = resolve_level(log_level, value.get("runtime", {}))
         _emit({"stage": "Preparing execution plan", "status": "START",
-               "attempt_id": check_id}, initial_level)
+               "attempt_id": check_id}, initial_level, announce=True)
         settings = PreparationSettings(_bytes({
             "dataset": value["dataset"], "recipe": value["recipe"],
             "parameters": value.get("preparation", {}),
@@ -1344,7 +1349,8 @@ def register_study(
             return study_id
         except BaseException as error:
             status = "FAIL" if isinstance(error, Exception) else "CANCELLED"
-            error.add_note(f"Registration attempt evidence: {issues_root}")
+            with suppress(BaseException):
+                error.add_note(f"Registration attempt evidence: {_text(_safe(str(issues_root)))}")
             try:
                 failed_stage = phase if execution.states[phase] == "START" else "registration"
                 _stage_event(audit, failed_stage, status, exception=type(error).__name__,
@@ -1357,7 +1363,8 @@ def register_study(
                 ))
             except BaseException as evidence_error:
                 message = "Registration failure evidence could not be verified."
-                error.add_note(message)
+                with suppress(BaseException):
+                    error.add_note(message)
                 with suppress(BaseException):
                     _emit({"stage": "Registration failure evidence", "status": "UNVERIFIED",
                            "attempt_id": check_id, "error_type": type(evidence_error).__name__,

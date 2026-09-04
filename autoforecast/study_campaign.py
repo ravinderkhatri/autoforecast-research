@@ -30,7 +30,6 @@ from autoforecast._exact_json import load_exact_json
 from autoforecast._exact_yaml import loads_exact_yaml
 from autoforecast._execution import (
     Execution,
-    _console,
     _stage,
     _stage_event,
     configure_logging,
@@ -555,8 +554,6 @@ def _model_job(
             raise ValueError(f"worker dependency differs: {package}")
     path = pathlib.Path(request["study"]["path"])
     verify_benchmark(path, request["study"]["sha256"], _reuse_verified=True)
-    if _console() is None:
-        configure_logging(progress="plain")
     # Workers receive paths and IDs, then establish their own logging context.
     with standalone_attempt(pathlib.Path(campaign_root) / "progress", "Model job",
                             campaign_id=pathlib.Path(campaign_root).name,

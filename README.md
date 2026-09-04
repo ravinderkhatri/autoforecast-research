@@ -58,6 +58,7 @@ Start with the [tutorial guide](tutorials/README.md). Each notebook explains one
 Already have training and testing DataFrames? Follow [supply your own stages](tutorials/10-supply-your-own-stages.ipynb).
 Validation is optional; leaving it out creates no extra split. For application data rules, see
 [prepare and check data](tutorials/11-prepare-and-check-data.ipynb).
+You can also [create or reuse a study in one call](tutorials/README.md#create-or-reuse-a-study-in-one-call).
 
 Choose an optional destination: [Delta](tutorials/07-publish-delta.ipynb),
 [PostgreSQL](tutorials/08-publish-postgresql.ipynb), or [BigQuery](tutorials/09-publish-bigquery.ipynb).
@@ -129,15 +130,7 @@ See [model profiles](configs/models/) for settings.
 
 ## See what is running
 
-Call `configure_logging()` once to see the current step and its progress.
-
-```python
-from autoforecast import configure_logging
-
-# Show progress in this notebook or script.
-configure_logging()
-```
-
+Registration and model runs show progress automatically. No setup call is needed.
 The display shows completed and remaining stages. A download can show bytes copied;
 a model callback with no progress counter shows elapsed time. The percentage of stages
 completed is a stage count, not an estimate of how much runtime remains.

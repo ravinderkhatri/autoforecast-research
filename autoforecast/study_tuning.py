@@ -250,11 +250,8 @@ def _validation_controls(controls: dict) -> dict:
     }
 
 
-def _resolve_options(study: Study, controls: dict, tuning_origin: str | None,
-                     *, select: bool = True) -> dict:
-    recipe = study.recipe
-    if tuning_origin is not None and (type(tuning_origin) is not str or not tuning_origin.strip()):
-        raise ValueError("tuning_origin must be a nonblank frozen origin string")
+def _validate_controls(controls: dict) -> tuple[dict, dict]:
+    """Check model choices that do not require reading or registering study data."""
     selection = controls.get("selection", {})
     if type(selection) is not dict or set(selection) - {
         "stage",
@@ -264,17 +261,49 @@ def _resolve_options(study: Study, controls: dict, tuning_origin: str | None,
         "direction",
     }:
         raise TuningError("selection contains unknown settings")
-    stage = selection.get("stage", "tuning")
-    metric = selection.get("metric", recipe["metric"])
-    if stage not in ("tuning", "validation"):
+    if selection.get("stage", "tuning") not in ("tuning", "validation"):
         raise TuningError("selection.stage must be tuning or validation; testing is reserved")
-    if metric not in SELECTION_METRICS:
+    if "metric" in selection and selection["metric"] not in SELECTION_METRICS:
         raise TuningError("selection.metric must be mae, rmse, wape or wrmsse")
     if (
         selection.get("aggregation", "mean") != "mean"
         or selection.get("direction", "minimize") != "minimize"
     ):
         raise TuningError("selection uses equal-weight mean and the metric's minimize direction")
+    if selection.get("stage", "tuning") == "validation" and "origins" in selection:
+        raise TuningError("validation selection uses the existing outer boundary")
+    origins = selection.get("origins")
+    if origins is not None and origins != "all" and (
+        type(origins) is not list or not origins or any(type(x) is not str for x in origins)
+        or len(origins) != len(set(origins))
+    ):
+        raise TuningError("selection.origins must be all or a nonempty unique list")
+    reporting = controls.get("reporting", {})
+    if type(reporting) is not dict or set(reporting) - {"metrics", "forecast_accuracy_breakdown"}:
+        raise TuningError("reporting contains unknown settings")
+    if "metrics" in reporting:
+        validate_study_metrics(reporting["metrics"])
+    validate_forecast_accuracy_breakdown(reporting.get("forecast_accuracy_breakdown", "none"))
+    if controls.get("series_policy", "error") not in (
+        "error", "exclude_unavailable", "use_available",
+    ):
+        raise TuningError("series_policy must be error, exclude_unavailable or use_available")
+    minimum = controls.get("minimum_history", 1)
+    if type(minimum) is not int or minimum < 1:
+        raise TuningError("minimum_history must be a positive integer declared for the model")
+    return selection, reporting
+
+
+def _resolve_options(study: Study, controls: dict, tuning_origin: str | None,
+                     *, select: bool = True) -> dict:
+    recipe = study.recipe
+    if tuning_origin is not None and (type(tuning_origin) is not str or not tuning_origin.strip()):
+        raise ValueError("tuning_origin must be a nonblank frozen origin string")
+    selection, reporting = _validate_controls(controls)
+    stage = selection.get("stage", "tuning")
+    metric = selection.get("metric", recipe["metric"])
+    if metric not in SELECTION_METRICS:
+        raise TuningError("selection.metric must be mae, rmse, wape or wrmsse")
     if tuning_origin is not None and ("origins" in selection or stage != "tuning"):
         raise TuningError("tuning_origin conflicts with the selection policy")
     if not select:
@@ -282,8 +311,6 @@ def _resolve_options(study: Study, controls: dict, tuning_origin: str | None,
     elif stage == "validation":
         if not recipe["validation_origins"]:
             raise HPOError("outer validation is not configured; declare inner tuning windows")
-        if "origins" in selection:
-            raise TuningError("validation selection uses the existing outer boundary")
         windows = [
             {"origin": recipe["validation_origins"][0], "horizon": recipe["validation_horizon"]}
         ]
@@ -301,32 +328,17 @@ def _resolve_options(study: Study, controls: dict, tuning_origin: str | None,
                     "or selection.origins=all"
                 )
         elif origins != "all":
-            if (
-                type(origins) is not list
-                or not origins
-                or any(type(x) is not str for x in origins)
-                or len(origins) != len(set(origins))
-            ):
-                raise TuningError("selection.origins must be all or a nonempty unique list")
             if not set(origins) <= {w["origin"] for w in windows}:
                 raise HPOError("tuning_origin is absent from the frozen study")
             windows = [window for window in windows if window["origin"] in origins]
-    reporting = controls.get("reporting", {})
-    if type(reporting) is not dict or set(reporting) - {"metrics", "forecast_accuracy_breakdown"}:
-        raise TuningError("reporting contains unknown settings")
     defaults = ["mae", "rmse", "wape", "bias"] + (
         ["wrmsse"] if recipe["metric"] == "wrmsse" else []
     )
     metrics = validate_study_metrics(reporting.get("metrics", defaults))
     metrics = tuple(dict.fromkeys([*metrics, metric]))
     mode = reporting.get("forecast_accuracy_breakdown", "none")
-    validate_forecast_accuracy_breakdown(mode)
     policy = controls.get("series_policy", "error")
-    if policy not in ("error", "exclude_unavailable", "use_available"):
-        raise TuningError("series_policy must be error, exclude_unavailable or use_available")
     minimum = controls.get("minimum_history", 1)
-    if type(minimum) is not int or minimum < 1:
-        raise TuningError("minimum_history must be a positive integer declared for the model")
     return {
         "stage": stage,
         "windows": windows,

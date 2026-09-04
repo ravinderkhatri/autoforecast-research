@@ -95,21 +95,61 @@ Saved outputs let you inspect and publish the same result without training again
 
 ![Saved outputs](../assets/04-run-outputs.svg)
 
+## Create or reuse a study in one call
+
+Use `run_study()` when you want to save new inputs and run a model together.
+Inside notebook 2, you can use this after creating the registry and before stopping Spark.
+
+```python
+from autoforecast import run_study
+
+# Save the configured data, then run a model. Keep the results as files.
+config_path = work / "study.yaml"
+study_info = {"study_id": None, "create_study": True, "publish_results": False}
+result = run_study(study_info=study_info, config=config_path,
+                   registry=registry, model="seasonal_naive")
+print(result.study_id)
+```
+
+Keep the printed ID. To run on the same saved data, pass that ID and set
+`create_study=False`. Leave out `config` and `prepare`: reuse reads the frozen
+study, not the original source. The dictionary must contain all three keys.
+
+```python
+# Use the saved study without reading its source again.
+study_info = {"study_id": result.study_id, "create_study": False, "publish_results": False}
+result = run_study(study_info=study_info, registry=registry, model="seasonal_naive")
+print(result.path)
+```
+
+The path contains the saved forecasts and scores. Set `publish_results=True`
+to also use the registry's configured result tables. This does not control study
+storage or MLflow tracking. A new registration always saves its checked data.
+For direct DataFrame inputs, see notebook 10. An optional `prepare` hook works
+with configured sources, as shown in notebook 11.
+
+If training fails after registration, the exception's `registered_study_id` identifies the
+saved study. Retry with that ID and `create_study=False`. If publication fails,
+use its `study_id` and `workflow_path` with `registry.publish_results(study_id, workflow_path)`
+to retry the table write without training again. Calling creation again can
+reread and check the source; it is not a shortcut for reusing a saved study.
+
+The existing `run_study(study_id, model, ...)` call still works. Choose either that
+form or `study_info`; do not supply both. Use `register_study()` alone when you
+want to save data without training.
+
 ## Progress and logs
 
-Call `configure_logging()` once before registering data or running a model. Repeating
-it in another cell is safe. At the default INFO level, a notebook with display
+Registration and model runs show progress automatically. At the default INFO level,
+a notebook with display
 support shows one panel per registration, model-run or publication attempt.
 The panel updates in place without clearing other output. WARNING or higher hides
-the panel. Stage outcomes remain as ordinary INFO log lines, so you can still
-read them in an exported notebook. Opening saved evidence can also show ordinary
+the panel. Stage outcomes also use Python logging. An application's logging
+settings decide which of those messages appear. Opening saved evidence can show ordinary
 verification messages, without starting a numbered progress panel.
 
 ```python
-from autoforecast import configure_logging, register_study, run_study
-
-# Enable progress for this notebook.
-configure_logging()
+from autoforecast import register_study, run_study
 
 # Register data and show each step as it runs.
 study_id = register_study(config_path, registry=registry)
@@ -135,9 +175,17 @@ Both registration and model runs choose their logging level in this order:
 3. The resolved configuration's `runtime.log_level`.
 4. `INFO`.
 
+For optional customization, import `configure_logging` from `autoforecast`.
 Use `configure_logging(progress="plain")` for job logs, or `progress="off"` to
-keep only permanent log messages. Applications that already configure Python
-logging can use their own handlers instead. The helper does not change the root logger.
+keep only permanent log messages. Set `AUTOFORECAST_LOG_LEVEL=WARNING` to hide normal
+progress throughout a session. Applications can keep their own logging handlers;
+automatic progress does not add handlers or change the root logger. Unless you choose
+an explicit stream, text output follows the current notebook cell's standard output.
+If you configure handlers or filters on the library logger, those settings replace
+the automatic display. A root logging level of ERROR or CRITICAL also hides it.
+The usual root WARNING level still allows basic progress. Creation uses runtime
+settings in its configuration over registry defaults; explicit call options and
+environment settings keep the precedence listed above.
 
 Registration saves its audit under the registry's `checks/<attempt>/audit.jsonl`.
 A model run returns its audit path in `result.publication["audit_path"]`. These

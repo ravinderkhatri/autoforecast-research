@@ -12,6 +12,7 @@ import os
 import pathlib
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -27,6 +28,7 @@ _OPERATION: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 _AUDITING = contextvars.ContextVar("autoforecast_writing_audit", default=False)
 _SETUP_LOCK = threading.RLock()
+_FALLBACK_CONSOLE = None
 
 
 def resolve_level(explicit=None, runtime=None):
@@ -96,10 +98,11 @@ def _message(event):
 
 
 class _Console(logging.StreamHandler):
-    """One explicit library handler; notebook refreshes never clear cell output."""
+    """Shared progress renderer; notebook refreshes never clear cell output."""
 
     def __init__(self, stream, progress, interval):
-        super().__init__(stream)
+        self.dynamic_stream = stream is None
+        super().__init__(sys.stdout if stream is None else stream)
         self.interval = interval
         self.live = False
         self.live_rows = 0
@@ -110,21 +113,39 @@ class _Console(logging.StreamHandler):
     def set_mode(self, stream, progress):
         assert self.lock is not None
         with self.lock:
+            self.dynamic_stream = stream is None
+            if self.dynamic_stream and self.stream is not sys.stdout:
+                self.stream = sys.stdout
+                self.live = False
+                self.live_rows = 0
             same_terminal = getattr(self, "terminal", False)
             old_stream = self.stream
-            self._clear_panel()
+            with suppress(Exception):
+                self._clear_panel()
+            self.live = False
+            self.live_rows = 0
             self._set_mode(stream, progress)
             if not (same_terminal and self.terminal and old_stream is self.stream):
                 self.panels.clear()
             if self.terminal:
                 self._draw_panels()
 
+    def _sync_stream(self):
+        # A later notebook cell can own a different stdout, or close the old one.
+        if self.dynamic_stream and self.stream is not sys.stdout:
+            self.stream = sys.stdout
+            self.live = False
+            self.live_rows = 0
+            self._set_mode(None, self.progress)
+
     def _set_mode(self, stream, progress):
         self.progress = progress
         self.display = None
         self.terminal = False
         if stream is not None and stream is not self.stream:
-            self.setStream(stream)
+            with suppress(Exception):
+                self.flush()
+            self.stream = stream
         if progress == "auto" and stream is None:
             with suppress(ImportError, AttributeError):
                 from IPython import get_ipython
@@ -138,6 +159,7 @@ class _Console(logging.StreamHandler):
     def emit(self, record):
         assert self.lock is not None
         with self.lock:
+            self._sync_stream()
             self._clear_panel()
             super().emit(record)
             if self.terminal:
@@ -168,6 +190,7 @@ class _Console(logging.StreamHandler):
     def panel(self, execution, text, *, final=False, transition=False):
         assert self.lock is not None
         with self.lock:
+            self._sync_stream()
             if final:
                 self.panels.pop(execution.display_id, None)
             if self.progress == "off":
@@ -201,10 +224,12 @@ class _Console(logging.StreamHandler):
 def configure_logging(*, stream=None, progress="auto", interval=10.0):
     """Show library events and progress without changing the root logger.
 
-    Call once in a notebook or script. Repeating this call updates the same handler.
+    Basic operation progress appears automatically. Call this for customization.
+    Repeating this call updates the same handler.
     ``progress='plain'`` is useful for job logs; ``'off'`` keeps permanent events only.
     Runtime log_level controls verbosity. Applications may instead configure Python logging.
     """
+    global _FALLBACK_CONSOLE
     if progress not in {"auto", "plain", "off"}:
         raise ValueError("progress must be auto, plain or off")
     if isinstance(interval, bool) or not isinstance(interval, int | float) or not (
@@ -215,27 +240,69 @@ def configure_logging(*, stream=None, progress="auto", interval=10.0):
         logger = logging.getLogger("autoforecast.stages")
         owned = next((h for h in logger.handlers if isinstance(h, _Console)), None)
         if owned is None:
-            logger.addHandler(_Console(stream, progress, interval))
+            owned = _FALLBACK_CONSOLE
+        if owned is None:
+            owned = _Console(stream, progress, interval)
         else:
             # Preserve the handler and active display identities on repeated setup.
             owned.interval = interval
             owned.set_mode(stream, progress)
+        if owned not in logger.handlers:
+            logger.addHandler(owned)
+        if owned is _FALLBACK_CONSOLE:
+            _FALLBACK_CONSOLE = None
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
 
 
 def _console():
-    return next((h for h in logging.getLogger("autoforecast.stages").handlers
-                 if isinstance(h, _Console)), None)
+    global _FALLBACK_CONSOLE
+    logger = logging.getLogger("autoforecast.stages")
+    if logger.disabled or logger.manager.disable >= logging.INFO:
+        return None
+    parent = logger
+    # Root WARNING is a Python/platform default, not an operation quiet setting.
+    while parent is not None and parent is not logging.getLogger():
+        if parent.level != logging.NOTSET:
+            if parent.level > logging.INFO:
+                return None
+            break
+        parent = parent.parent
+    with _SETUP_LOCK:
+        owned = next((h for h in logger.handlers if isinstance(h, _Console)), None)
+        if owned is not None:
+            return owned
+        parent = logger
+        while parent is not None and parent is not logging.getLogger():
+            # An application that configures library handlers owns this output.
+            if parent.handlers or parent.filters or not parent.propagate:
+                return None
+            parent = parent.parent
+        if logging.getLogger().level > logging.WARNING:
+            return None
+        if _FALLBACK_CONSOLE is None:
+            # A broken optional display must not stop forecasting or hide its error.
+            with suppress(Exception):
+                _FALLBACK_CONSOLE = _Console(None, "auto", 10.0)
+        return _FALLBACK_CONSOLE
 
 
-def _emit(event, level):
+def _emit(event, level, *, announce=False):
     severity = (logging.ERROR if event["status"] in {"FAIL", "CANCELLED", "UNVERIFIED"}
                 else logging.WARNING if event["status"] == "UNAVAILABLE"
                 or event.get("warnings") else logging.INFO)
     if severity >= level:
         with suppress(Exception):
-            logging.getLogger("autoforecast.stages").log(severity, "%s", _message(event))
+            logger = logging.getLogger("autoforecast.stages")
+            logger.log(severity, "%s", _message(event))
+            # Registration can validate source plans before it has an audit directory.
+            # Show that initial step when the platform's default logger hides INFO.
+            if announce and (not logger.hasHandlers() or not logger.isEnabledFor(severity)):
+                handler = _console()
+                if handler is not None and handler is _FALLBACK_CONSOLE:
+                    handler.handle(logger.makeRecord(
+                        logger.name, severity, __file__, 0, _message(event), (), None,
+                    ))
 
 
 class Execution:
@@ -338,9 +405,11 @@ class Execution:
         return "\n".join(lines)
 
     def refresh(self, *, force=False, final=False):
+        if self.level > logging.INFO:
+            return
         handler = _console()
         now = time.monotonic()
-        if handler is None or self.level > logging.INFO:
+        if handler is None:
             return
         if force or now - self.last_refresh >= handler.interval:
             self.last_refresh = now
@@ -365,7 +434,7 @@ class Execution:
         self.operation_token = _OPERATION.set(None)
         self.parent_token = _PARENT_AUDIT.set(None)
         try:
-            if _console() and self.level <= logging.INFO:
+            if self.level <= logging.INFO and _console():
                 self.thread = threading.Thread(target=self._heartbeat, daemon=True)
                 self.thread.start()
         except BaseException:

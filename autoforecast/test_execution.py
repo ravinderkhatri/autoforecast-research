@@ -1,6 +1,7 @@
 """Operational progress has its own counters and never changes model evidence."""
 
 import concurrent.futures
+import contextlib
 import io
 import json
 import logging
@@ -12,6 +13,7 @@ import pytest
 
 from autoforecast import _execution as events
 from autoforecast import configure_logging
+from autoforecast import study_registration as registration
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +29,68 @@ def records(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def test_automatic_progress_follows_cells_without_configuring_logging():
+    script = '''
+import contextlib, io, logging, tempfile
+from pathlib import Path
+from autoforecast._execution import Execution, _stage
+root = logging.getLogger()
+application_stream = io.StringIO()
+handler = logging.StreamHandler(application_stream)
+root.addHandler(handler)
+root.setLevel(logging.WARNING)
+library = logging.getLogger("autoforecast.stages")
+with tempfile.TemporaryDirectory() as folder:
+    streams = []
+    for index in range(2):
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            with Execution(Path(folder)/f"{index}.jsonl", ["prepare"], attempt_id=str(index)):
+                with _stage(Path(folder)/f"{index}.jsonl", "prepare"):
+                    pass
+        text = stream.getvalue()
+        assert "prepare" in text and "100.0%" in text
+        streams.append(text)
+        stream.close()
+    assert "'attempt_id': '1'" not in streams[0]
+    assert "'attempt_id': '0'" not in streams[1]
+assert root.handlers == [handler] and root.level == logging.WARNING
+assert library.handlers == [] and library.level == logging.NOTSET
+assert application_stream.getvalue() == ""
+print("PASS")
+'''
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "PASS\n"
+
+
+@pytest.mark.parametrize("quiet", ["runtime", "library", "disabled"])
+def test_automatic_progress_respects_quiet_settings(tmp_path, monkeypatch, quiet):
+    logger = logging.getLogger("autoforecast.stages")
+    monkeypatch.setattr(logger, "level", logging.WARNING if quiet == "library" else logging.NOTSET)
+    monkeypatch.setattr(logger, "disabled", quiet == "disabled")
+    stream = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stream)
+    with events.Execution(tmp_path / "audit.jsonl", ["prepare"],
+                          level=logging.WARNING if quiet == "runtime" else logging.INFO):
+        with events._stage(tmp_path / "audit.jsonl", "prepare"):
+            pass
+    assert stream.getvalue() == ""
+    assert records(tmp_path / "audit.jsonl")
+
+
+def test_default_events_use_existing_application_handler_once(tmp_path, monkeypatch):
+    stream = io.StringIO()
+    logger = logging.getLogger("autoforecast.stages")
+    handler = logging.StreamHandler(stream)
+    monkeypatch.setattr(logger, "handlers", [handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    logger.setLevel(logging.INFO)
+    events._stage_event(tmp_path / "audit.jsonl", "example", "START")
+    assert stream.getvalue().count("START example") == 1
+    assert logger.handlers == [handler]
+
+
 def test_fresh_process_explicit_setup_and_repeat_preserve_root():
     script = '''
 import io, logging, tempfile
@@ -36,8 +100,11 @@ handler = logging.StreamHandler(io.StringIO())
 root.addHandler(handler)
 root.setLevel(logging.ERROR)
 from autoforecast import configure_logging
+from autoforecast import study_registration as registration
 assert logging.getLogger('autoforecast.stages').handlers == []
 from autoforecast._execution import _stage_event
+from autoforecast import _execution as events
+assert events._FALLBACK_CONSOLE is None
 stream = io.StringIO()
 configure_logging(stream=stream, progress='off')
 configure_logging(stream=stream, progress='off')
@@ -89,7 +156,8 @@ def test_stage_position_completed_remaining_and_runtime_skip(tmp_path):
     assert run.result == "INCOMPLETE"
 
 
-def test_notebook_same_display_throttle_and_no_progress_audit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("explicit_setup", [False, True])
+def test_notebook_same_display_throttle_and_no_progress_audit(tmp_path, monkeypatch, explicit_setup):
     from types import ModuleType, SimpleNamespace
     calls = []
     ipython, display = ModuleType("IPython"), ModuleType("IPython.display")
@@ -98,7 +166,10 @@ def test_notebook_same_display_throttle_and_no_progress_audit(tmp_path, monkeypa
     display.update_display = lambda data, **kw: calls.append(("update", data, kw))
     monkeypatch.setitem(sys.modules, "IPython", ipython)
     monkeypatch.setitem(sys.modules, "IPython.display", display)
-    configure_logging(interval=10)
+    monkeypatch.setattr(events, "_FALLBACK_CONSOLE", None)
+    logging.getLogger("autoforecast.stages").setLevel(logging.NOTSET)
+    if explicit_setup:
+        configure_logging(interval=10)
     now = [100.0]
     monkeypatch.setattr(events.time, "monotonic", lambda: now[0])
     path = tmp_path / "audit.jsonl"
@@ -123,6 +194,11 @@ def test_notebook_same_display_throttle_and_no_progress_audit(tmp_path, monkeypa
     assert calls[-1][2]["display_id"] == run.display_id
     assert run.thread is not None and not run.thread.is_alive()
     assert run.result == "PASS"
+    with events.Execution(tmp_path / "next.jsonl", ["verify"]) as next_run:
+        with events._stage(tmp_path / "next.jsonl", "verify"):
+            pass
+    assert [c[0] for c in calls].count("create") == 2
+    assert next_run.display_id != run.display_id
 
 
 @pytest.mark.parametrize("error", [ValueError("original"), KeyboardInterrupt(), SystemExit(1)])
@@ -270,3 +346,251 @@ def test_worker_standalone_scope_restores_parent_identity(tmp_path):
     rows = records(next((tmp_path / 'execution-attempts').glob('*.jsonl')))
     assert all(r['campaign_id'] == 'campaign' and r['model_variant'] == 'variant' for r in rows)
     assert rows[-1]['workflow_id'] == 'workflow'
+
+
+@pytest.fixture
+def default_progress(monkeypatch):
+    loggers = [logging.getLogger(name) for name in ("", "autoforecast", "autoforecast.stages")]
+    saved = [
+        (
+            logger,
+            logger.handlers[:],
+            logger.filters[:],
+            logger.level,
+            logger.propagate,
+            logger.disabled,
+        )
+        for logger in loggers
+    ]
+    disabled = logging.getLogger().manager.disable
+    monkeypatch.setattr(events, "_FALLBACK_CONSOLE", None)
+    monkeypatch.delenv("AUTOFORECAST_LOG_LEVEL", raising=False)
+    for logger in loggers:
+        logger.handlers, logger.filters, logger.propagate, logger.disabled = [], [], True, False
+        logger.setLevel(logging.WARNING if logger is loggers[0] else logging.NOTSET)
+    logging.disable(logging.NOTSET)
+    try:
+        yield
+    finally:
+        for logger, handlers, filters, level, propagate, quiet in saved:
+            logger.handlers, logger.filters = handlers, filters
+            logger.propagate, logger.disabled = propagate, quiet
+            logger.setLevel(level)
+        logging.disable(disabled)
+
+
+@pytest.mark.usefixtures("default_progress")
+@pytest.mark.parametrize("level", [logging.ERROR, logging.CRITICAL])
+def test_root_explicit_quiet_hides_automatic_panels(tmp_path, level):
+    logging.getLogger().setLevel(level)
+    logging.getLogger().addHandler(logging.StreamHandler(io.StringIO()))
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text):
+        with events.Execution(tmp_path / "audit.jsonl", ["fit"]):
+            with events._stage(tmp_path / "audit.jsonl", "fit"):
+                pass
+    assert text.getvalue() == ""
+
+
+@pytest.mark.usefixtures("default_progress")
+@pytest.mark.parametrize("level", [logging.WARNING, logging.ERROR, logging.CRITICAL])
+def test_application_handler_quiet_is_not_bypassed_by_panel(tmp_path, level):
+    logger = logging.getLogger("autoforecast.stages")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.StreamHandler(io.StringIO())
+    handler.setLevel(level)
+    logger.addHandler(handler)
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text):
+        with events.Execution(tmp_path / "audit.jsonl", ["fit"]):
+            with events._stage(tmp_path / "audit.jsonl", "fit"):
+                pass
+    assert text.getvalue() == ""
+
+
+@pytest.mark.usefixtures("default_progress")
+def test_planning_event_visible_with_default_root_application_handler(tmp_path, monkeypatch):
+    logging.getLogger().addHandler(logging.StreamHandler(io.StringIO()))
+    data = {"dataset": {}, "recipe": {}, "source": {}, "runtime": {}}
+    monkeypatch.setattr(registration, "_configuration", lambda _: (data, tmp_path))
+    stop = RuntimeError("stop at preparation validation")
+
+    class Hook:
+        def validate(self, _):
+            raise stop
+
+        def prepare(self, _):
+            pass
+
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text):
+        with pytest.raises(RuntimeError) as caught:
+            registration.register_study("config.json", prepare=Hook())
+    assert caught.value is stop
+    assert "START Preparing execution plan" in text.getvalue()
+
+
+@pytest.mark.usefixtures("default_progress")
+def test_console_discovery_error_does_not_abort_operation(tmp_path, monkeypatch):
+    class Output(io.StringIO):
+        def isatty(self):
+            raise OSError("output capability unavailable")
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "IPython", None)
+    monkeypatch.setattr(sys, "stdout", Output())
+    marker = []
+    with events.Execution(tmp_path / "audit.jsonl", ["fit"]):
+        marker.append("entered")
+        with events._stage(tmp_path / "audit.jsonl", "fit"):
+            pass
+    assert marker == ["entered"]
+
+
+@pytest.mark.usefixtures("default_progress")
+@pytest.mark.parametrize("mode", ["auto", "plain", "off"])
+def test_fallback_terminal_handoff_clears_prior_panel(tmp_path, monkeypatch, mode):
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "IPython", None)
+    stream = TTY()
+    with contextlib.redirect_stdout(stream):
+        with events.Execution(tmp_path / "audit.jsonl", ["fit"]) as execution:
+            with events._stage(tmp_path / "audit.jsonl", "fit"):
+                fallback = events._FALLBACK_CONSOLE
+                assert fallback.live and execution.display_id in fallback.panels
+                offset = len(stream.getvalue())
+                events.configure_logging(progress=mode)
+                assert "\x1b[2K" in stream.getvalue()[offset:]
+        assert execution.display_id not in fallback.panels
+
+
+@pytest.mark.usefixtures("default_progress")
+@pytest.mark.parametrize("policy", ["logger_filter", "handler_filter", "null_handler"])
+def test_application_filter_quiet_is_not_bypassed(tmp_path, policy):
+    logger = logging.getLogger("autoforecast.stages")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = (
+        logging.NullHandler() if policy == "null_handler" else logging.StreamHandler(io.StringIO())
+    )
+    logger.addHandler(handler)
+    if policy == "logger_filter":
+        logger.addFilter(lambda _: False)
+    if policy == "handler_filter":
+        handler.addFilter(lambda _: False)
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text):
+        with events.Execution(tmp_path / "audit.jsonl", ["fit"]):
+            with events._stage(tmp_path / "audit.jsonl", "fit"):
+                pass
+    assert text.getvalue() == ""
+
+
+@pytest.mark.usefixtures("default_progress")
+@pytest.mark.parametrize("explicit_stream", [False, True])
+def test_repeat_customization_after_previous_cell_stream_closed(tmp_path, explicit_stream):
+    previous, current = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(previous):
+        configure_logging(stream=previous if explicit_stream else None)
+    previous.close()
+    with contextlib.redirect_stdout(current):
+        configure_logging(stream=current if explicit_stream else None)
+        with events.Execution(tmp_path / "audit.jsonl", ["fit"]):
+            with events._stage(tmp_path / "audit.jsonl", "fit"):
+                pass
+    assert "1/1 (100.0%" in current.getvalue()
+    assert len(logging.getLogger("autoforecast.stages").handlers) == 1
+
+
+@pytest.mark.usefixtures("default_progress")
+@pytest.mark.parametrize("level", [logging.INFO, logging.ERROR])
+def test_notebook_discovery_failure_preserves_operation(tmp_path, monkeypatch, level):
+    from types import ModuleType
+
+    calls = []
+    ipython, display = ModuleType("IPython"), ModuleType("IPython.display")
+    def unavailable():
+        calls.append("discovery")
+        raise RuntimeError("frontend unavailable")
+    ipython.get_ipython = unavailable
+    display.display = display.update_display = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "IPython", ipython)
+    monkeypatch.setitem(sys.modules, "IPython.display", display)
+    original = ValueError("model failure")
+    with pytest.raises(ValueError) as caught:
+        with events.Execution(tmp_path / "audit.jsonl", ["fit"], level=level):
+            with events._stage(tmp_path / "audit.jsonl", "fit"):
+                raise original
+    assert caught.value is original
+    assert bool(calls) == (level == logging.INFO)
+    assert events._FALLBACK_CONSOLE is None
+
+
+@pytest.mark.usefixtures("default_progress")
+def test_closed_stdout_reconfiguration_with_live_fallback(tmp_path, monkeypatch):
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "IPython", None)
+    first, second = TTY(), TTY()
+    with contextlib.redirect_stdout(first):
+        with events.Execution(tmp_path / "one.jsonl", ["work"]) as execution:
+            with events._stage(execution.audit, "work"):
+                first.close()
+                sys.stdout = second
+                events.configure_logging(progress="plain")
+    assert execution.result == "PASS"
+    assert (
+        events._CURRENT.get() is None
+        and execution.thread is not None
+        and not execution.thread.is_alive()
+    )
+    assert "work" in second.getvalue()
+
+
+@pytest.mark.usefixtures("default_progress")
+@pytest.mark.parametrize("mode", ["plain", "off"])
+@pytest.mark.parametrize("broken", ["isatty", "IPython"])
+def test_explicit_plain_or_off_avoids_old_auto_discovery(tmp_path, monkeypatch, mode, broken):
+    import sys
+    from types import ModuleType
+
+    class TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    class NoCapability(io.StringIO):
+        def isatty(self):
+            raise OSError("unsupported terminal capability")
+
+    monkeypatch.setitem(sys.modules, "IPython", None)
+    old = TTY()
+    with contextlib.redirect_stdout(old):
+        with events.Execution(tmp_path / "audit.jsonl", ["fit"]):
+            with events._stage(tmp_path / "audit.jsonl", "fit"):
+                pass
+    assert events._FALLBACK_CONSOLE is not None
+    current = NoCapability() if broken == "isatty" else io.StringIO()
+    if broken == "IPython":
+        module, display = ModuleType("IPython"), ModuleType("IPython.display")
+
+        def fail():
+            raise RuntimeError("frontend discovery unavailable")
+
+        module.get_ipython = fail
+        display.display = display.update_display = lambda *a, **k: None
+        monkeypatch.setitem(sys.modules, "IPython", module)
+        monkeypatch.setitem(sys.modules, "IPython.display", display)
+    with contextlib.redirect_stdout(current):
+        events.configure_logging(progress=mode)
+        assert events._console().progress == mode

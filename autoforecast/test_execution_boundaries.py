@@ -1,6 +1,7 @@
 """Progress respects protected paths, context boundaries and measured work."""
 
 import dataclasses
+import inspect
 import io
 import json
 import logging
@@ -10,7 +11,7 @@ import re
 import stat
 import sys
 from contextlib import contextmanager
-from types import ModuleType, SimpleNamespace
+from types import MappingProxyType, ModuleType, SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -18,7 +19,14 @@ import pytest
 from mlops import _safe_files, _volume_files
 
 from autoforecast import _execution as events
-from autoforecast import benchmark, run_mlflow, study_campaign, study_tuning, study_workflow
+from autoforecast import (
+    benchmark,
+    run_mlflow,
+    run_study,
+    study_campaign,
+    study_tuning,
+    study_workflow,
+)
 from autoforecast import study_registration as registration
 from autoforecast.integrations import delta
 from autoforecast.study_registration import StudyRegistry
@@ -539,15 +547,60 @@ class FakeResult:
     run_id: str = "workflow-1"
     study_id: str = "study-1"
     publication: object = None
+    provenance: object = None
+
+
+def test_combined_registration_failure_preserves_error_and_never_fits(tmp_path, monkeypatch):
+    from autoforecast import run_study
+
+    error = RuntimeError("registration failed")
+    registry = SimpleNamespace(root=tmp_path / "registry", runtime={}, store=None)
+    def fail(**kwargs):
+        raise error
+    monkeypatch.setattr(registration, "register_study", fail)
+    monkeypatch.setattr(study_workflow, "run_forecast_workflow",
+                        lambda *a, **k: pytest.fail("failed registration must not fit"))
+    choice = {"study_id": None, "create_study": True, "publish_results": False}
+    config = tmp_path / "study.yaml"
+    config.write_text("{}")
+    with pytest.raises(RuntimeError) as caught:
+        run_study(study_info=choice, config=config, registry=registry, model="seasonal_naive")
+    assert caught.value is error and caught.value.study_id is None
+    assert choice["study_id"] is None
+    assert caught.value.audit_path.is_file()
+
+
+@pytest.mark.parametrize("options, error, message", [
+    ({}, ValueError, "creation requires"),
+    ({"unknown_input": 1}, TypeError, "unexpected keyword argument"),
+    ({"training_data": object()}, ValueError, "creation requires"),
+])
+def test_creation_needs_supported_inputs_before_opening_registry(options, error, message, monkeypatch):
+    from autoforecast import run_study
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid creation must not open a registry or capture data")
+    monkeypatch.setattr(StudyRegistry, "from_environment", forbidden)
+    monkeypatch.setattr(StudyRegistry, "from_config", forbidden)
+    monkeypatch.setattr(registration, "_register_study", forbidden)
+    monkeypatch.setattr(registration, "_capture_stages", forbidden)
+    with pytest.raises(error, match=message):
+        run_study(study_info={"study_id": None, "create_study": True, "publish_results": False},
+                  model="seasonal_naive", **options)
 
 
 @pytest.mark.parametrize("publish", [False, True])
-def test_run_study_accepts_successful_mlflow_links(tmp_path, monkeypatch, publish):
+@pytest.mark.parametrize("choice", ["legacy", "reuse", "create"])
+def test_run_study_accepts_successful_mlflow_links(tmp_path, monkeypatch, publish, choice):
     path = tmp_path / "workflow"
     path.mkdir()
     (path / "artifact_manifest.json").write_text("{}")
     profile = tmp_path / "profile.json"
-    profile.write_text('{"model": {"id": "example"}}')
+    domain = {"kind": "int", "low": 1, "high": 1, "step": 1}
+    profile.write_text(json.dumps({
+        "schema_version": 2, "model": {"id": "example", "adapter": "external"},
+        "hyperparameters": {"model.period": {"default": 1, "valid": domain, "search": domain}},
+    }))
     tracking = {
         "validation": run_mlflow.RunMLflowLink("https://tracking.example", "1", "validation"),
         "test": run_mlflow.RunMLflowLink("https://tracking.example", "1", "test"),
@@ -570,9 +623,24 @@ def test_run_study_accepts_successful_mlflow_links(tmp_path, monkeypatch, publis
     monkeypatch.setattr(study_workflow, "run_forecast_workflow", lambda *a, **k: FakeResult(path))
     monkeypatch.setattr(run_mlflow, "resolve_study_experiment", lambda **_: "1")
     monkeypatch.setattr(run_mlflow, "export_forecast_workflow", lambda *a, **k: tracking)
+    registered = []
+    def register(**kwargs):
+        registered.append(kwargs)
+        return "study-1"
+    monkeypatch.setattr(registration, "register_study", register)
+    options = ({"study_id": "study-1", "publish": publish} if choice == "legacy" else {
+        "study_info": {"study_id": None if choice == "create" else "study-1",
+                       "create_study": choice == "create", "publish_results": publish},
+    })
+    if choice == "create":
+        options["config"] = tmp_path / "study.yaml"
+        options["config"].write_text("{}")
     result = study_workflow.run_study(
-        "study-1", lambda _: None, registry=registry, model_config=profile, publish=publish
+        model=lambda _: None, registry=registry, model_config=profile,
+        implementation={"name": "example", "version": "1", "source_sha256": "a" * 64,
+                        "dependencies": {}}, **options,
     )
+    assert len(registered) == (1 if choice == "create" else 0)
     assert result.status == "completed"
     assert bool(published) == publish
     if publish:
@@ -3413,3 +3481,870 @@ def test_retry_removes_old_failure_and_counts_new_attempt(tmp_path, operation_cl
     rows = [json.loads(line) for line in audit.read_text().splitlines()]
     assert [row["status"] for row in rows] == ["START", "FAIL", "START", "PASS"]
     assert [row["operation_attempt"] for row in rows] == [1, 1, 2, 2]
+
+
+_CREATE_STUDY_INFO = {"study_id": None, "create_study": True, "publish_results": False}
+_TEST_IMPLEMENTATION = {
+    "name": "synthetic",
+    "version": "1",
+    "source_sha256": "a" * 64,
+    "dependencies": {},
+}
+
+
+def _combined_profile(folder, controls=None):
+    domain = {"kind": "int", "low": 1, "high": 1, "step": 1}
+    value = {
+        "schema_version": 2,
+        "model": {"id": "synthetic", "adapter": "external"},
+        "hyperparameters": {"model.period": {"default": 1, "valid": domain, "search": domain}},
+    }
+    value.update(controls or {})
+    path = folder / "model.json"
+    path.write_text(json.dumps(value))
+    return path
+
+
+def _combined_route(folder, monkeypatch, *, fail=None, effective=False):
+    (folder / "source.json").write_text("{}")
+    output = folder / "workflow"
+    output.mkdir()
+    (output / "artifact_manifest.json").write_text("{}")
+    calls = []
+
+    def register(*args, **kwargs):
+        calls.append(("register", kwargs))
+        return "registered-A"
+
+    register.__signature__ = inspect.signature(registration.register_study)
+
+    @contextmanager
+    def load(study_id):
+        calls.append(("load", study_id))
+        yield SimpleNamespace(registration={"sha256": "verified"})
+
+    def workflow(*args, **kwargs):
+        calls.append(("workflow", kwargs))
+        if fail is not None:
+            raise fail
+        return FakeResult(
+            output,
+            study_id="derived-A" if effective else "registered-A",
+            provenance={"study": {"path": str(folder / "derived.json")}},
+        )
+
+    def publish(study_id, path, **kwargs):
+        calls.append(("publish", (study_id, path, kwargs)))
+        return {"status": "published"}
+
+    registry = SimpleNamespace(
+        root=folder / "registry",
+        scratch_root=folder,
+        runtime={},
+        store=SimpleNamespace(
+            validate_destinations=lambda: None, tables={"study_results": "generic.results"}
+        ),
+        load_study=load,
+        _registration_path=lambda _id: None,
+        publish_results=publish,
+        retain_derived=lambda *args: None,
+    )
+    monkeypatch.setattr(registration, "register_study", register)
+    monkeypatch.setattr(study_workflow, "run_forecast_workflow", workflow)
+    return registry, calls
+
+
+@pytest.mark.parametrize("explicit_registry", [False, True])
+def test_configured_create_accepts_spark_forwarding(tmp_path, monkeypatch, explicit_registry):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    session = object()
+    factories = []
+
+    def from_config(cls, path, **kwargs):
+        factories.append((path, kwargs))
+        return registry
+
+    monkeypatch.setattr(registration.StudyRegistry, "from_config", classmethod(from_config))
+    result = run_study(
+        study_info=_CREATE_STUDY_INFO,
+        model=lambda _: None,
+        config=tmp_path / "source.json",
+        spark=session,
+        registry=registry if explicit_registry else None,
+        model_config=_combined_profile(tmp_path),
+        implementation=_TEST_IMPLEMENTATION,
+    )
+    assert result.study_id == "registered-A"
+    assert calls[0][1]["spark"] is session
+    if not explicit_registry:
+        assert factories[0][1]["spark"] is session
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"selection": {"stage": "testing"}},
+        {"selection": {"direction": "maximize"}},
+        {"reporting": {"metrics": ["invalid"]}},
+        {"reporting": {"forecast_accuracy_breakdown": "invalid"}},
+        {"series_policy": "invalid"},
+        {"minimum_history": 0},
+    ],
+)
+def test_static_profile_controls_fail_before_registration(tmp_path, monkeypatch, controls):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    with pytest.raises(ValueError):
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            model=lambda _: None,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model_config=_combined_profile(
+                tmp_path, {**controls, "hpo": {"backend": "optuna", "max_trials": 1, "seed": 42}}
+            ),
+            implementation=_TEST_IMPLEMENTATION,
+        )
+    assert not any(item[0] == "register" for item in calls), calls
+
+
+@pytest.mark.parametrize(
+    "fixed", [{"model.period": 2}, {"model.unknown": 1}, {"model.period": True}]
+)
+def test_manual_parameters_fail_before_registration(tmp_path, monkeypatch, fixed):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    with pytest.raises(ValueError):
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            model=lambda _: None,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION,
+            fixed_parameters=fixed,
+        )
+    assert not any(item[0] == "register" for item in calls), calls
+
+
+def test_failure_enrichment_retains_prior_workflow_and_audit_paths(tmp_path, monkeypatch):
+    error = RuntimeError("original fit error")
+    error.workflow_path = tmp_path / "retained-failed-workflow"
+    error.audit_path = tmp_path / "original-audit.jsonl"
+    registry, _ = _combined_route(tmp_path, monkeypatch, fail=error)
+    with pytest.raises(RuntimeError) as caught:
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            model=lambda _: None,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION,
+        )
+    assert caught.value is error
+    assert error.workflow_path == tmp_path / "retained-failed-workflow"
+    assert error.audit_path == tmp_path / "original-audit.jsonl"
+
+
+def test_publication_failure_has_effective_retry_study_id(tmp_path, monkeypatch):
+    registry, calls = _combined_route(tmp_path, monkeypatch, effective=True)
+    error = OSError("partial publication")
+
+    def publish(study_id, path, **kwargs):
+        assert study_id == "derived-A"
+        raise error
+
+    registry.publish_results = publish
+    with pytest.raises(OSError) as caught:
+        run_study(
+            study_info={**_CREATE_STUDY_INFO, "publish_results": True},
+            model=lambda _: None,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION,
+        )
+    assert caught.value is error and error.workflow_path == tmp_path / "workflow"
+    assert error.study_id == "derived-A"
+    assert error.registered_study_id == "registered-A"
+    assert len([item for item in calls if item[0] == "workflow"]) == 1
+
+
+def test_mapping_subclass_cannot_hide_extra_snapshot_key():
+    class Choice(dict):
+        def __iter__(self):
+            return iter(("study_id", "create_study", "publish_results"))
+
+    choice = Choice({**_CREATE_STUDY_INFO, "extra": "not allowed"})
+    assert "extra" in dict(choice)
+    with pytest.raises(ValueError, match="requires exactly"):
+        study_workflow._study_choice(study_workflow._UNSET, choice, study_workflow._UNSET)
+
+
+def test_study_choice_returns_primitive_string():
+    class ID(str):
+        pass
+
+    selected, _, _ = study_workflow._study_choice(
+        study_workflow._UNSET,
+        {"study_id": ID("registered-A"), "create_study": False, "publish_results": False},
+        study_workflow._UNSET,
+    )
+    assert type(selected) is str
+
+
+def test_str_subclass_cannot_defeat_id_guard():
+    class ID(str):
+        __hash__ = str.__hash__
+
+        def strip(self):
+            return self
+
+        def isprintable(self):
+            return True
+
+        def __eq__(self, other):
+            return True
+
+        def __ne__(self, other):
+            return False
+
+    with pytest.raises(ValueError, match="reuse requires"):
+        study_workflow._study_choice(
+            study_workflow._UNSET,
+            {"study_id": ID("../outside"), "create_study": False, "publish_results": False},
+            study_workflow._UNSET,
+        )
+
+
+def test_readonly_mapping_is_supported_and_copied():
+    original = {"study_id": "saved", "create_study": False, "publish_results": True}
+    choice = MappingProxyType(original)
+    resolved = study_workflow._study_choice(study_workflow._UNSET, choice, study_workflow._UNSET)
+    original.update(study_id="different", publish_results=False)
+    assert resolved == ("saved", False, True)
+
+
+@pytest.mark.parametrize(
+    "phase", ["registration", "tracking_setup", "load", "workflow", "publication"]
+)
+@pytest.mark.parametrize("kind", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_combined_failures_retain_exact_exception_id_and_context(
+    tmp_path, monkeypatch, phase, kind
+):
+    from autoforecast import run_mlflow
+    from autoforecast import study_registration as registration
+
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    primary = kind("synthetic primary")
+    if phase == "registration":
+
+        def fail(**kwargs):
+            raise primary
+
+        monkeypatch.setattr(registration, "register_study", fail)
+    elif phase == "load":
+
+        def fail(*args):
+            raise primary
+
+        registry.load_study = fail
+    elif phase == "workflow":
+
+        def fail(*args, **kwargs):
+            raise primary
+
+        monkeypatch.setattr(study_workflow, "run_forecast_workflow", fail)
+    elif phase == "publication":
+
+        def fail(*args, **kwargs):
+            raise primary
+
+        registry.publish_results = fail
+    options = {}
+    if phase == "tracking_setup":
+        registry.runtime = {
+            "tracking": "mlflow",
+            "tracking_uri": "https://tracking.example",
+            "mlflow_experiment": "existing",
+        }
+
+        def fail(**kwargs):
+            raise primary
+
+        monkeypatch.setattr(run_mlflow, "resolve_study_experiment", fail)
+    with pytest.raises(kind) as caught:
+        run_study(
+            study_info={**_CREATE_STUDY_INFO, "publish_results": phase == "publication"},
+            config=tmp_path / "source.json",
+            registry=registry,
+            model=lambda _: None,
+            model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION,
+            log_level="CRITICAL",
+            **options,
+        )
+    assert caught.value is primary
+    assert primary.study_id == (
+        None if phase in {"registration", "tracking_setup"} else "registered-A"
+    )
+    assert primary.audit_path.is_file()
+    assert events._CURRENT.get() is None and events._OPERATION.get() is None
+    assert len([name for name, *_ in calls if name == "workflow"]) == (
+        1 if phase == "publication" else 0
+    )
+    if phase == "publication":
+        assert primary.workflow_path == tmp_path / "workflow"
+
+
+def test_all_create_handoffs_preserve_exact_supplied_values(tmp_path, monkeypatch):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+
+    def callback(_):
+        return None
+
+    model = _combined_profile(tmp_path)
+    prepare = object()
+    output = tmp_path / "custom-result"
+    params = {"model.period": 1}
+    result = run_study(
+        study_info=_CREATE_STUDY_INFO,
+        config=tmp_path / "source.json",
+        prepare=prepare,
+        model=callback,
+        registry=registry,
+        model_config=model,
+        implementation=_TEST_IMPLEMENTATION,
+        fixed_parameters=params,
+        output_dir=output,
+        model_label="Synthetic model",
+        log_level="CRITICAL",
+    )
+    assert result.study_id == "registered-A"
+    assert calls[0][1]["config"] == tmp_path / "source.json"
+    assert calls[0][1]["prepare"] is prepare and calls[0][1]["registry"] is registry
+    assert calls[1] == ("load", "registered-A")
+    kwargs = next(item[1] for item in calls if item[0] == "workflow")
+    assert kwargs["fit_predict"] is callback and kwargs["config"] is model
+    assert kwargs["implementation"] is _TEST_IMPLEMENTATION and kwargs["fixed_parameters"] is params
+    assert kwargs["output_dir"] is output and kwargs["model_label"] == "Synthetic model"
+
+
+def test_combined_create_bad_profile_never_registers(tmp_path, monkeypatch):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    model = tmp_path / "invalid-model.json"
+    model.write_text("{}")
+    with pytest.raises(ValueError):
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model=lambda _: None,
+            model_config=model,
+            implementation=_TEST_IMPLEMENTATION,
+            log_level="CRITICAL",
+        )
+    assert calls == []
+
+
+def test_combined_create_bad_implementation_never_registers(tmp_path, monkeypatch):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="source_sha256"):
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model=lambda _: None,
+            model_config=_combined_profile(tmp_path),
+            implementation={**_TEST_IMPLEMENTATION, "source_sha256": "bad"},
+            log_level="CRITICAL",
+        )
+    assert calls == []
+
+
+def test_combined_creation_reports_id_before_workflow(tmp_path, monkeypatch):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    original = study_workflow.run_forecast_workflow
+
+    def workflow(*args, **kwargs):
+        execution = events._CURRENT.get()
+        assert execution.identity["study_id"] == "registered-A"
+        assert execution.receipt["study_id"] == "registered-A"
+        rows = [json.loads(line) for line in execution.audit.read_text().splitlines()]
+        assert any(
+            r["stage"] == "Study registered" and r["study_id"] == "registered-A" for r in rows
+        )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(study_workflow, "run_forecast_workflow", workflow)
+    run_study(
+        study_info=_CREATE_STUDY_INFO,
+        config=tmp_path / "source.json",
+        registry=registry,
+        model=lambda _: None,
+        model_config=_combined_profile(tmp_path),
+        implementation=_TEST_IMPLEMENTATION,
+        log_level="CRITICAL",
+    )
+
+
+def test_worker_does_not_reconfigure_explicit_quiet_console(tmp_path, monkeypatch):
+    from autoforecast import study_campaign as campaign
+
+    stream = io.StringIO()
+    events.configure_logging(stream=stream, progress="off")
+    logger = logging.getLogger("autoforecast.stages")
+    owned = logger.handlers[0]
+    logger.setLevel(logging.WARNING)
+    request = {
+        "models": [
+            {
+                "id": "m1",
+                "entrypoint": "synthetic:callback",
+                "code_sha256": "a" * 64,
+                "source_modules": {},
+                "implementation": _TEST_IMPLEMENTATION,
+                "fixed_parameters": {},
+            }
+        ],
+        "runtime": {},
+        "study": {"path": str(tmp_path / "study.json"), "sha256": "sha"},
+    }
+    monkeypatch.setattr(campaign, "_read", lambda *a: request)
+    monkeypatch.setattr(campaign, "_runtime_identity", lambda: {})
+    monkeypatch.setattr(campaign, "_entrypoint", lambda *a: (lambda _: None, None))
+    monkeypatch.setattr(campaign, "verify_benchmark", lambda *a, **k: None)
+    monkeypatch.setattr(
+        campaign, "_load_model_result", lambda *a, **k: {"workflow_path": str(tmp_path / "saved")}
+    )
+    completion = tmp_path / "models/candidate-0/test/result.json"
+    completion.parent.mkdir(parents=True)
+    completion.write_text("{}")
+    campaign._model_job("request", "sha", 0, "test", str(tmp_path), None)
+    assert logger.level == logging.WARNING
+    assert owned.stream is stream and owned.progress == "off"
+
+
+def test_study_model_requires_profile_before_registration(tmp_path, monkeypatch):
+    import autoforecast.study_campaign as campaign
+    from autoforecast.study_campaign import StudyModel
+
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    monkeypatch.setattr(campaign, "_entrypoint", lambda *a: (lambda _: None, "verified"))
+    selected = StudyModel("synthetic:callback", implementation=_TEST_IMPLEMENTATION)
+    with pytest.raises(ValueError, match="model_config"):
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            model=selected,
+            config=tmp_path / "source.json",
+            registry=registry,
+        )
+    assert not any(item[0] == "register" for item in calls), calls
+
+
+@pytest.mark.parametrize(
+    "uri,experiment", [("", "existing"), ("https://tracking.example", ""), (None, None)]
+)
+def test_blank_tracking_destination_fails_before_registration(
+    tmp_path, monkeypatch, uri, experiment
+):
+    from autoforecast import run_mlflow
+
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    registry.runtime = {"tracking": "mlflow", "tracking_uri": uri, "mlflow_experiment": experiment}
+
+    def forbidden():
+        pytest.fail("invalid destinations must fail before loading an MLflow client")
+
+    monkeypatch.setattr(run_mlflow, "_mlflow", forbidden)
+    with pytest.raises(ValueError, match="tracking requires"):
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            model=lambda _: None,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION,
+        )
+    assert not any(item[0] == "register" for item in calls), calls
+
+
+@pytest.mark.parametrize("environment,explicit,expected", [
+    (None, None, "ERROR"), ("WARNING", None, "WARNING"),
+    ("ERROR", "INFO", "INFO"), ("INFO", "CRITICAL", "CRITICAL"),
+])
+def test_configured_creation_runtime_precedence(tmp_path, monkeypatch, environment, explicit, expected):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    registry.runtime = {"log_level": "DEBUG", "tracking": "none"}
+    original = dict(registry.runtime)
+    config = tmp_path / "source.json"
+    config.write_text(json.dumps({"runtime": {"log_level": "ERROR"}}))
+    if environment is None:
+        monkeypatch.delenv("AUTOFORECAST_LOG_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("AUTOFORECAST_LOG_LEVEL", environment)
+    observed = []
+    workflow = study_workflow.run_forecast_workflow
+    def run(*args, **kwargs):
+        observed.append(events._CURRENT.get().level)
+        return workflow(*args, **kwargs)
+    monkeypatch.setattr(study_workflow, "run_forecast_workflow", run)
+    options = {} if explicit is None else {"log_level": explicit}
+    run_study(study_info=_CREATE_STUDY_INFO, config=config, registry=registry,
+              model=lambda _: None, model_config=_combined_profile(tmp_path),
+              implementation=_TEST_IMPLEMENTATION, **options)
+    assert calls[0][1]["log_level"] == expected
+    assert observed == [logging.getLevelNamesMapping()[expected]]
+    assert registry.runtime == original
+    assert json.loads(config.read_text()) == {"runtime": {"log_level": "ERROR"}}
+
+
+@pytest.mark.parametrize("explicit_registry", [False, True])
+def test_configured_creation_captures_relative_source_before_registration(
+    tmp_path, monkeypatch, explicit_registry,
+):
+    from autoforecast.implementation import CapturedImplementation
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    source = tmp_path / "source"
+    source.mkdir()
+    module = source / "model.py"
+    module.write_text("def forecast(request):\n    return None\n")
+    namespace = {"__name__": "synthetic_model"}
+    exec(compile(module.read_text(), str(module), "exec"), namespace)
+    config = tmp_path / "source.json"
+    config.write_text(json.dumps({"storage": {"root": str(registry.root)}, "runtime": {"implementation": {
+        "source_roots": {"model": "source"}}}}))
+    factory = registration.StudyRegistry.from_config
+    created = []
+    def from_config(cls, path, **kwargs):
+        # Use the real factory and source-path resolution; replace only saved-data loading.
+        actual = factory(path, **kwargs)
+        actual.load_study = registry.load_study
+        created.append(actual)
+        return actual
+    monkeypatch.setattr(registration.StudyRegistry, "from_config", classmethod(from_config))
+    register = registration.register_study
+    captured = []
+    resolve = study_workflow.resolve_implementation
+    def capture(*args):
+        value = resolve(*args)
+        captured.append(value)
+        return value
+    def register_after_capture(**kwargs):
+        assert len(captured) == 1
+        return register(**kwargs)
+    register_after_capture.__signature__ = inspect.signature(register)
+    monkeypatch.setattr(study_workflow, "resolve_implementation", capture)
+    monkeypatch.setattr(registration, "register_study", register_after_capture)
+    run_study(study_info=_CREATE_STUDY_INFO, config=config, registry=registry if explicit_registry else None,
+              spark=object(), model=namespace["forecast"], model_config=_combined_profile(tmp_path))
+    implementation = next(row[1]["implementation"] for row in calls if row[0] == "workflow")
+    assert isinstance(implementation, CapturedImplementation)
+    assert implementation is captured[0]
+    assert json.loads(implementation.scope_bytes)["source_roots"] == {"model": str(source)}
+    assert dict(implementation.source_bytes) == {"model/model.py": module.read_bytes()}
+    assert registry.runtime == {}
+
+    assert len(created) == (0 if explicit_registry else 1)
+    if created:
+        assert created[0].runtime["implementation"]["source_roots"] == {"model": str(source)}
+
+
+@pytest.mark.parametrize("keyword", [
+    "spark", "training_data", "testing_data", "validation_data", "series_id", "date_col",
+    "target_col", "target_unit", "frequency", "training_date_range", "testing_date_range",
+    "validation_date_range", "metric", "history_missing", "actual_missing", "feature_roles",
+    "feature_availability", "references", "tuning_windows", "tuning_schedule",
+])
+def test_configured_create_accepts_existing_registration_null_defaults(tmp_path, monkeypatch, keyword):
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    run_study(study_info=_CREATE_STUDY_INFO, config=tmp_path / "source.json", registry=registry,
+              model=lambda _: None, model_config=_combined_profile(tmp_path),
+              implementation=_TEST_IMPLEMENTATION, **{keyword: None})
+    assert keyword in calls[0][1] and calls[0][1][keyword] is None
+    assert [row[0] for row in calls] == ["register", "load", "workflow"]
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_registry_environment_flag_requires_boolean_before_read(tmp_path, value):
+    with pytest.raises(ValueError, match="use_environment must be a boolean"):
+        registration.StudyRegistry.from_config(tmp_path / "absent.json", use_environment=value)
+
+
+@pytest.mark.parametrize("model_kind", ["callback", "StudyModel", "builtin"])
+def test_explicit_search_without_hpo_rejected_before_registration(
+    tmp_path, monkeypatch, model_kind
+):
+    from autoforecast import study_campaign as campaign
+    from autoforecast.study_campaign import StudyModel
+
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    profile = _combined_profile(tmp_path)
+
+    def callback(_):
+        return None
+
+    monkeypatch.setattr(campaign, "_entrypoint", lambda *a: (callback, "source-hash"))
+    model = (
+        StudyModel("synthetic:callback", config=profile, implementation=_TEST_IMPLEMENTATION)
+        if model_kind == "StudyModel"
+        else "seasonal_naive"
+        if model_kind == "builtin"
+        else callback
+    )
+
+    @contextmanager
+    def load(study_id):
+        calls.append(("load", study_id))
+        yield SimpleNamespace(
+            registration={"sha256": "verified"}, panel=SimpleNamespace(season_length=1)
+        )
+
+    registry.load_study = load
+
+    def workflow(*args, **kwargs):
+        # Execute the actual existing profile requirement without Spark/model fitting.
+        study_tuning._config(
+            pathlib.Path(kwargs["config"]), require_hpo=kwargs["fixed_parameters"] is None
+        )
+        raise AssertionError("invalid explicit search reached the body")
+
+    monkeypatch.setattr(study_workflow, "run_forecast_workflow", workflow)
+    options = (
+        {}
+        if model_kind in ("StudyModel", "builtin")
+        else {"model_config": profile, "implementation": _TEST_IMPLEMENTATION}
+    )
+    with pytest.raises(ValueError, match="requires an hpo mapping"):
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model=model,
+            fixed_parameters=None,
+            log_level="CRITICAL",
+            **options,
+        )
+    assert not any(row[0] == "register" for row in calls), calls
+
+
+@pytest.mark.parametrize("phase", ["tracking_export", "table_publication"])
+def test_completed_result_preserves_prior_exception_workflow_evidence(tmp_path, monkeypatch, phase):
+    from autoforecast import run_mlflow
+
+    registry, calls = _combined_route(tmp_path, monkeypatch)
+    error = OSError("retained publication failure")
+    original = tmp_path / "prior-publication-evidence"
+    error.workflow_path = original
+    error.audit_path = tmp_path / "prior-audit.jsonl"
+
+    def fail(*a, **k):
+        raise error
+
+    if phase == "tracking_export":
+        registry.runtime = {
+            "tracking": "mlflow",
+            "tracking_uri": "https://tracking.example",
+            "mlflow_experiment": "existing",
+        }
+        monkeypatch.setattr(run_mlflow, "resolve_study_experiment", lambda **k: "existing")
+        monkeypatch.setattr(run_mlflow, "export_forecast_workflow", fail)
+    else:
+        registry.publish_results = fail
+    with pytest.raises(OSError) as caught:
+        run_study(
+            study_info={**_CREATE_STUDY_INFO, "publish_results": phase == "table_publication"},
+            config=tmp_path / "source.json",
+            registry=registry,
+            model=lambda _: None,
+            model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION,
+            log_level="CRITICAL",
+        )
+    assert caught.value is error
+    assert error.audit_path == tmp_path / "prior-audit.jsonl"
+    assert error.workflow_path == tmp_path / "workflow"
+    assert error.prior_workflow_path == original
+
+
+@pytest.mark.parametrize("primary_kind", [RuntimeError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("secondary_kind", [KeyboardInterrupt, SystemExit])
+def test_failure_enrichment_preserves_primary_exception(
+    tmp_path, monkeypatch, primary_kind, secondary_kind
+):
+    secondary = secondary_kind("secondary evidence interruption")
+
+    class Primary(primary_kind):
+        def __getattribute__(self, name):
+            if name == "__dict__":
+                raise secondary
+            return super().__getattribute__(name)
+
+        def add_note(self, *args):
+            raise secondary
+
+    primary = Primary("original model error")
+    registry, calls = _combined_route(tmp_path, monkeypatch, fail=primary)
+    caught = None
+    try:
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            config=tmp_path / "source.json",
+            registry=registry,
+            model=lambda _: None,
+            model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION,
+            log_level="CRITICAL",
+        )
+    except BaseException as error:
+        caught = error
+    assert caught is primary
+    assert events._CURRENT.get() is None and events._OPERATION.get() is None
+
+
+def test_failure_output_does_not_disclose_private_registry_location(tmp_path, monkeypatch):
+    import traceback
+
+    from autoforecast.study_registration import StudyRegistry
+
+    primary = RuntimeError("synthetic fit error")
+    registry, calls = _combined_route(tmp_path, monkeypatch, fail=primary)
+    sensitive = tmp_path / "https:/alice:private-password@example.test/registry?token=private-token"
+    # The real constructor accepts this normalized POSIX path; no Spark methods are used.
+    actual = StudyRegistry(sensitive, spark=object())
+    actual.load_study = registry.load_study
+    stream = io.StringIO()
+    events.configure_logging(stream=stream, progress="plain")
+    with pytest.raises(RuntimeError) as caught:
+        run_study(
+            study_info=_CREATE_STUDY_INFO,
+            config=tmp_path / "source.json",
+            registry=actual,
+            model=lambda _: None,
+            model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION,
+        )
+    assert caught.value is primary
+    assert "private-password" not in stream.getvalue() and "private-token" not in stream.getvalue()
+    assert "private-password" not in primary.audit_path.read_text()
+    # Python loggers/frontends format exception notes along with the traceback.
+    diagnostic = "".join(traceback.format_exception(primary))
+    assert "private-password" not in diagnostic and "private-token" not in diagnostic
+
+
+def _registration_failure_route(tmp_path, monkeypatch, root=None):
+    from autoforecast import study_registration as registration
+
+    data = {
+        "dataset": {},
+        "recipe": {
+            "source_keys": ["item"],
+            "frequency": "D",
+            "metric": "mae",
+            "target_unit": "units",
+            "training_start": "2024-01-01",
+            "validation_origins": ["2024-01-05"],
+            "history_missing": "zero",
+        },
+        "source": {"kind": "parquet"},
+        "runtime": {},
+    }
+    monkeypatch.setattr(registration, "_configuration", lambda _: (data, tmp_path))
+    return registration, SimpleNamespace(
+        root=root or tmp_path / "registry",
+        scratch_root=tmp_path / "scratch",
+        runtime={},
+        store=None,
+    )
+
+
+@pytest.mark.parametrize("primary_kind", [RuntimeError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("secondary_kind", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("note_site", ["registration_attempt", "evidence_failure"])
+def test_registration_note_cancellation_preserves_primary(
+    tmp_path, monkeypatch, primary_kind, secondary_kind, note_site
+):
+    registration, registry = _registration_failure_route(tmp_path, monkeypatch)
+    secondary = secondary_kind("secondary note interruption")
+
+    class Primary(primary_kind):
+        def add_note(self, message):
+            if (
+                note_site == "registration_attempt" and message.startswith("Registration attempt")
+            ) or (
+                note_site == "evidence_failure"
+                and message.startswith("Registration failure evidence")
+            ):
+                raise secondary
+            return super().add_note(message)
+
+    primary = Primary("original preparation failure")
+
+    def fail(*a, **k):
+        raise primary
+
+    monkeypatch.setattr(registration, "_register_study", fail)
+    if note_site == "evidence_failure":
+        emit = registration._stage_event
+
+        def fail_evidence(path, stage, status, **kwargs):
+            if stage == "sources" and status in ("FAIL", "CANCELLED"):
+                raise OSError("audit unavailable")
+            return emit(path, stage, status, **kwargs)
+
+        monkeypatch.setattr(registration, "_stage_event", fail_evidence)
+    caught = None
+    try:
+        registration.register_study("synthetic.json", registry=registry, log_level="CRITICAL")
+    except BaseException as error:
+        caught = error
+    assert caught is primary
+    assert events._CURRENT.get() is None and events._OPERATION.get() is None
+
+
+@pytest.mark.parametrize(
+    "shape", ["single", "adjacent", "ambiguous", "newline", "carriage_return", "escape"]
+)
+def test_registration_attempt_note_is_sanitized(tmp_path, monkeypatch, shape):
+    from autoforecast.study_registration import StudyRegistry
+
+    locations = {
+        "single": "https:/alice:private-password@example.test/registry?token=private-token",
+        "adjacent": "https:/alice:private-password@example.test/a,https:/bob:private-token@other.test/b",
+        "ambiguous": "workspace:/private-token@archive/registry",
+        "newline": "registry\nFORGED",
+        "carriage_return": "registry\rFORGED",
+        "escape": "registry\x1bFORGED",
+    }
+    actual = StudyRegistry(tmp_path / locations[shape], spark=object())
+    registration, registry = _registration_failure_route(tmp_path, monkeypatch, root=actual.root)
+    primary = RuntimeError("original preparation failure")
+
+    def fail(*a, **k):
+        raise primary
+
+    monkeypatch.setattr(registration, "_register_study", fail)
+    with pytest.raises(RuntimeError) as caught:
+        registration.register_study("synthetic.json", registry=registry, log_level="CRITICAL")
+    assert caught.value is primary
+    note = next(
+        value for value in primary.__notes__ if value.startswith("Registration attempt evidence:")
+    )
+    assert all(
+        value not in note for value in ["private-password", "private-token", "\n", "\r", "\x1b"]
+    )
+
+
+@pytest.mark.parametrize("character", ["\n", "\r", "\x1b"])
+def test_run_failure_preserves_original_notes(tmp_path, monkeypatch, character):
+    primary = RuntimeError("original model failure")
+    primary.add_note("Original error detail")
+    registry, _ = _combined_route(tmp_path, monkeypatch, fail=primary)
+    registry.root = tmp_path / ("registry" + character + "FORGED")
+    with pytest.raises(RuntimeError) as caught:
+        run_study(
+            study_info=_CREATE_STUDY_INFO, config=tmp_path / "source.json",
+            registry=registry, model=lambda _: None, model_config=_combined_profile(tmp_path),
+            implementation=_TEST_IMPLEMENTATION, log_level="CRITICAL",
+        )
+    assert caught.value is primary
+    assert primary.__notes__ == ["Original error detail"]
+    assert primary.audit_path.is_file()
