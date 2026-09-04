@@ -1,77 +1,38 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1740" viewBox="0 0 1600 1740" role="img" aria-labelledby="title desc">
-<title id="title">Saved outputs: locate, inspect, verify and reuse</title>
-<desc id="desc">Keep each execution separate, with a file guide for people and typed artifacts for analysis.</desc>
-<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#245DD8"/></marker></defs>
-<rect x="0" y="0" width="1600" height="1740" rx="0" fill="#F4F7FB"/>
-<text x="56" y="45" font-family="Arial, sans-serif" font-size="16" fill="#245DD8" xml:space="preserve" font-weight="700">AUTOFORECAST / HOW IT WORKS</text>
-<text x="56" y="100" font-family="Arial, sans-serif" font-size="42" fill="#172A43" xml:space="preserve" font-weight="700">Saved outputs: locate, inspect, verify and reuse</text>
-<text x="56" y="142" font-family="Arial, sans-serif" font-size="21" fill="#53647A" xml:space="preserve">Keep each execution separate, with a file guide for people and typed artifacts for analysis.</text>
-<rect x="56" y="180" width="1488" height="230" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="78" y="202" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="89" y="227" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">1</text>
-<text x="134" y="228" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">One experiment parent; a new child for each ordinary workflow call</text>
-<text x="82" y="263" font-family="Courier New, monospace" font-size="23" fill="#172A43" xml:space="preserve">outputs/demand-baseline/</text>
-<text x="82" y="300" font-family="Courier New, monospace" font-size="23" fill="#172A43" xml:space="preserve">  workflow-20261028t081530z-&lt;32 hexadecimal UUID characters&gt;/</text>
-<text x="82" y="337" font-family="Courier New, monospace" font-size="23" fill="#172A43" xml:space="preserve">    RUN.md</text>
-<text x="82" y="382" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve">UTC time helps navigation. A full UUID and exclusive creation prevent accidental overwrite.</text>
-<rect x="56" y="438" width="940" height="495" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="78" y="460" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="89" y="485" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">2</text>
-<text x="134" y="486" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Open RUN.md first</text>
-<text x="82" y="526" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve" font-weight="700">metadata/*.yaml</text>
-<text x="502" y="526" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Saved source / reconstructed profiles</text>
-<text x="82" y="572" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve" font-weight="700">metadata/winner-config.json</text>
-<text x="502" y="572" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Effective selected or fixed parameters</text>
-<text x="82" y="618" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve" font-weight="700">metadata/provenance.json</text>
-<text x="502" y="618" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Data, implementation and settings identities</text>
-<text x="82" y="664" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve" font-weight="700">validation/ and test/</text>
-<text x="502" y="664" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Native model/, forecasts/, scores/, artifacts/</text>
-<text x="82" y="710" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve" font-weight="700">result.json</text>
-<text x="502" y="710" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Stage results and artifact references</text>
-<text x="82" y="756" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve" font-weight="700">artifact_manifest.json</text>
-<text x="502" y="756" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">File inventory, byte sizes and SHA-256</text>
-<text x="82" y="802" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve" font-weight="700">completion.json</text>
-<text x="502" y="802" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Terminal status; binds the manifest</text>
-<text x="82" y="848" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve" font-weight="700">failure.json, when produced</text>
-<text x="502" y="848" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Failure evidence without fabricated results</text>
-<rect x="1020" y="438" width="524" height="495" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="1044" y="486" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Use a small set of formats</text>
-<text x="1046" y="527" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">Parquet</text>
-<text x="1046" y="556" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Forecasts, scores and analysis tables</text>
-<text x="1046" y="600" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">JSON</text>
-<text x="1046" y="629" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Metadata, provenance and status</text>
-<text x="1046" y="673" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">Markdown</text>
-<text x="1046" y="702" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">RUN.md file guide</text>
-<text x="1046" y="746" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">YAML</text>
-<text x="1046" y="775" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Supplied model configuration</text>
-<text x="1046" y="819" font-family="Arial, sans-serif" font-size="23" fill="#245DD8" xml:space="preserve" font-weight="700">Native formats</text>
-<text x="1046" y="848" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Model files saved by the callback</text>
-<rect x="56" y="961" width="1488" height="250" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="78" y="983" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="89" y="1008" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">3</text>
-<text x="134" y="1009" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Read verified evidence; export a separate analysis dataset</text>
-<text x="82" y="1046" font-family="Courier New, monospace" font-size="22" fill="#172A43" xml:space="preserve">tables = read_workflow_results(run.path, include_tuning=True)</text>
-<text x="82" y="1082" font-family="Courier New, monospace" font-size="22" fill="#172A43" xml:space="preserve">export_results(tables, run.path.parent / (run.path.name + &quot;-analysis&quot;))</text>
-<text x="82" y="1130" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Export: predictions.parquet, metadata.json, optional source-keys.parquet and series-scores.parquet, RUN.md.</text>
-<text x="82" y="1174" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve">Keep model, run, stage, origin and trial labels in dashboards. Reading and exporting do not retrain models.</text>
-<rect x="56" y="1239" width="728" height="344" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="80" y="1287" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Tuning evidence stays available</text>
-<text x="82" y="1320" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Search: selection.json, report.html and RUN.md.</text>
-<text x="82" y="1354" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Trials: separate attempt and window directories.</text>
-<text x="82" y="1388" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Native models, forecasts, scores and optional diagnostics</text>
-<text x="82" y="1422" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">remain beside their producing attempt / window.</text>
-<text x="82" y="1456" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">read_tuning_results(path) also reads sealed failed attempts</text>
-<text x="82" y="1490" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">and completed windows, without inventing a winner.</text>
-<text x="82" y="1552" font-family="Arial, sans-serif" font-size="19" fill="#A15B08" xml:space="preserve" font-weight="700">Unsealed attempts do not become analysis rows.</text>
-<rect x="808" y="1239" width="736" height="344" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="832" y="1287" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Recovery is an explicit choice</text>
-<text x="834" y="1320" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Ordinary repeated workflows create separate executions.</text>
-<text x="834" y="1354" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Matching campaign requests reopen verified work.</text>
-<text x="834" y="1388" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Explicit reuse_tuning and validation_run reopen evidence.</text>
-<text x="834" y="1422" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">A new campaign name / destination starts a new campaign.</text>
-<text x="834" y="1456" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Bundle and attempt guides are sealed; coordinator guides</text>
-<text x="834" y="1490" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">are snapshots of work that may still be changing.</text>
-<text x="834" y="1552" font-family="Arial, sans-serif" font-size="19" fill="#245DD8" xml:space="preserve" font-weight="700">Retain referenced frozen-study and search directories.</text>
-<text x="56" y="1695" font-family="Arial, sans-serif" font-size="17" fill="#53647A" xml:space="preserve">Default workflow parent: .autoforecast/study-workflows/&lt;study-id&gt;/ beside the registry. run.path is authoritative.</text>
-<text x="56" y="1720" font-family="Arial, sans-serif" font-size="15" fill="#53647A" xml:space="preserve">Optional diagnostics must be produced by the callback. Temporary training slices are not automatically archived. No old-format migration.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+<title id="title">Results you can inspect and reuse</title><desc id="desc">Each run keeps its own evidence, with checks before loading and analysis.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#245DD8"/></marker></defs>
+<rect width="1200" height="760" fill="#F4F7FB"/>
+<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
+<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#172A43" font-weight="700">Results you can inspect and reuse</text>
+<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#53647A">Each run keeps its own evidence, with checks before loading and analysis.</text>
+<rect x="40" y="165" width="1120" height="111" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="60" y="199" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">A reusable frozen study</text>
+<text x="60" y="234" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Population, preparation decisions, data snapshots and evaluation boundaries stay bound together.</text>
+<path d="M600 276 V300 M215 300 H985" stroke="#245DD8" stroke-width="2.5" fill="none"/>
+<path d="M215 300 L215 320" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M600 300 L600 320" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M985 300 L985 320" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="40" y="328" width="350" height="185" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="60" y="362" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">Forecasts and scores</text>
+<text x="60" y="397" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Predictions for each stage</text>
+<text x="60" y="424" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Metrics and coverage</text>
+<text x="60" y="451" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Comparable analysis tables</text>
+<rect x="425" y="328" width="350" height="185" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="445" y="362" font-family="Arial, sans-serif" font-size="21" fill="#087F82" font-weight="700">Fitted models</text>
+<text x="445" y="397" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Validation and refit models</text>
+<text x="445" y="424" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Native model files</text>
+<text x="445" y="451" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Optional diagnostics</text>
+<rect x="810" y="328" width="350" height="185" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="830" y="362" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">Execution evidence</text>
+<text x="830" y="397" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Effective settings and identities</text>
+<text x="830" y="424" font-family="Arial, sans-serif" font-size="17" fill="#172A43">File integrity checks</text>
+<text x="830" y="451" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Status and failure details</text>
+<path d="M215 513 L215 554" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M600 513 L600 554" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M985 513 L985 554" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="40" y="568" width="1120" height="132" rx="14" fill="#E8F5F3" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="60" y="604" font-family="Arial, sans-serif" font-size="24" fill="#087F82" font-weight="700">Verify, then reuse</text>
+<text x="60" y="641" font-family="Arial, sans-serif" font-size="18" fill="#172A43">Inspect saved results, export analysis tables, or publish checked results without retraining.</text>
+<text x="60" y="673" font-family="Arial, sans-serif" font-size="17" fill="#53647A">Keep referenced study and search artifacts. Check completion and coverage before drawing conclusions.</text>
+<text x="40" y="737" font-family="Arial, sans-serif" font-size="17" fill="#53647A">A separate run identity keeps repeated and concurrent executions apart.</text>
 </svg>

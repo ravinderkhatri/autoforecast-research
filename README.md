@@ -209,6 +209,151 @@ an explicit `registry=` overrides both. Config-based loading reads storage/runti
 only, never the original source SQL.
 There is no process-global active registry. Separate explicit registries can run concurrently.
 
+### Application preparation and admission evidence
+
+Pass an explicit preparation object to the same registration call when your application
+owns eligibility or transformation decisions. Its `validate` method checks domain settings
+before managed source access. Its `prepare` method receives captured settings, resolved
+windows, materialized observations, named audit inputs, exact population keys, generic
+findings and a temporary workspace. Configuration never names Python code to import.
+
+For example, a daily sensor application can explicitly exclude sensors with too few
+observed values before the first validation origin. This is an application policy, not a
+library default. Add these settings to the study configuration:
+
+```yaml
+preparation:
+  minimum_observations: 12
+records:
+  format: json
+```
+
+```python
+from pyspark.sql import functions as F
+from autoforecast import register_study
+from autoforecast.study_registration import EXCLUSION_REASON_COLUMN, PreparationResult
+
+class SensorPreparation:
+    def validate(self, settings):
+        minimum = settings.parameters.get("minimum_observations")
+        if type(minimum) is not int or minimum < 1:
+            raise ValueError("minimum_observations must be a positive integer")
+        if settings.recipe["frequency"] != "D":
+            raise ValueError("This sensor preparation policy uses daily observations")
+
+    def prepare(self, context):
+        recipe = context.settings.recipe
+        panel = context.settings.dataset["dataset"]["panel"]
+        keys = recipe["source_keys"]
+        minimum = context.settings.parameters["minimum_observations"]
+        history = context.observations.filter(
+            F.col(panel["time_col"]).between(
+                F.lit(recipe["training_start"]).cast("date"),
+                F.lit(recipe["validation_origins"][0]).cast("date"),
+            )
+        )
+        counts = history.groupBy(*keys).agg(
+            F.count(panel["target_col"]).alias("__af_observed_count")
+        )
+        excluded = context.starting_keys.join(counts, keys, "left").filter(
+            F.coalesce(F.col("__af_observed_count"), F.lit(0)) < minimum
+        ).select(*keys)
+        retained = context.starting_keys.join(excluded, keys, "left_anti")
+        return PreparationResult(
+            observations=context.observations.join(retained, keys, "inner"),
+            starting_keys=context.starting_keys,
+            retained_keys=retained,
+            exclusions=excluded.withColumn(EXCLUSION_REASON_COLUMN, F.lit("SHORT_SENSOR_HISTORY")),
+            identifier="sensor-history", version="1",
+            policy={"minimum_observations": minimum},
+            actions=("exclude sensors below the declared history requirement",),
+        )
+
+study_id = register_study("sensors.yaml", registry=registry, prepare=SensorPreparation())
+```
+
+Run models by this ID using the existing `run_study` API. The application does not hash
+data, write issue tables, link findings or author generated admission records.
+`PreparationSettings`, `PreparationContext`, `PreparationResult` and `StudyPreparation`
+are public contracts in `autoforecast.study_registration`.
+
+Starting keys must equal the disjoint union of retained and excluded keys, with the same
+types and a nonblank `EXCLUSION_REASON_COLUMN` for every exclusion. Equal counts with different IDs fail.
+Prepared observations must contain exactly the declared retained keys. Optional `starts`
+contains those keys plus a canonical string `START_COLUMN`; optional `findings` uses the supplied
+findings schema. `actions` records actions taken; `planned_actions` records declared intent.
+Neither can replace native structural failures or managed source facts.
+Preparation parameters and policies are mappings of named JSON scalars, not nested objects.
+The metadata columns are `__af_exclusion_reason` and `__af_history_start`, using the existing
+reserved prefix so ordinary keys such as `reason` or `start` remain valid. Import both column
+constants from `autoforecast.study_registration`. Existing configured starts are retained for
+surviving keys when the hook excludes series without supplying replacement starts.
+
+To calculate references from a separate prepared frame, return `reference_input` with the
+existing reference calculation settings. To supply already computed references, configure
+`references: {prepared: true}` and return `scoring_references`. These routes are mutually
+exclusive and use the same reference schema, coverage and numeric checks as native registration.
+Key, stage and origin types remain strict; reference origins are canonical strings.
+
+For managed Delta audit inputs, extend the source section with named SQL files:
+
+```yaml
+source:
+  kind: delta
+  sql: observations.sql
+  tables:
+    measurements: catalog.schema.sensor_readings
+  audit_queries:
+    original: population.sql
+  population: original
+  require_matching_population: true
+```
+
+For this example, both queries read the declared `measurements` alias. The primary query
+selects the configured observation columns; the population query selects distinct source
+keys. Every query is checked before any source-version lookup. Each physical table is pinned
+once across aliases and queries. The existing read-only SQL operator restrictions apply;
+CTEs and undeclared relations are not enabled by this feature. Audit queries require an
+explicit preparation hook.
+
+`population` names the query supplying the starting IDs, defaulting to the primary query.
+SQL date conditions and pinned Delta versions are recorded separately. Primary and population
+membership must match unless `require_matching_population: false` is explicit. Differences
+then remain separate population findings and key artifacts; the hook must still account for
+every retained or excluded population key. Choosing the correct business population remains
+the application's responsibility. The primary input must satisfy the native observation
+contract before preparation; transaction-level or attribute-only data belongs in audit inputs.
+
+Registration retains exact membership, exclusions, findings, policies and final cohort evidence.
+Their logical identity participates in the existing study identity. Changed material decisions
+produce a different ID even when prepared observations are identical. Returned lazy frames
+are materialized before checks, and captured settings/source baselines cannot be replaced by
+hook output. Native exclusions are reconciled again, for example 100 starting sensors,
+95 after application eligibility, and 93 after two native reference exclusions.
+
+Configuration accepts `.yaml`, `.yml` and `.json` through one validation path. Nested duplicate
+keys, unsafe YAML tags, anchors/aliases, non-string mapping keys and non-finite numbers fail.
+Quote ISO dates. Equivalent validated configuration and resolved paths have the same logical
+identity across input encodings. Generated registration and admission metadata default to JSON;
+`records: {format: yaml}` selects YAML. Readers authenticate either format, reject conflicting
+copies, and keep the first published bytes and location on identical retries. Benchmark and
+tracking manifests, Parquet artifacts and JSON table columns retain their existing formats.
+Current no-hook registrations and current-format study IDs remain supported unchanged.
+
+Load verifies admission records and retained artifacts before exposing model inputs. It needs
+neither the original source/configuration nor the preparation object. Source SQL, versions,
+schemas and input hashes attest to the inputs read during registration; discarded raw/audit
+rows are not replayable from those hashes. Full raw/audit-row archival is not enabled by default,
+and Delta versions alone do not guarantee replay after vacuum. Frozen model inputs and durable
+admission evidence are retained through the existing stores.
+
+Preparation is trusted Python, not a sandbox. Only managed reads receive library-verified
+provenance. Storage baselines require the same protected shared POSIX filesystem as existing
+registrations. Configuration, source, admission, freeze and publication stages log START/PASS/FAIL
+without routine row contents. Failed attempts retain available findings and failure records.
+Evidence and issue linking must succeed before completed registration publication; the sequence
+of file and table writes is not one transaction.
+
 ### Optional Delta storage and publication
 
 Supply a Delta-enabled Spark session and credentials through your runtime. Core file workflows
@@ -416,7 +561,7 @@ See the [small callback examples](autoforecast/test_study_campaign.py) and
 [callback types](autoforecast/study_tuning.py). These are trusted Python functions:
 AutoForecast supplies bounded history but cannot control other data your code reads.
 
-![Arguments, callback inputs, model fitting, and retained results](assets/02-workflow-function.svg)
+![Application responsibilities and the checked registration and model lifecycle](assets/02-workflow-function.svg)
 
 ## Tune and evaluate over time
 
@@ -439,7 +584,7 @@ With five trials and three tuning windows, a successful fresh workflow makes
 Fixed settings make two calls. Final test scores never choose the settings.
 MAE means mean absolute error: the average size of the forecast errors.
 
-![Time windows and a worked example of selecting settings](assets/01-cross-validation.svg)
+![Earlier tuning windows, validation, and the separate final test](assets/01-cross-validation.svg)
 
 To use saved settings on new data, pass `selected_config=run.selected_config` to a new
 study's workflow, keep the same implementation identity, and omit `fixed_parameters`. It performs two fresh fits without tuning. To tune again, use
@@ -544,7 +689,7 @@ The default campaign parent is `.autoforecast/study-campaigns/<study-id>/`; `out
 Keep referenced study and search folders: the workflow folder alone may not contain every input.
 Saved records must use the current format; older formats are rejected.
 
-![Run folders, file formats, verified reading, and reuse](assets/04-run-outputs.svg)
+![Saved forecasts, fitted models, execution evidence, and verified reuse](assets/04-run-outputs.svg)
 
 ## More examples and development
 
@@ -563,10 +708,12 @@ installed-wheel checks, and model-extra checks in parallel. Every group must pas
 pull-request runs are cancelled automatically; a failing matrix member does not cancel its
 siblings, so one run can report failures across all supported variants.
 
-The regression runner balances modules using measured durations in
-`configs/ci/test_durations.json`. Durations affect scheduling only: every discovered module
-still runs exactly once, new modules receive a 60-second estimate, and stale entries do not
-add tests. Refresh estimates from completed CI module timings when workloads change.
+The regression runner balances modules using recent timings and estimates for new or split
+modules in `configs/ci/test_durations.json`. Durations affect scheduling only: every discovered
+module still runs exactly once, modules without an entry receive a 60-second estimate, and
+stale entries do not add tests. Campaign recovery and availability checks run in a separate
+module so one long module does not hold up the entire matrix. Refresh estimates from completed
+CI module timings when workloads change.
 Run one of the same shards locally with:
 
 ```sh

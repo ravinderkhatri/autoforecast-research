@@ -140,6 +140,15 @@ def test_unknown_study_read_does_not_provision_storage(spark):
     assert not spark.catalog.databaseExists("absent_study_namespace")
 
 
+@pytest.mark.parametrize("table", ["", ".bad", "bad..name", None])
+def test_invalid_managed_table_identifiers_fail_before_runtime_access(table):
+    from autoforecast.integrations.delta import read_sources
+
+    with pytest.raises(ValueError, match="table names require"):
+        read_sources(None, queries={"primary": "SELECT * FROM valid"},
+                     tables={"valid": "neutral.sensors", "invalid": table})
+
+
 def test_source_query_pins_versions_and_rejects_commands_and_undeclared_tables(store):
     from autoforecast.integrations.delta import read_source
 
@@ -159,6 +168,182 @@ def test_source_query_pins_versions_and_rejects_commands_and_undeclared_tables(s
         with pytest.raises(ValueError):
             read_source(store.spark, sql=query, tables={"source": table})
     assert store.spark.table(table).count() == 2
+
+
+@pytest.mark.parametrize("spelling", ["same", "qualified", "unqualified", "shared_location"])
+@pytest.mark.parametrize("change", ["append", "update"])
+def test_managed_queries_pin_shared_physical_table_once_before_any_execution(
+    store, monkeypatch, spelling, change,
+):
+    from autoforecast.integrations import delta
+
+    table = store.namespace + ".managed_input"
+    store.spark.createDataFrame([(1,)], "item int").write.format("delta").saveAsTable(table)
+    session = store.spark.newSession()
+    session.catalog.setCurrentDatabase(store.namespace)
+    audit_table = table
+    if spelling == "qualified":
+        audit_table = "spark_catalog." + table
+    elif spelling == "unqualified":
+        audit_table = "managed_input"
+    elif spelling == "shared_location":
+        audit_table = store.namespace + ".alternate_input"
+        location = session.sql(f"DESCRIBE DETAIL {delta.quote_table(table)}").first()["location"]
+        quoted_location = location.replace("'", "''")
+        session.sql(f"CREATE TABLE {delta.quote_table(audit_table)} "
+                    f"USING DELTA LOCATION '{quoted_location}'")
+    original = delta.latest_delta_version
+    lookups = []
+
+    def changing(spark, physical):
+        version = original(spark, physical)
+        lookups.append(physical)
+        if change == "append":
+            (spark.createDataFrame([(2,)], "item int").write.format("delta")
+             .mode("append").saveAsTable(physical))
+        else:
+            spark.sql(f"UPDATE {delta.quote_table(physical)} SET item = 2")
+        return version
+
+    monkeypatch.setattr(delta, "latest_delta_version", changing)
+    tables = {"observations": table, "audit_source": audit_table}
+    queries = {"primary": "SELECT item FROM observations",
+               "audit": "SELECT item FROM audit_source"}
+    managed = delta.read_sources(session, queries=queries, tables=tables)
+    assert lookups == ["spark_catalog." + table]
+    for frame, provenance in managed.values():
+        assert [row.item for row in frame.collect()] == [1]
+        assert {item["version"] for item in provenance["tables"].values()} == {0}
+        assert provenance["sql"] in queries.values()
+    for name in queries:
+        for bad in ("DROP TABLE observations", "SELECT * FROM undeclared",
+                    "SELECT * FROM observations WHERE item IN (SELECT item FROM undeclared)"):
+            lookups.clear()
+            with pytest.raises(ValueError):
+                delta.read_sources(session, queries={**queries, name: bad}, tables=tables)
+            assert not lookups
+
+
+def test_prepared_registration_owns_audit_query_evidence_and_links_before_publication(
+    store, tmp_path, monkeypatch,
+):
+    import dataclasses
+    import json
+
+    import yaml
+
+    from autoforecast import register_study
+    from autoforecast.study_registration import EXCLUSION_REASON_COLUMN, StudyRegistry
+    from autoforecast.test_study_preparation import SensorPreparation
+    from autoforecast.test_study_registration import configuration
+
+    path = configuration(tmp_path)
+    table = store.namespace + ".sensors"
+    (store.spark.read.parquet(str(tmp_path / "source.parquet")).write.format("delta")
+     .saveAsTable(table))
+    (tmp_path / "primary.sql").write_text("SELECT item, day, value FROM measurements")
+    (tmp_path / "population.sql").write_text("SELECT DISTINCT item FROM inventory")
+    value = yaml.safe_load(path.read_text())
+    value["source"] = {"kind": "delta", "sql": "primary.sql",
+                       "tables": {"measurements": table, "inventory": table},
+                       "audit_queries": {"population": "population.sql"},
+                       "population": "population"}
+    value["records"] = {"format": "yaml"}
+    path.write_text(yaml.safe_dump(value))
+    registry = StudyRegistry(tmp_path / "registry", spark=store.spark, namespace=store.namespace)
+
+    class SensorAudit(SensorPreparation):
+        def prepare(self, context):
+            assert set(context.audits) == {"population"}
+            assert context.audits["population"].count() == 2
+            return dataclasses.replace(
+                super().prepare(context), findings=context.findings.withColumn(
+                    "issue_code", F.lit("SENSOR_NOTE")))
+
+    append = registry.store.append_once
+
+    def unavailable(role, frame, *, scope):
+        if role == "study_data_issues" and scope.get("check_id", "").endswith("-application"):
+            raise OSError("injected findings transport failure")
+        return append(role, frame, scope=scope)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(registry.store, "append_once", unavailable)
+        with pytest.raises(OSError, match="findings transport failure"):
+            register_study(path, registry=registry, prepare=SensorAudit())
+    assert not list((registry.root / "registrations").glob("*.*"))
+    assert store.spark.table(store.tables["studies"]).count() == 0
+    assert list((registry.root / "checks").glob("*/application/*.parquet"))
+    link = registry.store.link_issues
+
+    def interrupted(check_id, study_id):
+        link(check_id, study_id)
+        if check_id.endswith("-application"):
+            raise OSError("injected application linkage failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(registry.store, "link_issues", interrupted)
+        with pytest.raises(OSError, match="application linkage failure"):
+            register_study(path, registry=registry, prepare=SensorAudit())
+    assert not list((registry.root / "registrations").glob("*.*"))
+    assert store.spark.table(store.tables["studies"]).count() == 0
+    study_id = register_study(path, registry=registry, prepare=SensorAudit())
+    definition, _ = registry.definition(study_id)
+    record = yaml.safe_load((registry.root / definition["admission_evidence"]["path"]).read_text())
+    assert record["identity"]["population_query"] == "population"
+    assert record["identity"]["sources"]["population"]["rows"] == 2
+    for source in record["identity"]["sources"].values():
+        assert {item["version"] for item in source["tables"].values()} == {0}
+    issues = store.spark.table(store.tables["study_data_issues"])
+    successful = [p.parent.name for p in (registry.root / "checks").glob("*/registration.yaml")]
+    assert len(successful) == 1
+    completed = issues.filter(F.col("check_id").startswith(successful[0]))
+    assert completed.count() > 0
+    assert completed.filter(F.col("study_id").isNull()).count() == 0
+    assert completed.filter(F.col("issue_json").contains("SENSOR_NOTE")).count() > 0
+    # The interrupted attempt remains visible as failed evidence; its unfinished
+    # report links must not be attributed to the later successful attempt.
+    assert len(list((registry.root / "checks").glob("*/attempt.yaml"))) == 2
+    stored = store.spark.table(store.tables["studies"]).first()
+    assert json.loads(stored.definition_json) == definition
+    # Population: A and B from inventory. The primary query loses B before
+    # eligibility. Strict matching rejects this; explicit exclusion must account
+    # for B when the caller permits a primary/population mismatch.
+    (tmp_path / "primary.sql").write_text(
+        "SELECT item, day, value FROM measurements WHERE item = 'A'")
+    with pytest.raises(ValueError, match="membership"):
+        register_study(path, registry=registry, prepare=SensorAudit())
+    value["source"]["require_matching_population"] = False
+    path.write_text(yaml.safe_dump(value))
+
+    class MissingSensor(SensorAudit):
+        def prepare(self, context):
+            result = super().prepare(context)
+            retained = context.observations.select("item").distinct()
+            excluded = context.starting_keys.join(retained, ["item"], "left_anti")
+            return dataclasses.replace(
+                result, retained_keys=retained,
+                exclusions=excluded.withColumn(EXCLUSION_REASON_COLUMN, F.lit("NO_OBSERVATIONS")),
+            )
+
+    filtered_id = register_study(path, registry=registry, prepare=MissingSensor())
+    filtered, _ = registry.definition(filtered_id)
+    evidence = registry.root / filtered["admission_evidence"]["path"]
+    missing = store.spark.read.parquet(str(evidence.parent / "input_missing_keys")).collect()
+    excluded = store.spark.read.parquet(str(evidence.parent / "exclusions")).collect()
+    assert {row.item for row in missing} == {"B"}
+    assert {(row.item, row[EXCLUSION_REASON_COLUMN]) for row in excluded} == {
+        ("B", "NO_OBSERVATIONS"),
+    }
+    record = yaml.safe_load(evidence.read_text())
+    assert record["outcome"]["starting"] == 2 and record["outcome"]["final_retained"] == 1
+    assert filtered_id != study_id
+    store.spark.sql(f"UPDATE {table} SET value = 200.0")
+    path.unlink()
+    (tmp_path / "primary.sql").unlink()
+    (tmp_path / "population.sql").unlink()
+    with registry.load_study(study_id) as study:
+        assert study.training_data.filter("value = 200.0").count() == 0
 
 
 @pytest.mark.parametrize("tracking,publish", [("none", False), ("none", True),
@@ -343,11 +528,10 @@ def test_sql_registration_partial_definition_recovery_and_live_source_changes(st
     with pytest.raises(OSError, match="registration interrupted"):
         register_study(path, registry=registry)
     assert store.spark.table(store.tables["studies"]).count() == 0
-    baseline = next((registry.root / "registrations").glob("*.json"))
-    with pytest.raises(ValueError, match="table definition"):
-        registry.load_study(baseline.stem)
+    assert not list((registry.root / "registrations").glob("*.json"))
     monkeypatch.setattr(registry.store, "append_once", append)
     study_id = register_study(path, registry=registry)
+    baseline = registry.root / "registrations" / (study_id + ".json")
     before, before_sha = registry.definition(study_id)
     assert before["source"]["tables"]["observations"]["version"] == 0
     baseline_bytes = baseline.read_bytes()
@@ -547,12 +731,12 @@ def test_registration_links_reports_before_discovery_and_keeps_failed_checks(
     registry = StudyRegistry.from_environment(spark=store.spark)
     original = StudyRegistry._publish_definition
 
-    def checked_publish(self, definition):
+    def checked_publish(self, definition, **options):
         issues = store.spark.table(store.tables["study_data_issues"])
         assert issues.count() > 0
         assert issues.filter(F.col("study_id").isNull()).count() == 0
         assert issues.filter(F.col("study_id") != definition["study_id"]).count() == 0
-        return original(self, definition)
+        return original(self, definition, **options)
 
     monkeypatch.setattr(StudyRegistry, "_publish_definition", checked_publish)
     study_id = register_study(path, spark=store.spark)

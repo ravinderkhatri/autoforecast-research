@@ -246,6 +246,13 @@ def test_manifest_structure_is_validated_before_identity_or_artifact_reads(tmp_p
     monkeypatch.setattr(benchmark, "_identity", lambda *_: pytest.fail("identity saw malformed record"))
     monkeypatch.setattr(benchmark, "directory_digest", lambda *_a, **_k: pytest.fail("read artifacts"))
     malformed = list(_malformed_records(record)) + [[], None, {"schema": benchmark.STUDY_SCHEMA}]
+    malformed.extend({**record, "admission_identity": value} for value in (
+        None, [], {}, {"schema": "unsupported", "sha256": "a" * 64},
+        {"schema": "autoforecast.admission-identity.v1", "sha256": None},
+        {"schema": "autoforecast.admission-identity.v1", "sha256": "x" * 64},
+        {"schema": "autoforecast.admission-identity.v1", "sha256": "a" * 63},
+        {"schema": "autoforecast.admission-identity.v1", "sha256": "a" * 64, "extra": 1},
+    ))
     assert len(malformed) > 40
     for value in malformed:
         path.write_text(json.dumps(value))

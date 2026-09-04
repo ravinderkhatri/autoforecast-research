@@ -1,72 +1,41 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1660" viewBox="0 0 1600 1660" role="img" aria-labelledby="title desc">
-<title id="title">One callback, a complete forecast workflow</title>
-<desc id="desc">The application defines how to fit once. AutoForecast controls when to fit and what history to supply.</desc>
-<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#245DD8"/></marker></defs>
-<rect x="0" y="0" width="1600" height="1660" rx="0" fill="#F4F7FB"/>
-<text x="56" y="45" font-family="Arial, sans-serif" font-size="16" fill="#245DD8" xml:space="preserve" font-weight="700">AUTOFORECAST / HOW IT WORKS</text>
-<text x="56" y="100" font-family="Arial, sans-serif" font-size="42" fill="#172A43" xml:space="preserve" font-weight="700">One callback, a complete forecast workflow</text>
-<text x="56" y="142" font-family="Arial, sans-serif" font-size="21" fill="#53647A" xml:space="preserve">The application defines how to fit once. AutoForecast controls when to fit and what history to supply.</text>
-<rect x="56" y="180" width="1488" height="230" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="78" y="202" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="89" y="227" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">1</text>
-<text x="134" y="228" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">The application starts the workflow</text>
-<text x="82" y="265" font-family="Courier New, monospace" font-size="22" fill="#172A43" xml:space="preserve">run = study.run_forecast_workflow(</text>
-<text x="82" y="297" font-family="Courier New, monospace" font-size="22" fill="#172A43" xml:space="preserve">    fit_predict=fit_model, implementation=model_implementation,</text>
-<text x="82" y="329" font-family="Courier New, monospace" font-size="22" fill="#172A43" xml:space="preserve">    config=&quot;model.yaml&quot;, fixed_parameters={},</text>
-<text x="82" y="361" font-family="Courier New, monospace" font-size="22" fill="#172A43" xml:space="preserve">    output_dir=&quot;outputs/demand-baseline&quot;,</text>
-<text x="82" y="393" font-family="Courier New, monospace" font-size="22" fill="#172A43" xml:space="preserve">)</text>
-<rect x="56" y="438" width="476" height="334" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="80" y="486" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">What the arguments mean</text>
-<text x="82" y="520" font-family="Arial, sans-serif" font-size="19" fill="#172A43" xml:space="preserve">study: registered data and boundaries</text>
-<text x="82" y="553" font-family="Arial, sans-serif" font-size="19" fill="#172A43" xml:space="preserve">fit_predict: your Python function</text>
-<text x="82" y="586" font-family="Arial, sans-serif" font-size="19" fill="#172A43" xml:space="preserve">implementation: declared code identity</text>
-<text x="82" y="619" font-family="Arial, sans-serif" font-size="19" fill="#172A43" xml:space="preserve">config: model profile file</text>
-<text x="82" y="652" font-family="Arial, sans-serif" font-size="19" fill="#172A43" xml:space="preserve">fixed_parameters={}: use defaults</text>
-<text x="82" y="685" font-family="Arial, sans-serif" font-size="19" fill="#172A43" xml:space="preserve">output_dir: parent for retained runs</text>
-<text x="82" y="744" font-family="Arial, sans-serif" font-size="19" fill="#245DD8" xml:space="preserve" font-weight="700">run.path gives the exact saved folder.</text>
-<rect x="556" y="438" width="988" height="334" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="578" y="460" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="589" y="485" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">2</text>
-<text x="634" y="486" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">AutoForecast calls fit_model(request)</text>
-<text x="582" y="520" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">History: training_data, series_mapping, panel</text>
-<text x="582" y="560" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">Forecast boundary: origin, forecast_dates, model_id</text>
-<text x="582" y="600" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">Controls: model_parameters, training_parameters, seed, purpose</text>
-<text x="582" y="640" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">Workspace: request.output_dir</text>
-<rect x="582" y="679" width="936" height="66" rx="10" fill="#EAF0FD"/>
-<text x="602" y="706" font-family="Arial, sans-serif" font-size="19" fill="#245DD8" xml:space="preserve">The request contains history through origin, without future target actuals.</text>
-<text x="602" y="732" font-family="Arial, sans-serif" font-size="19" fill="#245DD8" xml:space="preserve">purpose is selection, validation or refit. The callback must apply the seed.</text>
-<rect x="56" y="800" width="728" height="280" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="78" y="822" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="89" y="847" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">3</text>
-<text x="134" y="848" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Parameter names become dictionaries</text>
-<text x="82" y="883" font-family="Courier New, monospace" font-size="18" fill="#172A43" xml:space="preserve">Profile key  →  Callback value</text>
-<text x="82" y="919" font-family="Courier New, monospace" font-size="18" fill="#172A43" xml:space="preserve">model.level: 4.0 → model_parameters[&quot;level&quot;] = 4.0</text>
-<text x="82" y="955" font-family="Courier New, monospace" font-size="18" fill="#172A43" xml:space="preserve">training.offset: 3 → training_parameters[&quot;offset&quot;] = 3</text>
-<text x="82" y="1012" font-family="Arial, sans-serif" font-size="20" fill="#53647A" xml:space="preserve">These are example profile-defined names.</text>
-<text x="82" y="1041" font-family="Arial, sans-serif" font-size="20" fill="#53647A" xml:space="preserve">Your model decides how to use them when fitting.</text>
-<rect x="808" y="800" width="736" height="280" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="830" y="822" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="841" y="847" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">4</text>
-<text x="886" y="848" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">The callback fits and saves one result</text>
-<text x="834" y="883" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">1. Fit with the supplied history and parameters.</text>
-<text x="834" y="919" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">2. Predict the supplied forecast_dates.</text>
-<text x="834" y="955" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">3. Save native model files under model/.</text>
-<text x="834" y="991" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">4. Save forecast Parquet beneath request.output_dir.</text>
-<text x="834" y="1040" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Diagnostics go in artifacts/; other scratch is discarded.</text>
-<rect x="56" y="1108" width="1488" height="222" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="78" y="1130" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="89" y="1155" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">5</text>
-<text x="134" y="1156" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Return forecasts; AutoForecast calculates the scores</text>
-<text x="82" y="1189" font-family="Courier New, monospace" font-size="21" fill="#172A43" xml:space="preserve">return FitPredictResult(forecasts=forecast, model_format=&quot;your-native-format&quot;)</text>
-<text x="82" y="1234" font-family="Arial, sans-serif" font-size="20" fill="#53647A" xml:space="preserve">forecast wraps saved Parquet with series_id, date and yhat. Its adapter equals request.model_id.</text>
-<text x="82" y="1265" font-family="Arial, sans-serif" font-size="20" fill="#53647A" xml:space="preserve">AutoForecast checks, scores, selects settings, validates, refits and retains the produced artifacts.</text>
-<text x="82" y="1296" font-family="Arial, sans-serif" font-size="20" fill="#53647A" xml:space="preserve">request.output_dir is temporary. run.path is the retained workflow directory.</text>
-<rect x="56" y="1358" width="1488" height="190" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="80" y="1406" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Responsibility stays clear</text>
-<text x="82" y="1440" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" xml:space="preserve" font-weight="700">AutoForecast</text>
-<text x="280" y="1440" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Scheduling, checked boundaries, scoring, selection, retention and explicit recovery.</text>
-<text x="82" y="1480" font-family="Arial, sans-serif" font-size="21" fill="#087F82" xml:space="preserve" font-weight="700">Application</text>
-<text x="280" y="1480" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve">Data access, correct training, native model loading and business publication.</text>
-<text x="56" y="1615" font-family="Arial, sans-serif" font-size="17" fill="#53647A" xml:space="preserve">implementation declares name, version, source_sha256 and dependencies; it is not a Python sandbox.</text>
-<text x="56" y="1640" font-family="Arial, sans-serif" font-size="15" fill="#53647A" xml:space="preserve">Fixed settings, selected settings and validation checkpoints are explicit modes. See README.md for the integration outline.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800" role="img" aria-labelledby="title desc">
+<title id="title">A clear division of responsibility</title><desc id="desc">Bring your preparation decisions and model. AutoForecast manages the checked lifecycle.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#245DD8"/></marker></defs>
+<rect width="1200" height="800" fill="#F4F7FB"/>
+<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
+<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#172A43" font-weight="700">A clear division of responsibility</text>
+<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#53647A">Bring your preparation decisions and model. AutoForecast manages the checked lifecycle.</text>
+<rect x="40" y="157" width="335" height="170" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="60" y="191" font-family="Arial, sans-serif" font-size="21" fill="#087F82" font-weight="700">Your application</text>
+<text x="60" y="226" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Choose the population and eligibility.</text>
+<text x="60" y="253" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Declare preparation rules and reasons.</text>
+<text x="60" y="280" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Provide the model fitting function.</text>
+<rect x="425" y="157" width="735" height="170" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="445" y="191" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">1  Register the study</text>
+<text x="445" y="226" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Validate settings and pin the managed sources.</text>
+<text x="445" y="253" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Check exact membership and retain preparation evidence.</text>
+<text x="445" y="280" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Freeze the model inputs and return a reusable study identity.</text>
+<path d="M375 242 L418 242" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="425" y="368" width="735" height="153" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="445" y="402" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">2  Run one or several models</text>
+<text x="445" y="437" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Supply only the history available at each forecast boundary.</text>
+<text x="445" y="464" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Tune when requested, validate, then refit for final testing.</text>
+<path d="M791 327 L791 361" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="40" y="368" width="335" height="153" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="60" y="402" font-family="Arial, sans-serif" font-size="21" fill="#087F82" font-weight="700">Your model</text>
+<text x="60" y="437" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Fit the supplied history.</text>
+<text x="60" y="464" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Predict the requested horizon.</text>
+<text x="60" y="491" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Save the fitted model and forecasts.</text>
+<path d="M425 445 L382 445" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M375 480 L418 480" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="425" y="563" width="735" height="147" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="445" y="597" font-family="Arial, sans-serif" font-size="21" fill="#245DD8" font-weight="700">3  Keep checked results</text>
+<text x="445" y="632" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Verify forecasts and calculate comparable scores.</text>
+<text x="445" y="659" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Retain models, predictions, coverage and failure evidence.</text>
+<path d="M791 521 L791 556" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="40" y="563" width="335" height="147" rx="14" fill="#E8F5F3" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="60" y="597" font-family="Arial, sans-serif" font-size="22" fill="#087F82" font-weight="700">Reuse the study</text>
+<text x="60" y="632" font-family="Arial, sans-serif" font-size="17" fill="#172A43">Compare models against the same</text>
+<text x="60" y="659" font-family="Arial, sans-serif" font-size="17" fill="#172A43">frozen data and evaluation rules.</text>
+<text x="40" y="757" font-family="Arial, sans-serif" font-size="19" fill="#53647A">Data decisions stay explicit. Tracking and table publication are independent options.</text>
 </svg>

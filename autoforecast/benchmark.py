@@ -246,6 +246,8 @@ def _identity(record: dict) -> dict:
         identity.update({key: record[key] for key in (
             "execution_policy", "parent", "inherited_roles",
         )})
+    if "admission_identity" in record:
+        identity["admission_identity"] = record["admission_identity"]
     return identity
 
 
@@ -544,6 +546,7 @@ def freeze_benchmark(
     study_id: str | None = None,
     scoring_references: pathlib.Path | None = None,
     scratch_root: str | pathlib.Path | None = None,
+    admission_identity: dict | None = None,
 ) -> pathlib.Path:
     """Freeze one study from authenticated, operation-owned input snapshots."""
     with ExitStack() as inputs:
@@ -552,6 +555,7 @@ def freeze_benchmark(
                 contract_path=contract_path, sources=sources, recipe=recipe,
                 output_root=output_root, spark=spark, study_id=study_id,
                 scoring_references=scoring_references, inputs=inputs, scratch_root=scratch_root,
+                admission_identity=admission_identity,
             )
         except LineageError as error:
             raise BenchmarkError(str(error)) from error
@@ -568,6 +572,7 @@ def _freeze_benchmark(
     study_id: str | None = None,
     scoring_references: pathlib.Path | None = None,
     scratch_root: str | pathlib.Path | None = None,
+    admission_identity: dict | None = None,
 ) -> pathlib.Path:
     """Validate source scope, normalize keys, and publish immutable role snapshots and grids.
 
@@ -589,6 +594,9 @@ def _freeze_benchmark(
     from autoforecast import grid
 
     recipe = json.loads(json.dumps(recipe, allow_nan=False))
+    if admission_identity is not None:
+        admission_identity = json.loads(json.dumps(admission_identity, allow_nan=False))
+        _validate_admission_identity(admission_identity)
     if scoring_references is not None and recipe.get("metric") != "wrmsse":
         recipe.setdefault("reference_metrics", ["wrmsse"])
     recipe = _normalise_recipe(recipe)
@@ -824,6 +832,8 @@ def _freeze_benchmark(
         "excluded_new_series": excluded,
         "cohort_series_count": final_count,
     }
+    if admission_identity is not None:
+        identity["admission_identity"] = admission_identity
 
     def authenticate_sources():
         if contract_path.read_bytes() != contract_bytes or any(
@@ -1084,6 +1094,14 @@ def _publish_frozen_benchmark(
             shutil.rmtree(scratch)
 
 
+def _validate_admission_identity(value):
+    if (not isinstance(value, dict) or set(value) != {"schema", "sha256"}
+            or value["schema"] != "autoforecast.admission-identity.v1"
+            or not isinstance(value["sha256"], str) or len(value["sha256"]) != 64
+            or any(c not in "0123456789abcdef" for c in value["sha256"])):
+        raise BenchmarkError("invalid admission identity binding")
+
+
 def _validate_manifest(record: object) -> dict:
     """Reject malformed persisted records before any identity or filesystem lookup."""
     def mapping(value, fields, label):
@@ -1113,6 +1131,9 @@ def _validate_manifest(record: object) -> dict:
     }
     if "execution_policy" in record:
         fields |= {"execution_policy", "parent", "inherited_roles"}
+    if "admission_identity" in record:
+        fields.add("admission_identity")
+        _validate_admission_identity(record["admission_identity"])
     mapping(record, fields, "manifest")
     recipe = record["recipe"]
     validate_recipe(recipe)

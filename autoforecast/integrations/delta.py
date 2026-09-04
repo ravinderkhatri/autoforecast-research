@@ -58,8 +58,9 @@ def latest_delta_version(spark: SparkSession, table: str) -> int:
     return row["version"]
 
 
-def read_source(spark: SparkSession, *, sql: str, tables: Mapping[str, str]):
-    """Resolve every source version once and query only isolated pinned aliases.
+def validate_source_queries(spark: SparkSession, *, queries: Mapping[str, str],
+                            tables: Mapping[str, str]):
+    """Validate every managed query before any source lookup or execution.
 
     SQL is a caller-owned SELECT over the declared aliases. Commands, external
     relations and unrecognised logical operators are rejected before execution.
@@ -69,12 +70,17 @@ def read_source(spark: SparkSession, *, sql: str, tables: Mapping[str, str]):
         raise ValueError("source tables require simple nonempty SQL aliases")
     if len({key.casefold() for key in tables}) != len(tables):
         raise ValueError("source aliases must be unambiguous")
+    for table in tables.values():
+        quote_table(table)
+    if (not queries or any(not isinstance(name, str) or not name.isidentifier()
+                           or not isinstance(sql, str) or not sql.strip()
+                           for name, sql in queries.items())):
+        raise ValueError("managed queries require names and nonempty SQL")
     session = spark.newSession()
     timezone = spark.conf.get("spark.sql.session.timeZone")
     if timezone is not None:
         session.conf.set("spark.sql.session.timeZone", timezone)
     # Catalyst is a dynamic JVM API, outside PySpark's typed Python surface.
-    plan = cast(Any, session._jsparkSession).sessionState().sqlParser().parsePlan(sql)
     operators = {
         "Project", "Filter", "Join", "SubqueryAlias", "Aggregate", "Sort", "GlobalLimit",
         "LocalLimit", "Distinct", "Union", "Intersect", "Except", "UnresolvedRelation",
@@ -110,14 +116,47 @@ def read_source(spark: SparkSession, *, sql: str, tables: Mapping[str, str]):
         for child in items(node.children()):
             inspect_plan(child)
 
-    inspect_plan(plan)
-    versions = {alias: {"table": table, "version": latest_delta_version(spark, table)}
+    for sql in queries.values():
+        plan = cast(Any, session._jsparkSession).sessionState().sqlParser().parsePlan(sql)
+        inspect_plan(plan)
+    return session
+
+
+def read_sources(spark: SparkSession, *, queries: Mapping[str, str],
+                 tables: Mapping[str, str]):
+    """Execute declared queries against one version per physical Delta table."""
+    session = validate_source_queries(spark, queries=queries, tables=tables)
+    physical = {}
+    resolved = {}
+    locations = {}
+    for table in dict.fromkeys(tables.values()):
+        detail = spark.sql(f"DESCRIBE DETAIL {quote_table(table)}").first()
+        if detail is None:
+            raise ValueError("source has no Delta table identity")
+        info = spark.catalog.getTable(quote_table(table))
+        target = ".".join([info.catalog or spark.catalog.currentCatalog(),
+                           *(info.namespace or [spark.catalog.currentDatabase()]), info.name])
+        identity = (detail["id"], detail["location"])
+        if identity not in physical:
+            physical[identity] = latest_delta_version(spark, target)
+        resolved[table] = physical[identity]
+        locations[table] = {"id": detail["id"], "location": detail["location"],
+                            "read_target": target}
+    versions = {alias: {"table": table, "version": resolved[table]}
                 for alias, table in tables.items()}
     for alias, source in versions.items():
         session.read.option("versionAsOf", source["version"]).table(
-            source["table"],
+            quote_table(locations[source["table"]]["read_target"]),
         ).createOrReplaceTempView(alias)
-    return session.sql(sql), {"sql": sql, "tables": versions}
+    return {name: (session.sql(sql), {"sql": sql, "tables": versions,
+                                    "resolved_tables": locations})
+            for name, sql in queries.items()}
+
+
+def read_source(spark: SparkSession, *, sql: str, tables: Mapping[str, str]):
+    """Read one managed query through the shared pinned source boundary."""
+    frame, provenance = read_sources(spark, queries={"primary": sql}, tables=tables)["primary"]
+    return frame, {"sql": provenance["sql"], "tables": provenance["tables"]}
 
 
 def _transport_type(dtype):

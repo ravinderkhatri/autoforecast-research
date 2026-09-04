@@ -1,182 +1,78 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1450" viewBox="0 0 1600 1450" role="img" aria-labelledby="title desc">
-<title id="title">Cross-validation follows time</title>
-<desc id="desc">Compare settings on earlier windows. Validate the choice. Then refit for the final forecast.</desc>
-<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#245DD8"/></marker></defs>
-<rect x="0" y="0" width="1600" height="1450" rx="0" fill="#F4F7FB"/>
-<text x="56" y="45" font-family="Arial, sans-serif" font-size="16" fill="#245DD8" xml:space="preserve" font-weight="700">AUTOFORECAST / HOW IT WORKS</text>
-<text x="56" y="100" font-family="Arial, sans-serif" font-size="42" fill="#172A43" xml:space="preserve" font-weight="700">Cross-validation follows time</text>
-<text x="56" y="142" font-family="Arial, sans-serif" font-size="21" fill="#53647A" xml:space="preserve">Compare settings on earlier windows. Validate the choice. Then refit for the final forecast.</text>
-<rect x="56" y="180" width="1488" height="460" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="78" y="202" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="89" y="227" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">1</text>
-<text x="134" y="228" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">One registered study; five forecast boundaries</text>
-<text x="82" y="265" font-family="Arial, sans-serif" font-size="20" fill="#53647A" xml:space="preserve">Training ends at the origin. Each forecast covers the next two periods.</text>
-<text x="419" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">1</text>
-<text x="479" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">2</text>
-<text x="539" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">3</text>
-<text x="599" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">4</text>
-<text x="659" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">5</text>
-<text x="719" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">6</text>
-<text x="779" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">7</text>
-<text x="839" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">8</text>
-<text x="899" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">9</text>
-<text x="959" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">10</text>
-<text x="1019" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">11</text>
-<text x="1079" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">12</text>
-<text x="1139" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">13</text>
-<text x="1199" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">14</text>
-<text x="1259" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">15</text>
-<text x="1319" y="305" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">16</text>
-<text x="82" y="351" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve" font-weight="700">Tuning window 1</text>
-<rect x="400" y="325" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="460" y="325" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="520" y="325" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="580" y="325" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="640" y="325" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="700" y="325" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<text x="711" y="348" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" xml:space="preserve" font-weight="700">end</text>
-<rect x="760" y="325" width="55" height="34" rx="5" fill="#245DD8"/>
-<rect x="820" y="325" width="55" height="34" rx="5" fill="#245DD8"/>
-<rect x="880" y="325" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="940" y="325" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1000" y="325" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1060" y="325" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1120" y="325" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1180" y="325" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1240" y="325" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1300" y="325" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<text x="82" y="403" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve" font-weight="700">Tuning window 2</text>
-<rect x="400" y="377" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="460" y="377" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="520" y="377" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="580" y="377" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="640" y="377" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="700" y="377" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="760" y="377" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="820" y="377" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<text x="831" y="400" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" xml:space="preserve" font-weight="700">end</text>
-<rect x="880" y="377" width="55" height="34" rx="5" fill="#245DD8"/>
-<rect x="940" y="377" width="55" height="34" rx="5" fill="#245DD8"/>
-<rect x="1000" y="377" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1060" y="377" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1120" y="377" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1180" y="377" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1240" y="377" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1300" y="377" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<text x="82" y="455" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve" font-weight="700">Tuning window 3</text>
-<rect x="400" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="460" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="520" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="580" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="640" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="700" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="760" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="820" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="880" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="940" y="429" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<text x="951" y="452" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" xml:space="preserve" font-weight="700">end</text>
-<rect x="1000" y="429" width="55" height="34" rx="5" fill="#245DD8"/>
-<rect x="1060" y="429" width="55" height="34" rx="5" fill="#245DD8"/>
-<rect x="1120" y="429" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1180" y="429" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1240" y="429" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1300" y="429" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<text x="82" y="507" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve" font-weight="700">Outer validation</text>
-<rect x="400" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="460" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="520" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="580" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="640" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="700" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="760" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="820" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="880" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="940" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="1000" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="1060" y="481" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<text x="1071" y="504" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" xml:space="preserve" font-weight="700">end</text>
-<rect x="1120" y="481" width="55" height="34" rx="5" fill="#087F82"/>
-<rect x="1180" y="481" width="55" height="34" rx="5" fill="#087F82"/>
-<rect x="1240" y="481" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<rect x="1300" y="481" width="55" height="34" rx="5" fill="#F0F3F7"/>
-<text x="82" y="559" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve" font-weight="700">Final test</text>
-<rect x="400" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="460" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="520" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="580" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="640" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="700" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="760" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="820" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="880" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="940" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="1000" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="1060" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="1120" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<rect x="1180" y="533" width="55" height="34" rx="5" fill="#EAF0FD"/>
-<text x="1191" y="556" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" xml:space="preserve" font-weight="700">end</text>
-<rect x="1240" y="533" width="55" height="34" rx="5" fill="#A15B08"/>
-<rect x="1300" y="533" width="55" height="34" rx="5" fill="#A15B08"/>
-<rect x="82" y="600" width="18" height="18" rx="3" fill="#EAF0FD"/>
-<text x="110" y="615" font-family="Arial, sans-serif" font-size="17" fill="#53647A" xml:space="preserve">Training history</text>
-<rect x="310" y="600" width="18" height="18" rx="3" fill="#245DD8"/>
-<text x="338" y="615" font-family="Arial, sans-serif" font-size="17" fill="#53647A" xml:space="preserve">Held-out forecast</text>
-<text x="720" y="615" font-family="Arial, sans-serif" font-size="17" fill="#53647A" xml:space="preserve">Illustrative periods 1–16; boundaries come from the study.</text>
-<rect x="56" y="664" width="780" height="440" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="78" y="686" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="89" y="711" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">2</text>
-<text x="134" y="712" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Try five parameter settings on three windows</text>
-<text x="82" y="745" font-family="Arial, sans-serif" font-size="20" fill="#53647A" xml:space="preserve">Example MAE values (lower is better)</text>
-<text x="90" y="790" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve" font-weight="700">Settings</text>
-<text x="345" y="790" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve" font-weight="700">W1</text>
-<text x="455" y="790" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve" font-weight="700">W2</text>
-<text x="565" y="790" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve" font-weight="700">W3</text>
-<text x="680" y="790" font-family="Arial, sans-serif" font-size="20" fill="#172A43" xml:space="preserve" font-weight="700">Mean</text>
-<text x="90" y="827" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">A</text>
-<text x="345" y="827" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">4</text>
-<text x="455" y="827" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">5</text>
-<text x="565" y="827" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">6</text>
-<text x="680" y="827" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">5</text>
-<text x="90" y="870" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">B</text>
-<text x="345" y="870" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">3</text>
-<text x="455" y="870" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">4</text>
-<text x="565" y="870" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">5</text>
-<text x="680" y="870" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">4</text>
-<rect x="78" y="885" width="732" height="39" rx="7" fill="#E5F4EF"/>
-<text x="90" y="913" font-family="Arial, sans-serif" font-size="21" fill="#087F82" xml:space="preserve" font-weight="700">C</text>
-<text x="345" y="913" font-family="Arial, sans-serif" font-size="21" fill="#087F82" xml:space="preserve" font-weight="700">2</text>
-<text x="455" y="913" font-family="Arial, sans-serif" font-size="21" fill="#087F82" xml:space="preserve" font-weight="700">3</text>
-<text x="565" y="913" font-family="Arial, sans-serif" font-size="21" fill="#087F82" xml:space="preserve" font-weight="700">4</text>
-<text x="680" y="913" font-family="Arial, sans-serif" font-size="21" fill="#087F82" xml:space="preserve" font-weight="700">3</text>
-<text x="90" y="956" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">D</text>
-<text x="345" y="956" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">4</text>
-<text x="455" y="956" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">3</text>
-<text x="565" y="956" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">5</text>
-<text x="680" y="956" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">4</text>
-<text x="90" y="999" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">E</text>
-<text x="345" y="999" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">5</text>
-<text x="455" y="999" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">6</text>
-<text x="565" y="999" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">7</text>
-<text x="680" y="999" font-family="Arial, sans-serif" font-size="21" fill="#172A43" xml:space="preserve">6</text>
-<text x="90" y="1075" font-family="Arial, sans-serif" font-size="20" fill="#087F82" xml:space="preserve" font-weight="700">C wins: (2 + 3 + 4) / 3 = 3. Equal weight per window.</text>
-<rect x="860" y="664" width="684" height="440" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<rect x="882" y="686" width="40" height="36" rx="9" fill="#EAF0FD"/>
-<text x="893" y="711" font-family="Arial, sans-serif" font-size="20" fill="#245DD8" xml:space="preserve" font-weight="700">3</text>
-<text x="938" y="712" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">Keep selection separate from final evaluation</text>
-<text x="886" y="753" font-family="Arial, sans-serif" font-size="23" fill="#172A43" xml:space="preserve">Calls 1–15: five trials × three windows</text>
-<text x="886" y="798" font-family="Arial, sans-serif" font-size="23" fill="#172A43" xml:space="preserve">Call 16: fresh validation fit using C</text>
-<text x="886" y="843" font-family="Arial, sans-serif" font-size="23" fill="#172A43" xml:space="preserve">Call 17: refit using C through period 14</text>
-<rect x="886" y="887" width="632" height="76" rx="12" fill="#EAF0FD"/>
-<text x="907" y="932" font-family="Arial, sans-serif" font-size="30" fill="#245DD8" xml:space="preserve" font-weight="700">15 + 1 + 1 = 17 callback calls</text>
-<text x="886" y="1001" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Test results never choose the trial settings.</text>
-<text x="886" y="1029" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">A callback may fit one global model or many series models.</text>
-<text x="886" y="1075" font-family="Arial, sans-serif" font-size="18" fill="#53647A" xml:space="preserve">Fresh successful run; no reuse or early failure.</text>
-<rect x="56" y="1128" width="1488" height="216" rx="18" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
-<text x="80" y="1176" font-family="Arial, sans-serif" font-size="25" fill="#172A43" xml:space="preserve" font-weight="700">What controls this example?</text>
-<text x="82" y="1210" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve">hpo: {backend: optuna, max_trials: 5, seed: 42}</text>
-<text x="82" y="1241" font-family="Courier New, monospace" font-size="19" fill="#172A43" xml:space="preserve">selection: {stage: tuning, origins: all, metric: mae}</text>
-<text x="82" y="1284" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Profile fragment; the study already contains three tuning windows.</text>
-<text x="82" y="1313" font-family="Arial, sans-serif" font-size="19" fill="#53647A" xml:space="preserve">Fixed settings: 2 calls. Outer-validation search: 5 selection calls + winning-fit reuse + 1 refit = 6 calls.</text>
-<text x="56" y="1405" font-family="Arial, sans-serif" font-size="17" fill="#53647A" xml:space="preserve">The same declared series population and scoring rules apply across candidate settings.</text>
-<text x="56" y="1430" font-family="Arial, sans-serif" font-size="15" fill="#53647A" xml:space="preserve">Illustrative numbers, not benchmark measurements. See README.md and autoforecast/study_workflow.py.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="850" viewBox="0 0 1200 850" role="img" aria-labelledby="title desc">
+<title id="title">Evaluate forecasts in time order</title><desc id="desc">Optional tuning uses earlier windows. Validation and final testing remain separate.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#245DD8"/></marker></defs>
+<rect width="1200" height="850" fill="#F4F7FB"/>
+<text x="40" y="37" font-family="Arial, sans-serif" font-size="14" fill="#245DD8" font-weight="700">AUTOFORECAST / CAPABILITIES</text>
+<text x="40" y="84" font-family="Arial, sans-serif" font-size="32" fill="#172A43" font-weight="700">Evaluate forecasts in time order</text>
+<text x="40" y="119" font-family="Arial, sans-serif" font-size="18" fill="#53647A">Optional tuning uses earlier windows. Validation and final testing remain separate.</text>
+<path d="M331 185 L1130 185" fill="none" stroke="#245DD8" stroke-width="2.5" marker-end="url(#arrow)"/>
+<text x="334" y="168" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Earlier observations</text>
+<text x="1000" y="168" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Later observations</text>
+<text x="40" y="248" font-family="Arial, sans-serif" font-size="22" fill="#172A43" font-weight="700">Tune settings</text>
+<text x="40" y="277" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Earlier window 1</text>
+<rect x="333" y="225" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="398" y="225" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="463" y="225" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="528" y="225" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="593" y="225" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="658" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="723" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="788" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="853" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="918" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="983" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="1048" y="225" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="338" y="311" font-family="Arial, sans-serif" font-size="16" fill="#245DD8">History supplied for fitting</text>
+<text x="528" y="311" font-family="Arial, sans-serif" font-size="16" fill="#B46B08">Forecast and score</text>
+<text x="40" y="350" font-family="Arial, sans-serif" font-size="22" fill="#172A43" font-weight="700">Repeat the comparison</text>
+<text x="40" y="379" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Earlier window 2</text>
+<rect x="333" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="398" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="463" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="528" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="593" y="327" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="658" y="327" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="723" y="327" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="788" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="853" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="918" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="983" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="1048" y="327" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="338" y="413" font-family="Arial, sans-serif" font-size="16" fill="#245DD8">History supplied for fitting</text>
+<text x="658" y="413" font-family="Arial, sans-serif" font-size="16" fill="#B46B08">Forecast and score</text>
+<text x="40" y="472" font-family="Arial, sans-serif" font-size="22" fill="#172A43" font-weight="700">Validate the choice</text>
+<text x="40" y="501" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Evaluate chosen settings</text>
+<rect x="333" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="398" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="463" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="528" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="593" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="658" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="723" y="449" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="788" y="449" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="853" y="449" width="55" height="58" rx="6" fill="#FFF0CF" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="918" y="449" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="983" y="449" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="1048" y="449" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="338" y="535" font-family="Arial, sans-serif" font-size="16" fill="#245DD8">History supplied for fitting</text>
+<text x="788" y="535" font-family="Arial, sans-serif" font-size="16" fill="#B46B08">Forecast and score</text>
+<text x="40" y="594" font-family="Arial, sans-serif" font-size="22" fill="#172A43" font-weight="700">Refit and test</text>
+<text x="40" y="623" font-family="Arial, sans-serif" font-size="16" fill="#53647A">Use more recent history</text>
+<rect x="333" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="398" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="463" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="528" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="593" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="658" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="723" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="788" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="853" y="571" width="55" height="58" rx="6" fill="#DCE7FC" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="918" y="571" width="55" height="58" rx="6" fill="#D8F1E9" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="983" y="571" width="55" height="58" rx="6" fill="#D8F1E9" stroke="#D8E1ED" stroke-width="1.5"/>
+<rect x="1048" y="571" width="55" height="58" rx="6" fill="#EDF0F5" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="338" y="657" font-family="Arial, sans-serif" font-size="16" fill="#245DD8">History supplied for fitting</text>
+<text x="918" y="657" font-family="Arial, sans-serif" font-size="16" fill="#087F82">Forecast and score</text>
+<rect x="40" y="738" width="1120" height="72" rx="14" fill="white" stroke="#D8E1ED" stroke-width="1.5"/>
+<text x="60" y="768" font-family="Arial, sans-serif" font-size="18" fill="#172A43" font-weight="700">Future target values are held back from fitting.</text>
+<text x="60" y="795" font-family="Arial, sans-serif" font-size="17" fill="#53647A">Final test scores never select the model settings. Window lengths come from the study configuration.</text>
 </svg>
