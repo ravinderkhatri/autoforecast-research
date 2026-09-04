@@ -20,7 +20,7 @@ import pathlib
 import tempfile
 import uuid
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from functools import lru_cache
 
@@ -359,16 +359,15 @@ def remove_tree(path: pathlib.Path) -> None:
 _DOWNLOAD_WORKERS = 8
 
 
-def _download(remote: str, destination: pathlib.Path) -> int:
+def _download(remote: str, destination: pathlib.Path, copied: list[int], slot: int) -> None:
+    """Copy one file, counting its bytes in its own ``copied`` slot as they arrive."""
     response = _client().files.download(remote)
     if response.contents is None:
         raise OSError("volume download returned no content")
-    copied = 0
     with response.contents as source, destination.open("wb") as output:
         while chunk := source.read(1024 * 1024):
             output.write(chunk)
-            copied += len(chunk)
-    return copied
+            copied[slot] += len(chunk)
 
 
 @contextmanager
@@ -407,22 +406,31 @@ def local_snapshot(path: pathlib.Path, *, parquet_only: bool = False):
                               destination, expected_size))
         sizes = [size for _remote, _destination, size in downloads]
         total = sum(sizes) if None not in sizes else None
-        copied = finished = 0
+        copied, finished, reported = [0] * len(downloads), 0, None
         _client()  # Construct the shared client once, before worker threads use it.
         with operation("Download snapshot for integrity checks", dataset=str(path),
                        engine="driver", files_total=len(downloads),
                        **({"marker_files_not_downloaded": skipped} if skipped else {})) as update:
             with ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as pool:
-                pending = {pool.submit(_download, remote, destination): (destination, size)
-                           for remote, destination, size in downloads}
+                pending = {pool.submit(_download, remote, destination, copied, slot):
+                           (destination, size)
+                           for slot, (remote, destination, size) in enumerate(downloads)}
+                running = set(pending)
                 try:
-                    for future in as_completed(pending):
-                        destination, expected_size = pending[future]
-                        copied += future.result()
-                        finished += 1
-                        if destination.stat().st_size != expected_size:
-                            raise OSError("volume file changed size while it was copied")
-                        update(completed=copied, total=total, unit="bytes", files=finished)
+                    # Workers only count bytes; progress is reported from this thread,
+                    # at least once a second while a large file is still arriving.
+                    while running:
+                        done, running = wait(running, timeout=1.0, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            destination, expected_size = pending[future]
+                            future.result()
+                            finished += 1
+                            if destination.stat().st_size != expected_size:
+                                raise OSError("volume file changed size while it was copied")
+                        if (sum(copied), finished) != reported:
+                            reported = (sum(copied), finished)
+                            update(completed=reported[0], total=total, unit="bytes",
+                                   files=finished)
                 except BaseException:
                     for future in pending:
                         future.cancel()

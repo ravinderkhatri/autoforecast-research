@@ -2021,6 +2021,68 @@ def test_upload_failure_found_at_close_marks_the_run_unverified(volume, monkeypa
     assert not any(p.endswith("closed.json") for p in client.values)
 
 
+def test_download_progress_advances_while_a_large_file_is_still_arriving(volume, monkeypatch):
+    import contextlib
+    import time
+
+    root, client = volume
+    folder = root / "large"
+    folder.mkdir()
+    client.values[str(folder / "part.parquet")] = b"x" * (2 * 1024 * 1024)
+    stalled, release, updates = threading.Event(), threading.Event(), []
+
+    class Stalling(io.BytesIO):
+        def read(self, size=-1):
+            if self.tell() == 1024 * 1024:
+                stalled.set()
+                assert release.wait(10)
+            return super().read(size)
+
+    @contextlib.contextmanager
+    def recorded(*args, **kwargs):
+        yield lambda **state: updates.append(state)
+
+    def copy():
+        with _volume_files.local_snapshot(folder):
+            pass
+
+    monkeypatch.setattr(client, "download", lambda path: SimpleNamespace(
+        contents=Stalling(client.values[path])))
+    monkeypatch.setattr(_volume_files, "operation", recorded)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        copied = pool.submit(copy)
+        try:
+            assert stalled.wait(10)
+            deadline = time.monotonic() + 5
+            while not updates and time.monotonic() < deadline:
+                time.sleep(0.01)
+            during = list(updates)
+        finally:
+            release.set()
+        copied.result(timeout=10)
+    assert during and during[-1]["completed"] == 1024 * 1024 and during[-1]["files"] == 0
+    assert updates[-1] == {"completed": 2 * 1024 * 1024, "total": 2 * 1024 * 1024,
+                           "unit": "bytes", "files": 1}
+
+
+def test_volume_snapshot_downloads_files_concurrently(volume, monkeypatch):
+    root, client = volume
+    folder = root / "parts"
+    folder.mkdir()
+    for n in range(2):
+        client.values[str(folder / f"part-{n}.parquet")] = b"part %d" % n
+    together = threading.Barrier(2, timeout=5)
+    download = client.download
+
+    def overlapping(path):
+        together.wait()  # Breaks unless both downloads are in flight at once.
+        return download(path)
+
+    monkeypatch.setattr(client, "download", overlapping)
+    with _volume_files.local_snapshot(folder) as copy:
+        assert sorted(p.read_bytes() for p in copy.iterdir()) == [b"part 0", b"part 1"]
+
+
 def test_pending_event_prevents_closure(volume, monkeypatch):
     root, client = volume
     audit = root / "events.jsonl"
