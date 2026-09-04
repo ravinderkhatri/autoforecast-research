@@ -331,7 +331,12 @@ def _emit(event, level, *, announce=False):
             logger.log(severity, "%s", _message(event))
             # Registration can validate source plans before it has an audit directory.
             # Show that initial step when the platform's default logger hides INFO.
-            if announce and (not logger.hasHandlers() or not logger.isEnabledFor(severity)):
+            # display='logs' has no panel, so its event lines are shown the same way.
+            execution = _CURRENT.get()
+            lines = (execution is not None and execution.display == "logs"
+                     and severity < logging.WARNING)
+            if ((announce or lines)
+                    and (not logger.hasHandlers() or not logger.isEnabledFor(severity))):
                 handler = _console()
                 if handler is not None and handler is _FALLBACK_CONSOLE:
                     handler.handle(logger.makeRecord(

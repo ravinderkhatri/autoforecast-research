@@ -383,6 +383,8 @@ configure_logging(display="both")      # The panel and event lines (the default)
 A study configuration can set the same choice as `runtime.display`; an explicit
 `configure_logging(display=...)` takes precedence. A run keeps the choice it started
 with, and a registration started inside `run_study` uses the run's choice.
+Without `configure_logging`, Python logging still decides which event lines appear
+beside the panel. `display="logs"` has no panel, so it shows its event lines itself.
 `display="progress"` with `log_level="WARNING"` shows only warnings and errors.
 
 For example, `Stage 3/5` means stage three is running. It does not mean three

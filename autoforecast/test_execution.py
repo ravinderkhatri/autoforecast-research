@@ -635,6 +635,31 @@ def test_display_chooses_console_content_and_keeps_every_audit_event(
     ]
 
 
+@pytest.mark.usefixtures("default_progress")
+@pytest.mark.parametrize("display,panel,info", [
+    ("progress", True, False), ("logs", False, True), ("both", True, False),
+])
+def test_runtime_display_without_configured_logging(tmp_path, monkeypatch, display, panel, info):
+    # Python's default WARNING logger hides INFO lines. display='logs' has no panel, so
+    # AutoForecast's own console shows its lines; the other choices keep the default.
+    monkeypatch.setattr(events, "_DISPLAY", None)
+    monkeypatch.setattr(logging.getLogger(), "handlers", [])  # pytest's own capture handler
+    stream, errors, path = io.StringIO(), io.StringIO(), tmp_path / "audit.jsonl"
+    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(errors):
+        with events.Execution(path, ["read"], display=events.resolve_display({"display": display})):
+            with events._stage(path, "read") as outcome:
+                events.note("Checked inputs", rows=3)
+                outcome["status"] = "UNAVAILABLE"
+    output = stream.getvalue()
+    assert ("RUN {" in output) is panel
+    assert ("INFO Checked inputs" in output) is info
+    # Python's last-resort handler shows the warning once; it is never repeated.
+    assert (output + errors.getvalue()).count("UNAVAILABLE read") == 1
+    assert [(row["stage"], row["status"]) for row in records(path)] == [
+        ("read", "START"), ("Checked inputs", "INFO"), ("read", "UNAVAILABLE"),
+    ]
+
+
 @pytest.mark.parametrize("display,progress", [
     ("progress", "off"), ("both", "off"), ("logs", "auto"), ("logs", "plain"), ("quiet", None),
 ])
