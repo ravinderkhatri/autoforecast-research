@@ -17,6 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from mlops import _safe_files, _volume_files
+from mlops.test_volume_files import volume as volume
 
 from autoforecast import _execution as events
 from autoforecast import (
@@ -3256,7 +3257,7 @@ def test_registration_directory_links_cannot_create_inside_saved_data(tmp_path, 
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("collision", [False, True])
 def test_registration_claims_fresh_attempt_without_reusing_evidence(
-    tmp_path, monkeypatch, native, collision,
+    tmp_path, monkeypatch, request, native, collision,
 ):
     from mlops import _volume_files
 
@@ -3281,8 +3282,10 @@ def test_registration_claims_fresh_attempt_without_reusing_evidence(
 
     monkeypatch.setattr(registration, "_register_study", body)
     if native:
+        # Use the existing in-memory service for locks and immutable audit segments.
+        _, client = request.getfixturevalue("volume")
         monkeypatch.setattr(_volume_files, "is_volume", lambda path: path.is_relative_to(root))
-        monkeypatch.setattr(_volume_files, "append_bytes", lambda path, data: writes.append(data))
+        writes = client.requests
     registry = SimpleNamespace(root=root, scratch_root=scratch, runtime={}, store=None)
     if collision:
         with pytest.raises(OSError):
@@ -3292,8 +3295,13 @@ def test_registration_claims_fresh_attempt_without_reusing_evidence(
     else:
         assert registration.register_study(config, registry=registry) == "study-id"
         assert calls == [True]
-        audit = b"".join(writes) if native else (attempt / "audit.jsonl").read_bytes()
-        assert json.loads(audit.splitlines()[0])["status"] == "START"
+        if native:
+            assert any(".events/" in path for path, _overwrite in writes)
+            assert all(not overwrite for _path, overwrite in writes)
+        else:
+            assert not writes
+        audit = events.read_execution_events(attempt / "audit.jsonl")
+        assert audit[0]["status"] == "START"
 
 
 @pytest.fixture
