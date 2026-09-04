@@ -120,7 +120,7 @@ def _create_directory_fd(path: pathlib.Path) -> int:
 
 
 def _create_fresh_directory(
-    path: pathlib.Path, child_directories: Iterable[str] = ()
+    path: pathlib.Path, child_directories: Iterable[str] = (), *, mode: int = 0o755,
 ) -> pathlib.Path:
     """Claim a new directory hierarchy without following any existing symlink component."""
     absolute = _platform_absolute(path)
@@ -134,20 +134,20 @@ def _create_fresh_directory(
     try:
         for part in absolute.parts[1:-1]:
             try:
-                os.mkdir(part, mode=0o755, dir_fd=current)
+                os.mkdir(part, mode=mode, dir_fd=current)
             except FileExistsError:
                 pass
             child_fd = os.open(part, flags, dir_fd=current)
             os.close(current)
             current = child_fd
         try:
-            os.mkdir(absolute.name, mode=0o755, dir_fd=current)
+            os.mkdir(absolute.name, mode=mode, dir_fd=current)
         except FileExistsError as exc:
             raise SafeFileError(f"fresh directory already exists: {path}") from exc
         leaf = os.open(absolute.name, flags, dir_fd=current)
         try:
             for child in children:
-                os.mkdir(child, mode=0o755, dir_fd=leaf)
+                os.mkdir(child, mode=mode, dir_fd=leaf)
             os.fsync(leaf)
         finally:
             os.close(leaf)
@@ -357,13 +357,49 @@ def is_regular_file(path: pathlib.Path) -> bool:
     return _volume_files.exists(path) if _volume_files.is_volume(path) else path.is_file()
 
 
-def append_audit_bytes(path: pathlib.Path, payload: bytes) -> None:
-    """Add an audit event, using a shared lock when the filesystem cannot append."""
+def _ensure_directory_fd(path: pathlib.Path) -> int:
+    """Open a directory, creating missing components without following links."""
+    try:
+        return _open_directory_fd(path)
+    except FileNotFoundError:
+        try:
+            _create_fresh_directory(path, mode=0o777)
+        except SafeFileError:
+            # Another writer may have created it. The no-follow open remains decisive.
+            pass
+        return _open_directory_fd(path)
+
+
+def create_directory(path: pathlib.Path, *, exist_ok: bool = False) -> None:
+    """Create a local link-free directory or use the native volume ownership rules."""
     if _volume_files.is_volume(path):
-        _volume_files.append_bytes(path, payload)
+        path.mkdir(parents=True, exist_ok=exist_ok)
+    elif exist_ok:
+        os.close(_ensure_directory_fd(path))
     else:
-        with path.open("ab") as stream:
+        _create_fresh_directory(path, mode=0o777)
+
+
+def append_audit_bytes(path: pathlib.Path, payload: bytes) -> None:
+    """Append through a link-free local parent, or the existing native volume lock."""
+    if _volume_files.is_volume(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _volume_files.append_bytes(path, payload)
+        return
+    parent = _ensure_directory_fd(path.parent)
+    try:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            descriptor = os.open(path.name, flags | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=parent)
+        except FileExistsError:
+            descriptor = os.open(path.name, flags, dir_fd=parent)
+        with os.fdopen(descriptor, "ab") as stream:
+            identity = os.fstat(stream.fileno())
+            if not stat.S_ISREG(identity.st_mode) or identity.st_nlink != 1:
+                raise SafeFileError("audit destination must be a regular file with one link")
             stream.write(payload)
+    finally:
+        os.close(parent)
 
 
 def _read_regular_bytes_at(root_fd: int, relative_path: str,

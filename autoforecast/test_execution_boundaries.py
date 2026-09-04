@@ -4,7 +4,9 @@ import dataclasses
 import io
 import json
 import logging
+import os
 import pathlib
+import stat
 import sys
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
@@ -215,7 +217,7 @@ def test_growing_file_digest_never_displays_above_100_percent(tmp_path, monkeypa
         snapshots.append(events._CURRENT.get().render())
 
     monkeypatch.setattr(lineage, "progress", record_progress)
-    monkeypatch.setattr(lineage.os, "fstat", lambda fd: SimpleNamespace(st_size=1))
+    monkeypatch.setattr(lineage, "os", SimpleNamespace(fstat=lambda fd: SimpleNamespace(st_size=1)))
     with events.Execution(tmp_path / "events.jsonl", ["hash"]):
         with events._stage(tmp_path / "events.jsonl", "hash"):
             with pytest.raises(lineage.LineageError, match="changed size"):
@@ -2548,3 +2550,675 @@ def test_study_method_keeps_public_label_and_original_result(tmp_path, monkeypat
     if label is not None:
         assert f"model_label={label}" in stream.getvalue()
     assert events._CURRENT.get() is None
+
+
+@pytest.mark.parametrize("route", ["workflow", "publication", "run", "worker"])
+def test_audit_directory_symlink_does_not_write_inside_protected_tree(tmp_path, monkeypatch, route):
+    from autoforecast.study_registration import StudyRegistry
+    from autoforecast.study_workflow import run_forecast_workflow, run_study
+
+    root = tmp_path / "out"
+    root.mkdir()
+    protected = tmp_path / "frozen"
+    protected.mkdir()
+    (protected / "benchmark.json").write_text('{"frozen":true}\n')
+    events.configure_logging(stream=io.StringIO(), progress="off")
+    error = None
+    try:
+        if route == "workflow":
+            (root / "execution-attempts").symlink_to(protected, target_is_directory=True)
+            study = SimpleNamespace(
+                study_id="s", _path=protected / "benchmark.json", _record=lambda: {"sources": {}}
+            )
+            run_forecast_workflow(
+                study, fit_predict=lambda _: None, config=tmp_path / "absent.yaml", output_dir=root
+            )
+        elif route == "publication":
+            (root / "execution-attempts").symlink_to(protected, target_is_directory=True)
+            registry = SimpleNamespace(
+                root=root, store=None, scratch_root=tmp_path, definition=lambda _: ({}, "sha")
+            )
+            writer = SimpleNamespace(publish_results=lambda *a, **k: "published")
+            StudyRegistry.publish_results(registry, "s", "existing", destination=writer)
+        elif route == "run":
+            (root / "run-attempts").symlink_to(protected, target_is_directory=True)
+            registry = SimpleNamespace(
+                root=root, runtime={}, store=None, _registration_path=lambda *_: None
+            )
+            run_study("s", lambda _: None, registry=registry)
+        else:
+            from autoforecast import study_campaign as campaign
+
+            progress_root = root / "progress"
+            progress_root.mkdir()
+            (progress_root / "execution-attempts").symlink_to(protected, target_is_directory=True)
+            marker = RuntimeError("stop after worker attempt starts")
+            model = {
+                "id": "m",
+                "source_modules": {},
+                "implementation_source": None,
+                "implementation": {"dependencies": {}},
+                "entrypoint": "module.callback",
+                "code_sha256": "x",
+                "fixed_parameters": {},
+            }
+            request = {
+                "models": [model],
+                "runtime": {"ok": True},
+                "study": {"path": str(protected / "benchmark.json"), "sha256": "x"},
+            }
+            monkeypatch.setattr(campaign, "_read", lambda *_: request)
+            monkeypatch.setattr(campaign, "_runtime_identity", lambda: {"ok": True})
+            monkeypatch.setattr(campaign, "_entrypoint", lambda *_: (lambda _: None, None))
+            monkeypatch.setattr(campaign, "verify_benchmark", lambda *_: None)
+
+            def stop(*args, **kwargs):
+                raise marker
+
+            monkeypatch.setattr(campaign, "note", stop)
+            campaign._model_job("request", "sha", 0, "validation", str(root), None)
+    except Exception as exc:
+        error = exc
+    intrusions = sorted(p.name for p in protected.iterdir() if p.name != "benchmark.json")
+    assert intrusions == []
+    assert isinstance(error, OSError)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_audit_leaf_link_does_not_change_protected_file(tmp_path, kind):
+    protected = tmp_path / "frozen.json"
+    original = b'{"frozen":true}\n'
+    protected.write_bytes(original)
+    audit = tmp_path / "events.jsonl"
+    if kind == "symlink":
+        audit.symlink_to(protected)
+    else:
+        os.link(protected, audit)
+    error = None
+    try:
+        with events._stage(audit, "fit"):
+            pass
+    except Exception as exc:
+        error = exc
+    assert protected.read_bytes() == original
+    assert isinstance(error, OSError)
+
+
+class InterruptPanel(io.StringIO):
+    def __init__(self, mode, interrupt, trigger_state):
+        super().__init__()
+        self.mode = mode
+        self.interrupt = interrupt
+        self.trigger_state = trigger_state
+        self.hit = 0
+
+    def write(self, text):
+        current = events._CURRENT.get()
+        if current is not None and not self.hit:
+            if self.mode == "final":
+                triggered = current.result == self.trigger_state and text.startswith("RUN ")
+            else:
+                states = [op.get("status") for op in current.operations.values()]
+                triggered = (
+                    current.result == "RUNNING"
+                    and events._OPERATION.get() is None
+                    and text.startswith("RUN ")
+                    and (self.trigger_state in states if self.trigger_state else not states)
+                )
+            if triggered:
+                self.hit += 1
+                raise self.interrupt
+        return super().write(text)
+
+
+@pytest.mark.parametrize("primary_type", [ValueError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_final_panel_interruption_preserves_body_error(tmp_path, primary_type, secondary_type):
+    primary = primary_type("primary")
+    secondary = secondary_type("secondary final display")
+    stream = InterruptPanel(
+        "final", secondary, "FAIL" if issubclass(primary_type, Exception) else "CANCELLED"
+    )
+    events.configure_logging(stream=stream, progress="plain", interval=3600)
+    audit = tmp_path / "audit.jsonl"
+    with pytest.raises(BaseException) as caught:
+        with events.Execution(audit, ["fit"]) as execution:
+            with events._stage(audit, "fit"):
+                raise primary
+    assert stream.hit == 1
+    assert events._CURRENT.get() is None and execution.stop.is_set()
+    assert caught.value is primary
+
+
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_final_panel_interrupt_after_success_is_not_swallowed(tmp_path, secondary_type):
+    secondary = secondary_type("cancel final display")
+    stream = InterruptPanel("final", secondary, "PASS")
+    events.configure_logging(stream=stream, progress="plain", interval=3600)
+    audit = tmp_path / "audit.jsonl"
+    with pytest.raises(secondary_type) as caught:
+        with events.Execution(audit, ["fit"]):
+            with events._stage(audit, "fit"):
+                pass
+    assert stream.hit == 1 and caught.value is secondary
+    assert events._CURRENT.get() is None
+
+
+@pytest.mark.parametrize("kind", ["planned", "nested"])
+@pytest.mark.parametrize("source", ["body", "start_audit", "pass_audit"])
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_scope_cleanup_interruption_preserves_primary(
+    tmp_path, monkeypatch, kind, source, secondary_type
+):
+    primary = ValueError("body primary") if source == "body" else OSError("audit primary")
+    secondary = secondary_type("secondary scope display")
+    stream = InterruptPanel("scope", secondary, "FAIL" if source == "body" else "UNVERIFIED")
+    events.configure_logging(stream=stream, progress="plain", interval=1e-9)
+    audit = tmp_path / "audit.jsonl"
+    append = _safe_files.append_audit_bytes
+
+    def write(path, payload):
+        row = json.loads(payload)
+        wanted = "START" if source == "start_audit" else "PASS"
+        if source != "body" and row["stage"] == "fit" and row["status"] == wanted:
+            raise primary
+        return append(path, payload)
+
+    monkeypatch.setattr(_safe_files, "append_audit_bytes", write)
+    with pytest.raises(BaseException) as caught:
+        with events.Execution(audit, ["fit"] if kind == "planned" else ["outer"]):
+            with events._stage(audit, "fit") if kind == "planned" else events.operation("fit"):
+                if source == "body":
+                    raise primary
+    assert stream.hit == 1
+    assert events._CURRENT.get() is None and events._OPERATION.get() is None
+    assert caught.value is primary
+
+
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_scope_cleanup_interrupt_after_success_is_not_swallowed(tmp_path, secondary_type):
+    secondary = secondary_type("cancel scope display")
+    stream = InterruptPanel("scope", secondary, None)
+    events.configure_logging(stream=stream, progress="plain", interval=1e-9)
+    audit = tmp_path / "audit.jsonl"
+    with pytest.raises(secondary_type) as caught:
+        with events.Execution(audit, ["outer"]):
+            with events.operation("fit"):
+                pass
+    assert stream.hit == 1 and caught.value is secondary
+    assert events._CURRENT.get() is None
+
+
+@pytest.mark.parametrize("kind", ["hash", "audited", "audit_error"])
+def test_standalone_events_honor_environment_level(tmp_path, monkeypatch, kind):
+    from provenance.lineage import directory_digest
+
+    monkeypatch.setenv("AUTOFORECAST_LOG_LEVEL", "CRITICAL")
+    stream = io.StringIO()
+    events.configure_logging(stream=stream, progress="off")
+    if kind == "hash":
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "part.bin").write_bytes(b"payload")
+        assert directory_digest(data)
+    elif kind == "audited":
+        with events._stage(tmp_path / "audit.jsonl", "fit"):
+            pass
+    else:
+
+        def fail(*_):
+            raise OSError("audit failure")
+
+        monkeypatch.setattr(_safe_files, "append_audit_bytes", fail)
+        with pytest.raises(OSError):
+            with events._stage(tmp_path / "audit.jsonl", "fit"):
+                pass
+    assert stream.getvalue() == ""
+
+
+def test_active_execution_explicit_info_overrides_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOFORECAST_LOG_LEVEL", "CRITICAL")
+    stream = io.StringIO()
+    events.configure_logging(stream=stream, progress="off")
+    audit = tmp_path / "audit.jsonl"
+    with events.Execution(audit, ["fit"], level=logging.INFO):
+        with events._stage(audit, "fit"):
+            pass
+    assert "START fit" in stream.getvalue() and "PASS fit" in stream.getvalue()
+
+
+def test_standalone_note_already_honors_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOFORECAST_LOG_LEVEL", "CRITICAL")
+    stream = io.StringIO()
+    events.configure_logging(stream=stream, progress="off")
+    events.note("Decision")
+    assert stream.getvalue() == ""
+
+
+def test_missing_audit_parents_are_not_created_through_directory_symlink(tmp_path):
+    protected = tmp_path / "frozen"
+    protected.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(protected, target_is_directory=True)
+    error = None
+    try:
+        with events._stage(alias / "new" / "subdir" / "events.jsonl", "fit"):
+            pass
+    except Exception as exc:
+        error = exc
+    assert not (protected / "new").exists()
+    assert isinstance(error, OSError)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_public_workflow_does_not_append_through_replaced_audit_leaf(tmp_path, monkeypatch, kind):
+    from autoforecast import study_workflow
+
+    frozen = tmp_path / "study"
+    frozen.mkdir()
+    target = frozen / "benchmark.json"
+    original = b'{"frozen":true}\n'
+    target.write_bytes(original)
+    output = tmp_path / "out"
+    study = SimpleNamespace(study_id="s", _path=target, _record=lambda: {"sources": {}})
+    primary = RuntimeError("stop after audit leaf swap")
+
+    def config(*args, **kwargs):
+        audit = next((output / "execution-attempts").glob("*.jsonl"))
+        audit.unlink()
+        if kind == "symlink":
+            audit.symlink_to(target)
+        else:
+            os.link(target, audit)
+        raise primary
+
+    monkeypatch.setattr(study_workflow, "_config", config)
+    events.configure_logging(stream=io.StringIO(), progress="off")
+    with pytest.raises(RuntimeError) as caught:
+        study_workflow.run_forecast_workflow(
+            study, fit_predict=lambda _: None, config="unused", output_dir=output
+        )
+    assert caught.value is primary
+    assert target.read_bytes() == original
+
+
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_join_interruption_does_not_replace_primary(tmp_path, secondary_type):
+    primary = ValueError("primary body failure")
+    secondary = secondary_type("interrupt while joining heartbeat")
+    execution = events.Execution(tmp_path / "audit.jsonl", ["fit"])
+
+    class InterruptedThread:
+        def join(self):
+            raise secondary
+
+    with pytest.raises(BaseException) as caught:
+        with execution:
+            execution.thread = InterruptedThread()
+            raise primary
+    assert execution.stop.is_set() and events._CURRENT.get() is None
+    assert caught.value is primary
+
+
+@pytest.mark.parametrize("kind", ["planned", "nested"])
+@pytest.mark.parametrize("primary_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_scope_cleanup_preserves_primary_cancellation(tmp_path, kind, primary_type, secondary_type):
+    primary = primary_type("primary cancellation")
+    secondary = secondary_type("secondary scope display")
+    stream = InterruptPanel("scope", secondary, "CANCELLED")
+    events.configure_logging(stream=stream, progress="plain", interval=1e-9)
+    audit = tmp_path / "audit.jsonl"
+    with pytest.raises(BaseException) as caught:
+        with events.Execution(audit, ["fit"] if kind == "planned" else ["outer"]):
+            with events._stage(audit, "fit") if kind == "planned" else events.operation("fit"):
+                raise primary
+    assert stream.hit == 1
+    assert events._CURRENT.get() is None and events._OPERATION.get() is None
+    assert caught.value is primary
+
+
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_join_interrupt_after_success_is_not_swallowed(tmp_path, secondary_type):
+    secondary = secondary_type("interrupt while joining heartbeat")
+    execution = events.Execution(tmp_path / "audit.jsonl", ["fit"])
+
+    class InterruptedThread:
+        def join(self):
+            raise secondary
+
+    with pytest.raises(secondary_type) as caught:
+        with execution:
+            execution.thread = InterruptedThread()
+    assert execution.stop.is_set() and events._CURRENT.get() is None
+    assert caught.value is secondary
+
+
+@pytest.mark.parametrize("level", ["WARNING", "ERROR"])
+def test_standalone_hash_suppresses_info_at_requested_level(tmp_path, monkeypatch, level):
+    from provenance.lineage import directory_digest
+
+    monkeypatch.setenv("AUTOFORECAST_LOG_LEVEL", level)
+    stream = io.StringIO()
+    events.configure_logging(stream=stream, progress="off")
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "part.bin").write_bytes(b"payload")
+    assert directory_digest(data)
+    assert stream.getvalue() == ""
+
+
+def test_workflow_audit_symlink_cannot_invalidate_completed_bundle(tmp_path):
+    from mlops.run_bundle import load_completed_run_bundle, open_run_bundle
+
+    from autoforecast.study_workflow import run_forecast_workflow
+
+    bundle = open_run_bundle(tmp_path / "bundles", run_id="completed", task="forecast")
+    bundle.write_json("metrics/result.json", {"value": 1})
+    bundle.finalize(status="completed", summary={"score": 1})
+    assert load_completed_run_bundle(bundle.path)["status"] == "completed"
+    protected = tmp_path / "study"
+    protected.mkdir()
+    (protected / "benchmark.json").write_text("{}")
+    study = SimpleNamespace(
+        study_id="s", _path=protected / "benchmark.json", _record=lambda: {"sources": {}}
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "execution-attempts").symlink_to(bundle.path, target_is_directory=True)
+    events.configure_logging(stream=io.StringIO(), progress="off")
+    with pytest.raises(OSError):
+        run_forecast_workflow(
+            study, fit_predict=lambda _: None, config=tmp_path / "absent", output_dir=output
+        )
+    assert load_completed_run_bundle(bundle.path)["status"] == "completed"
+
+
+@pytest.mark.parametrize("primary_type", [ValueError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_registration_initial_failure_display_preserves_primary(
+    tmp_path, monkeypatch, primary_type, secondary_type
+):
+    from autoforecast import study_registration
+
+    primary = primary_type("invalid registration configuration")
+    secondary = secondary_type("secondary failure display")
+
+    class FailureStream(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.hit = 0
+
+        def write(self, text):
+            if not self.hit and text.startswith(
+                ("FAIL Preparing execution plan |", "CANCELLED Preparing execution plan |")
+            ):
+                self.hit += 1
+                raise secondary
+            return super().write(text)
+
+    stream = FailureStream()
+    events.configure_logging(stream=stream, progress="off")
+
+    def invalid(_):
+        raise primary
+
+    monkeypatch.setattr(study_registration, "_configuration", invalid)
+    registry = SimpleNamespace(runtime={})
+    with pytest.raises(BaseException) as caught:
+        study_registration.register_study({}, registry=registry)
+    assert stream.hit == 1
+    assert caught.value is primary
+
+
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+def test_registration_initial_start_interrupt_is_not_swallowed(
+    tmp_path, monkeypatch, secondary_type
+):
+    from autoforecast import study_registration
+
+    secondary = secondary_type("initial start cancelled")
+
+    class StartStream(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.hit = 0
+
+        def write(self, text):
+            if not self.hit and text.startswith("START Preparing execution plan |"):
+                self.hit += 1
+                raise secondary
+            return super().write(text)
+
+    stream = StartStream()
+    events.configure_logging(stream=stream, progress="off")
+    monkeypatch.setattr(study_registration, "_configuration", lambda _: ({"runtime": {}}, tmp_path))
+    with pytest.raises(secondary_type) as caught:
+        study_registration.register_study({}, registry=SimpleNamespace(runtime={}))
+    assert stream.hit == 1 and caught.value is secondary
+
+
+def test_audit_append_creates_missing_parents_and_retains_prior_bytes(tmp_path):
+    audit = tmp_path / "new/nested/events.jsonl"
+    _safe_files.append_audit_bytes(audit, b"first\n")
+    _safe_files.append_audit_bytes(audit, b"second\n")
+    assert audit.read_bytes() == b"first\nsecond\n"
+
+
+def test_audit_append_rejects_fifo_without_blocking(tmp_path):
+    audit = tmp_path / "events.jsonl"
+    os.mkfifo(audit)
+    with pytest.raises(OSError):
+        _safe_files.append_audit_bytes(audit, b"never written\n")
+
+
+def test_audit_append_handles_concurrent_parent_creation(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    audit = tmp_path / "new/nested/events.jsonl"
+    payloads = [f"event-{index}\n".encode() for index in range(4)]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda payload: _safe_files.append_audit_bytes(audit, payload), payloads))
+    assert sorted(audit.read_bytes().splitlines(keepends=True)) == sorted(payloads)
+
+
+@pytest.mark.parametrize("primary_type", [ValueError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("secondary_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("mode", ["scope", "manual"])
+def test_join_interrupt_preserves_terminal_result_and_final_panel(
+    tmp_path, primary_type, secondary_type, mode
+):
+    primary = primary_type("body failure")
+    secondary = secondary_type("join interruption")
+    output = io.StringIO()
+    audit = tmp_path / "audit.jsonl"
+    execution = events.Execution(audit, ["fit"])
+
+    class InterruptedThread:
+        def join(self):
+            raise secondary
+
+    with pytest.raises(BaseException) as caught:
+        with execution:
+            events.configure_logging(stream=output, progress="plain", interval=3600)
+            execution.thread = InterruptedThread()
+            if mode == "manual":
+                events._stage_event(audit, "fit", "START")
+                raise primary
+            with events._stage(audit, "fit"):
+                raise primary
+    expected = "FAIL" if issubclass(primary_type, Exception) else "CANCELLED"
+    rows = [json.loads(line) for line in audit.read_text().splitlines()]
+    panels = [line for line in output.getvalue().splitlines() if line.startswith("RUN ")]
+    assert caught.value is primary and execution.stop.is_set() and events._CURRENT.get() is None
+    assert [r["status"] for r in rows] == ["START", expected]
+    assert execution.result == expected
+    assert any(line.endswith("| " + expected) for line in panels)
+
+
+@pytest.mark.parametrize("mask", [0o002, 0o077])
+def test_local_audit_honors_group_access_chosen_by_umask(tmp_path, mask):
+    from mlops.run_bundle import open_run_bundle
+
+    previous = os.umask(mask)
+    try:
+        old = tmp_path / "legacy" / "shared" / "events.jsonl"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        with old.open("ab") as stream:
+            stream.write(b"event\n")
+        new = tmp_path / "new" / "shared" / "events.jsonl"
+        with events._stage(new, "fit"):
+            pass
+        bundle = open_run_bundle(tmp_path / "bundles", run_id="test", task="forecast")
+        with events._stage(bundle.path / "events.jsonl", "fit"):
+            pass
+        bundle.finalize(status="completed", summary={})
+        manifest = json.loads((bundle.path / "artifact_manifest.json").read_text())
+        assert "events.jsonl" in [x["path"] for x in manifest["artifacts"]]
+        old_dir_mode = stat.S_IMODE(old.parent.stat().st_mode)
+        new_dir_mode = stat.S_IMODE(new.parent.stat().st_mode)
+        old_file_mode = stat.S_IMODE(old.stat().st_mode)
+        new_file_mode = stat.S_IMODE(new.stat().st_mode)
+        bundle_file_mode = stat.S_IMODE((bundle.path / "events.jsonl").stat().st_mode)
+        assert new_dir_mode == old_dir_mode
+        assert new_file_mode == old_file_mode
+        assert bundle_file_mode == old_file_mode
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.parametrize("parent_exists", [False, True])
+def test_concurrent_creations_preserve_every_audit_append(tmp_path, parent_exists):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from mlops import _safe_files
+
+    failures = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for attempt in range(120):
+            audit = tmp_path / f"iteration-{attempt}" / "nested" / "events.jsonl"
+            if parent_exists:
+                audit.parent.mkdir(parents=True)
+            barrier = Barrier(4)
+
+            def write(index, audit=audit, barrier=barrier):
+                barrier.wait()
+                try:
+                    _safe_files.append_audit_bytes(audit, f"event-{index}\n".encode())
+                except Exception as error:
+                    return index, type(error).__name__, str(error), audit.parent.exists()
+                return None
+
+            results = list(pool.map(write, range(4)))
+            bad = [item for item in results if item is not None]
+            if bad:
+                failures.append((attempt, bad))
+                continue
+            rows = audit.read_bytes().splitlines()
+            if sorted(rows) != [f"event-{i}".encode() for i in range(4)]:
+                failures.append((attempt, ["missing or merged event", rows]))
+    assert not failures
+
+
+def test_parallel_real_operations_can_share_new_audit(tmp_path):
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    failures = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for attempt in range(120):
+            audit = tmp_path / f"attempt-{attempt}" / "audit.jsonl"
+            audit.parent.mkdir()
+            barrier = Barrier(4)
+            with events.Execution(audit, ["work"]) as execution:
+                contexts = [contextvars.copy_context() for _ in range(4)]
+
+                def work(i, barrier=barrier):
+                    barrier.wait()
+                    with events.operation("parallel", trial_id=str(i)):
+                        pass
+
+                def run(i, contexts=contexts, work=work):
+                    try:
+                        contexts[i].run(work, i)
+                    except Exception as error:
+                        return (i, type(error).__name__, str(error))
+                    return None
+
+                bad = [x for x in pool.map(run, range(4)) if x]
+                if not bad:
+                    rows = [json.loads(line) for line in audit.read_text().splitlines()]
+                    assert len(rows) == 8
+                    assert len({row["operation_id"] for row in rows}) == 4
+                if bad:
+                    failures.append((attempt, bad, execution.audit_error))
+    assert not failures
+
+
+@pytest.mark.parametrize("component", ["checks", "registry", "scratch"])
+def test_registration_directory_links_cannot_create_inside_saved_data(tmp_path, monkeypatch, component):
+    from autoforecast.test_study_registration import configuration
+
+    config = configuration(tmp_path / "input")
+    protected = tmp_path / "saved"
+    protected.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(protected, target_is_directory=True)
+    root, scratch = tmp_path / "registry", tmp_path / "scratch"
+    if component == "checks":
+        root.mkdir()
+        (root / "checks").symlink_to(protected, target_is_directory=True)
+    elif component == "registry":
+        root = alias / "new-registry"
+    else:
+        scratch = alias / "new-scratch"
+    registry = SimpleNamespace(root=root, scratch_root=scratch, runtime={}, store=None)
+    monkeypatch.setattr(registration, "_register_study", lambda *a: pytest.fail("unexpected data work"))
+    with pytest.raises(OSError):
+        registration.register_study(config, registry=registry)
+    assert list(protected.iterdir()) == []
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("collision", [False, True])
+def test_registration_claims_fresh_attempt_without_reusing_evidence(
+    tmp_path, monkeypatch, native, collision,
+):
+    from mlops import _volume_files
+
+    from autoforecast.test_study_registration import configuration
+
+    config = configuration(tmp_path / "input")
+    root, scratch = tmp_path / "registry", tmp_path / "scratch"
+    root.mkdir()
+    scratch.mkdir()
+    identity = "a" * 32
+    attempt = root / "checks" / identity
+    old = b'{"existing":true}\n'
+    if collision:
+        attempt.mkdir(parents=True)
+        (attempt / "audit.jsonl").write_bytes(old)
+    monkeypatch.setattr(registration.uuid, "uuid4", lambda: SimpleNamespace(hex=identity))
+    calls, writes = [], []
+
+    def body(*args):
+        calls.append(True)
+        return "study-id"
+
+    monkeypatch.setattr(registration, "_register_study", body)
+    if native:
+        monkeypatch.setattr(_volume_files, "is_volume", lambda path: path.is_relative_to(root))
+        monkeypatch.setattr(_volume_files, "append_bytes", lambda path, data: writes.append(data))
+    registry = SimpleNamespace(root=root, scratch_root=scratch, runtime={}, store=None)
+    if collision:
+        with pytest.raises(OSError):
+            registration.register_study(config, registry=registry)
+        assert (attempt / "audit.jsonl").read_bytes() == old
+        assert calls == writes == []
+    else:
+        assert registration.register_study(config, registry=registry) == "study-id"
+        assert calls == [True]
+        audit = b"".join(writes) if native else (attempt / "audit.jsonl").read_bytes()
+        assert json.loads(audit.splitlines()[0])["status"] == "START"

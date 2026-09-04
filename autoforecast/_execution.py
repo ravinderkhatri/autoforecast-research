@@ -15,7 +15,7 @@ import shutil
 import threading
 import time
 import uuid
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from typing import Any
 
 _LOG_LEVEL = contextvars.ContextVar("autoforecast_log_level", default=logging.INFO)
@@ -371,7 +371,8 @@ class Execution:
 
     def __exit__(self, kind, error, traceback):
         try:
-            self._finish(kind)
+            with suppress(BaseException) if kind is not None else nullcontext():
+                self._finish(kind)
         finally:
             self._restore_context()
 
@@ -385,7 +386,8 @@ class Execution:
     def _finish(self, kind):
         self.stop.set()
         if self.thread:
-            self.thread.join()
+            with suppress(BaseException) if kind is not None else nullcontext():
+                self.thread.join()
         with self.lock:
             if kind:
                 for name, status in list(self.states.items()):
@@ -429,7 +431,6 @@ def _stage_event(path, stage, status, *, elapsed=None, _recorded=None, **context
     try:
         from mlops._safe_files import append_audit_bytes
 
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = (json.dumps(event, sort_keys=True, allow_nan=False) + "\n").encode()
         append_audit_bytes(path, payload)
     except BaseException as error:
@@ -443,7 +444,7 @@ def _stage_event(path, stage, status, *, elapsed=None, _recorded=None, **context
         with suppress(BaseException):
             if execution:
                 execution.observe(path, event)
-            _emit(event, _LOG_LEVEL.get())
+            _emit(event, _LOG_LEVEL.get() if execution else resolve_level())
         raise
     finally:
         _AUDITING.reset(token)
@@ -453,7 +454,7 @@ def _stage_event(path, stage, status, *, elapsed=None, _recorded=None, **context
     # Record the verified outcome before calling fallible display code.
     if execution:
         execution.observe(path, event)
-    _emit(event, _LOG_LEVEL.get())
+    _emit(event, _LOG_LEVEL.get() if execution else resolve_level())
 
 
 def _parent():
@@ -482,6 +483,7 @@ def _scope(path, name, *, planned=False, **facts):
     path_token = _PARENT_AUDIT.set(str(path) if path is not None else None)
     started = False
     terminal_attempted = False
+    failed = False
     outcome = {}
     if execution:
         with execution.lock:
@@ -512,7 +514,7 @@ def _scope(path, name, *, planned=False, **facts):
             if status == "START":
                 start_recorded()
             _emit(_safe({**_identity(), "stage": name, "status": status, **metadata}),
-                  _LOG_LEVEL.get())
+                  _LOG_LEVEL.get() if execution else resolve_level())
 
     try:
         event("START")
@@ -532,6 +534,7 @@ def _scope(path, name, *, planned=False, **facts):
             with execution.lock:
                 execution.operations.pop(key)
     except BaseException as error:
+        failed = True
         if started and not terminal_attempted:
             status = "FAIL" if isinstance(error, Exception) else "CANCELLED"
             if execution:
@@ -546,8 +549,9 @@ def _scope(path, name, *, planned=False, **facts):
         _OPERATION.reset(operation_token)
         _IDENTITY.reset(identity_token)
         if execution:
-            with execution.lock:
-                execution.refresh()
+            with suppress(BaseException) if failed else nullcontext():
+                with execution.lock:
+                    execution.refresh()
 
 
 @contextmanager

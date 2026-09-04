@@ -23,6 +23,7 @@ from typing import Any, Protocol
 
 from mlops import _volume_files
 from mlops._safe_files import (
+    create_directory,
     path_exists,
     publish_bytes,
     read_path_bytes,
@@ -828,14 +829,15 @@ def register_study(config, *, registry=None, spark=None,
                 "primary": value["source"]["sql"], **value["source"]["audit_queries"],
             }, tables=value["source"]["tables"])
     except BaseException as error:
-        _emit({"stage": "Preparing execution plan",
-               "status": "FAIL" if isinstance(error, Exception) else "CANCELLED",
-               "attempt_id": check_id, "error_type": type(error).__name__}, initial_level)
+        with suppress(BaseException):
+            _emit({"stage": "Preparing execution plan",
+                   "status": "FAIL" if isinstance(error, Exception) else "CANCELLED",
+                   "attempt_id": check_id, "error_type": type(error).__name__}, initial_level)
         raise
-    registry.root.mkdir(parents=True, exist_ok=True)
-    registry.scratch_root.mkdir(parents=True, exist_ok=True)
+    create_directory(registry.root, exist_ok=True)
+    create_directory(registry.scratch_root, exist_ok=True)
     issues_root = registry.root / "checks" / check_id
-    issues_root.mkdir(parents=True)
+    create_directory(issues_root)
     phase = "configuration"
     starts = {}
     audit = issues_root / "audit.jsonl"
