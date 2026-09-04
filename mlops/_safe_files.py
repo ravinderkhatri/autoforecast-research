@@ -1,4 +1,9 @@
-"""Descriptor-relative publication of immutable local artifact files."""
+"""Immutable artifact publication for local files and owned volume directories.
+
+Local operations pin directory handles. Volume operations use native paths and
+require exclusive output ownership and unchanged source snapshots; they cannot
+prevent an external process from replacing a remote directory.
+"""
 
 from __future__ import annotations
 
@@ -173,11 +178,10 @@ def _open_regular_fd(path: pathlib.Path) -> int:
 
 
 def _regular_file_identity(path: pathlib.Path) -> tuple[str, int]:
-    """Hash one stable regular file without following any path component."""
+    """Hash a local regular file or the current bytes of an immutable volume file."""
     descriptor: int | None = None
     try:
         if _volume_files.is_volume(path):
-            descriptor = _open_directory_fd(path.parent)
             digest = hashlib.sha256()
             size = 0
             for block in _volume_files.iter_blocks(path):
@@ -264,10 +268,11 @@ def _open_regular_at(root_fd: int, relative_path: str) -> int:
 
 def _publish_blocks_at(root_fd: int, relative_path: str, blocks: Iterable[bytes],
                        *, volume_root: pathlib.Path | None = None) -> None:
-    """Publish below one pinned root so a path replacement cannot redirect later files."""
+    """Publish below a pinned local root or an exclusively owned volume path."""
     with _parent_fd_at(root_fd, relative_path) as (parent_fd, name):
         if volume_root is not None:
-            # A volume cannot create hard links. The native API refuses replacement.
+            # Refuse overwriting this file. The caller owns the remote directory;
+            # a local directory handle cannot stop its external replacement.
             try:
                 _volume_files.publish_blocks(volume_root / relative_path, blocks)
             except OSError as error:
@@ -378,8 +383,11 @@ def _read_regular_bytes_at(root_fd: int, relative_path: str,
 
 
 def read_regular_bytes(root: pathlib.Path, relative_path: str) -> bytes:
-    """Read a regular artifact below a pinned, link-free root."""
+    """Read an artifact from a pinned local root or an unchanged volume path."""
     try:
+        # Native reads must work before the mounted directory cache catches up.
+        if _volume_files.is_volume(root):
+            return _volume_files.read_bytes(root.joinpath(*_relative_parts(relative_path)))
         root_fd = _open_directory_fd(root)
         try:
             return _read_regular_bytes_at(
@@ -395,7 +403,11 @@ def read_regular_bytes(root: pathlib.Path, relative_path: str) -> bytes:
 
 
 def publish_bytes_set(root: pathlib.Path, payloads: Mapping[str, bytes]) -> pathlib.Path:
-    """Idempotently publish a byte set through one pinned directory descriptor."""
+    """Publish identical bytes on retry, refusing conflicting existing files.
+
+    Volume callers must exclusively own the directory for this whole operation.
+    This helper does not publish a completion marker or a multi-file transaction.
+    """
     if not payloads:
         raise SafeFileError("immutable artifact set must not be empty")
     for relative_path in payloads:
@@ -443,11 +455,7 @@ def publish_bytes_set(root: pathlib.Path, payloads: Mapping[str, bytes]) -> path
 def copy_regular_file(root: pathlib.Path, relative_path: str, source: pathlib.Path) -> pathlib.Path:
     """Copy a regular source once below *root*, refusing source and destination links."""
     if _volume_files.is_volume(source):
-        descriptor = _open_directory_fd(source.parent)
-        try:
-            return _publish_blocks(root, relative_path, _volume_files.iter_blocks(source))
-        finally:
-            os.close(descriptor)
+        return _publish_blocks(root, relative_path, _volume_files.iter_blocks(source))
     try:
         source_fd = _open_regular_fd(source)
     except OSError as exc:
@@ -471,7 +479,12 @@ def snapshot_regular_files(
     destination_root: pathlib.Path,
     relative_paths: Iterable[str],
 ) -> pathlib.Path:
-    """Copy an explicit immutable file set into a new link-free snapshot directory."""
+    """Copy an immutable file set into a fresh, caller-owned snapshot directory.
+
+    Volume sources must remain unchanged throughout the copy. The caller checks
+    previously frozen hashes before accepting the snapshot; this helper alone
+    cannot authenticate a collection or pin a remote source directory.
+    """
     paths = tuple(relative_paths)
     if len(set(paths)) != len(paths):
         raise SafeFileError("snapshot file paths must be unique")
@@ -480,11 +493,13 @@ def snapshot_regular_files(
     source_fd: int | None = None
     destination_fd: int | None = None
     try:
-        source_fd = _open_directory_fd(source_root)
+        source_is_volume = _volume_files.is_volume(source_root)
+        if not source_is_volume:
+            source_fd = _open_directory_fd(source_root)
         destination_fd = _create_directory_fd(destination_root)
         destination_identity = os.fstat(destination_fd)
         for relative_path in sorted(paths):
-            if _volume_files.is_volume(source_root):
+            if source_is_volume:
                 _publish_blocks_at(
                     destination_fd, relative_path,
                     _volume_files.iter_blocks(source_root / relative_path),
@@ -492,6 +507,7 @@ def snapshot_regular_files(
                        if _volume_files.is_volume(destination_root) else {}),
                 )
                 continue
+            assert source_fd is not None
             file_fd = _open_regular_at(source_fd, relative_path)
             try:
 
@@ -509,8 +525,8 @@ def snapshot_regular_files(
                 )
             finally:
                 os.close(file_fd)
-        # The pinned descriptor protects writes, but callers receive the lexical path. Refuse a
-        # rename/replacement rather than returning a path to a different directory.
+        # Detect a replacement visible to the mount before returning its path.
+        # Local writes are pinned; remote writes still require exclusive ownership.
         observed_fd = _open_directory_fd(destination_root)
         try:
             observed_identity = os.fstat(observed_fd)

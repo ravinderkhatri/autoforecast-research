@@ -14,6 +14,7 @@ import re
 import subprocess
 from typing import cast
 
+from mlops._safe_files import is_regular_file, read_regular_bytes
 from mlops.provenance import (
     ProvenanceError,
     sanitize_repository_origin,
@@ -1320,7 +1321,7 @@ def parameter_resolution_from_selection(
         raise ParameterSourceError("HPO selection kind must be tune or reuse_selection")
     root = _without_links(project_root, "project root").resolve()
     selection = _without_links(selection_path, "HPO selection").resolve()
-    if not selection.is_file() or selection.name != "selection.json":
+    if not is_regular_file(selection) or selection.name != "selection.json":
         raise ParameterSourceError("HPO selection must be a regular selection.json")
     study_path = _without_links(study.source_path, "HPO study config").resolve()
     if not study_path.is_file() or not study_path.is_relative_to(root):
@@ -1336,7 +1337,8 @@ def parameter_resolution_from_selection(
     if selection.parent.name != study.id:
         raise ParameterSourceError("HPO selection path does not match its declared study ID")
     try:
-        selection_bytes = selection.read_bytes()
+        # Retain the same native bytes that the selection loader verifies.
+        selection_bytes = read_regular_bytes(selection.parent, selection.name)
         sealed = load_study_selection(selection.parent)
     except (ExperimentError, ExactJSONError) as error:
         raise ParameterSourceError(f"HPO selection is invalid: {error}") from error
@@ -1402,7 +1404,7 @@ def parameter_resolution_from_selection(
         )
     except TuningError as error:
         raise ParameterSourceError(f"selected HPO parameters are invalid: {error}") from error
-    if selection.read_bytes() != selection_bytes:
+    if read_regular_bytes(selection.parent, selection.name) != selection_bytes:
         raise ParameterSourceError("HPO selection changed while it was being verified")
     selected_source_commit, observed_protocol = _selected_source_commit(
         attempt,

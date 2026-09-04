@@ -6,6 +6,7 @@ import copy
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -442,6 +443,52 @@ def test_live_identity_recheck_keeps_snapshot_valid_but_refuses_checkout_change(
         "differs from its committed blob",
     )
     subject.validate_executable_source_snapshot(authorization)
+
+
+def test_snapshot_runs_storage_hashing_without_importing_installed_mlops() -> None:
+    workspace, repository = _repository()
+    source = pathlib.Path(__file__).resolve().parent.parent
+    # Use the real hashing and storage code, including their package imports.
+    for package in ("mlops", "provenance"):
+        for original in (source / package).rglob("*.py"):
+            target = repository / original.relative_to(source)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, target)
+    _git(repository, "add", "mlops", "provenance")
+    _git(repository, "commit", "--quiet", "-m", "retain storage dependencies")
+    authorization = subject.materialize_executable_source_snapshot(
+        repository, workspace / "snapshots"
+    )
+    snapshot = pathlib.Path(authorization["root"])
+    data = workspace / "data"
+    data.mkdir()
+    (data / "part.bin").write_bytes(b"frozen input")
+    imported = subprocess.run(
+        [sys.executable, "-B", "-c", """
+import pathlib
+import sys
+from mlops import _volume_files
+from provenance.lineage import directory_digest
+assert pathlib.Path(_volume_files.__file__).resolve().is_relative_to(pathlib.Path.cwd())
+print(directory_digest(sys.argv[1]))
+""", str(data)],
+        cwd=snapshot,
+        env={**os.environ, "PYTHONPATH": str(snapshot)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert imported.returncode == 0, imported.stderr
+    from provenance.lineage import directory_digest
+
+    assert imported.stdout.strip() == directory_digest(data)
+    subject.validate_executable_source_snapshot(authorization)
+    # Storage code is part of the identity, so edits must invalidate the snapshot.
+    storage = snapshot / "mlops/_volume_files.py"
+    storage.chmod(0o644)
+    storage.write_text("raise RuntimeError('changed storage')\n")
+    storage.chmod(0o444)
+    _refuses(lambda: subject.validate_executable_source_snapshot(authorization), "differs")
 
 
 if __name__ == "__main__":

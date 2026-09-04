@@ -24,7 +24,7 @@ from typing import cast
 EXECUTABLE_SOURCE_MANIFEST_SCHEMA = "autoforecast.executable-source-manifest.v2"
 EXECUTABLE_SOURCE_SNAPSHOT_SCHEMA = "autoforecast.executable-source-snapshot.v2"
 SOURCE_MANIFEST_FILENAME = "_autoforecast_source_manifest.json"
-SOURCE_ROOTS = ("autoforecast", "forecast", "provenance", "scripts", "spec")
+SOURCE_ROOTS = ("autoforecast", "forecast", "mlops", "provenance", "scripts", "spec")
 SUPPORTING_EXECUTABLE_SOURCES = ("pyproject.toml", "uv.lock")
 
 # These are called out separately so an apparently complete manifest cannot silently omit the
@@ -43,6 +43,9 @@ CRITICAL_EXECUTABLE_SOURCES = (
     "autoforecast/wrmsse.py",
     "forecast/features/commercial.py",
     "forecast/models/mft/trunk.py",
+    "mlops/__init__.py",
+    "mlops/_safe_files.py",
+    "mlops/_volume_files.py",
 )
 
 

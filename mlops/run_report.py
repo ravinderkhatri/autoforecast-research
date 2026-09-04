@@ -22,7 +22,7 @@ def _discard_unsealed_guide(root: pathlib.Path, payload: bytes, error: Exception
             if any(name in entries for name in ("artifact_manifest.json", "completion.json")):
                 return
             if "RUN.md" in entries and _volume_files.read_bytes(root / "RUN.md") == payload:
-                _volume_files._client().files.delete(str(root / "RUN.md"))
+                _volume_files._client().files.delete(_volume_files._path(root / "RUN.md"))
             return
         descriptor = _open_directory_fd(root)
         try:

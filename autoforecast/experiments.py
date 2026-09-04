@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from mlops import _volume_files
 from mlops._safe_files import (
     SafeFileError,
     _create_fresh_directory,
@@ -32,7 +33,7 @@ from mlops._safe_files import (
 )
 from mlops.run_report import _discard_unsealed_guide, run_guide
 
-from autoforecast._exact_json import ExactJSONError, load_exact_json, loads_exact_json
+from autoforecast._exact_json import ExactJSONError, loads_exact_json
 from autoforecast.frequency import FrequencyError, TimePoint, parse_origin
 
 __all__ = [
@@ -590,13 +591,24 @@ def _selection_candidates(
     a hidden policy decision, so this first contract refuses it until a study declares one.
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
-    for attempt_path in sorted(study_root.glob("trials/*/attempts/*")):
+    if _volume_files.is_volume(study_root):
+        # Discover attempts from the same remote tree whose bytes we verify below.
+        _, entries = _volume_files._inventory(study_root)
+        attempt_paths = []
+        for name, (is_directory, _size, _modified) in entries.items():
+            parts = pathlib.PurePosixPath(name).parts
+            if (not is_directory and len(parts) == 5 and parts[0] == "trials"
+                    and parts[2] == "attempts" and parts[4] == "completion.json"):
+                attempt_paths.append((study_root / name).parent)
+    else:
+        attempt_paths = study_root.glob("trials/*/attempts/*")
+    for attempt_path in sorted(attempt_paths):
         if not is_regular_file(attempt_path / "completion.json"):
             continue
         metadata, completion = load_completed_attempt(attempt_path)
         if completion.get("status") != "completed":
             continue
-        validation = load_exact_json(attempt_path / "evaluation" / "validation.json")
+        validation = _load_attempt_json(attempt_path, "evaluation/validation.json")
         if not isinstance(validation, dict):
             raise ExperimentError(f"validation result must be an object: {attempt_path}")
         value = validation.get("value")
@@ -676,6 +688,11 @@ def _selection_candidates(
 def _create_json_once(path: pathlib.Path, payload: Mapping[str, Any]) -> pathlib.Path:
     """Atomically publish a small terminal study record without replacing a prior publication."""
     raw = json.dumps(payload, allow_nan=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    if _volume_files.is_volume(path):
+        try:
+            return publish_bytes(path.parent, path.name, raw)
+        except SafeFileError as error:
+            raise ExperimentError(f"could not publish sealed study record: {path}") from error
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_bytes(raw)
@@ -735,7 +752,7 @@ def seal_study_selection(
 def load_study_selection(study_root: str | pathlib.Path) -> dict[str, Any]:
     """Load the sealed validation selection for a later held-out evaluator or renderer."""
     root = pathlib.Path(study_root)
-    record = load_exact_json(root / "selection.json")
+    record = _load_attempt_json(root, "selection.json")
     required = {
         "schema",
         "study_id",

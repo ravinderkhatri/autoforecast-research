@@ -3,6 +3,10 @@
 Volumes look like local directories but do not support append or hard links.
 The Files API supplies create-if-absent writes. Credentials come from the
 Databricks SDK's normal authentication; no workspace or client is hard-coded.
+
+Callers own their output directories and keep source snapshots unchanged while
+reading. These path-based operations cannot pin a remote directory against
+external replacement. Locks coordinate only writers that follow this contract.
 """
 
 from __future__ import annotations
@@ -132,6 +136,7 @@ def publish_blocks(path: pathlib.Path, blocks: Iterable[bytes]) -> None:
 def exclusive_lock(path: pathlib.Path):
     """Claim a shared lock once; never remove or steal another writer's lock.
 
+    This lock does not prevent external deletion or replacement of a directory.
     An interrupted writer can leave this small ownership file behind. Recovery
     must confirm that the writer stopped before deleting it. Failing closed is
     safer than treating a driver-local FUSE flock as a distributed lock.

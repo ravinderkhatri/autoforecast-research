@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from mlops import sanitize_web_url
+from mlops._safe_files import is_regular_file
 from mlops.run_report import run_guide
 
 from autoforecast._exact_json import load_exact_json
@@ -82,7 +83,7 @@ def render_study_report(
             rows.append((attempt, metadata, completion, _epochs(attempt)))
     if not rows:
         raise ExperimentError(f"no completed attempts in {root}")
-    selection = load_study_selection(root) if (root / "selection.json").is_file() else None
+    selection = load_study_selection(root) if is_regular_file(root / "selection.json") else None
     fingerprints = {
         str(metadata.get("comparability_fingerprint", ""))
         for _, metadata, _, _ in rows

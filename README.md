@@ -75,6 +75,30 @@ A stopped process can leave a volume lock behind. A later run stops instead of s
 Confirm that the owning run has stopped before removing that lock; do not remove an active
 writer's lock. Existing study files and SHA mismatches are never silently replaced.
 
+### Ownership and publication
+
+Each run or attempt owns a fresh directory. Different runs can write in parallel in separate
+directories; do not share one writable run directory between notebooks. A new attempt needs
+a new ID. Reusing an existing run directory is refused. Published snapshots and completed
+results must remain unchanged; create a new version when the data or results change.
+
+Files are created without overwriting existing files and are read back to check their bytes.
+Run bundles and attempts write their SHA manifest before writing `completion.json` last.
+Readers accept a completed result only after checking its manifest, file list and hashes.
+An interrupted run without a valid completion record is not a usable result. Retain its
+evidence and start a fresh attempt; never manufacture a completion record to recover it.
+
+Volume operations use paths, not a pinned directory handle or a transaction across files.
+The deployment must restrict write/delete access and coordinate cleanup: no other process
+may rename, replace or delete a source snapshot or an active output directory. Library locks
+coordinate cooperating writers only. Local filesystem directory protections do not extend
+to remote volume paths, even when the mount exposes a local directory handle.
+
+Previously frozen hashes are checked when copying study snapshots and loading results.
+Calculating a new hash after copying files cannot prove that they came from one source version.
+Keep source snapshots immutable throughout reads, and do not let cleanup jobs remove them
+while a run still uses them. These ownership rules also apply to interrupted writes and retries.
+
 ## What the library keeps
 
 AutoForecast saves the study data, evaluation rules, model settings, selected source files,

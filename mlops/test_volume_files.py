@@ -328,6 +328,9 @@ def test_volume_retained_audit_is_sealed_and_reloadable_before_mount_refresh(vol
         output = open_local_attempt(root, study_id="study", trial_id="trial", attempt_id="attempt",
                                     metadata=_metadata(learning_rate=0.01))
         load = load_completed_attempt
+    # The API can see a nested artifact before its parent appears in the mount.
+    output.write_bytes("artifacts/nested.bin", b"model bytes")
+    (output.path / "artifacts").rmdir()
     audit = output.path / "events.jsonl"
     _stage_event(audit, "check", "START")
     _stage_event(audit, "check", "PASS")
@@ -822,3 +825,246 @@ def test_volume_staging_inputs_and_cleanup_use_remote_listing(volume):
     assert _staging_directories(staging) == [staging / "reference_input"]
     assert client.values[str(staging / "note.json")] == b"note"
     _remove_staging_directory(staging / "absent")
+
+
+@pytest.mark.parametrize("operation", ["read", "identity", "copy", "snapshot"])
+def test_volume_reads_do_not_require_mounted_parent_directories(volume, operation):
+    import hashlib
+
+    root, client = volume
+    source = root / "unmounted/nested/model.bin"
+    client.values[str(source)] = b"complete model"
+    assert not source.parent.exists()
+    if operation == "read":
+        assert _safe_files.read_regular_bytes(source.parent, source.name) == b"complete model"
+    elif operation == "identity":
+        assert _safe_files._regular_file_identity(source) == (
+            hashlib.sha256(b"complete model").hexdigest(), len(b"complete model"),
+        )
+    elif operation == "copy":
+        _safe_files.copy_regular_file(root, "copied.bin", source)
+        assert client.values[str(root / "copied.bin")] == b"complete model"
+    else:
+        _safe_files.snapshot_regular_files(source.parent, root / "snapshot", [source.name])
+        assert client.values[str(root / "snapshot" / source.name)] == b"complete model"
+
+
+def test_volume_selection_ranks_verified_bytes_and_reloads_without_mounted_attempts(volume):
+    import json
+    import shutil
+
+    from autoforecast.experiments import (
+        load_study_selection,
+        open_local_attempt,
+        seal_study_selection,
+    )
+    from autoforecast.test_experiments import _metadata
+
+    root, _ = volume
+    for number, value in enumerate((1.0, 2.0), start=1):
+        attempt = open_local_attempt(
+            root, study_id="smoke", trial_id=f"trial{number}", attempt_id="attempt1",
+            metadata={**_metadata(learning_rate=0.001 * number),
+                      "study": {"direction": "minimize", "top_k": 1}},
+        )
+        validation = {"objective": "validation/objective", "value": value,
+                      "test_metrics": "not_evaluated"}
+        attempt.write_json("evaluation/validation.json", validation)
+        attempt.finalize(status="completed", summary={"test_metrics": "not_evaluated"})
+        # Cached scores would choose the other trial if ranking used the mount.
+        (attempt.path / "evaluation/validation.json").write_text(
+            json.dumps({**validation, "value": 10.0 - value}),
+        )
+    study = root / "studies/smoke"
+    seal_study_selection(study, top_k=1, direction="minimize", required_trial_count=2)
+    assert load_study_selection(study)["selected"][0]["trial_id"] == "trial1"
+    shutil.rmtree(study / "trials")  # Remote files remain, but their mount entries vanish.
+    assert load_study_selection(study)["selected"][0]["trial_id"] == "trial1"
+
+
+def test_volume_relative_guide_cleanup_uses_an_absolute_api_path(volume, monkeypatch):
+    from mlops.run_report import _discard_unsealed_guide
+
+    root, client = volume
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        _volume_files, "is_volume", lambda path: path.absolute().is_relative_to(root),
+    )
+    client.values[str(root / "bundle/RUN.md")] = b"guide"
+    error = ValueError("original failure")
+    _discard_unsealed_guide(Path("bundle"), b"guide", error)
+    assert str(root / "bundle/RUN.md") not in client.values
+    assert not getattr(error, "__notes__", [])
+
+
+def test_volume_relative_bundle_can_retry_after_manifest_failure(volume, monkeypatch):
+    from mlops.run_bundle import load_completed_run_bundle, open_run_bundle
+
+    root, _ = volume
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        _volume_files, "is_volume", lambda path: path.absolute().is_relative_to(root),
+    )
+    bundle = open_run_bundle(Path("stores"), run_id="relative", task="verification")
+    write_json = type(bundle).write_json
+
+    def fail_manifest(self, relative, payload):
+        if relative == "artifact_manifest.json":
+            raise OSError("injected manifest failure")
+        return write_json(self, relative, payload)
+
+    monkeypatch.setattr(type(bundle), "write_json", fail_manifest)
+    with pytest.raises(OSError, match="injected manifest failure") as caught:
+        bundle.finalize(status="completed", summary={})
+    assert not getattr(caught.value, "__notes__", [])
+    monkeypatch.setattr(type(bundle), "write_json", write_json)
+    bundle.finalize(status="completed", summary={})
+    load_completed_run_bundle(bundle.path)
+
+
+def test_volume_runs_are_isolated_and_only_completed_results_load(volume):
+    from mlops.run_bundle import load_completed_run_bundle, open_run_bundle
+
+    root, client = volume
+    barrier = threading.Barrier(2)
+
+    def run(run_id):
+        bundle = open_run_bundle(root, run_id=run_id, task="verification")
+        bundle.write_bytes("model.bin", run_id.encode())
+        with pytest.raises(ValueError):
+            load_completed_run_bundle(bundle.path)
+        # Both writers are active, but their artifacts have separate owners.
+        barrier.wait(timeout=10)
+        bundle.finalize(status="completed", summary={"model": run_id})
+        return bundle
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        bundles = list(pool.map(run, ["run-a", "run-b"]))
+    for bundle in bundles:
+        assert load_completed_run_bundle(bundle.path)["run_id"] == bundle.run_id
+        assert client.values[str(bundle.path / "model.bin")] == bundle.run_id.encode()
+        writes = [path for path, _ in client.requests if path.startswith(str(bundle.path) + "/")]
+        assert writes[-1] == str(bundle.path / "completion.json")
+        with pytest.raises(ValueError, match="already exists"):
+            open_run_bundle(root, run_id=bundle.run_id, task="verification")
+        with pytest.raises(ValueError, match="completed"):
+            bundle.write_bytes("late.bin", b"no")
+    # Changing one published run invalidates it without affecting the other.
+    client.values[str(bundles[0].path / "model.bin")] = b"changed"
+    with pytest.raises(ValueError):
+        load_completed_run_bundle(bundles[0].path)
+    assert load_completed_run_bundle(bundles[1].path)["run_id"] == "run-b"
+
+
+def test_volume_interrupted_publication_requires_a_fresh_attempt(volume, monkeypatch):
+    from mlops.run_bundle import load_completed_run_bundle, open_run_bundle
+
+    root, client = volume
+    failed = open_run_bundle(root, run_id="interrupted", task="verification")
+    failed.write_bytes("model.bin", b"first model")
+    publish = _volume_files.publish_blocks
+
+    def stop_before_completion(path, blocks):
+        if path == failed.path / "completion.json":
+            raise OSError("interrupted before completion")
+        return publish(path, blocks)
+
+    monkeypatch.setattr(_volume_files, "publish_blocks", stop_before_completion)
+    with pytest.raises(ValueError):
+        failed.finalize(status="completed", summary={})
+    assert str(failed.path / "artifact_manifest.json") in client.values
+    assert str(failed.path / "completion.json") not in client.values
+    with pytest.raises(ValueError):
+        load_completed_run_bundle(failed.path)
+    retained = dict(client.values)
+    fresh = open_run_bundle(root, run_id="new-attempt", task="verification")
+    fresh.write_bytes("model.bin", b"second model")
+    fresh.finalize(status="completed", summary={})
+    assert load_completed_run_bundle(fresh.path)["status"] == "completed"
+    assert all(client.values[path] == value for path, value in retained.items())
+
+
+def test_volume_snapshot_checks_previously_frozen_hash(volume):
+    from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
+
+    root, client = volume
+    source = root / "source"
+    source.mkdir()
+    client.values[str(source / "a.parquet")] = b"first version a"
+    client.values[str(source / "b.parquet")] = b"first version b"
+    expected = directory_digest(source, suffixes=(".parquet",))
+    # A stable inventory with changed bytes must not establish a new trusted hash.
+    client.values[str(source / "b.parquet")] = b"other version b"
+    with pytest.raises(LineageError, match="changed before its snapshot"):
+        snapshot_parquet_directory(
+            source, root / "snapshot", expected_sha256=expected, label="training",
+        )
+    assert not any(path.startswith(str(root / "snapshot") + "/") for path in client.values)
+
+
+def test_native_selection_is_shown_as_sealed_before_mount_refresh(volume):
+    from autoforecast import experiment_report
+    from autoforecast.experiments import (
+        load_study_selection,
+        open_local_attempt,
+        seal_study_selection,
+    )
+    from autoforecast.test_experiments import _metadata
+
+    root, client = volume
+    attempt = open_local_attempt(
+        root, study_id="smoke", trial_id="trial1", attempt_id="attempt1",
+        metadata={**_metadata(learning_rate=0.001),
+                  "study": {"direction": "minimize", "top_k": 1}},
+    )
+    attempt.write_json("evaluation/validation.json", {
+        "objective": "validation/objective", "value": 1.0, "test_metrics": "not_evaluated",
+    })
+    attempt.finalize(status="completed", summary={})
+    # Previous artifact cache entries are current; only the just-published selection lags.
+    for name, raw in client.values.items():
+        path = Path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+    study = root / "studies/smoke"
+    selection = seal_study_selection(study, top_k=1, direction="minimize", required_trial_count=1)
+    assert not selection.exists()
+    assert load_study_selection(study)["selected"][0]["trial_id"] == "trial1"
+    report = experiment_report.render_study_report(study)
+    assert "Selection is sealed: top_k=1" in report.read_text()
+    assert "Selected (rank 1)" in report.read_text()
+
+
+@pytest.mark.parametrize("cached", ["missing", "stale"])
+def test_native_selection_parameter_resolution_uses_authenticated_bytes(
+    volume, monkeypatch, cached,
+):
+    import hashlib
+
+    from autoforecast import parameter_sources
+    from autoforecast.experiments import load_study_selection, seal_study_selection
+    from autoforecast.test_parameter_sources import _project
+
+    root, client = volume
+    # The existing fixture is valid and exercises all ordinary provenance checks.
+    with monkeypatch.context() as local:
+        local.setattr(_volume_files, "is_volume", lambda _: False)
+        project, candidate, study, selection, attempt = _project(root / "fixture")
+    for path in (root / "fixture" / "hpo").rglob("*"):
+        if path.is_file():
+            client.values[str(path)] = path.read_bytes()
+    del client.values[str(selection)]
+    selection.unlink()
+    seal_study_selection(selection.parent, top_k=1, direction="minimize", required_trial_count=1)
+    trusted = client.values[str(selection)]
+    if cached == "stale":
+        # A cache can retain bytes from an older result at this path.
+        selection.write_bytes(b'{"obsolete_selection":true}\n')
+    assert load_study_selection(selection.parent)["selected"]
+    record = parameter_sources.parameter_resolution_from_selection(
+        candidate, study, selection, kind="reuse_selection", project_root=project,
+    )
+    parameters, source = record["effective_parameters"], record["source"]
+    assert isinstance(parameters, dict) and isinstance(source, dict)
+    assert parameters["model.hidden_size"] == 32
+    assert source["selection_sha256"] == hashlib.sha256(trusted).hexdigest()
