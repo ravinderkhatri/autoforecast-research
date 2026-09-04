@@ -659,14 +659,13 @@ def _selection_candidates(
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     if _volume_files.is_volume(study_root):
-        # Discover attempts from the same remote tree whose bytes we verify below.
-        _, entries = _volume_files._inventory(study_root)
-        attempt_paths = []
-        for name, (is_directory, _size, _modified) in entries.items():
-            parts = pathlib.PurePosixPath(name).parts
-            if (not is_directory and len(parts) == 5 and parts[0] == "trials"
-                    and parts[2] == "attempts" and parts[4] == "completion.json"):
-                attempt_paths.append((study_root / name).parent)
+        # Discover attempts natively, listing only the trial and attempt levels; each
+        # attempt's own files are listed when it is checked below.
+        attempt_paths = [
+            attempt
+            for trial in _volume_files.child_directories(study_root / "trials")
+            for attempt in _volume_files.child_directories(trial / "attempts")
+        ]
     else:
         attempt_paths = study_root.glob("trials/*/attempts/*")
     for attempt_path in sorted(attempt_paths):

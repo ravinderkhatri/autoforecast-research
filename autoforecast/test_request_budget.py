@@ -32,6 +32,7 @@ class LocalFiles:
 
     def __init__(self):
         self.downloads = collections.Counter()
+        self.listings = collections.Counter()
         self.lock = threading.Lock()
         self.files = self
         self.api_client = self
@@ -69,6 +70,8 @@ class LocalFiles:
             raise NotFound("directory missing")
 
     def list_directory_contents(self, path):
+        with self.lock:
+            self.listings[path] += 1
         entries = []
         for entry in os.scandir(path):
             directory = entry.is_dir(follow_symlinks=False)
@@ -145,6 +148,7 @@ def test_search_reads_each_trial_file_a_bounded_number_of_times(spark, tmp_path,
                        spark=spark, scratch_root=scratch)
     # Count only the search's work, not loading the study, which checks every file in full.
     files.downloads.clear()
+    files.listings.clear()
     recalculated.clear()
     with study:
         result = tune_study(study, fit_predict=many_files, config=profile,
@@ -185,3 +189,8 @@ def test_search_reads_each_trial_file_a_bounded_number_of_times(spark, tmp_path,
                                   "coverage/validation", "coverage/test"))}
     assert unused and max(unused.values()) <= 5, unused
     assert max(frozen.values()) <= 11, frozen
+    listed = {str(pathlib.Path(path).relative_to(trials)): count
+              for path, count in files.listings.items() if pathlib.Path(path).is_relative_to(trials)}
+    # Folders are listed when their files are copied, hashed or checked; finding the
+    # attempts lists only the trial and attempt levels, never the whole search tree.
+    assert sum(listed.values()) <= 200, sorted(listed.items(), key=lambda item: -item[1])[:8]

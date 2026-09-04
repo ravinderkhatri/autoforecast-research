@@ -332,6 +332,19 @@ def _inventory(path: pathlib.Path):
     return True, entries
 
 
+def child_directories(path: pathlib.Path) -> list[pathlib.Path]:
+    """List the directories directly below a volume directory, or none if it is absent."""
+    from databricks.sdk.errors import NotFound
+
+    try:
+        entries = list(_client().files.list_directory_contents(os.path.abspath(path)))
+    except NotFound:
+        return []
+    if any(entry.path is None or type(entry.is_directory) is not bool for entry in entries):
+        raise OSError("volume listing has an incomplete entry")
+    return sorted(pathlib.Path(entry.path) for entry in entries if entry.is_directory)
+
+
 def remove_tree(path: pathlib.Path) -> None:
     """Remove an operation-owned directory, including parts absent from the mount.
 
