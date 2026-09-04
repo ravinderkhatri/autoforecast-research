@@ -1714,6 +1714,60 @@ def test_failed_background_upload_retries_identical_bytes(volume, monkeypatch, p
     assert [row["item"] for row in read_execution_events(audit)] == list(range(4))
 
 
+def test_other_readers_see_a_valid_prefix_while_uploads_are_running(volume, monkeypatch):
+    import time
+
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    release = threading.Event()
+
+    def slow_second_event(path, contents, *, overwrite):
+        if str(path).split("/")[-1].startswith("000000000002-"):
+            assert release.wait(10)
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", slow_second_event)
+    with events.Execution(audit, []) as writer:
+        for n in range(6):
+            writer.write_event(audit, {"item": n})
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not any(
+            p.split("/")[-1].startswith("000000000005-") for p in client.values
+        ):
+            time.sleep(0.01)
+        # A reader in another process does not flush this execution's uploads.
+        rows = [json.loads(line) for line in
+                _volume_files.read_audit_bytes(audit).splitlines()]
+        assert [row["item"] for row in rows] == list(range(len(rows)))
+        release.set()
+    assert [row["item"] for row in read_execution_events(audit)] == list(range(6))
+
+
+def test_interruption_after_submission_keeps_a_consistent_closed_audit(volume, monkeypatch):
+    root, client = volume
+    audit = root / "events.jsonl"
+    with pytest.raises(KeyboardInterrupt):
+        with events.Execution(audit, []) as writer:
+            submit = writer.uploader.submit
+            calls = []
+
+            def interrupted(*args, **kwargs):
+                future = submit(*args, **kwargs)
+                calls.append(future)
+                if len(calls) == 2:
+                    raise KeyboardInterrupt("after the upload was queued")
+                return future
+
+            monkeypatch.setattr(writer.uploader, "submit", interrupted)
+            for n in range(5):
+                writer.write_event(audit, {"item": n})
+    rows = read_execution_events(audit)
+    assert [row["item"] for row in rows] == [0, 1, 2]
+    closed = str(audit.with_name(audit.name + ".events") / "closed.json")
+    assert json.loads(client.values[closed])["count"] == 3
+
+
 def test_reader_inside_execution_sees_its_own_queued_events(volume):
     root, _ = volume
     audit = root / "events.jsonl"

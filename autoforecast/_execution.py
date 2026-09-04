@@ -32,8 +32,8 @@ _AUDITING = contextvars.ContextVar("autoforecast_writing_audit", default=False)
 _SETUP_LOCK = threading.RLock()
 _FALLBACK_CONSOLE = None
 # Each remote audit event costs an upload and a readback (about 0.5 s on a volume).
-# A running execution uploads this many events at a time, off the main path.
-_AUDIT_UPLOADS = 8
+# A running execution uploads them off the main path, one at a time and in order,
+# so every saved audit is a complete prefix that readers in other processes accept.
 _DISPLAYS = ("progress", "logs", "both")
 # An explicit configure_logging(display=...) choice; otherwise runtime.display applies.
 _DISPLAY = None
@@ -373,13 +373,14 @@ class Execution:
     def write_event(self, path, event):
         """Keep one writer and ordered, retry-stable event bytes for each remote audit.
 
-        Sequence, hash link and bytes are fixed here, so uploads may finish in any order.
-        The first event claims the audit for this writer before returning. While the
-        execution is running, later events of its own audit upload in the background; a
-        failed upload is retried with identical bytes before the next event and at close.
-        A hard process failure can lose events whose upload had not finished. Other audit
-        paths, such as a run bundle's events, stay synchronous because their owners may
-        seal them before this execution ends.
+        Sequence, hash link and bytes are fixed and recorded here before any upload. The
+        first event claims the audit for this writer before returning. While the execution
+        is running, later events of its own audit upload in the background, in sequence
+        order. After a failed upload nothing later is uploaded until the failed event is
+        retried with identical bytes, before the next event or at close. A hard process
+        failure can lose the unsaved tail; what was saved remains a valid prefix. Other
+        audit paths, such as a run bundle's events, stay synchronous because their owners
+        may seal them before this execution ends.
         """
         from mlops import _volume_files
 
@@ -388,7 +389,7 @@ class Execution:
                 raise ValueError("execution audit is closed")
             state = self.audit_segments.setdefault(path, {
                 "owner": uuid.uuid4().hex, "sequence": 0, "previous": None, "pending": None,
-                "uploads": {},
+                "uploads": {}, "blocked": False,
             })
 
             def acknowledge():
@@ -406,25 +407,46 @@ class Execution:
                 state["pending"] = payload
                 acknowledge()
                 return
-            future = self.uploader.submit(
-                _volume_files.publish_audit_segment, path, payload,
-                owner=state["owner"], sequence=state["sequence"],
-            )
-            state["uploads"][state["sequence"]] = payload, future
-            state.update(sequence=state["sequence"] + 1,
-                         previous=hashlib.sha256(payload).hexdigest())
+            # Record the event before submitting it, so an interruption between the two
+            # leaves an unsubmitted entry that _settle uploads, never a reused sequence.
+            sequence = state["sequence"]
+            entry = state["uploads"][sequence] = [payload, None]
+            state.update(sequence=sequence + 1, previous=hashlib.sha256(payload).hexdigest())
+            entry[1] = self.uploader.submit(self._upload, path, state, sequence, payload)
+
+    @staticmethod
+    def _upload(path, state, sequence, payload):
+        from mlops import _volume_files
+
+        if state["blocked"]:
+            raise OSError("an earlier audit event is not saved yet")
+        try:
+            _volume_files.publish_audit_segment(path, payload, owner=state["owner"],
+                                                sequence=sequence)
+        except BaseException:
+            state["blocked"] = True
+            raise
 
     def _settle(self, path, state, *, wait):
-        """Retry failed background uploads with identical bytes; with ``wait``, finish all."""
+        """Save finished or failed uploads in order; with ``wait``, save every event.
+
+        A failed or never-submitted event is retried here with identical bytes before any
+        later one, so the saved audit stays a prefix.
+        """
         from mlops import _volume_files
 
         for sequence, (payload, future) in sorted(state["uploads"].items()):
-            if not wait and not future.done():
-                continue
-            if future.exception() is not None:
+            if future is not None and not future.done():
+                if not wait:
+                    break
+                with suppress(BaseException):
+                    future.result()
+            if future is None or future.exception() is not None:
                 _volume_files.publish_audit_segment(path, payload, owner=state["owner"],
                                                     sequence=sequence)
             del state["uploads"][sequence]
+        if not state["uploads"]:
+            state["blocked"] = False
 
     def flush_audit(self, path):
         """Finish background uploads for one audit, for a reader inside this execution."""
@@ -533,8 +555,7 @@ class Execution:
         if self.display is None:
             self.display = parent.display if parent else resolve_display()
         self.token = _CURRENT.set(self)
-        self.uploader = ThreadPoolExecutor(max_workers=_AUDIT_UPLOADS,
-                                           thread_name_prefix="autoforecast-audit")
+        self.uploader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autoforecast-audit")
         self.level_token = _LOG_LEVEL.set(self.level)
         self.identity_token = _IDENTITY.set({})
         self.operation_token = _OPERATION.set(None)
