@@ -20,6 +20,7 @@ from mlops._safe_files import (
     _create_fresh_directory,
     _regular_file_identity,
     copy_regular_file,
+    is_regular_file,
     publish_bytes,
     read_regular_bytes,
     snapshot_tree_types,
@@ -131,18 +132,18 @@ class RunBundle:
             raise ProvenanceError("bundle status must be completed or failed")
         if self._finalized:
             raise ProvenanceError("run bundle is already complete")
-        if (self.path / "RUN.md").exists():
+        descendants = snapshot_tree_types(self.path)
+        if (self.path / "RUN.md") in descendants:
             raise ProvenanceError("RUN.md is reserved for the generated file guide")
         manifest_path = self.path / "artifact_manifest.json"
         completion_path = self.path / "completion.json"
-        descendants = tuple(self.path.rglob("*"))
-        linked = [item for item in descendants if item.is_symlink()]
+        linked = [item for item, kind in descendants.items() if kind == "symlink"]
         if linked:
             raise ProvenanceError(f"bundle artifacts may not traverse symlinks: {linked[0]}")
         files = sorted(
             file
-            for file in descendants
-            if file.is_file() and file not in {manifest_path, completion_path}
+            for file, kind in descendants.items()
+            if kind == "file" and file not in {manifest_path, completion_path}
         )
         artifacts = []
         for file in files:
@@ -242,8 +243,8 @@ def load_completed_run_bundle(path: str | pathlib.Path) -> dict[str, Any]:
         root.is_symlink()
         or _traverses_symlink(root, completion_path)
         or _traverses_symlink(root, manifest_path)
-        or not completion_path.is_file()
-        or not manifest_path.is_file()
+        or not is_regular_file(completion_path)
+        or not is_regular_file(manifest_path)
     ):
         raise ProvenanceError(f"completed bundle is missing terminal records: {root}")
     try:
@@ -320,7 +321,7 @@ def load_completed_run_bundle(path: str | pathlib.Path) -> dict[str, Any]:
         digest, size = _file_identity(target)
         if (
             _traverses_symlink(root, target)
-            or not target.is_file()
+            or not is_regular_file(target)
             or digest != entry["sha256"]
             or size != entry["bytes"]
         ):
@@ -368,7 +369,7 @@ def load_completed_run_bundle(path: str | pathlib.Path) -> dict[str, Any]:
         digest, size = _file_identity(target)
         if (
             _traverses_symlink(root, target)
-            or not target.is_file()
+            or not is_regular_file(target)
             or digest != entry["sha256"]
             or size != entry["bytes"]
         ):

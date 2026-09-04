@@ -59,6 +59,22 @@ Choose an optional destination: [Delta](tutorials/07-publish-delta.ipynb),
 [PostgreSQL](tutorials/08-publish-postgresql.ipynb), or [BigQuery](tutorials/09-publish-bigquery.ipynb).
 The default saves results to files and needs none of these databases.
 
+## Databricks and shared storage
+
+Managed Delta source queries work with Spark Connect, including Serverless. Queries read
+only their declared aliases, with one pinned Delta version per physical source table.
+Script transforms and Spark `${...}` substitution are not accepted in managed source SQL.
+
+A storage root under `/Volumes/catalog/schema/volume/...` uses the Databricks Files API
+for immutable files and shared locks. The SDK must authenticate to the same workspace as
+Spark and have read/write access to the volume. Other paths keep the local POSIX behavior.
+Hash checks read fresh remote bytes into temporary local storage, so allow local disk space
+for the checked artifact. Individual files published through Files API 2.0 are limited to 5 GiB.
+
+A stopped process can leave a volume lock behind. A later run stops instead of stealing it.
+Confirm that the owning run has stopped before removing that lock; do not remove an active
+writer's lock. Existing study files and SHA mismatches are never silently replaced.
+
 ## What the library keeps
 
 AutoForecast saves the study data, evaluation rules, model settings, selected source files,

@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
+from mlops import _volume_files
+from mlops._safe_files import read_path_bytes
 from mlops.run_bundle import open_run_bundle
 from mlops.run_report import new_run_id
 from pyspark.sql import DataFrame, SparkSession
@@ -62,13 +64,18 @@ def load_study(
     except BenchmarkError as error:
         if (isinstance(error.__cause__, FileNotFoundError)
                 and error.__cause__.filename == str(registry / study_id / "benchmark.json")):
-            try:
-                (registry / study_id).lstat()
-            except FileNotFoundError:
-                if registry.is_dir():
+            if _volume_files.is_volume(registry):
+                if (not _volume_files.directory_exists(registry / study_id)
+                        and _volume_files.directory_exists(registry)):
                     raise FileNotFoundError(f"Unknown study_id: {study_id}") from error
+            else:
+                try:
+                    (registry / study_id).lstat()
+                except FileNotFoundError:
+                    if registry.is_dir():
+                        raise FileNotFoundError(f"Unknown study_id: {study_id}") from error
         raise
-    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    sha = hashlib.sha256(read_path_bytes(path)).hexdigest()
     _, record = verify_benchmark(path, sha)
     if record["study_id"] != study_id:
         raise BenchmarkError("study identity changed while loading")
@@ -153,7 +160,7 @@ class Study:
         """Frozen column, cadence and target settings; use stage properties for data."""
         record = self._record()
         path = self._path.parent / "dataset.yaml"
-        payload = path.read_bytes()
+        payload = read_path_bytes(path)
         if hashlib.sha256(payload).hexdigest() != record["dataset_sha256"]:
             raise BenchmarkError("dataset contract changed before study use")
         return _load_dataset_contract_bytes(payload, path).panel(
@@ -432,7 +439,7 @@ class Study:
                             != evidence["sha256"]):
                         raise BenchmarkError("retained study horizon metric evidence changed")
                 for name in ("forecast", "scoring"):
-                    if (hashlib.sha256(pathlib.Path(stage[name]).read_bytes()).hexdigest()
+                    if (hashlib.sha256(read_path_bytes(pathlib.Path(stage[name]))).hexdigest()
                             != stage[name + "_sha256"]):
                         raise BenchmarkError("retained study evidence changed during scoring")
                 retained = output / stage_name

@@ -20,7 +20,15 @@ import uuid
 from contextlib import contextmanager, suppress
 from typing import Any, Protocol
 
-from mlops._safe_files import publish_bytes, read_regular_bytes
+from mlops import _volume_files
+from mlops._safe_files import (
+    append_audit_bytes,
+    path_exists,
+    publish_bytes,
+    read_path_bytes,
+    read_regular_bytes,
+    snapshot_tree_types,
+)
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
@@ -242,7 +250,9 @@ def _runtime(value):
 
 def _record_path(root, name):
     paths = [root / (name + suffix) for suffix in (".json", ".yaml", ".yml")]
-    present = [p for p in paths if p.exists() or p.is_symlink()]
+    present = [p for p in paths if (
+        _volume_files.exists(p) if _volume_files.is_volume(p) else p.exists() or p.is_symlink()
+    )]
     if len(present) > 1:
         raise ValueError("conflicting JSON and YAML record copies")
     return present[0] if present else None
@@ -261,10 +271,31 @@ def _publication_lock(root):
     import fcntl
 
     root.mkdir(parents=True, exist_ok=True)
+    if _volume_files.is_volume(root):
+        with _volume_files.exclusive_lock(root / ".registration.lock"):
+            yield
+        return
     descriptor = os.open(root / ".registration.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         yield
+
+
+def _staging_directories(path):
+    # Read the remote listing so recently saved evidence cannot be left out.
+    if _volume_files.is_volume(path):
+        return sorted(p for p, kind in snapshot_tree_types(path).items()
+                      if p.parent == path and kind == "directory")
+    return sorted(p for p in path.iterdir() if p.is_dir())
+
+
+def _remove_staging_directory(path):
+    # Only remove temporary data owned by this registration attempt.
+    if _volume_files.is_volume(path):
+        if _volume_files.directory_exists(path):
+            _volume_files.remove_tree(path)
+    elif path.exists():
+        shutil.rmtree(path)
 
 
 def _artifact_record(path):
@@ -286,6 +317,11 @@ def _verify_admission(root, binding):
     record = _read_saved(path)
     if digest(record) != binding["sha256"]:
         raise ValueError("admission record differs from its baseline")
+    required = {"starting_keys", "retained_keys", "exclusions", "final_keys", "native_exclusions"}
+    if not required <= set(record["artifacts"]):
+        raise ValueError("admission record is missing required cohort evidence")
+    if set(record["artifacts"]) != {p.name for p in _staging_directories(path.parent)}:
+        raise ValueError("admission artifact directory set differs from its baseline")
     for name, expected in record["artifacts"].items():
         if not name.isidentifier() or _artifact_record(path.parent / name) != expected:
             raise ValueError("admission artifact differs from its baseline")
@@ -324,14 +360,13 @@ def _save_admission(registry, staging, identity, frozen, *, format):
               "outcome": {"starting": starting.count(), "application_retained": retained.count(),
                           "final_retained": final_keys.count(),
                           "native_admission": frozen["recipe"]},
-              "artifacts": {p.name: _artifact_record(p) for p in sorted(staging.iterdir())
-                            if p.is_dir()}}
+              "artifacts": {p.name: _artifact_record(p) for p in _staging_directories(staging)}}
     destination = registry.root / "admissions" / study_id
     with _publication_lock(registry.root):
         existing = _record_path(destination, "admission")
         if existing is None:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
+            if path_exists(destination):
                 raise ValueError("incomplete admission destination requires explicit recovery")
             (staging / ("admission." + format)).write_bytes(record_bytes(record, format=format))
             os.rename(staging, destination)
@@ -707,7 +742,7 @@ class StudyRegistry:
     def retain_derived(self, parent_id, manifest):
         """Register an existing preflight-derived identity, reusing its parent snapshot."""
         parent, parent_sha = self.definition(parent_id)
-        raw = pathlib.Path(manifest).read_bytes()
+        raw = read_path_bytes(pathlib.Path(manifest))
         _, record = verify_benchmark(pathlib.Path(manifest), hashlib.sha256(raw).hexdigest())
         expected = self.root / "benchmarks" / record["study_id"] / "benchmark.json"
         if pathlib.Path(manifest).resolve() != expected.resolve():
@@ -780,8 +815,7 @@ def register_study(config, *, registry=None, spark=None,
                  "evidence": str(issues_root), **facts}
         logger.info("%s %s attempt=%s %s", stage, status, check_id,
                     " ".join(f"{name}={item}" for name, item in facts.items()))
-        with (issues_root / "audit.jsonl").open("ab") as stream:
-            stream.write(_bytes(entry))
+        append_audit_bytes(issues_root / "audit.jsonl", _bytes(entry))
 
     event("configuration", "START")
     event("configuration", "PASS")
@@ -812,7 +846,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         root = pathlib.Path(temporary)
         contract_path = root / "dataset.yaml"
         contract_path.write_bytes(_bytes(value["dataset"]))
-        contract = _load_dataset_contract_bytes(contract_path.read_bytes(), contract_path)
+        contract = _load_dataset_contract_bytes(read_path_bytes(contract_path), contract_path)
         recipe = value["recipe"]
         source = value["source"]
         source_record: dict[str, Any]
@@ -882,7 +916,9 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                     frame.filter(F.col(panel.time_col).between(start, origin))
                     .select(*keys).distinct().count())
                 contract_path.write_bytes(_bytes(value["dataset"]))
-                contract = _load_dataset_contract_bytes(contract_path.read_bytes(), contract_path)
+                contract = _load_dataset_contract_bytes(
+                    read_path_bytes(contract_path), contract_path,
+                )
             prepared_report = _save_findings(
                 registry, report_source_issues(frame, contract=contract, recipe=recipe),
                 issues_root, "prepared", check_id + "-prepared",
@@ -1021,7 +1057,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                 "captured_inputs": {
                     p.name: {"logical_sha256": parquet_content_hash(p),
                              "schema": session.read.parquet(str(p)).schema.jsonValue()}
-                    for p in sorted(staging.iterdir()) if p.is_dir()
+                    for p in _staging_directories(staging)
                 },
             }
         event("admission", "PASS", retained_series=retained, excluded_references=len(exclusions))
@@ -1040,7 +1076,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             root / ("admitted" if prepare is not None else "source"),
             keys=keys, scratch_root=registry.scratch_root,
         ) if registry.store is not None else None)
-        library_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        library_sha = hashlib.sha256(read_path_bytes(manifest)).hexdigest()
         _, frozen = verify_benchmark(manifest, library_sha)
         event("freeze", "PASS", study_id=frozen["study_id"])
         definition = {
@@ -1061,8 +1097,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             # Source/preparation hashes attest to captured inputs. Frozen model rows
             # live in the existing benchmark; do not retain duplicate raw inputs.
             for name in ("prepared", "declared_starting", "reference_input", "scoring_references"):
-                if (staging / name).exists():
-                    shutil.rmtree(staging / name)
+                _remove_staging_directory(staging / name)
             definition["admission_evidence"] = _save_admission(
                 registry, staging, admission_identity, frozen, format=format,
             )
@@ -1074,7 +1109,6 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             record_bytes({"study_id": definition["study_id"]}, format=format))
         study_id = registry._publish_definition(definition, format=format)
         registry.definition(study_id)
-        if staging.exists():
-            shutil.rmtree(staging)
+        _remove_staging_directory(staging)
         event("publication", "PASS", study_id=study_id, retained_series=retained)
         return study_id

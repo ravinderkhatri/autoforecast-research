@@ -11,6 +11,8 @@ import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 
+from mlops import _volume_files
+
 
 class SafeFileError(OSError):
     """A path could not be published without following links or replacing bytes."""
@@ -36,6 +38,13 @@ def _require_stable_read(before: os.stat_result, after: os.stat_result, label: o
 
 def snapshot_tree_types(root: pathlib.Path) -> dict[pathlib.Path, str]:
     """Snapshot every descendant's lexical path and non-followed filesystem type."""
+    if _volume_files.is_volume(root):
+        try:
+            _, entries = _volume_files._inventory(root)
+            return {root / name: "directory" if value[0] else "file"
+                    for name, value in entries.items()}
+        except Exception as error:
+            raise SafeFileError(f"could not inspect artifact tree: {root}") from error
     observed: dict[pathlib.Path, str] = {}
     try:
         descendants = tuple(root.rglob("*"))
@@ -167,6 +176,14 @@ def _regular_file_identity(path: pathlib.Path) -> tuple[str, int]:
     """Hash one stable regular file without following any path component."""
     descriptor: int | None = None
     try:
+        if _volume_files.is_volume(path):
+            descriptor = _open_directory_fd(path.parent)
+            digest = hashlib.sha256()
+            size = 0
+            for block in _volume_files.iter_blocks(path):
+                digest.update(block)
+                size += len(block)
+            return digest.hexdigest(), size
         descriptor = _open_regular_fd(path)
         before = os.fstat(descriptor)
         digest = hashlib.sha256()
@@ -202,20 +219,21 @@ def _parent_fd_at(root_fd: int, relative_path: str) -> Iterator[tuple[int, str]]
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     descriptors: list[int] = [os.dup(root_fd)]
     try:
-        current = descriptors[0]
-        for part in parts[:-1]:
-            try:
-                os.mkdir(part, mode=0o755, dir_fd=current)
-            except FileExistsError:
-                pass
-            child = os.open(part, flags, dir_fd=current)
-            descriptors.append(child)
-            current = child
+        try:
+            current = descriptors[0]
+            for part in parts[:-1]:
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=current)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=current)
+                descriptors.append(child)
+                current = child
+        except OSError as exc:
+            raise SafeFileError(
+                f"artifact path is not a link-free directory hierarchy: {relative_path}"
+            ) from exc
         yield current, parts[-1]
-    except OSError as exc:
-        raise SafeFileError(
-            f"artifact path is not a link-free directory hierarchy: {relative_path}"
-        ) from exc
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
@@ -244,9 +262,19 @@ def _open_regular_at(root_fd: int, relative_path: str) -> int:
     return descriptor
 
 
-def _publish_blocks_at(root_fd: int, relative_path: str, blocks: Iterable[bytes]) -> None:
+def _publish_blocks_at(root_fd: int, relative_path: str, blocks: Iterable[bytes],
+                       *, volume_root: pathlib.Path | None = None) -> None:
     """Publish below one pinned root so a path replacement cannot redirect later files."""
     with _parent_fd_at(root_fd, relative_path) as (parent_fd, name):
+        if volume_root is not None:
+            # A volume cannot create hard links. The native API refuses replacement.
+            try:
+                _volume_files.publish_blocks(volume_root / relative_path, blocks)
+            except OSError as error:
+                raise SafeFileError(
+                    f"could not publish immutable artifact: {relative_path}"
+                ) from error
+            return
         temporary = f".{name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         destination_fd: int | None = None
         try:
@@ -295,7 +323,8 @@ def _publish_blocks(
             f"artifact path is not a link-free directory hierarchy: {relative_path}"
         ) from exc
     try:
-        _publish_blocks_at(root_fd, relative_path, blocks)
+        _publish_blocks_at(root_fd, relative_path, blocks,
+                           **({"volume_root": root} if _volume_files.is_volume(root) else {}))
     finally:
         os.close(root_fd)
     return root.joinpath(*_relative_parts(relative_path))
@@ -306,7 +335,36 @@ def publish_bytes(root: pathlib.Path, relative_path: str, payload: bytes) -> pat
     return _publish_blocks(root, relative_path, (payload,))
 
 
-def _read_regular_bytes_at(root_fd: int, relative_path: str) -> bytes:
+def read_path_bytes(path: pathlib.Path) -> bytes:
+    """Read current volume bytes; preserve normal Path.read_bytes behavior elsewhere."""
+    return _volume_files.read_bytes(path) if _volume_files.is_volume(path) else path.read_bytes()
+
+
+def path_exists(path: pathlib.Path) -> bool:
+    """Check files and directories using the storage system that owns the path."""
+    if _volume_files.is_volume(path):
+        return _volume_files.directory_exists(path) or _volume_files.exists(path)
+    return path.exists()
+
+
+def is_regular_file(path: pathlib.Path) -> bool:
+    """Check the native volume metadata, or the ordinary filesystem for local files."""
+    return _volume_files.exists(path) if _volume_files.is_volume(path) else path.is_file()
+
+
+def append_audit_bytes(path: pathlib.Path, payload: bytes) -> None:
+    """Add an audit event, using a shared lock when the filesystem cannot append."""
+    if _volume_files.is_volume(path):
+        _volume_files.append_bytes(path, payload)
+    else:
+        with path.open("ab") as stream:
+            stream.write(payload)
+
+
+def _read_regular_bytes_at(root_fd: int, relative_path: str,
+                           *, volume_root: pathlib.Path | None = None) -> bytes:
+    if volume_root is not None:
+        return _volume_files.read_bytes(volume_root.joinpath(*_relative_parts(relative_path)))
     descriptor = _open_regular_at(root_fd, relative_path)
     try:
         before = os.fstat(descriptor)
@@ -324,7 +382,10 @@ def read_regular_bytes(root: pathlib.Path, relative_path: str) -> bytes:
     try:
         root_fd = _open_directory_fd(root)
         try:
-            return _read_regular_bytes_at(root_fd, relative_path)
+            return _read_regular_bytes_at(
+                root_fd, relative_path,
+                **({"volume_root": root} if _volume_files.is_volume(root) else {}),
+            )
         finally:
             os.close(root_fd)
     except SafeFileError:
@@ -345,10 +406,16 @@ def publish_bytes_set(root: pathlib.Path, payloads: Mapping[str, bytes]) -> path
         root_identity = os.fstat(root_fd)
         for relative_path, payload in sorted(payloads.items()):
             try:
-                _publish_blocks_at(root_fd, relative_path, (payload,))
+                _publish_blocks_at(
+                    root_fd, relative_path, (payload,),
+                    **({"volume_root": root} if _volume_files.is_volume(root) else {}),
+                )
             except SafeFileError as error:
                 try:
-                    observed = _read_regular_bytes_at(root_fd, relative_path)
+                    observed = _read_regular_bytes_at(
+                        root_fd, relative_path,
+                        **({"volume_root": root} if _volume_files.is_volume(root) else {}),
+                    )
                 except SafeFileError:
                     raise error from None
                 if observed != payload:
@@ -375,6 +442,12 @@ def publish_bytes_set(root: pathlib.Path, payloads: Mapping[str, bytes]) -> path
 
 def copy_regular_file(root: pathlib.Path, relative_path: str, source: pathlib.Path) -> pathlib.Path:
     """Copy a regular source once below *root*, refusing source and destination links."""
+    if _volume_files.is_volume(source):
+        descriptor = _open_directory_fd(source.parent)
+        try:
+            return _publish_blocks(root, relative_path, _volume_files.iter_blocks(source))
+        finally:
+            os.close(descriptor)
     try:
         source_fd = _open_regular_fd(source)
     except OSError as exc:
@@ -411,6 +484,14 @@ def snapshot_regular_files(
         destination_fd = _create_directory_fd(destination_root)
         destination_identity = os.fstat(destination_fd)
         for relative_path in sorted(paths):
+            if _volume_files.is_volume(source_root):
+                _publish_blocks_at(
+                    destination_fd, relative_path,
+                    _volume_files.iter_blocks(source_root / relative_path),
+                    **({"volume_root": destination_root}
+                       if _volume_files.is_volume(destination_root) else {}),
+                )
+                continue
             file_fd = _open_regular_at(source_fd, relative_path)
             try:
 
@@ -421,7 +502,11 @@ def snapshot_regular_files(
                             return
                         yield block
 
-                _publish_blocks_at(destination_fd, relative_path, blocks())
+                _publish_blocks_at(
+                    destination_fd, relative_path, blocks(),
+                    **({"volume_root": destination_root}
+                       if _volume_files.is_volume(destination_root) else {}),
+                )
             finally:
                 os.close(file_fd)
         # The pinned descriptor protects writes, but callers receive the lexical path. Refuse a

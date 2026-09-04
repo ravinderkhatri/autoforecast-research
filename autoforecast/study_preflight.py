@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+from mlops._safe_files import read_path_bytes
 from pyarrow.compute import field
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
@@ -647,7 +648,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
     report.update(
         status="passed",
         effective_study_id=effective["study_id"],
-        effective_study_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        effective_study_sha256=hashlib.sha256(read_path_bytes(path)).hexdigest(),
     )
     return PreflightResult(
         path, effective["study_id"], report["effective_study_sha256"], output, report
@@ -683,11 +684,11 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
     try:
         import yaml
 
-        dataset = yaml.safe_load((study._path.parent / "dataset.yaml").read_text())
+        dataset = yaml.safe_load(read_path_bytes(study._path.parent / "dataset.yaml"))
         dataset["dataset"]["required_series_count"] = len(retained)
         (scratch / "dataset.yaml").write_text(yaml.safe_dump(dataset))
         record["dataset_sha256"] = hashlib.sha256(
-            (scratch / "dataset.yaml").read_bytes()
+            read_path_bytes(scratch / "dataset.yaml")
         ).hexdigest()
         if retained != original_ids:
             for role in ("source-keys", "scoring_references"):

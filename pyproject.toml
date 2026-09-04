@@ -16,6 +16,8 @@ requires-python = ">=3.12,<3.14"
 # Extra model libraries remain opt-in below.
 dependencies = [
     "PyYAML==6.0.3",
+    "sqlglot==30.27.0",
+    "databricks-sdk==0.137.0",
     "pyspark==4.2.0",
     "pyarrow==24.0.0",
     "numpy==2.5.3",

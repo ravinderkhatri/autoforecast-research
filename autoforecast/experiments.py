@@ -25,6 +25,7 @@ from mlops._safe_files import (
     _create_fresh_directory,
     _regular_file_identity,
     copy_regular_file,
+    is_regular_file,
     publish_bytes,
     read_regular_bytes,
     snapshot_tree_types,
@@ -245,19 +246,21 @@ class LocalAttempt:
         """Hash all prior attempt bytes, then publish terminal completion metadata last."""
         if type(status) is not str or status not in {"completed", "failed"}:
             raise ExperimentError("attempt status must be 'completed' or 'failed'")
-        if self._finalized or (self.path / "completion.json").exists():
+        if self._finalized:
             raise ExperimentError("attempt already has terminal completion metadata")
-        if (self.path / "RUN.md").exists():
+        descendants = snapshot_tree_types(self.path)
+        if (self.path / "completion.json") in descendants:
+            raise ExperimentError("attempt already has terminal completion metadata")
+        if (self.path / "RUN.md") in descendants:
             raise ExperimentError("RUN.md is reserved for the generated file guide")
         artifact_manifest = self.path / "artifact_manifest.json"
-        descendants = tuple(self.path.rglob("*"))
-        linked = [path for path in descendants if path.is_symlink()]
+        linked = [path for path, kind in descendants.items() if kind == "symlink"]
         if linked:
             raise ExperimentError(f"attempt artifacts may not traverse symlinks: {linked[0]}")
         files = sorted(
             path
-            for path in descendants
-            if path.is_file() and path not in {artifact_manifest, self.path / "completion.json"}
+            for path, kind in descendants.items()
+            if kind == "file" and path not in {artifact_manifest, self.path / "completion.json"}
         )
         artifacts = []
         for path in files:
@@ -520,7 +523,7 @@ def load_completed_attempt(path: pathlib.Path) -> tuple[dict[str, Any], dict[str
         digest, size = _file_identity(artifact)
         if (
             _traverses_symlink(path, artifact)
-            or not artifact.is_file()
+            or not is_regular_file(artifact)
             or not isinstance(entry.get("sha256"), str)
             or entry.get("sha256") != digest
             or type(entry.get("bytes")) is not int
@@ -560,7 +563,7 @@ def load_completed_attempt(path: pathlib.Path) -> tuple[dict[str, Any], dict[str
         digest, size = _file_identity(artifact)
         if (
             _traverses_symlink(path, artifact)
-            or not artifact.is_file()
+            or not is_regular_file(artifact)
             or digest != entry["sha256"]
             or size != entry["bytes"]
         ):
@@ -588,7 +591,7 @@ def _selection_candidates(
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for attempt_path in sorted(study_root.glob("trials/*/attempts/*")):
-        if not (attempt_path / "completion.json").is_file():
+        if not is_regular_file(attempt_path / "completion.json"):
             continue
         metadata, completion = load_completed_attempt(attempt_path)
         if completion.get("status") != "completed":

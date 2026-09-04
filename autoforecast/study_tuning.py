@@ -17,7 +17,14 @@ from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, cast
 
-from mlops._safe_files import _platform_absolute, read_regular_bytes, snapshot_tree_types
+from mlops._safe_files import (
+    _platform_absolute,
+    append_audit_bytes,
+    is_regular_file,
+    read_path_bytes,
+    read_regular_bytes,
+    snapshot_tree_types,
+)
 from mlops.run_report import new_run_id
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -74,8 +81,7 @@ def _stage_event(path, stage, status, *, elapsed=None, **context):
              "status": status, "elapsed_seconds": elapsed, **context}
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as stream:
-        stream.write(json.dumps(event, sort_keys=True, allow_nan=False) + "\n")
+    append_audit_bytes(path, (json.dumps(event, sort_keys=True, allow_nan=False) + "\n").encode())
     level = (logging.ERROR if status == "FAIL" else logging.WARNING
              if status == "UNAVAILABLE" or context.get("warnings") else logging.INFO)
     if level >= _LOG_LEVEL.get():
@@ -229,9 +235,9 @@ def _config(
     require_hpo: bool = True,
 ) -> tuple[bytes, TuningSpec, int, int, dict]:
     """Read once: profile settings and explicit budget; dates come only from the study."""
-    if path.is_symlink() or not path.is_file():
+    if path.is_symlink() or not is_regular_file(path):
         raise TuningError("external tuning config must be a regular file")
-    raw = path.read_bytes()
+    raw = read_path_bytes(path)
     try:
         value = loads_exact_yaml(raw)
     except ExactYAMLError as error:
@@ -446,7 +452,7 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
         pathlib.Path(context["study"]["path"]), context["study"]["sha256"]
     )
     dataset_path = study_path.parent / "dataset.yaml"
-    dataset = _load_dataset_contract_bytes(dataset_path.read_bytes(), dataset_path)
+    dataset = _load_dataset_contract_bytes(read_path_bytes(dataset_path), dataset_path)
     if not isinstance(evidence.get("windows"), list):
         raise HPOError("external trial requires current window evidence; rerun the search")
     windows = tuple(_window_result(attempt, window) for window in evidence["windows"])

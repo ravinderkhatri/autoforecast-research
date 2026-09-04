@@ -10,12 +10,20 @@ from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from urllib.parse import quote
 
+from mlops import _volume_files
 from mlops._safe_files import _open_directory_fd, _read_regular_bytes_at
 
 
 def _discard_unsealed_guide(root: pathlib.Path, payload: bytes, error: Exception) -> None:
     """Discard only this invocation's guide, before terminal evidence is published."""
     try:
+        if _volume_files.is_volume(root):
+            _, entries = _volume_files._inventory(root)
+            if any(name in entries for name in ("artifact_manifest.json", "completion.json")):
+                return
+            if "RUN.md" in entries and _volume_files.read_bytes(root / "RUN.md") == payload:
+                _volume_files._client().files.delete(str(root / "RUN.md"))
+            return
         descriptor = _open_directory_fd(root)
         try:
             for name in ("artifact_manifest.json", "completion.json"):

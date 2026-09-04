@@ -188,6 +188,11 @@ def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()
     reader-visible files must have that exact suffix, hidden markers are ignored, and
     links, special files, and streaming metadata are refused. Other filters select suffixes.
     """
+    from mlops import _volume_files
+
+    if _volume_files.is_volume(pathlib.Path(path)):
+        with _volume_files.local_snapshot(pathlib.Path(path)) as local:
+            return directory_digest(local, suffixes=suffixes)
     files = _digest_files(path, suffixes)
     digest = hashlib.sha256()
     digest.update(_DIRECTORY_DIGEST_DOMAIN)
@@ -211,6 +216,11 @@ def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()
 
 def directory_content_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()) -> str:
     """Hash the multiset of file bytes without names, detecting byte-identical renamed copies."""
+    from mlops import _volume_files
+
+    if _volume_files.is_volume(pathlib.Path(path)):
+        with _volume_files.local_snapshot(pathlib.Path(path)) as local:
+            return directory_content_digest(local, suffixes=suffixes)
     files = _digest_files(path, suffixes)
     payloads: list[tuple[int, bytes]] = []
     for _relative, file_path in files:
@@ -462,7 +472,31 @@ def snapshot_parquet_directory(
     label: str,
 ) -> pathlib.Path:
     """Copy authenticated Parquet bytes into an operation-owned input boundary."""
-    if destination.exists():
+    from mlops import _volume_files
+    from mlops._safe_files import path_exists
+
+    def discard(error):
+        try:
+            if _volume_files.is_volume(destination):
+                _volume_files.remove_tree(destination)
+            else:
+                shutil.rmtree(destination)
+        except Exception as cleanup_error:
+            error.add_note(f"Snapshot cleanup also failed: {cleanup_error}")
+
+    if _volume_files.is_volume(source):
+        with _volume_files.local_snapshot(source) as local:
+            result = snapshot_parquet_directory(
+                local, destination, expected_sha256=expected_sha256, label=label,
+            )
+            try:
+                if directory_digest(source, suffixes=(".parquet",)) != expected_sha256:
+                    raise LineageError(f"{label} changed while its snapshot was copied")
+            except BaseException as error:
+                discard(error)
+                raise
+            return result
+    if path_exists(destination):
         raise LineageError(f"{label} snapshot destination already exists")
     if directory_digest(source, suffixes=(".parquet",)) != expected_sha256:
         raise LineageError(f"{label} changed before its snapshot")
@@ -473,11 +507,16 @@ def snapshot_parquet_directory(
             relative = pathlib.Path(part.name) if source.is_file() else part.relative_to(source)
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(part, target, follow_symlinks=False)
+            if _volume_files.is_volume(destination):
+                from mlops._safe_files import copy_regular_file
+
+                copy_regular_file(destination, relative.as_posix(), part)
+            else:
+                shutil.copyfile(part, target, follow_symlinks=False)
         if (directory_digest(destination, suffixes=(".parquet",)) != expected_sha256
                 or directory_digest(source, suffixes=(".parquet",)) != expected_sha256):
             raise LineageError(f"{label} changed while its snapshot was copied")
         return destination
-    except BaseException:
-        shutil.rmtree(destination)
+    except BaseException as error:
+        discard(error)
         raise

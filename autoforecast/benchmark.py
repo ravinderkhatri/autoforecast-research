@@ -13,6 +13,8 @@ import tempfile
 from contextlib import ExitStack
 from functools import partial
 
+from mlops._safe_files import is_regular_file, read_path_bytes
+
 from autoforecast._exact_json import loads_exact_json
 from autoforecast.column_names import validate_column_names
 from autoforecast.data_admission import _load_dataset_contract_bytes
@@ -173,6 +175,11 @@ def parquet_content_hash(path: pathlib.Path) -> str:
     """
     import pyarrow as pa
     import pyarrow.dataset as ds
+    from mlops import _volume_files
+
+    if _volume_files.is_volume(path):
+        with _volume_files.local_snapshot(path) as local:
+            return parquet_content_hash(local)
 
     dataset = ds.dataset(path, format="parquet", exclude_invalid_files=False)
     columns = sorted(dataset.schema.names)
@@ -615,9 +622,9 @@ def _freeze_benchmark(
     cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
     test_horizon = recipe["final_test_horizon"]
     end = advance(cutoff, cadence, test_horizon)
-    if contract_path.is_symlink() or not contract_path.is_file():
+    if contract_path.is_symlink() or not is_regular_file(contract_path):
         raise BenchmarkError("dataset contract must be a regular file")
-    contract_bytes = contract_path.read_bytes()
+    contract_bytes = read_path_bytes(contract_path)
     contract = _load_dataset_contract_bytes(contract_bytes, contract_path)
     panel = contract.panel(sources["selection"])
     validate_study_panel(panel, recipe)
@@ -836,7 +843,7 @@ def _freeze_benchmark(
         identity["admission_identity"] = admission_identity
 
     def authenticate_sources():
-        if contract_path.read_bytes() != contract_bytes or any(
+        if read_path_bytes(contract_path) != contract_bytes or any(
             directory_digest(path, suffixes=(".parquet",)) != before[name]
             for name, path in all_sources.items()
         ):
@@ -950,7 +957,7 @@ def _freeze_benchmark(
                 written[logical] = name
         identity.update(
             logical_snapshots=logical_snapshots,
-            dataset_sha256=hashlib.sha256((scratch / "dataset.yaml").read_bytes()).hexdigest(),
+            dataset_sha256=hashlib.sha256(read_path_bytes(scratch / "dataset.yaml")).hexdigest(),
             grid_identities={
                 key: {
                     "content_sha256": parquet_content_hash(scratch / item["path"]),
@@ -991,7 +998,7 @@ def _freeze_benchmark(
                 name: directory_digest(scratch / role_paths[name], suffixes=(".parquet",))
                 for name in artifact_roles
             },
-            "dataset_sha256": hashlib.sha256((scratch / "dataset.yaml").read_bytes()).hexdigest(),
+            "dataset_sha256": hashlib.sha256(read_path_bytes(scratch / "dataset.yaml")).hexdigest(),
         }
         (scratch / "benchmark.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
         _publish_frozen_benchmark(scratch, destination, benchmark_id)
@@ -1310,7 +1317,7 @@ def read_benchmark_manifest(
     if path.is_symlink():
         raise BenchmarkError("benchmark manifest must not be a symlink")
     try:
-        payload = path.read_bytes()
+        payload = read_path_bytes(path)
         if expected_sha256 is not None and hashlib.sha256(payload).hexdigest() != expected_sha256:
             raise BenchmarkError("benchmark manifest changed")
         record = loads_exact_json(payload)
@@ -1370,7 +1377,7 @@ def verify_benchmark(
                 != record["coverage_identities"][key]["content_sha256"]):
             raise BenchmarkError("study scoring coverage changed")
     if (
-        hashlib.sha256((path.parent / "dataset.yaml").read_bytes()).hexdigest()
+        hashlib.sha256(read_path_bytes(path.parent / "dataset.yaml")).hexdigest()
         != record["dataset_sha256"]
     ):
         raise BenchmarkError("prepared dataset contract changed")
@@ -1403,7 +1410,7 @@ def _evaluation_contract_from_record(
         "schema": "autoforecast.fixed-evaluation.v2",
         "benchmark_id": record["benchmark_id"], "study_id": record["study_id"],
         "study": {"path": str(path.resolve()),
-                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+                  "sha256": hashlib.sha256(read_path_bytes(path)).hexdigest()},
         "boundary": key,
         "grid": {**record["grids"][key],
                  "path": str(path.parent / record["grids"][key]["path"])},

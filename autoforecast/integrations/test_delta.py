@@ -1033,3 +1033,112 @@ def test_explicit_result_destination_overrides_delta_store(store, tmp_path, monk
     assert calls == [((definition, sha, path), {"scratch_root": registry.scratch_root,
                                               "mlflow_links": links})]
     assert registry.definition(study_id) == (definition, sha)
+
+
+@pytest.mark.parametrize("sql", [
+    "DROP TABLE observations", "DELETE FROM observations", "INSERT INTO observations VALUES (1)",
+    "SELECT * FROM observations; SELECT 1", "SELECT * INTO observations FROM observations",
+    "SELECT * FROM other", "SELECT * FROM db.observations", "SELECT * FROM delta.`/tmp/data`",
+    "SELECT * FROM range(3)", "SELECT * FROM read_files('/tmp/data')",
+    "SELECT * FROM observations VERSION AS OF 0",
+    "SELECT * FROM observations WHERE item IN (SELECT item FROM other)",
+    "SELECT (SELECT max(item) FROM other) FROM observations",
+    "WITH observations AS (SELECT * FROM other) SELECT * FROM observations",
+    "SELECT * FROM observations UNION ALL SELECT * FROM other",
+    "SELECT * FROM observations LATERAL VIEW explode(array(1)) t AS x",
+    "SELECT * FROM observations TABLESAMPLE (50 PERCENT)",
+    "SELECT * FROM observations JOIN range(3) ON true",
+    "SELECT TRANSFORM(item) USING 'cat' FROM observations",
+    "SELECT * FROM (SELECT TRANSFORM(item) USING 'cat' FROM observations) q",
+    "SELECT ${source_expression} FROM observations",
+    "SELECT '${hiveconf:source_expression}' FROM observations",
+    "SELECT * FROM observations -- ${env:source_expression}",
+    "SELECT * FROM observations /* ${system:source_expression} */",
+    "SELECT * FROM observations@v0",
+    "SELECT * FROM observations@20260101000000000",
+])
+def test_managed_sql_rejection_needs_no_spark_connection(sql):
+    from autoforecast.integrations.delta import read_sources
+
+    # No Spark object is available: forbidden SQL must fail before source lookup.
+    with pytest.raises(ValueError):
+        read_sources(None, queries={"primary": "SELECT * FROM observations", "audit": sql},
+                     tables={"observations": "neutral.observations"})
+
+
+def test_managed_sql_keeps_literals_and_qualified_names_without_format_injection():
+    from autoforecast.integrations.delta import validate_source_queries
+
+    sql = ("SELECT observations.item, '{af_source_0.__class__}' AS literal "
+           "FROM `observations` WHERE item IN (SELECT item FROM OBSERVATIONS AS o) "
+           "-- {unused} observations")
+    bound = validate_source_queries(None, queries={"primary": sql},
+                                    tables={"observations": "neutral.input"})["primary"]
+    rendered = bound.format(af_source_0="pinned_frame")
+    assert rendered == (
+        "SELECT observations.item, '{af_source_0.__class__}' AS literal "
+        "FROM pinned_frame AS `observations` WHERE item IN (SELECT item FROM pinned_frame AS o) "
+        "-- {unused} observations"
+    )
+
+
+def test_managed_sources_preserve_caller_views_and_lazy_pinned_results(store, monkeypatch):
+    from autoforecast.integrations.delta import read_sources
+
+    table = store.namespace + ".connect_input"
+    store.spark.createDataFrame([(1,), (2,)], "item int").write.format("delta").saveAsTable(table)
+    store.spark.createDataFrame([(999,)], "item int").createOrReplaceTempView("observations")
+    # The same public path must work when newSession is unavailable, as on Serverless.
+    monkeypatch.setattr(store.spark, "newSession", lambda: pytest.fail("newSession called"))
+    sql = ("SELECT observations.item, '{literal}' AS label FROM observations "
+           "WHERE item = (SELECT max(item) FROM observations)")
+    try:
+        before = {t.name for t in store.spark.catalog.listTables() if t.isTemporary}
+        first = read_sources(store.spark, queries={"primary": sql}, tables={"observations": table})
+        store.spark.sql(f"UPDATE {table} SET item = item + 10")
+        second = read_sources(store.spark, queries={"primary": sql}, tables={"observations": table})
+        assert first["primary"][0].collect()[0].asDict() == {"item": 2, "label": "{literal}"}
+        assert second["primary"][0].collect()[0].item == 12
+        assert store.spark.table("observations").first().item == 999
+        assert {t.name for t in store.spark.catalog.listTables() if t.isTemporary} == before
+        assert first["primary"][1]["sql"] == sql
+        assert first["primary"][1]["tables"]["observations"]["version"] == 0
+        assert second["primary"][1]["tables"]["observations"]["version"] == 1
+    finally:
+        store.spark.catalog.dropTempView("observations")
+
+
+@pytest.mark.parametrize("table", ["catalog.${source_table}", "${hiveconf:catalog}.input"])
+def test_managed_table_variables_fail_before_runtime_access(table):
+    from autoforecast.integrations.delta import read_sources
+
+    with pytest.raises(ValueError, match="variable substitution"):
+        read_sources(None, queries={"primary": "SELECT * FROM observations"},
+                     tables={"observations": table})
+
+
+def test_managed_select_syntax_keeps_pinned_rows(store):
+    from autoforecast.integrations.delta import read_sources
+
+    table = store.namespace + ".syntax_input"
+    store.spark.createDataFrame([(1,), (2,)], "item int").write.format("delta").saveAsTable(table)
+    queries = {
+        "sort": "SELECT item FROM observations SORT BY item",
+        "distribute": "SELECT item FROM observations DISTRIBUTE BY item",
+        "cluster": "SELECT item FROM observations CLUSTER BY item",
+        "distribute_sort": "SELECT item FROM observations DISTRIBUTE BY item SORT BY item",
+        "grouped_join": "SELECT a.item FROM (observations a JOIN observations b ON a.item=b.item)",
+        "grouped_cross_join": ("SELECT a.item FROM (observations a CROSS JOIN observations b) "
+                               "GROUP BY a.item"),
+        "grouped_alias": "SELECT q.item FROM (observations a JOIN observations b USING (item)) q",
+        "line_comment": "SELECT item FROM observations; -- end",
+        "block_comment": "SELECT item FROM observations; /* end */",
+        "array_transform": ("SELECT item FROM observations "
+                            "WHERE size(transform(array(item), x -> x + 1)) = 1"),
+    }
+    for name, (frame, provenance) in read_sources(
+        store.spark, queries=queries, tables={"observations": table},
+    ).items():
+        assert sorted(row.item for row in frame.collect()) == [1, 2], name
+        assert provenance["sql"] == queries[name]
+        assert provenance["tables"]["observations"]["version"] == 0

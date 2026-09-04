@@ -11,12 +11,14 @@ from __future__ import annotations
 import pathlib
 import tempfile
 from collections.abc import Mapping
-from contextlib import suppress
-from typing import Any, cast
+from contextlib import ExitStack, suppress
 
+from mlops import _volume_files
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError
 
 from autoforecast.benchmark import digest, parquet_content_hash
 from autoforecast.study_results import PUBLICATION_SCHEMAS, _publication
@@ -37,8 +39,9 @@ JSON_OPTIONS = {
 
 def quote_table(name: str) -> str:
     """Quote a multipart identifier; never accept an expression in its place."""
-    if not isinstance(name, str) or not name or any(not part for part in name.split(".")):
-        raise ValueError("table names require nonempty identifier parts")
+    if (not isinstance(name, str) or not name or "${" in name
+            or any(not part for part in name.split("."))):
+        raise ValueError("table names require nonempty parts without variable substitution")
     return ".".join("`" + part.replace("`", "``") + "`" for part in name.split("."))
 
 
@@ -55,7 +58,8 @@ def validate_source_queries(spark: SparkSession, *, queries: Mapping[str, str],
 
     SQL is a caller-owned SELECT over the declared aliases. Commands, external
     relations and unrecognised logical operators are rejected before execution.
-    This uses Spark's parser rather than attempting to sanitize SQL with regexes.
+    SQLGlot checks the Spark SQL syntax without accessing a JVM or Spark session.
+    Returns query templates that bind only the declared, version-pinned frames.
     """
     if not tables or any(not key.isidentifier() for key in tables):
         raise ValueError("source tables require simple nonempty SQL aliases")
@@ -67,56 +71,96 @@ def validate_source_queries(spark: SparkSession, *, queries: Mapping[str, str],
                            or not isinstance(sql, str) or not sql.strip()
                            for name, sql in queries.items())):
         raise ValueError("managed queries require names and nonempty SQL")
-    session = spark.newSession()
-    timezone = spark.conf.get("spark.sql.session.timeZone")
-    if timezone is not None:
-        session.conf.set("spark.sql.session.timeZone", timezone)
-    # Catalyst is a dynamic JVM API, outside PySpark's typed Python surface.
-    operators = {
-        "Project", "Filter", "Join", "SubqueryAlias", "Aggregate", "Sort", "GlobalLimit",
-        "LocalLimit", "Distinct", "Union", "Intersect", "Except", "UnresolvedRelation",
-        "UnresolvedHaving", "Window", "RepartitionByExpression", "Repartition", "OneRowRelation",
+    # Parse locally: Spark Connect does not expose the JVM SQL parser. Validate
+    # every query before looking up source tables or writing study records.
+    bindings = {alias.casefold(): f"af_source_{index}" for index, alias in enumerate(tables)}
+    return {name: _bound_source_sql(sql, bindings) for name, sql in queries.items()}
+
+
+def _bound_source_sql(sql: str, bindings: Mapping[str, str]) -> str:
+    """Check a SELECT and replace only its parsed source names with DataFrame slots.
+
+    Args:
+        sql: Original Spark SQL. Its literals, comments and expressions stay intact.
+        bindings: Case-folded source aliases mapped to Spark SQL keyword arguments.
+
+    Returns:
+        SQL for spark.sql(..., **frames). Rejects writes, undeclared relations and
+        source-version overrides before Spark is called. Braces in caller SQL are
+        escaped so they cannot become Python format fields.
+    """
+    # Spark expands these variables after parsing, even inside quoted text.
+    # Reject them so the executed query cannot gain unverified table references.
+    if "${" in sql:
+        raise ValueError("source SQL does not support variable substitution")
+    try:
+        statements = [statement for statement in parse(sql, read="spark")
+                      if statement is not None and not isinstance(statement, exp.Semicolon)]
+    except ParseError as error:
+        raise ValueError("source SQL is not a supported SELECT") from error
+    queries = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
+    if len(statements) != 1 or not isinstance(statements[0], queries):
+        raise ValueError("source SQL requires one read-only SELECT")
+    tree = statements[0]
+    # Keep the supported query surface explicit. In particular, SELECT INTO and
+    # WITH commands must not reach Spark as apparent read-only queries.
+    allowed = {
+        exp.Select: {"expressions", "from_", "joins", "where", "group", "having",
+                     "order", "limit", "offset", "distinct", "windows",
+                     "sort", "distribute", "cluster"},
+        exp.Union: {"this", "expression", "distinct", "by_name", "order", "limit", "offset"},
+        exp.Intersect: {"this", "expression", "distinct", "order", "limit", "offset"},
+        exp.Except: {"this", "expression", "distinct", "order", "limit", "offset"},
+        exp.Subquery: {"this", "alias", "order", "limit", "offset"},
     }
-    aliases = {key.casefold() for key in tables}
-
-    def items(sequence):
-        iterator = sequence.iterator()
-        while iterator.hasNext():
-            yield iterator.next()
-
-    def inspect_expression(expression):
-        cls = expression.getClass()
-        while cls is not None:
-            if cls.getSimpleName() == "SubqueryExpression":
-                inspect_plan(expression.plan())
-                break
-            cls = cls.getSuperclass()
-        for child in items(expression.children()):
-            inspect_expression(child)
-
-    def inspect_plan(node):
-        name = node.getClass().getSimpleName()
-        if name not in operators:
+    replacements = []
+    for node in tree.walk():
+        if isinstance(node, exp.DDL | exp.DML | exp.Command | exp.Into | exp.With
+                      | exp.Lateral | exp.QueryTransform):
             raise ValueError("source SQL contains an unsupported or writable operator")
-        if name == "UnresolvedRelation":
-            parts = list(items(node.multipartIdentifier()))
-            if len(parts) != 1 or parts[0].casefold() not in aliases:
-                raise ValueError("source SQL may read only declared pinned aliases")
-        for expression in items(node.expressions()):
-            inspect_expression(expression)
-        for child in items(node.children()):
-            inspect_plan(child)
-
-    for sql in queries.values():
-        plan = cast(Any, session._jsparkSession).sessionState().sqlParser().parsePlan(sql)
-        inspect_plan(plan)
-    return session
+        if isinstance(node, exp.Query):
+            if type(node) not in allowed or any(
+                value and key not in allowed[type(node)] | {"sort", "distribute", "cluster"}
+                for key, value in node.args.items()
+            ):
+                raise ValueError("source SQL contains an unsupported or writable operator")
+        if isinstance(node, exp.From | exp.Join) and not isinstance(
+            node.this, exp.Table | exp.Subquery
+        ):
+            raise ValueError("source SQL may read only declared pinned aliases")
+        # A table alias must be a name. Parameter aliases can hide @v0 time travel.
+        if isinstance(node, exp.TableAlias) and not isinstance(node.this, exp.Identifier):
+            raise ValueError("source SQL requires literal table aliases")
+        if not isinstance(node, exp.Table):
+            continue
+        if (not isinstance(node.this, exp.Identifier) or node.name.casefold() not in bindings
+                or any(value and key not in {"this", "alias", "joins"}
+                       for key, value in node.args.items())):
+            raise ValueError("source SQL may read only declared pinned aliases")
+        # Token spans let us retain the original Spark expression syntax rather
+        # than regenerate it in a second SQL dialect.
+        start, end = node.this.meta.get("start"), node.this.meta.get("end")
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end < len(sql):
+            raise ValueError("source SQL has an unsupported relation token")
+        replacement = "{" + bindings[node.name.casefold()] + "}"
+        if not node.alias:
+            replacement += " AS " + quote_table(node.name)
+        replacements.append((start, end + 1, replacement))
+    parts = []
+    cursor = 0
+    for start, end, replacement in sorted(replacements):
+        if start < cursor:
+            raise ValueError("source SQL has overlapping relation tokens")
+        parts.extend((sql[cursor:start].replace("{", "{{").replace("}", "}}"), replacement))
+        cursor = end
+    parts.append(sql[cursor:].replace("{", "{{").replace("}", "}}"))
+    return "".join(parts)
 
 
 def read_sources(spark: SparkSession, *, queries: Mapping[str, str],
                  tables: Mapping[str, str]):
     """Execute declared queries against one version per physical Delta table."""
-    session = validate_source_queries(spark, queries=queries, tables=tables)
+    bound_queries = validate_source_queries(spark, queries=queries, tables=tables)
     physical = {}
     resolved = {}
     locations = {}
@@ -135,12 +179,15 @@ def read_sources(spark: SparkSession, *, queries: Mapping[str, str],
                             "read_target": target}
     versions = {alias: {"table": table, "version": resolved[table]}
                 for alias, table in tables.items()}
-    for alias, source in versions.items():
-        session.read.option("versionAsOf", source["version"]).table(
+    # Pass pinned DataFrames through Spark's public SQL API. Spark Connect carries
+    # their plans with the query; no caller-owned temporary view is overwritten.
+    frames = {
+        f"af_source_{index}": spark.read.option("versionAsOf", source["version"]).table(
             quote_table(locations[source["table"]]["read_target"]),
-        ).createOrReplaceTempView(alias)
-    return {name: (session.sql(sql), {"sql": sql, "tables": versions,
-                                    "resolved_tables": locations})
+        ) for index, source in enumerate(versions.values())
+    }
+    return {name: (spark.sql(bound_queries[name], **frames),
+                   {"sql": sql, "tables": versions, "resolved_tables": locations})
             for name, sql in queries.items()}
 
 
@@ -220,19 +267,23 @@ class DeltaStudyStore:
             raise ValueError("study table roles must have distinct names")
 
     def prepare(self, *, lock_path: pathlib.Path) -> None:
-        """Serialize initial DDL with the registry's shared POSIX file lock.
+        """Serialize initial DDL with the registry's shared lock.
 
-        Delta row appends are concurrent; first-time metastore/table creation is
-        not. Every provisioner of these destinations must use the same lock file.
-        The existing file-lock primitive never steals a live writer's lock, and
-        the OS releases it on process exit. This is not an object-store lock.
+        Delta row appends are concurrent; first-time table creation is not.
+        Every provisioner must use the same lock path. Local locks are released
+        by the OS on exit. Volume locks use native create-if-absent writes and
+        require explicit recovery if a writer stops before releasing its lock.
         """
         import fcntl
 
         from autoforecast.campaign import _open_lock
 
-        with _open_lock(lock_path) as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        with ExitStack() as stack:
+            if _volume_files.is_volume(lock_path):
+                stack.enter_context(_volume_files.exclusive_lock(lock_path))
+            else:
+                lock = stack.enter_context(_open_lock(lock_path))
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {quote_table(self.namespace)}")
             for kind, schema in SCHEMAS.items():
                 command = (
