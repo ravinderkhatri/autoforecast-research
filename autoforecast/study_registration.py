@@ -17,6 +17,7 @@ import pathlib
 import tempfile
 import uuid
 from contextlib import suppress
+from typing import Any
 
 from mlops._safe_files import SafeFileError, publish_bytes, read_regular_bytes
 from pyspark.sql import SparkSession
@@ -133,15 +134,17 @@ class StudyRegistry:
     publication. Object-store URLs are not filesystem paths.
     """
 
-    def __init__(self, root, *, spark=None, scratch_root=None, namespace=None, tables=None,
+    def __init__(self, root, *, spark: SparkSession | None = None, scratch_root=None,
+                 namespace=None, tables=None,
                  runtime=None):
         for location in (root, scratch_root):
             if location is not None and (not str(location).strip() or "://" in str(location)):
                 raise ValueError("registry/scratch roots require nonempty POSIX filesystem paths")
         self.root = pathlib.Path(root).expanduser().absolute()
-        self.spark = spark if spark is not None else SparkSession.getActiveSession()
-        if self.spark is None:
+        session = spark if spark is not None else SparkSession.getActiveSession()
+        if session is None:
             raise ValueError("provide or activate a Spark session")
+        self.spark: SparkSession = session
         self.scratch_root = pathlib.Path(scratch_root or self.root / "scratch").absolute()
         self.runtime = _runtime(runtime or {})
         self.store = None
@@ -317,6 +320,7 @@ def register_study(config, *, registry=None, spark=None) -> str:
         contract = _load_dataset_contract_bytes(contract_path.read_bytes(), contract_path)
         recipe = value["recipe"]
         source = value["source"]
+        source_record: dict[str, Any]
         if source["kind"] == "delta":
             from autoforecast.integrations.delta import read_source
 
@@ -410,15 +414,17 @@ def register_study(config, *, registry=None, spark=None) -> str:
                     raise ValueError(f"invalid scoring references; findings: {issues_root}")
                 excluded = report.filter(F.col("keys").isNotNull()).select("keys").distinct()
                 exclusions = [r.asDict(recursive=True)["keys"] for r in excluded.collect()]
-                exclusion_findings = [json.loads(row) for row in report.select(
+                exclusion_findings = [json.loads(row["json"]) for row in report.select(
                     "keys", "stage", "origin", "field", "issue_code",
                     F.col("observed_value").cast("string").alias("observed_value"),
-                ).toJSON().collect()]
+                ).select(F.to_json(F.struct("*")).alias("json")).collect()]
                 reference_definition["excluded_references"] = sorted([
-                    json.loads(row) for row in refs.join(
+                    json.loads(row["json"]) for row in refs.join(
                     excluded, "keys", "inner",
                 ).select("keys", "stage", "origin", F.col("weight").cast("string"),
-                         F.col("scale").cast("string")).toJSON().collect()], key=_bytes)
+                         F.col("scale").cast("string")).select(
+                             F.to_json(F.struct("*")).alias("json"),
+                         ).collect()], key=_bytes)
                 refs = refs.join(excluded, "keys", "left_anti")
                 if check_wrmsse_references(refs, origins=origins).limit(1).count():
                     raise ValueError("retained scoring references have no valid positive total")

@@ -64,7 +64,7 @@ def prepare_fit_history(frame: DataFrame, *, panel, origin: str, missing: str) -
         value, count = fresh_internal_names(frame.columns, ("_static_value", "_static_count"))
         labels = frame.groupBy(panel.series_col).agg(
             F.first(feature, ignorenulls=True).alias(value),
-            F.countDistinct(feature).alias(count),
+            F.count_distinct(feature).alias(count),
         )
         if labels.filter(F.col(count) > 1).limit(1).count():
             raise ValueError(f"static feature changes within the fit history: {feature}")

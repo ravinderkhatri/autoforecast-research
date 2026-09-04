@@ -365,8 +365,8 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
     schema = {field.name: field.dataType.simpleString() for field in raw.schema.fields}
     aggregate = frame.agg(
         F.count(F.lit(1)).alias("n_rows"),
-        F.countDistinct(panel.series_col).alias("n_series"),
-        F.countDistinct(time_name).alias("n_dates"),
+        F.count_distinct(panel.series_col).alias("n_series"),
+        F.count_distinct(time_name).alias("n_dates"),
         F.min(time_name).alias("first_date"),
         F.max(time_name).alias("last_date"),
         F.sum(F.col(panel.series_col).isNull().cast("long")).alias("null_series"),
@@ -486,7 +486,7 @@ def inspect_panel(panel: Panel, spark: SparkSession, *, as_of: str) -> CheckRepo
         )
         varying = (
             frame.groupBy(panel.series_col)
-            .agg(F.countDistinct(value_with_missingness).alias(levels_name))
+            .agg(F.count_distinct(value_with_missingness).alias(levels_name))
             .filter(F.col(levels_name) > 1)
             .count()
         )

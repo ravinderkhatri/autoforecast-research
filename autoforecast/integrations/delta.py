@@ -14,6 +14,7 @@ import pathlib
 import tempfile
 from collections.abc import Mapping
 from contextlib import suppress
+from typing import Any, cast
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -69,8 +70,11 @@ def read_source(spark: SparkSession, *, sql: str, tables: Mapping[str, str]):
     if len({key.casefold() for key in tables}) != len(tables):
         raise ValueError("source aliases must be unambiguous")
     session = spark.newSession()
-    session.conf.set("spark.sql.session.timeZone", spark.conf.get("spark.sql.session.timeZone"))
-    plan = session._jsparkSession.sessionState().sqlParser().parsePlan(sql)
+    timezone = spark.conf.get("spark.sql.session.timeZone")
+    if timezone is not None:
+        session.conf.set("spark.sql.session.timeZone", timezone)
+    # Catalyst is a dynamic JVM API, outside PySpark's typed Python surface.
+    plan = cast(Any, session._jsparkSession).sessionState().sqlParser().parsePlan(sql)
     operators = {
         "Project", "Filter", "Join", "SubqueryAlias", "Aggregate", "Sort", "GlobalLimit",
         "LocalLimit", "Distinct", "Union", "Intersect", "Except", "UnresolvedRelation",
@@ -413,6 +417,7 @@ class DeltaStudyStore:
                 ))
             scope = {"study_id": definition["study_id"], "study_sha": study_sha,
                      "run_id": durable.name}
+            assert forecasts is not None  # Both validated stages were collected above.
             self.append_once("forecasts", forecasts, scope=scope)
             # Atomic two-stage discovery: a retry may reuse an orphan forecast append.
             self.append_once("study_results", self.spark.createDataFrame(

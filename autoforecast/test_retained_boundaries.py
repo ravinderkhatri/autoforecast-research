@@ -212,10 +212,22 @@ def test_empty_optional_artifacts_preserve_callback_outcome(
 
 
 @pytest.mark.parametrize("shape", ["symlink", "fifo"])
-def test_optional_artifacts_reject_unsafe_empty_tree(saved, spark, tmp_path, shape):
+def test_optional_artifacts_reject_unsafe_empty_tree(saved, spark, tmp_path, shape, monkeypatch):
     import os
 
     manifest, cfg, _, _ = saved
+    retained_errors = []
+    retain = tuning._retain_callback_artifacts
+
+    def observe_rejection(work, output):
+        try:
+            return retain(work, output)
+        except HPOError as exc:
+            retained_errors.append(exc)
+            assert not (output / "artifacts").exists()
+            raise
+
+    monkeypatch.setattr(tuning, "_retain_callback_artifacts", observe_rejection)
 
     def callback(request):
         artifact = request.output_dir / "artifacts"
@@ -226,11 +238,14 @@ def test_optional_artifacts_reject_unsafe_empty_tree(saved, spark, tmp_path, sha
             os.mkfifo(artifact / "pipe")
         raise RuntimeError("callback failed")
 
-    with open_study(manifest, spark) as study, pytest.raises(HPOError, match="symlinks or special"):
+    with open_study(manifest, spark) as study, pytest.raises(RuntimeError, match="callback failed"):
         study.run_forecast_workflow(
             fit_predict=callback, implementation=implementation(), config=cfg,
             fixed_parameters={}, output_dir=tmp_path / "outputs",
         )
+    # Unsafe artifacts are still rejected; recovery must not mask the model failure.
+    assert len(retained_errors) == 1
+    assert "symlinks or special" in str(retained_errors[0])
 
 
 @pytest.mark.parametrize("present", [False, True])
