@@ -93,6 +93,11 @@ class OutputsMap:
                              "<th>Contains</th></tr>" + "".join(rows) + "</table>")
         return "".join(parts) or "<p>No study data or training results yet.</p>"
 
+    def _repr_mimebundle_(self, include=None, exclude=None) -> dict[str, str]:
+        # The standard notebook protocol: Databricks renders this for display(map) and for
+        # a map left as a cell's last line, where a plain _repr_html_ is not used.
+        return {"text/plain": str(self), "text/html": self._repr_html_()}
+
     def to_dict(self) -> dict[str, Any]:
         return {"facts": [{"section": s, "label": label, "value": value}
                           for s, label, value in self.facts],

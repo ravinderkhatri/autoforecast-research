@@ -76,6 +76,8 @@ def test_map_sections_render_as_text_html_frame_and_dict():
     page = outputs._repr_html_()
     # Locations and descriptions are escaped; only real links become anchors.
     assert "&lt;v1&gt;" in page and '<a href="https://x/y"' in page and page.count("<a ") == 1
+    # Notebooks, including Databricks display(), render the HTML from the mime bundle.
+    assert outputs._repr_mimebundle_() == {"text/plain": text, "text/html": page}
     assert list(outputs.to_frame()["name"]) == ["sales", "Forecasts"]
     assert outputs.to_dict()["facts"] == [{"section": "data", "label": "Study ID", "value": "abc"}]
     assert str(OutputsMap()) == "No study data or training results yet."
