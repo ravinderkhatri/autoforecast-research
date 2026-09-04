@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import errno
 import hashlib
@@ -42,6 +43,14 @@ START_COLUMN = "__af_history_start"
 
 class BenchmarkError(ValueError):
     """The requested population cannot be frozen without changing its meaning."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _VerifiedBenchmark:
+    """Manifest binding established by the writer or an independent winner check."""
+
+    path: pathlib.Path
+    sha256: str
 
 
 def digest(value) -> str:
@@ -581,14 +590,19 @@ def freeze_benchmark(
     admission_identity: dict | None = None,
 ) -> pathlib.Path:
     """Freeze one study from authenticated, operation-owned input snapshots."""
+    return _freeze_verified(
+        contract_path=contract_path, sources=sources, recipe=recipe,
+        output_root=output_root, spark=spark, study_id=study_id,
+        scoring_references=scoring_references, scratch_root=scratch_root,
+        admission_identity=admission_identity,
+    ).path
+
+
+def _freeze_verified(**settings) -> _VerifiedBenchmark:
+    """Keep the writer's original binding for the internal registration handoff."""
     with ExitStack() as inputs:
         try:
-            return _freeze_benchmark(
-                contract_path=contract_path, sources=sources, recipe=recipe,
-                output_root=output_root, spark=spark, study_id=study_id,
-                scoring_references=scoring_references, inputs=inputs, scratch_root=scratch_root,
-                admission_identity=admission_identity,
-            )
+            return _freeze_benchmark(inputs=inputs, **settings)
         except LineageError as error:
             raise BenchmarkError(str(error)) from error
 
@@ -605,7 +619,7 @@ def _freeze_benchmark(
     scoring_references: pathlib.Path | None = None,
     scratch_root: str | pathlib.Path | None = None,
     admission_identity: dict | None = None,
-) -> pathlib.Path:
+) -> _VerifiedBenchmark:
     """Validate source scope, normalize keys, and publish immutable role snapshots and grids.
 
     Population: all distinct source keys observed by the earliest validation origin.
@@ -653,13 +667,16 @@ def _freeze_benchmark(
     panel = contract.panel(sources["selection"])
     validate_study_panel(panel, recipe)
     availability = recipe["feature_availability"]
-    for path in sources.values():
+    for path in dict.fromkeys(sources.values()):
         contract.panel(path).validate()
     all_sources = dict(sources)
     if scoring_references is not None:
         all_sources["scoring_references"] = scoring_references
-    before = {name: directory_digest(path, suffixes=(".parquet",))
-              for name, path in all_sources.items()}
+    physical_sources = {
+        path: directory_digest(path, suffixes=(".parquet",))
+        for path in dict.fromkeys(all_sources.values())
+    }
+    before = {name: physical_sources[path] for name, path in all_sources.items()}
     snapshot_root = pathlib.Path(inputs.enter_context(tempfile.TemporaryDirectory(
         prefix="autoforecast-freeze-", dir=scratch_root,
     )))
@@ -673,9 +690,13 @@ def _freeze_benchmark(
             )
         read_paths[name] = physical_inputs[identity]
     frames = {}
+    normalized_inputs = {}
     key_types = None
     internal = "__af_series_id"
     for name in sources:
+        if read_paths[name] in normalized_inputs:
+            frames[name] = normalized_inputs[read_paths[name]]
+            continue
         frame = grid.read_time_parquet(spark, read_paths[name], panel.time_col)
         try:
             validate_column_names(frame.columns)
@@ -718,6 +739,7 @@ def _freeze_benchmark(
                 .filter(F.col("__af_count") != 1).limit(1).count()):
             raise BenchmarkError("duplicate source observations")
         frames[name] = frame
+        normalized_inputs[read_paths[name]] = frame
     selection = frames["selection"]
     cohort = (
         selection.filter(
@@ -728,8 +750,8 @@ def _freeze_benchmark(
         .distinct()
     )
     all_keys = frames["selection"].select(internal)
-    for name, frame in frames.items():
-        if name == "selection":
+    for path, frame in normalized_inputs.items():
+        if path == read_paths["selection"]:
             continue
         all_keys = all_keys.unionByName(frame.select(internal))
     original_count, final_count = all_keys.distinct().count(), cohort.count()
@@ -880,8 +902,8 @@ def _freeze_benchmark(
 
     def authenticate_sources():
         if read_path_bytes(contract_path) != contract_bytes or any(
-            directory_digest(path, suffixes=(".parquet",)) != before[name]
-            for name, path in all_sources.items()
+            directory_digest(path, suffixes=(".parquet",)) != expected
+            for path, expected in physical_sources.items()
         ):
             raise BenchmarkError("source changed during preparation")
 
@@ -908,9 +930,10 @@ def _freeze_benchmark(
             references.write.parquet(str(scratch / "scoring_references"))
             artifact_roles.append("scoring_references")
         logical_hashes = {}
+        physical_hashes = {}
 
         def content_hash(path, name):
-            logical_hashes[name] = _logical_hash.fingerprint(path, spark=spark)
+            logical_hashes[name], physical_hashes[name] = _logical_hash._capture(path, spark=spark)
             return logical_hashes[name]["sha256"]
 
         grids = {}
@@ -983,7 +1006,7 @@ def _freeze_benchmark(
             }
             coverage[key] = {
                 "path": coverage_path,
-                "sha256": directory_digest(scratch / coverage_path, suffixes=(".parquet",)),
+                "sha256": physical_hashes["coverage/" + key],
             }
         authenticate_sources()
         logical_snapshots = {name: content_hash(scratch / name, name) for name in artifact_roles}
@@ -1014,6 +1037,9 @@ def _freeze_benchmark(
             role_paths=role_paths, metric_definition=_metric_definition(recipe),
             coverage_identities=coverage_identities, counts=counts,
         )
+        for key, item in grids.items():
+            if item["sha256"] != physical_hashes["grids/" + key]:
+                raise BenchmarkError("scoring grid changed while establishing its identity")
         benchmark_id = digest(identity)
         if study_id is not None and study_id != benchmark_id:
             raise BenchmarkError(
@@ -1038,17 +1064,17 @@ def _freeze_benchmark(
                 for name, path in all_sources.items()
             },
             "artifacts": {
-                name: directory_digest(scratch / role_paths[name], suffixes=(".parquet",))
+                name: physical_hashes[role_paths[name]]
                 for name in artifact_roles
             },
             "dataset_sha256": hashlib.sha256(read_path_bytes(scratch / "dataset.yaml")).hexdigest(),
         }
         (scratch / "benchmark.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
-        _publish_frozen_benchmark(scratch, destination, benchmark_id, spark=spark)
+        published_sha = _publish_frozen_benchmark(scratch, destination, benchmark_id, spark=spark)
     finally:
         if scratch.exists():
             shutil.rmtree(scratch)
-    return destination / "benchmark.json"
+    return _VerifiedBenchmark(destination / "benchmark.json", published_sha)
 
 
 def _normalise_reference_frame(raw, key_map, keys):
@@ -1126,17 +1152,21 @@ def _prepare_scoring_references(path, key_map, keys, recipe, spark):
 
 def _publish_frozen_benchmark(
     scratch: pathlib.Path, destination: pathlib.Path, benchmark_id: str, *, spark=None,
-) -> None:
+) -> str:
     """Publish atomically, or authenticate an identical concurrent winner."""
+    original_sha = hashlib.sha256(read_path_bytes(scratch / "benchmark.json")).hexdigest()
     try:
         try:
             scratch.rename(destination)
         except OSError as error:
             if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
                 raise
-            _, winner = verify_benchmark(
-                destination / "benchmark.json", spark=spark, _scratch_root=scratch.parent,
-            )
+            # This digest pins the bytes for independent verification. It does
+            # not authorize reuse of the winner's untrusted logical hashes.
+            winner_path = destination / "benchmark.json"
+            original_sha = hashlib.sha256(read_path_bytes(winner_path)).hexdigest()
+            _, winner = verify_benchmark(winner_path, original_sha, spark=spark,
+                                         _scratch_root=scratch.parent)
             if winner["benchmark_id"] != benchmark_id:
                 raise BenchmarkError(
                     "published destination has a different benchmark identity"
@@ -1144,6 +1174,8 @@ def _publish_frozen_benchmark(
     finally:
         if scratch.exists():
             shutil.rmtree(scratch)
+    read_benchmark_manifest(destination / "benchmark.json", original_sha)
+    return original_sha
 
 
 def _validate_admission_identity(value):

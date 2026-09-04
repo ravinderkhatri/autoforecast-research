@@ -353,7 +353,8 @@ def test_study_interface_rejects_identity_changed_while_loading(frozen, spark, m
         assert path == manifest
         assert expected_sha256 == hashlib.sha256(manifest.read_bytes()).hexdigest()
         return verified_path, {**record, "study_id": "b" * 64}
-    monkeypatch.setattr(study_api, "verify_benchmark", changed)
+    # The final load handoff now authenticates metadata without rescanning rows.
+    monkeypatch.setattr(study_api, "read_benchmark_manifest", changed)
     with pytest.raises(benchmark.BenchmarkError, match="identity changed while loading"):
         load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark)
 
@@ -676,3 +677,134 @@ finally:
         context.stop()
 """, str(tmp_path / "project"), str(fail)], capture_output=True, text=True)
     assert process.returncode == 0, process.stdout + process.stderr
+
+
+@pytest.fixture(scope="module")
+def saved(tmp_path_factory, spark):
+    root = tmp_path_factory.mktemp("coverage-owned")
+    contract, sources, recipe = inputs(root)
+    return benchmark.freeze_benchmark(contract_path=contract, sources=sources, recipe=recipe,
+                                      output_root=root / "frozen", spark=spark)
+
+
+@pytest.mark.parametrize("protected", [False, True])
+def test_load_checks_dataset_once_then_metadata(saved, spark, monkeypatch, protected):
+    calls = []
+    verify = benchmark.verify_benchmark
+    def counted(*args, **kwargs):
+        calls.append(args[0])
+        return verify(*args, **kwargs)
+    monkeypatch.setattr(benchmark, "verify_benchmark", counted)
+    monkeypatch.setattr(study_api, "verify_benchmark", counted)
+    expected = hashlib.sha256(saved.read_bytes()).hexdigest() if protected else None
+    with study_api.load_study(saved.parent.name, registry_root=saved.parent.parent, spark=spark,
+                              _expected_sha256=expected):
+        pass
+    assert len(calls) == 1
+
+
+def test_frame_checks_selected_role_and_reuses_owned_copy(saved, spark, monkeypatch):
+    with study_api.load_study(saved.parent.name, registry_root=saved.parent.parent, spark=spark) as study:
+        monkeypatch.setattr(study_api, "verify_benchmark", lambda *_a, **_k: pytest.fail("rescanned all artifacts"))
+        copies = []
+        snapshot = study_api.snapshot_parquet_directory
+        def counted(*args, **kwargs):
+            copies.append(args[0])
+            return snapshot(*args, **kwargs)
+        monkeypatch.setattr(study_api, "snapshot_parquet_directory", counted)
+        assert study.series_mapping.count() == 2
+        assert study.series_mapping.count() == 2
+        assert len(copies) == 1
+
+
+@pytest.mark.parametrize("change", ["source", "manifest"])
+def test_frame_rechecks_original_bindings_after_reader_callback(saved, spark, monkeypatch, change):
+    from pyspark.sql.readwriter import DataFrameReader
+    with study_api.load_study(saved.parent.name, registry_root=saved.parent.parent, spark=spark) as study:
+        record = json.loads(saved.read_text())
+        part = next(benchmark.artifact_path(saved, record, "source-keys").glob("*.parquet"))
+        target = part if change == "source" else saved
+        payload = target.read_bytes()
+        original = DataFrameReader.parquet
+        calls = []
+        def replaced(reader, *paths, **kwargs):
+            frame = original(reader, *paths, **kwargs)
+            if pathlib.Path(paths[0]).is_relative_to(study._snapshots.name):
+                calls.append(paths[0])
+                target.write_bytes(payload + b" ")
+            return frame
+        monkeypatch.setattr(DataFrameReader, "parquet", replaced)
+        try:
+            with pytest.raises(benchmark.BenchmarkError, match="changed"):
+                _ = study.series_mapping
+            assert calls
+        finally:
+            target.write_bytes(payload)
+
+
+@pytest.mark.parametrize("role", ["selection", "final_training", "validation_score",
+                                  "final_score", "source-keys", "grids", "coverage"])
+@pytest.mark.parametrize("protected", [False, True])
+def test_load_keeps_its_original_manifest_binding(tmp_path, monkeypatch, role, protected):
+    import copy
+
+    from autoforecast.test_logical_hash import _versioned_example
+
+    manifest, original = _versioned_example(tmp_path)
+    original["recipe"]["validation_origins"] = original["recipe"]["validation_origins"][-1:]
+    allowed = {benchmark.boundary(stage, origin, horizon)
+               for stage, origin, horizon in benchmark.study_windows(original["recipe"])}
+    for field in ("grids", "grid_identities", "coverage", "coverage_identities"):
+        original[field] = {key: value for key, value in original[field].items() if key in allowed}
+    original["logical_hashes"] = {
+        key: value for key, value in original["logical_hashes"].items()
+        if key in original["artifacts"] or key.split("/", 1)[-1] in allowed
+    }
+    original["study_id"] = original["benchmark_id"] = benchmark.digest(benchmark._identity(original))
+    manifest.write_text(json.dumps(original))
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    manifest = manifest.parent.rename(registry / original["study_id"]) / "benchmark.json"
+    old_bytes = manifest.read_bytes()
+    key = next(iter(original[role])) if role in {"grids", "coverage"} else None
+    artifact = (manifest.parent / original[role][key]["path"] if key is not None
+                else benchmark.artifact_path(manifest, original, role))
+    part = next(artifact.glob("*.parquet"))
+    before = part.read_bytes()
+    pq.write_table(pq.read_table(part), part, compression="NONE")
+    updated = copy.deepcopy(original)
+    updated_binding = updated[role][key] if key is not None else updated["artifacts"]
+    original_binding = original[role][key] if key is not None else original["artifacts"]
+    physical_key = "sha256" if key is not None else role
+    updated_binding[physical_key] = directory_digest(artifact, suffixes=(".parquet",))
+    assert updated_binding[physical_key] != original_binding[physical_key]
+    replacement = (json.dumps(updated) + "\n").encode()
+    part.write_bytes(before)
+    verify = benchmark.verify_benchmark
+    calls = []
+
+    def swap_at_check(path, *args, **kwargs):
+        if calls:
+            return verify(path, *args, **kwargs)
+        calls.append(True)
+        pq.write_table(pq.read_table(part), part, compression="NONE")
+        manifest.write_bytes(replacement)
+        try:
+            return verify(path, *args, **kwargs)
+        finally:
+            manifest.write_bytes(old_bytes)
+
+    monkeypatch.setattr(benchmark, "verify_benchmark", swap_at_check)
+    monkeypatch.setattr(study_api, "verify_benchmark", swap_at_check)
+    loaded = None
+    try:
+        with pytest.raises(benchmark.BenchmarkError, match="changed"):
+            loaded = study_api.load_study(
+                manifest.parent.name, registry_root=manifest.parent.parent,
+                spark=object(), scratch_root=tmp_path,
+                _expected_sha256=hashlib.sha256(old_bytes).hexdigest() if protected else None,
+            )
+    finally:
+        if loaded is not None:
+            loaded.close()
+    assert calls

@@ -394,7 +394,10 @@ class DeltaStudyStore:
         existing, _ = self.read(kind, scope)
         if existing.limit(1).count():
             if not _same_rows(frame, existing):
-                raise ValueError(f"conflicting immutable {kind} records")
+                raise ValueError(f"conflicting immutable {kind} records" + (
+                    "; use a new registry root and a new registry namespace or new table names"
+                    if kind == "studies" else ""
+                ))
             note("Delta rows reused and verified", table=self.tables[kind], scope=dict(scope))
             return
         transaction = "autoforecast-" + digest({"table": self.tables[kind], "scope": dict(scope)})

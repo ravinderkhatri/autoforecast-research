@@ -14,10 +14,11 @@ import pyarrow.parquet as pq
 import pytest
 import yaml
 
+from autoforecast import _logical_hash as logical
 from autoforecast import benchmark, grid
 from autoforecast.data_admission import load_dataset_contract
 from autoforecast.panel import Forecast
-from autoforecast.test_study import freeze
+from autoforecast.test_study import freeze, inputs
 from autoforecast.test_study import spark as _spark_fixture
 from provenance.lineage import directory_digest
 
@@ -676,3 +677,84 @@ def test_known_future_features_do_not_extend_validation_actuals_into_test(tmp_pa
 
     assert leaked == []
     assert max(row["date"] for row in validation) == dt.date(2024, 1, 7)
+
+
+def test_each_shared_source_is_validated_and_normalized_once(tmp_path, spark, monkeypatch):
+    from pyspark.sql.classic.dataframe import DataFrame
+
+    from autoforecast import grid
+    from autoforecast.panel import Panel
+    contract, sources, recipe = inputs(tmp_path)
+    validations, normalizations, hashes, key_unions = [], [], [], []
+    validate, read = Panel.validate, grid.read_time_parquet
+    digest = benchmark.directory_digest
+    union = DataFrame.unionByName
+    def combined(frame, other, *args, **kwargs):
+        if frame.columns == other.columns == ["__af_series_id"]:
+            key_unions.append(True)
+        return union(frame, other, *args, **kwargs)
+    def hashed(path, *args, **kwargs):
+        if path in sources.values():
+            hashes.append(path)
+        return digest(path, *args, **kwargs)
+    def checked(panel):
+        validations.append(panel.path)
+        return validate(panel)
+    def normalized(*args, **kwargs):
+        if pathlib.Path(args[1]).parent.name.startswith("autoforecast-freeze-"):
+            normalizations.append(args[1])
+        return read(*args, **kwargs)
+    monkeypatch.setattr(Panel, "validate", checked)
+    monkeypatch.setattr(grid, "read_time_parquet", normalized)
+    monkeypatch.setattr(benchmark, "directory_digest", hashed)
+    monkeypatch.setattr(DataFrame, "unionByName", combined)
+    benchmark.freeze_benchmark(contract_path=contract, sources=sources, recipe=recipe,
+                               output_root=tmp_path / "frozen", spark=spark)
+    assert len(validations) == 1
+    assert len(normalizations) == 1
+    assert len(hashes) == 3
+    assert not key_unions
+
+
+def test_grid_capture_keeps_its_original_physical_binding(tmp_path, spark, monkeypatch):
+    contract, sources, recipe = inputs(tmp_path)
+    capture = logical._capture
+    changed = []
+    def replacement(path, **kwargs):
+        if "grids" in path.parts and not changed:
+            part = next(path.glob("*.parquet"))
+            table = pq.read_table(part)
+            pq.write_table(table, part, compression="NONE")
+            changed.append(path)
+        return capture(path, **kwargs)
+    monkeypatch.setattr(logical, "_capture", replacement)
+    with pytest.raises(benchmark.BenchmarkError, match="scoring grid changed"):
+        benchmark.freeze_benchmark(contract_path=contract, sources=sources, recipe=recipe,
+                                   output_root=tmp_path / "frozen", spark=spark)
+    assert changed
+
+
+@pytest.mark.parametrize("kind", ["artifact", "coverage"])
+def test_writer_keeps_captured_physical_hash_instead_of_repinning(tmp_path, spark, monkeypatch, kind):
+    contract, sources, recipe = inputs(tmp_path)
+    capture = logical._capture
+    changed = []
+    def replaced(path, **kwargs):
+        result = capture(path, **kwargs)
+        selected = (path.name == "selection" if kind == "artifact" else "coverage" in path.parts)
+        if selected and not changed:
+            part = next(path.glob("*.parquet"))
+            table = pq.read_table(part)
+            column = "y" if kind == "artifact" else "scored"
+            values = table[column].to_pylist()
+            values[0] = 999.0 if kind == "artifact" else 999
+            table = table.set_column(table.schema.get_field_index(column), table.schema.field(column), pa.array(values, type=table[column].type))
+            pq.write_table(table, part)
+            changed.append(path)
+        return result
+    monkeypatch.setattr(logical, "_capture", replaced)
+    binding = benchmark._freeze_verified(contract_path=contract, sources=sources, recipe=recipe,
+                                         output_root=tmp_path / "frozen", spark=spark)
+    assert changed
+    with pytest.raises(benchmark.BenchmarkError, match="artifact changed|coverage changed"):
+        benchmark.verify_benchmark(binding.path, binding.sha256, _reuse_verified=True)

@@ -594,3 +594,18 @@ def test_explicit_plain_or_off_avoids_old_auto_discovery(tmp_path, monkeypatch, 
     with contextlib.redirect_stdout(current):
         events.configure_logging(progress=mode)
         assert events._console().progress == mode
+
+
+@pytest.mark.parametrize("value", [None, [], [1], True, 1, "invalid"])
+def test_local_audit_reader_rejects_non_object_events(tmp_path, value):
+    path = tmp_path / "events.jsonl"
+    path.write_text(json.dumps({"stage": "first"}) + "\n" + json.dumps(value) + "\n")
+    with pytest.raises(ValueError, match="JSON objects"):
+        events.read_execution_events(path)
+
+
+def test_local_audit_reader_keeps_objects_and_ignores_blank_lines(tmp_path):
+    path = tmp_path / "events.jsonl"
+    expected = [{"stage": "first", "status": "START"}, {"stage": "first", "status": "PASS"}]
+    path.write_text("\n" + "\n\n".join(json.dumps(item) for item in expected) + "\n")
+    assert events.read_execution_events(path) == expected

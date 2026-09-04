@@ -461,7 +461,7 @@ def test_derived_registration_and_explicit_controls_override_environment(spark, 
                        mlflow_experiment=None, tracking_uri=None)
     assert result.study_id != parent_id and result.parent_study_id == parent_id
     child, _ = registry.definition(result.study_id)
-    assert child["snapshot"] == parent["snapshot"]
+    assert child["registry_backend"] == parent["registry_backend"] == "files"
     assert child["parent"] == {"study_id": parent_id, "study_sha256": parent_sha}
     assert child["effective_series"] == 1
     assert result.summary()["retained_series"] == 1
@@ -1316,3 +1316,95 @@ def test_registration_console_summary_preserves_identity_and_cancellation(spark,
         assert "CANCELLED" in stream.getvalue()
     finally:
         logger.handlers, logger.level, logger.propagate = previous
+
+
+@pytest.mark.parametrize('change', [None, 'manifest', 'data'])
+def test_registration_keeps_freezer_binding_through_publication(spark, tmp_path, monkeypatch, change):
+    import hashlib
+
+    from autoforecast import study_registration as registration
+    from autoforecast.benchmark import BenchmarkError, artifact_path
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    freeze = registration.freeze_benchmark
+    verify = registration.verify_benchmark
+    bindings = []
+    handoffs = []
+
+    def captured(**settings):
+        binding = freeze(**settings)
+        assert hashlib.sha256(binding.path.read_bytes()).hexdigest() == binding.sha256
+        bindings.append(binding)
+        if change == 'manifest':
+            binding.path.write_bytes(binding.path.read_bytes() + b' ')
+        elif change == 'data':
+            record = json.loads(binding.path.read_text())
+            target = artifact_path(binding.path, record, 'selection')
+            part = next(target.glob('*.parquet'))
+            part.write_bytes(b'not the captured rows')
+        return binding
+
+    def checked(manifest, expected=None, **options):
+        if bindings and manifest == bindings[-1].path:
+            handoffs.append((expected, options.get('_reuse_verified')))
+        return verify(manifest, expected, **options)
+
+    monkeypatch.setattr(registration, 'freeze_benchmark', captured)
+    monkeypatch.setattr(registration, 'verify_benchmark', checked)
+    if change:
+        with pytest.raises((BenchmarkError, ValueError)):
+            register_study(path, registry=registry)
+        assert not list((registry.root / 'registrations').glob('*.json'))
+    else:
+        study_id = register_study(path, registry=registry)
+        assert study_id == bindings[0].path.parent.name
+    assert handoffs
+    assert all(sha == bindings[0].sha256 and trusted for sha, trusted in handoffs)
+
+
+@pytest.mark.parametrize("schema", ["autoforecast.registration.v1",
+                                   "autoforecast.registration.v2"])
+def test_old_registration_format_is_refused_explicitly(tmp_path, schema):
+    from autoforecast.benchmark import digest
+
+    registry = object.__new__(StudyRegistry)
+    registry.root = tmp_path
+    registry.store = None
+    registrations = tmp_path / "registrations"
+    registrations.mkdir()
+    definition = {"schema": schema, "study_id": "saved"}
+    (registrations / "saved.json").write_text(json.dumps({
+        "definition": definition, "sha256": digest(definition),
+    }))
+    with pytest.raises(ValueError, match="unsupported registration format"):
+        registry.definition("saved")
+
+
+@pytest.mark.parametrize("old,new", [("v1", "v3"), ("v2", "v4")])
+@pytest.mark.parametrize("format", ["json", "yaml"])
+def test_registration_upgrade_names_a_fresh_destination(tmp_path, old, new, format):
+    registry = object.__new__(StudyRegistry)
+    registry.root = tmp_path
+    registry.store = None
+    study_id = "a" * 64
+    legacy = {"schema": "autoforecast.registration." + old, "study_id": study_id}
+    registry._publish_definition(legacy, format=format)
+    new_definition = {**legacy, "schema": "autoforecast.registration." + new,
+                      "registry_backend": "files"}
+    path = tmp_path / "registrations" / (study_id + "." + format)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="new registry root"):
+        registry._publish_definition(new_definition, format=format)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("schema", ["v3", "v4"])
+def test_new_root_accepts_reregistration(tmp_path, schema):
+    registry = object.__new__(StudyRegistry)
+    registry.root = tmp_path / "new-root"
+    registry.store = None
+    study_id = "a" * 64
+    new_definition = {"schema": "autoforecast.registration." + schema,
+                      "study_id": study_id, "registry_backend": "files"}
+    assert registry._publish_definition(new_definition) == study_id

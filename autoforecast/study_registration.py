@@ -58,13 +58,15 @@ from autoforecast.benchmark import (
     _reference_boundaries,
     artifact_path,
     digest,
-    freeze_benchmark,
     read_benchmark_manifest,
     study_source_roles,
     study_windows,
     training_cutoff,
     validate_study_panel,
     verify_benchmark,
+)
+from autoforecast.benchmark import (
+    _freeze_verified as freeze_benchmark,
 )
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.data_observability import report_source_issues
@@ -811,11 +813,14 @@ class StudyRegistry:
         if envelope["sha256"] != digest(definition) or definition["study_id"] != study_id:
             raise ValueError("registered definition identity differs from its baseline")
         if definition["schema"] not in {
-            "autoforecast.registration.v1",
-            "autoforecast.registration.v2",
+            "autoforecast.registration.v3",
+            "autoforecast.registration.v4",
         }:
-            raise ValueError("unsupported registration format")
-        if bool(definition["snapshot"]) != (self.store is not None):
+            raise ValueError(
+                "unsupported registration format; register inputs in a new registry root "
+                "and, for Delta, a new registry namespace or new table names",
+            )
+        if definition.get("registry_backend") != ("delta" if self.store is not None else "files"):
             raise ValueError("registry storage does not match the registered definition")
         if self.store is not None:
             rows, _ = self.store.read("studies", {"study_id": study_id})
@@ -823,20 +828,18 @@ class StudyRegistry:
             expected = (study_id, envelope["sha256"], _bytes(definition).decode())
             if len(rows) != 1 or tuple(rows[0]) != expected:
                 raise ValueError("registered table definition differs from its protected baseline")
-            self.scratch_root.mkdir(parents=True, exist_ok=True)
-            self.store.verify_observations(definition["snapshot"], scratch_root=self.scratch_root)
         manifest = self.root / "benchmarks" / study_id / "benchmark.json"
         _, record = verify_benchmark(manifest, definition["library_sha256"], _reuse_verified=True)
         if record["study_id"] != study_id:
             raise ValueError("registered library study identity differs")
         binding = record.get("admission_identity", {})
         if binding.get("schema") == "autoforecast.supplied-stage-identity.v1":
-            if (definition["schema"] != "autoforecast.registration.v2"
+            if (definition["schema"] != "autoforecast.registration.v4"
                     or definition["source"].get("kind") != "supplied_stages"
                     or "admission_evidence" in definition
                     or binding["sha256"] != digest(definition["source"])):
                 raise ValueError("supplied stage provenance differs from the frozen identity")
-        elif (definition["schema"] == "autoforecast.registration.v2"
+        elif (definition["schema"] == "autoforecast.registration.v4"
               or definition["source"].get("kind") == "supplied_stages"):
             raise ValueError("supplied stage provenance is missing its frozen identity")
         elif "admission_evidence" in definition:
@@ -878,7 +881,10 @@ class StudyRegistry:
             existing = _record_path(baseline, study_id)
             if existing is not None:
                 if _read_saved(existing) != envelope:
-                    raise ValueError("conflicting immutable study registration")
+                    raise ValueError(
+                        "conflicting immutable study registration; use a new registry root "
+                        "and, for Delta, a new registry namespace or new table names",
+                    )
             if self.store is not None:
                 from autoforecast.integrations.delta import SCHEMAS
 
@@ -1616,7 +1622,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             }
         event("admission", "PASS", retained_series=retained, excluded_references=len(exclusions))
         event("freeze", "START")
-        manifest = freeze_benchmark(
+        frozen_binding = freeze_benchmark(
             contract_path=contract_path, sources=dict.fromkeys(
                 sorted(study_source_roles(recipe)),
                 root / "admitted",
@@ -1628,20 +1634,20 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                                  "sha256": digest(admission_identity)}
                                 if admission_identity is not None else None),
         )
-        snapshot = (registry.store.freeze_observations(
-            root / ("admitted" if prepare is not None else "source"),
-            keys=keys, scratch_root=registry.scratch_root,
-        ) if registry.store is not None else None)
-        library_sha = hashlib.sha256(read_path_bytes(manifest)).hexdigest()
-        _, frozen = verify_benchmark(manifest, spark=session, _scratch_root=root)
+        manifest = frozen_binding.path
+        library_sha = frozen_binding.sha256
+        _, frozen = verify_benchmark(manifest, library_sha, _reuse_verified=True,
+                                     spark=session, _scratch_root=root)
         read_benchmark_manifest(manifest, library_sha)
         event("freeze", "PASS", study_id=frozen["study_id"])
         event("publication", "START", study_id=frozen["study_id"])
         definition = {
-            "schema": "autoforecast.registration.v2" if inputs is not None else
-                      "autoforecast.registration.v1", "study_id": manifest.parent.name,
+            "schema": "autoforecast.registration.v4" if inputs is not None else
+                      "autoforecast.registration.v3", "study_id": manifest.parent.name,
             "library_sha256": library_sha,
-            "source": source_record, "snapshot": snapshot, "recipe": frozen["recipe"],
+            "source": source_record,
+            "registry_backend": "delta" if registry.store is not None else "files",
+            "recipe": frozen["recipe"],
             "references": reference_definition,
             "effective_series": retained,
             "admission": {"invalid_references": value.get("invalid_references", "error"),

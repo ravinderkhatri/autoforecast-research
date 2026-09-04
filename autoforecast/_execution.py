@@ -322,6 +322,8 @@ class Execution:
         self.starts = {}
         self.operations = {}
         self.lock = threading.RLock()
+        self.audit_segments = {}
+        self.audit_closed = False
         self.stop = threading.Event()
         self.thread = None
         self.display_id = "autoforecast-" + uuid.uuid4().hex
@@ -330,6 +332,29 @@ class Execution:
         self.result = "RUNNING"
         self.receipt = {}
         self.audit_error = None
+
+    def write_event(self, path, event):
+        """Keep one writer and ordered, retry-stable event bytes for each remote audit."""
+        from mlops import _volume_files
+
+        with self.lock:
+            if self.audit_closed:
+                raise ValueError("execution audit is closed")
+            state = self.audit_segments.setdefault(path, {
+                "owner": uuid.uuid4().hex, "sequence": 0, "previous": None, "pending": None,
+            })
+
+            def acknowledge():
+                sha = _volume_files.publish_audit_segment(
+                    path, state["pending"], owner=state["owner"], sequence=state["sequence"],
+                )
+                state.update(sequence=state["sequence"] + 1, previous=sha, pending=None)
+
+            if state["pending"] is not None:
+                acknowledge()
+            event["audit_segment"] = {key: state[key] for key in ("owner", "sequence", "previous")}
+            state["pending"] = (json.dumps(event, sort_keys=True, allow_nan=False) + "\n").encode()
+            acknowledge()
 
     def observe(self, path, event):
         with self.lock:
@@ -474,6 +499,17 @@ class Execution:
                            if kind else "PASS" if all(v == "PASS" for v in self.states.values())
                            else "RESOLVED" if all(v in {"PASS", "SKIP"}
                                                   for v in self.states.values()) else "INCOMPLETE")
+            state = self.audit_segments.get(self.audit)
+            if state is not None:
+                if state["pending"] is not None:
+                    raise OSError("execution audit has an unacknowledged event")
+                from mlops import _volume_files
+
+                _volume_files.finish_audit(
+                    self.audit, owner=state["owner"], count=state["sequence"],
+                    last=state["previous"], status=self.result,
+                )
+            self.audit_closed = True
             self.refresh(force=True, final=True)
 
 
@@ -503,10 +539,14 @@ def _stage_event(path, stage, status, *, elapsed=None, _recorded=None, **context
                    "elapsed_seconds": elapsed})
     token = _AUDITING.set(True)
     try:
+        from mlops import _volume_files
         from mlops._safe_files import append_audit_bytes
 
-        payload = (json.dumps(event, sort_keys=True, allow_nan=False) + "\n").encode()
-        append_audit_bytes(path, payload)
+        if execution and _volume_files.is_volume(path):
+            execution.write_event(path, event)
+        else:
+            payload = (json.dumps(event, sort_keys=True, allow_nan=False) + "\n").encode()
+            append_audit_bytes(path, payload)
     except BaseException as error:
         # Append may have committed before readback or close failed. Do not invent
         # a second terminal outcome, or claim that the first event was not saved.
@@ -529,6 +569,17 @@ def _stage_event(path, stage, status, *, elapsed=None, _recorded=None, **context
     if execution:
         execution.observe(path, event)
     _emit(event, _LOG_LEVEL.get() if execution else resolve_level())
+
+
+def read_execution_events(path):
+    """Read local JSONL or remote event segments; this does not certify run completion."""
+    from mlops import _volume_files
+    path = pathlib.Path(path)
+    payload = _volume_files.read_audit_bytes(path)
+    events = [json.loads(line) for line in payload.splitlines() if line.strip()]
+    if any(not isinstance(event, dict) for event in events):
+        raise ValueError("audit events must be JSON objects")
+    return events
 
 
 def _parent():

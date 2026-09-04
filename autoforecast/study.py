@@ -24,7 +24,6 @@ from autoforecast.benchmark import (
     _evaluation_contract_from_record,
     artifact_path,
     read_benchmark_manifest,
-    resolve_study,
     training_cutoff,
     verify_benchmark,
 )
@@ -73,12 +72,12 @@ def load_study(
         try:
             pinned = hashlib.sha256(read_path_bytes(candidate)).hexdigest()
         except FileNotFoundError:
-            pass  # resolve_study supplies the existing unknown-ID diagnostic.
+            pass  # Verification below supplies the existing unknown-ID diagnostic.
         except (OSError, ValueError) as error:
             raise BenchmarkError(f"cannot read benchmark manifest: {error}") from error
     try:
         if _expected_sha256 is None:
-            path, _ = resolve_study(registry, study_id)
+            path, _ = verify_benchmark(candidate, pinned)
         else:
             # The registry supplies this digest from its protected registration.
             path, _ = verify_benchmark(
@@ -103,7 +102,9 @@ def load_study(
             "study manifest appeared while loading; retry with its stable identity"
         )
     sha = pinned
-    _, record = verify_benchmark(path, sha, _reuse_verified=True)
+    # The external load above checked the complete dataset. Pin its manifest
+    # across the handoff without scanning every artifact for a second time.
+    _, record = read_benchmark_manifest(path, sha)
     if record["study_id"] != study_id:
         raise BenchmarkError("study identity changed while loading")
     if len(record["recipe"]["validation_origins"]) > 1:
@@ -228,17 +229,20 @@ class Study:
         return self.testing_date_range
 
     def _frame(self, role: str, stage: str | None = None) -> DataFrame:
-        record = self._record(data=True)
+        record = self._record()
+        source = artifact_path(self._path, record, role)
+        expected = record["artifacts"][role]
+        if directory_digest(source, suffixes=(".parquet",)) != expected:
+            raise BenchmarkError(f"benchmark artifact changed: {role}")
         # Keep operation-owned bytes alive for Spark's deferred reads. Never return a
         # dataframe whose plan points at a mutable registry artifact.
         destination = pathlib.Path(self._snapshots.name) / record["role_paths"][role]
-        expected = record["artifacts"][role]
         if destination.exists():
             if directory_digest(destination, suffixes=(".parquet",)) != expected:
                 raise BenchmarkError("study snapshot changed")
         else:
             snapshot_parquet_directory(
-                artifact_path(self._path, record, role), destination,
+                source, destination,
                 expected_sha256=expected, label=role,
             )
         frame = self._spark.read.parquet(str(destination))
@@ -257,7 +261,9 @@ class Study:
             ))
         if directory_digest(destination, suffixes=(".parquet",)) != expected:
             raise BenchmarkError("study snapshot changed")
-        self._record(data=True)
+        if directory_digest(source, suffixes=(".parquet",)) != expected:
+            raise BenchmarkError(f"benchmark artifact changed: {role}")
+        self._record()
         return frame
 
     @property

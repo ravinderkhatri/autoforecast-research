@@ -189,8 +189,24 @@ environment settings keep the precedence listed above.
 
 Registration saves its audit under the registry's `checks/<attempt>/audit.jsonl`.
 A model run returns its audit path in `result.publication["audit_path"]`. These
-files record lifecycle events and decisions. Display refreshes do not add audit
-rows. Detailed SQL, exclusions, coverage and scores stay in their existing
+audits record lifecycle events and decisions. On volumes, the path points to a small
+record describing an adjacent `.events` folder. Events are saved once; a closed audit
+also records its final event count and identity. Use the same reader for both formats:
+
+```python
+from autoforecast import read_execution_events
+
+# Replace this with the audit path printed by registration or returned by a run.
+events = read_execution_events(audit_path)
+# Show each saved step and its outcome.
+for event in events:
+    print(event["stage"], event["status"])
+```
+
+Each line shows a step and its recorded state, such as START or PASS. The reader checks
+remote event order and contents. Reading events alone does not prove a run completed;
+load the saved run through the normal API to check its completion record too.
+Display refreshes do not add audit rows. Detailed SQL, exclusions, coverage and scores stay in their existing
 evidence files; the log points to them. Issue reasons can overlap, so adding
 their counts does not give the number of excluded series.
 
@@ -266,3 +282,9 @@ For a cleanup example, do not delete Monday's study while Tuesday's run still
 reads it. Wait until all readers and writers have stopped, then follow your
 storage-retention rules. A stopped writer may also leave a lock: confirm it has
 stopped before removing that lock. Never remove a lock belonging to an active run.
+
+Registration records now use formats v3 and v4. Older registration records cannot be reused.
+To register the same inputs with this version, choose a new `storage.root`. If you use
+Delta registry tables, choose a new `storage.namespace` or new table names too.
+For example, keep an old registry at `studies-v1` and put new registrations in `studies-v3`.
+Existing registries are left intact; this version does not migrate their records.

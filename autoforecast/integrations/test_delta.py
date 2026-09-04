@@ -637,11 +637,11 @@ def test_tracking_publication_matrix_and_retry(store, tmp_path, monkeypatch, tra
         assert result.parent_study_id == study_id
         parent, _ = registry.definition(study_id)
         child, _ = registry.definition(result.study_id)
-        assert child["snapshot"] == parent["snapshot"]
+        assert child["registry_backend"] == parent["registry_backend"] == "delta"
         assert child["effective_series"] == 1
-        assert store.read("frozen_observations", {
-            "snapshot_id": child["snapshot"]["snapshot_id"],
-        })[0].count() == 17
+        # Registration retains the typed benchmark; the old automatic JSON copy
+        # no longer exists. Explicit export tests above still exercise that API.
+        assert store.spark.table(store.tables["frozen_observations"]).count() == 0
     results, _ = store.read("study_results", {"study_id": study_id})
     forecasts, _ = store.read("forecasts", {"study_id": study_id})
     assert results.count() == (2 if publish else 0)
@@ -1446,3 +1446,24 @@ def test_explicit_delta_stage_registration_retains_version_provenance(store, tmp
     with registry.load_study(study_id) as study:
         assert study.testing_data.count() == 4
         assert study.validation_data is None
+
+
+@pytest.mark.parametrize("old,new", [("v1", "v3"), ("v2", "v4")])
+@pytest.mark.parametrize("new_root", [False, True])
+def test_registration_upgrade_requires_fresh_definition_tables(store, tmp_path, old, new, new_root):
+    from autoforecast.study_registration import StudyRegistry
+
+    first = StudyRegistry(tmp_path / "old-registry", spark=store.spark)
+    first.store = store
+    study_id = "a" * 64
+    legacy = {"schema": "autoforecast.registration." + old, "study_id": study_id}
+    first._publish_definition(legacy)
+    second = StudyRegistry(tmp_path / "new-registry", spark=store.spark) if new_root else first
+    second.store = store
+    current = {"schema": "autoforecast.registration." + new,
+               "study_id": study_id, "registry_backend": "delta"}
+    diagnostic = "new registry namespace"
+    with pytest.raises(ValueError, match=diagnostic):
+        second._publish_definition(current)
+    rows, _ = store.read("studies", {"study_id": study_id})
+    assert rows.count() == 1

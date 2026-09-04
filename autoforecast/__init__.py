@@ -141,6 +141,13 @@ def configure_logging(*, stream=None, progress="auto", interval=10.0):
     return configure(stream=stream, progress=progress, interval=interval)
 
 
+def read_execution_events(path):
+    """Read saved lifecycle events from a local file or remote audit segments."""
+    from autoforecast._execution import read_execution_events as read
+
+    return read(path)
+
+
 __all__ = [
     "validate_study_config",
     "study_config_schema",
@@ -149,6 +156,7 @@ __all__ = [
     "run_study",
     "StudyInfo",
     "configure_logging",
+    "read_execution_events",
     "DeltaTable",
     "StudyRegistry",
     "StudyPreparation",

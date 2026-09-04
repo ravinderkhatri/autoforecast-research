@@ -14,6 +14,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import io
+import json
 import os
 import pathlib
 import tempfile
@@ -176,11 +177,125 @@ def append_bytes(path: pathlib.Path, payload: bytes) -> None:
     cooperating writers hold this lock; previous events remain the same bytes.
     """
     with exclusive_lock(path.with_name(path.name + ".lock")):
+        if directory_exists(path.with_name(path.name + ".events")):
+            raise OSError("segmented audit writes require their owning execution")
         previous = read_bytes(path) if exists(path) else b""
+        try:
+            descriptor = json.loads(previous)
+        except ValueError:
+            descriptor = None
+        if (isinstance(descriptor, dict)
+                and descriptor.get("schema") == "autoforecast.audit-segments.v1"):
+            raise OSError("segmented audit writes require their owning execution")
         expected = previous + payload
         _put(path, expected, overwrite=True)
         if read_bytes(path) != expected:
             raise OSError("volume audit log differs from the recorded events")
+
+
+def _publish_audit_bytes(target, value):
+    try:
+        publish_blocks(target, (value,))
+    except OSError:
+        # Upload may have committed before the response was lost. Existing
+        # bytes count as success only when they are exactly this operation.
+        if read_bytes(target) != value:
+            raise OSError("audit segment conflicts with an existing writer") from None
+
+
+def publish_audit_segment(path, payload, *, owner, sequence):
+    """Save an immutable event; an uncertain acknowledgement retries identical bytes.
+
+    The caller serializes its own sequence. The immutable descriptor refuses a
+    second writer, including another process, instead of coordinating by FUSE.
+    """
+    if sequence == 0:
+        descriptor = json.dumps({"schema": "autoforecast.audit-segments.v1", "owner": owner},
+                                sort_keys=True).encode()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Both formats claim the same first-writer lock. A legacy read/replace
+        # cannot pass its absence check and then overwrite this descriptor.
+        with exclusive_lock(path.with_name(path.name + ".lock")):
+            _publish_audit_bytes(path, descriptor)
+    directory = path.with_name(path.name + ".events")
+    directory.mkdir(parents=True, exist_ok=True)
+    sha = hashlib.sha256(payload).hexdigest()
+    _publish_audit_bytes(directory / f"{sequence:012d}-{sha}.json", payload)
+    return sha
+
+
+def finish_audit(path, *, owner, count, last, status):
+    """Close the owning execution's audit after all event acknowledgements succeed."""
+    value = json.dumps({"owner": owner, "count": count, "last": last, "status": status},
+                       sort_keys=True).encode()
+    _publish_audit_bytes(path.with_name(path.name + ".events") / "closed.json", value)
+
+
+def read_audit_bytes(path):
+    """Read JSONL or an immutable segmented audit, checking sequence and hash links.
+
+    Events alone do not establish successful completion. A completed run must
+    also pass its normal completion/manifest checks.
+    """
+    from mlops._safe_files import read_path_bytes, snapshot_tree_types
+
+    payload = read_path_bytes(path)
+    directory = path.with_name(path.name + ".events")
+    has_segments = directory_exists(directory) if is_volume(directory) else directory.exists()
+    try:
+        descriptor = json.loads(payload)
+    except ValueError as error:
+        if has_segments:
+            raise ValueError("invalid audit descriptor") from error
+        return payload
+    if (not isinstance(descriptor, dict)
+            or descriptor.get("schema") != "autoforecast.audit-segments.v1"):
+        if has_segments:
+            raise ValueError("invalid audit descriptor")
+        return payload
+    if set(descriptor) != {"schema", "owner"} or not isinstance(descriptor["owner"], str):
+        raise ValueError("invalid audit descriptor")
+    directory = path.with_name(path.name + ".events")
+    if is_volume(directory):
+        _, entries = _inventory(directory)
+    else:
+        entries = {
+            str(member.relative_to(directory)): (kind == "directory", None, None)
+            for member, kind in snapshot_tree_types(directory).items()
+        }
+    previous = None
+    result = []
+    closed = entries.pop("closed.json", None)
+    for sequence, (relative, metadata) in enumerate(sorted(entries.items())):
+        is_directory, _size, _modified = metadata
+        if is_directory or pathlib.Path(relative).name != relative:
+            raise ValueError("invalid audit segment path")
+        event_bytes = read_path_bytes(directory / relative)
+        sha = hashlib.sha256(event_bytes).hexdigest()
+        if relative != f"{sequence:012d}-{sha}.json":
+            raise ValueError("audit segment is missing, duplicated or changed")
+        event = json.loads(event_bytes)
+        if not isinstance(event, dict) or event.get("audit_segment") != {
+            "owner": descriptor["owner"], "sequence": sequence, "previous": previous,
+        }:
+            raise ValueError("audit event belongs to a different sequence or writer")
+        result.append(event_bytes)
+        previous = sha
+    if closed is not None:
+        terminal = json.loads(read_path_bytes(directory / "closed.json"))
+        if (closed[0] or not isinstance(terminal, dict)
+                or set(terminal) != {"owner", "count", "last", "status"}
+                or terminal["owner"] != descriptor["owner"]
+                or type(terminal["count"]) is not int or terminal["count"] != len(result)
+                or terminal["last"] != previous
+                or not isinstance(terminal["status"], str)
+                or terminal["status"] not in {
+                    "PASS", "RESOLVED", "FAIL", "CANCELLED", "INCOMPLETE",
+                }):
+            raise ValueError("audit closure differs from the recorded sequence")
+    if read_path_bytes(path) != payload:
+        raise ValueError("audit descriptor changed while reading")
+    return b"".join(result)
 
 
 def _inventory(path: pathlib.Path):

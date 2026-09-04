@@ -29,6 +29,10 @@ ALGORITHM = "autoforecast.bucket-sha256.v1"
 ENCODING = "typed-ascii.v1"
 BUCKETS = 256
 _BUCKET_DOMAIN = b"autoforecast.bucket-sha256.v1/bucket\x00"
+# Evidence tables are often a few rows. Decode them without scheduling a Spark
+# job, but bound rows and a conservative encoded-value expansion estimate.
+_LOCAL_MAX_ROWS = 4096
+_LOCAL_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _json(value):
@@ -509,6 +513,8 @@ def _capture(path, *, spark=None):
         if not files:
             raise ValueError("logical hashing requires a Parquet schema")
         schema, rows, foreign_int96 = None, 0, False
+        decoded_bytes = 0
+        column_values = 0
         for file in files:
             if (
                 any("=" in part for part in file.relative_to(local).parts[:-1])
@@ -522,6 +528,15 @@ def _capture(path, *, spark=None):
                     raise ValueError("Parquet files have conflicting logical schemas")
                 schema = current
                 rows += footer.metadata.num_rows
+                decoded_bytes += sum(
+                    footer.metadata.row_group(i).total_byte_size
+                    for i in range(footer.metadata.num_row_groups)
+                )
+                column_values += max((
+                    footer.metadata.row_group(i).column(j).num_values
+                    for i in range(footer.metadata.num_row_groups)
+                    for j in range(footer.metadata.row_group(i).num_columns)
+                ), default=0)
                 foreign_int96 |= (
                     not (footer.metadata.created_by or "").startswith("parquet-mr")
                     and any(footer.schema.column(i).physical_type == "INT96"
@@ -531,7 +546,12 @@ def _capture(path, *, spark=None):
         fallback = foreign_int96 and spark is not None and (
             spark.conf.get("spark.sql.parquet.int96TimestampConversion", "false").lower() == "true"
         )
-        if fallback:
+        # Dictionary and repetition encoding can expand far beyond file size.
+        # Multiply by values, not only top-level rows, to keep that case on Spark.
+        expanded_bytes = decoded_bytes * max(1, rows, column_values)
+        small = (rows <= _LOCAL_MAX_ROWS and expanded_bytes <= _LOCAL_MAX_BYTES
+                 and sum(file.stat().st_size for file in files) <= _LOCAL_MAX_BYTES)
+        if fallback or small:
             # Spark applies this session-only conversion to foreign INT96 writers.
             # Decode the authenticated bytes instead of changing the caller's session.
             spark = None
@@ -545,12 +565,12 @@ def _capture(path, *, spark=None):
             bytes=sum(file.stat().st_size for file in files),
             rows=rows,
             **({"reason": "foreign INT96 requires decoding without session timezone conversion"}
-               if fallback else {}),
+               if fallback else {"reason": "small capture fits local hashing limits"}
+               if small else {}),
         ):
             if spark is None:
                 result = _offline(local, schema, rows)
             else:
-                from pyspark.sql import functions as F
 
                 frame = (
                     spark.read.schema(_spark_type({"struct": schema}))
@@ -558,32 +578,42 @@ def _capture(path, *, spark=None):
                     .option("int96RebaseMode", "CORRECTED")
                     .parquet(str(path))
                 )
-                expressions = [
-                    _expression(F.col("`" + n.replace("`", "``") + "`"), t) for n, t in schema
-                ]
-                payload = F.concat(*expressions) if expressions else F.lit("")
-                hashes = frame.select(F.sha2(payload, 256).alias("hex"))
-                hashes = (
-                    hashes.select(
-                        F.conv(F.substring("hex", 1, 2), 16, 10).cast("int").alias("bucket"),
-                        F.unhex("hex").alias("digest"),
-                    )
-                    .repartition("bucket")
-                    .sortWithinPartitions("bucket", "digest")
-                )
-                with operation(
-                    "Sort and combine bucket digests", engine="spark", algorithm=ALGORITHM
-                ):
-                    summaries = hashes.mapInArrow(
-                        _bucket_summaries, "bucket int, rows long, sha256 string"
-                    )
-                    result = _finish(
-                        schema, [r.asDict() for r in summaries.limit(BUCKETS + 1).collect()], rows
-                    )
+                result = _fingerprint_frame(frame, schema, rows=rows)
             if directory_digest(path, suffixes=(".parquet",)) != before:
                 raise ValueError("captured Parquet files changed during logical hashing")
             progress(completed=rows, total=rows, unit="rows", phase="logical SHA complete")
         return result, before
+
+
+def fingerprint_frame(frame):
+    """Hash rows from a pinned, retained native capture without a Parquet export.
+
+    The adapter must keep the same captured read alive through hashing and use.
+    This function does not turn a mutable query or an evictable cache into a
+    snapshot. Its canonical format is identical to the Parquet implementations.
+    """
+    from pyspark.sql.pandas.types import to_arrow_schema
+
+    schema = _schema(to_arrow_schema(frame.schema, timezone="UTC"))
+    return _fingerprint_frame(frame, schema)
+
+
+def _fingerprint_frame(frame, schema, *, rows=None):
+    from pyspark.sql import functions as F
+
+    expressions = [_expression(F.col("`" + n.replace("`", "``") + "`"), t)
+                   for n, t in schema]
+    payload = F.concat(*expressions) if expressions else F.lit("")
+    hashes = frame.select(F.sha2(payload, 256).alias("hex"))
+    hashes = (hashes.select(
+        F.conv(F.substring("hex", 1, 2), 16, 10).cast("int").alias("bucket"),
+        F.unhex("hex").alias("digest"),
+    ).repartition("bucket").sortWithinPartitions("bucket", "digest"))
+    with operation("Sort and combine bucket digests", engine="spark", algorithm=ALGORITHM):
+        summaries = hashes.mapInArrow(_bucket_summaries, "bucket int, rows long, sha256 string")
+        collected = [row.asDict() for row in summaries.limit(BUCKETS + 1).collect()]
+        return _finish(schema, collected,
+                       rows if rows is not None else sum(item["rows"] for item in collected))
 
 
 def verify_files(

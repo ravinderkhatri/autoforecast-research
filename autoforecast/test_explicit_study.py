@@ -672,9 +672,9 @@ def _assert_forged_admission_rejected(study_id, result, registry, tmp_path):
         "physical_sha256": hashlib.sha256(raw).hexdigest(),
     }
     try:
-        for schema, kind in (("autoforecast.registration.v2", "supplied_stages"),
-                             ("autoforecast.registration.v1", "supplied_stages"),
-                             ("autoforecast.registration.v1", "parquet")):
+        for schema, kind in (("autoforecast.registration.v4", "supplied_stages"),
+                             ("autoforecast.registration.v3", "supplied_stages"),
+                             ("autoforecast.registration.v3", "parquet")):
             altered["definition"]["schema"] = schema
             altered["definition"]["source"]["kind"] = kind
             altered["sha256"] = digest(altered["definition"])

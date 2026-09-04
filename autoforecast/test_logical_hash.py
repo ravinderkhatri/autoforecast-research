@@ -15,6 +15,13 @@ from autoforecast import _logical_hash as logical
 from provenance.lineage import directory_digest
 
 
+@pytest.fixture(autouse=True)
+def distributed_parity_cases(monkeypatch):
+    # These fixtures deliberately use tiny data to exercise the distributed
+    # implementation. The local-selection cases below set their own limits.
+    monkeypatch.setattr(logical, "_LOCAL_MAX_ROWS", -1)
+
+
 @pytest.fixture(scope="module")
 def spark():
     session = (
@@ -956,6 +963,8 @@ def test_concurrent_winner_rejects_cached_rebound_rows(tmp_path, spark):
         path.write_text(json.dumps(record))
         losing_capture = tmp_path / "losing-capture"
         losing_capture.mkdir()
+        # A publisher now carries its original manifest bytes as the handoff.
+        (losing_capture / "benchmark.json").write_text(json.dumps(record))
         with pytest.raises(benchmark.BenchmarkError, match="logical identity changed"):
             benchmark._publish_frozen_benchmark(
                 losing_capture, path.parent, record["study_id"], spark=spark,
@@ -1217,3 +1226,91 @@ def test_int96_conversion_uses_safe_backend_without_changing_session(
     ) == expected["sha256"]
     assert not list(tmp_path.glob("af-verify-hash-*"))
     assert {name: session.conf.get(name) for name in settings} == settings
+
+
+@pytest.mark.parametrize('rows,byte_limit,local', [(4, 100000, True), (5, 100000, False),
+                                                 (4, 1, False)])
+def test_small_capture_engine_selection_preserves_identity(
+    tmp_path, spark, monkeypatch, rows, byte_limit, local,
+):
+    target = tmp_path / 'input.parquet'
+    pq.write_table(pa.table({'x': [None, -1, 0, 1, 2][:rows]}), target)
+    expected = logical.fingerprint(target)
+    monkeypatch.setattr(logical, '_LOCAL_MAX_ROWS', 4)
+    monkeypatch.setattr(logical, '_LOCAL_MAX_BYTES', byte_limit)
+    offline = logical._offline
+    calls = []
+
+    def recorded(*args):
+        calls.append(True)
+        return offline(*args)
+
+    monkeypatch.setattr(logical, '_offline', recorded)
+    assert logical.fingerprint(target, spark=spark) == expected
+    assert bool(calls) is local
+
+
+def test_small_capture_does_not_launch_spark_and_checks_every_schema(tmp_path, monkeypatch):
+    class NoJobs:
+        @property
+        def read(self):
+            raise AssertionError('small evidence must not launch Spark work')
+
+    monkeypatch.setattr(logical, '_LOCAL_MAX_ROWS', 4096)
+    pq.write_table(pa.table({'x': pa.array([], type=pa.int64())}), tmp_path / 'empty.parquet')
+    pq.write_table(pa.table({'x': [1, -1, None]}), tmp_path / 'rows.parquet')
+    expected = logical.fingerprint(tmp_path)
+    assert logical.fingerprint(tmp_path, spark=NoJobs()) == expected
+    pq.write_table(pa.table({'x': ['different']}), tmp_path / 'conflict.parquet')
+    with pytest.raises(ValueError, match='conflicting logical schemas'):
+        logical.fingerprint(tmp_path, spark=NoJobs())
+
+
+@pytest.mark.parametrize('empty', [False, True])
+def test_native_frame_identity_matches_file_and_offline(tmp_path, spark, empty):
+    path = tmp_path / 'native'
+    frame = spark.createDataFrame(
+        [(1, -0.0, Decimal('1.20')), (1, -0.0, Decimal('1.20')), (None, None, None)],
+        'item long, value double, price decimal(10,2)',
+    )
+    if empty:
+        frame = frame.limit(0)
+    frame.write.parquet(str(path))
+    assert logical.fingerprint_frame(frame) == logical.fingerprint(path)
+    assert logical.fingerprint_frame(frame) == logical.fingerprint(path, spark=spark)
+
+
+def test_small_hash_limit_accounts_for_dictionary_expansion(tmp_path, spark, monkeypatch):
+    path = tmp_path / 'dictionary.parquet'
+    pq.write_table(pa.table({'x': ['x' * 2048] * 64}), path, use_dictionary=True)
+    expected = logical.fingerprint(path)
+    monkeypatch.setattr(logical, '_LOCAL_MAX_ROWS', 4096)
+    monkeypatch.setattr(logical, '_LOCAL_MAX_BYTES', 10000)
+    monkeypatch.setattr(logical, '_offline', lambda *a: pytest.fail('decoded expansion is too large'))
+    assert logical.fingerprint(path, spark=spark) == expected
+
+
+@pytest.mark.parametrize("kind", ["physical", "repeated"])
+def test_local_limits_are_independent(tmp_path, spark, monkeypatch, kind):
+    path = tmp_path / "input.parquet"
+    if kind == "physical":
+        table = pa.table({"x": [1]}).replace_schema_metadata({b"padding": b"a" * 10000})
+    else:
+        table = pa.table({"x": [["a" * 2048] * 128]})
+    pq.write_table(table, path, use_dictionary=True)
+    with pq.ParquetFile(path) as footer:
+        decoded = sum(footer.metadata.row_group(i).total_byte_size for i in range(footer.metadata.num_row_groups))
+    limit = 10000 if kind == "repeated" else 4096
+    assert decoded < limit
+    assert path.stat().st_size > limit if kind == "physical" else path.stat().st_size < limit
+    monkeypatch.setattr(logical, "_LOCAL_MAX_ROWS", 4096)
+    monkeypatch.setattr(logical, "_LOCAL_MAX_BYTES", limit)
+    offline = logical._offline
+    expected = logical.fingerprint(path)
+    calls = []
+    def local(*args):
+        calls.append(True)
+        return offline(*args)
+    monkeypatch.setattr(logical, "_offline", local)
+    assert logical.fingerprint(path, spark=spark) == expected
+    assert not calls

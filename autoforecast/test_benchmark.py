@@ -583,3 +583,19 @@ def test_logical_metadata_rejects_decimal_aliases_and_overflow(tmp_path, paramet
     path.write_text(json.dumps(record))
     with pytest.raises(benchmark.BenchmarkError, match="invalid logical hash schema"):
         benchmark.verify_benchmark(path)
+
+
+def test_writer_binding_precedes_rename(tmp_path, monkeypatch):
+    path, record, _ = _frozen_example(tmp_path)
+    scratch, target = tmp_path / "scratch", tmp_path / "published"
+    shutil.copytree(path.parent, scratch)
+    rename = pathlib.Path.rename
+    def changed(source, destination):
+        result = rename(source, destination)
+        if source == scratch:
+            manifest = destination / "benchmark.json"
+            manifest.write_bytes(manifest.read_bytes() + b" ")
+        return result
+    monkeypatch.setattr(pathlib.Path, "rename", changed)
+    with pytest.raises(benchmark.BenchmarkError, match="manifest changed"):
+        benchmark._publish_frozen_benchmark(scratch, target, record["benchmark_id"])

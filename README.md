@@ -76,6 +76,9 @@ Spark and have read/write access to the volume. Other paths keep the local POSIX
 Hash checks read fresh remote bytes into temporary local storage, so allow local disk space
 for the checked artifact. Individual files published through Files API 2.0 are limited to 5 GiB.
 
+Execution logs on volumes save each event separately, so progress does not rewrite the growing log.
+Use `read_execution_events(path)` to read these logs or ordinary local logs.
+
 A stopped process can leave a volume lock behind. A later run stops instead of stealing it.
 Confirm that the owning run has stopped before removing that lock; do not remove an active
 writer's lock. Existing study files and SHA mismatches are never silently replaced.
@@ -107,8 +110,9 @@ Your model can use the supplied training data, dates, parameters and random seed
 Source retention records files; it cannot prove which notebook cells or hidden state were used.
 Keep relevant helper code in the configured source roots and settings in the model profile.
 
-New studies calculate data fingerprints across Spark workers. When a protected study is
-reopened, AutoForecast checks its frozen files and reuses the verified fingerprint. Changing
+New studies use Spark workers to fingerprint large datasets and local hashing for small
+evidence tables. Both produce the same identity. When a protected study is reopened,
+AutoForecast checks its frozen files and reuses the verified fingerprint. Changing
 a frozen file still fails the check. Existing studies keep their original hash format.
 
 ## Install other models

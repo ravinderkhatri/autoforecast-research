@@ -1,6 +1,9 @@
 """Volume publication uses the native no-overwrite contract, never FUSE append."""
 
+import hashlib
 import io
+import json
+import pathlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -8,6 +11,8 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from autoforecast import _execution as events
+from autoforecast import read_execution_events
 from databricks.sdk.errors import AlreadyExists, NotFound
 from pyspark.sql import SparkSession
 
@@ -419,7 +424,6 @@ dataset:
     record = {"recipe": {"validation_origins": ["2024-01-05"]}, "study_id": "a" * 64,
               "dataset_sha256": hashlib.sha256(contract).hexdigest(),
               "role_paths": {"selection": "selection"}, "artifacts": {"selection": "0" * 64}}
-    monkeypatch.setattr(module, "resolve_study", lambda *_, **__: (manifest, record))
 
     def verified(path, sha, **kwargs):
         assert path == manifest and sha == hashlib.sha256(b"current manifest").hexdigest()
@@ -1127,8 +1131,8 @@ def test_volume_progress_reuses_inventory_bytes_and_does_not_recursively_audit(v
                 for count in range(100):
                     update(completed=count, total=100, unit='rows')
                 assert len(client.requests) == start
-            assert len(client.requests) - before == 4  # Two lifecycle appends, each with a lock.
-    rows = [json.loads(line) for line in client.values[str(audit)].splitlines()]
+            assert len(client.requests) - before == 2  # One immutable write per lifecycle event.
+    rows = [json.loads(line) for line in _volume_files.read_audit_bytes(audit).splitlines()]
     assert len(rows) == 6
     assert all(row['status'] in {'START', 'PASS'} for row in rows)
 
@@ -1154,7 +1158,7 @@ def test_download_reports_unequal_file_bytes_and_final_file_count(volume, monkey
                 assert (local / 'small.parquet').read_bytes() == b'a'
     assert snapshots[-1]['completed'] == snapshots[-1]['total'] == 1024 * 1024 + 5
     assert snapshots[-1]['files'] == 2
-    rows = [json.loads(line) for line in client.values[str(audit)].splitlines()]
+    rows = [json.loads(line) for line in _volume_files.read_audit_bytes(audit).splitlines()]
     finished = next(r for r in rows if r['stage'] == 'Download snapshot for integrity checks'
                     and r['status'] == 'PASS')
     assert finished['completed'] == 1024 * 1024 + 5 and finished['files'] == 2
@@ -1215,21 +1219,21 @@ def test_standalone_volume_load_pins_native_manifest_before_full_verification(vo
     assert not path.exists()
     original_sha = hashlib.sha256(client.values[str(path)]).hexdigest()
 
-    def resolved(registry, identity, **kwargs):
-        assert registry == root and identity == study_id
-        client.values[str(path)] = b"replacement after full verification"
-        return path, {}
+    checked = []
 
     def verified(manifest, expected_sha256, **kwargs):
-        assert manifest == path
-        assert expected_sha256 == original_sha
-        assert kwargs["_reuse_verified"]
+        assert manifest == path and expected_sha256 == original_sha
+        assert not kwargs.get("_reuse_verified", False)
+        # A remote replacement during the check cannot change the original binding.
+        client.values[str(path)] = b"replacement during full verification"
+        checked.append(expected_sha256)
+        assert hashlib.sha256(client.values[str(path)]).hexdigest() != expected_sha256
         raise BenchmarkError("benchmark manifest changed")
 
-    monkeypatch.setattr(api, "resolve_study", resolved)
     monkeypatch.setattr(api, "verify_benchmark", verified)
     with pytest.raises(BenchmarkError, match="manifest changed"):
         api.load_study(study_id, registry_root=root, spark=cast(SparkSession, object()))
+    assert checked == [original_sha]
 
 
 @pytest.mark.parametrize("changed", [False, True])
@@ -1355,3 +1359,505 @@ def test_delta_capture_cleans_native_files_and_preserves_primary_failure(
     assert {key: client.values[key] for key in original} == original
     if not cleanup_fails:
         assert client.values == original
+
+
+def test_segmented_audit_never_rewrites_prior_events_and_reopens_locally(volume, monkeypatch):
+    import json
+
+    from autoforecast import read_execution_events
+    from autoforecast._execution import Execution, _stage_event
+
+    root, client = volume
+    audit = root / 'execution.jsonl'
+    monkeypatch.setattr(_volume_files, 'append_bytes', lambda *a: pytest.fail('rewrote audit'))
+    with Execution(audit, []):
+        for index in range(20):
+            _stage_event(audit, 'work', 'INFO', completed=index)
+    assert len(client.requests) == 23  # Initial lock, descriptor, events and closure.
+    assert all(not overwrite for _, overwrite in client.requests)
+    rows = read_execution_events(audit)
+    assert [r['completed'] for r in rows] == list(range(20))
+    assert [r['audit_segment']['sequence'] for r in rows] == list(range(20))
+    assert max(map(len, client.values.values())) < 1024
+    # Copying a completed bundle keeps its event reader usable offline.
+    for name, value in client.values.items():
+        local = Path(name)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(value)
+    monkeypatch.setattr(_volume_files, 'is_volume', lambda p: False)
+    assert read_execution_events(audit) == rows
+    ordinary = root / 'local.jsonl'
+    ordinary.write_text(json.dumps({'status': 'PASS'}) + '\n')
+    assert read_execution_events(ordinary) == [{'status': 'PASS'}]
+
+
+def test_segmented_audit_lost_acknowledgement_reuses_exact_bytes(volume, monkeypatch):
+    from autoforecast import read_execution_events
+    from autoforecast._execution import Execution, _stage_event
+
+    root, client = volume
+    download = client.download
+    failed = []
+
+    def lost_ack(path):
+        if '.events/' in path and not failed:
+            failed.append(path)
+            raise OSError('lost read acknowledgement')
+        return download(path)
+
+    monkeypatch.setattr(client, 'download', lost_ack)
+    audit = root / 'execution.jsonl'
+    with Execution(audit, []):
+        _stage_event(audit, 'work', 'PASS')
+    assert len(read_execution_events(audit)) == 1
+    assert len(client.requests) == 4  # Initial lock, descriptor, event and closure.
+    assert failed
+
+
+def test_segmented_audit_retry_finishes_pending_event_before_next_event(volume, monkeypatch):
+    from autoforecast import read_execution_events
+    from autoforecast._execution import Execution
+
+    root, client = volume
+    audit = root / 'execution.jsonl'
+    write = _volume_files._put
+    blocked = True
+
+    def unavailable(path, contents, *, overwrite):
+        if '.events/' in str(path) and blocked:
+            raise OSError('connection unavailable')
+        return write(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, '_put', unavailable)
+    execution = Execution(audit, [])
+    with pytest.raises(OSError):
+        execution.write_event(audit, {'status': 'START', 'timestamp': 'original'})
+    pending = execution.audit_segments[audit]['pending']
+    blocked = False
+    execution.write_event(audit, {'status': 'FAIL', 'timestamp': 'later'})
+    rows = read_execution_events(audit)
+    assert [r['timestamp'] for r in rows] == ['original', 'later']
+    assert pending in client.values.values()
+    with pytest.raises(OSError, match='conflicts'):
+        Execution(audit, []).write_event(audit, {'status': 'START'})
+    assert len(read_execution_events(audit)) == 2
+
+
+@pytest.mark.parametrize('corruption', ['bytes', 'missing', 'duplicate', 'owner'])
+def test_segmented_audit_rejects_corrupted_sequence(volume, corruption):
+    import json
+
+    from autoforecast import read_execution_events
+    from autoforecast._execution import Execution
+
+    root, client = volume
+    audit = root / 'execution.jsonl'
+    writer = Execution(audit, [])
+    for status in ['START', 'INFO', 'PASS']:
+        writer.write_event(audit, {'status': status})
+    segments = sorted(p for p in client.values if '.events/' in p)
+    if corruption == 'bytes':
+        client.values[segments[1]] += b'changed'
+    elif corruption == 'missing':
+        del client.values[segments[1]]
+    elif corruption == 'duplicate':
+        duplicate = segments[1].replace('000000000001-', '000000000000-')
+        client.values[duplicate] = client.values[segments[1]]
+    else:
+        descriptor = json.loads(client.values[str(audit)])
+        descriptor['owner'] = 'different'
+        client.values[str(audit)] = json.dumps(descriptor).encode()
+    with pytest.raises(ValueError, match='audit'):
+        read_execution_events(audit)
+
+
+def test_closed_audit_detects_lost_tail_and_refuses_more_events(volume):
+    from autoforecast import read_execution_events
+    from autoforecast._execution import Execution
+
+    root, client = volume
+    audit = root / 'events.jsonl'
+    with Execution(audit, []) as writer:
+        writer.write_event(audit, {'status': 'START'})
+        writer.write_event(audit, {'status': 'PASS'})
+    with pytest.raises(ValueError, match='closed'):
+        writer.write_event(audit, {'status': 'INFO'})
+    last = sorted(p for p in client.values if '.events/' in p and not p.endswith('closed.json'))[-1]
+    del client.values[last]
+    with pytest.raises(ValueError, match='closure'):
+        read_execution_events(audit)
+
+
+def test_segmented_audit_serializes_threads_and_rejects_unowned_append(volume):
+    from autoforecast import read_execution_events
+    from autoforecast._execution import Execution
+
+    root, client = volume
+    audit = root / 'events.jsonl'
+    with Execution(audit, []) as writer:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda n: writer.write_event(audit, {'item': n}), range(20)))
+        original = client.values[str(audit)]
+        with pytest.raises(OSError, match='owning execution'):
+            _volume_files.append_bytes(audit, b'not an owned event\n')
+        assert client.values[str(audit)] == original
+    rows = read_execution_events(audit)
+    assert sorted(row['item'] for row in rows) == list(range(20))
+    assert [row['audit_segment']['sequence'] for row in rows] == list(range(20))
+
+
+def audit_bundle(root, client, count=1):
+    audit = root / "events.jsonl"
+    with events.Execution(audit, []) as writer:
+        for n in range(count):
+            writer.write_event(audit, {"item": n})
+    return audit
+
+
+@pytest.mark.parametrize("defect", ["extra", "owner_type"])
+def test_descriptor_shape_is_checked(volume, defect):
+    root, client = volume
+    audit = audit_bundle(root, client, 0)
+    # A zero-event execution creates no descriptor; use a deliberately empty valid bundle.
+    client.values[str(audit)] = json.dumps({"schema": "autoforecast.audit-segments.v1",
+                                          "owner": "expected"}).encode()
+    audit.with_name(audit.name + ".events").mkdir()
+    descriptor = json.loads(client.values[str(audit)])
+    if defect == "extra":
+        descriptor["unexpected"] = True
+    else:
+        descriptor["owner"] = 1
+    client.values[str(audit)] = json.dumps(descriptor).encode()
+    with pytest.raises(ValueError, match="descriptor"):
+        read_execution_events(audit)
+
+
+@pytest.mark.parametrize("field,value", [("previous", "unrelated"), ("sequence", 17)])
+def test_event_links_are_independently_checked(volume, field, value):
+    root, client = volume
+    audit = root / "events.jsonl"
+    events.Execution(audit, []).write_event(audit, {"item": 0})
+    part = next(p for p in client.values if ".events/" in p)
+    event = json.loads(client.values.pop(part))
+    event["audit_segment"][field] = value
+    payload = (json.dumps(event) + "\n").encode()
+    target = str(pathlib.Path(part).with_name(
+        "000000000000-" + hashlib.sha256(payload).hexdigest() + ".json",
+    ))
+    client.values[target] = payload
+    with pytest.raises(ValueError, match="sequence or writer"):
+        read_execution_events(audit)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("owner", "other"), ("count", 9), ("count", True),
+    ("last", "other"), ("status", "SUCCESS"), ("extra", True),
+])
+def test_every_closure_field_is_independently_checked(volume, field, value):
+    root, client = volume
+    audit = audit_bundle(root, client)
+    closed = str(audit.with_name(audit.name + ".events") / "closed.json")
+    terminal = json.loads(client.values[closed])
+    terminal[field] = value
+    client.values[closed] = json.dumps(terminal).encode()
+    with pytest.raises(ValueError, match="closure"):
+        read_execution_events(audit)
+
+
+def test_descriptor_is_rechecked_after_read(volume, monkeypatch):
+    root, client = volume
+    audit = audit_bundle(root, client)
+    read = _volume_files.read_bytes
+    count = 0
+    def changing(path):
+        nonlocal count
+        payload = read(path)
+        if path == audit:
+            count += 1
+            if count == 1:
+                client.values[str(path)] = payload + b" "
+        return payload
+    monkeypatch.setattr(_volume_files, "read_bytes", changing)
+    with pytest.raises(ValueError, match="descriptor changed"):
+        read_execution_events(audit)
+
+
+@pytest.mark.parametrize("outcome", ["FAIL", "CANCELLED", "RESOLVED", "INCOMPLETE", "PASS"])
+def test_closure_status_matches_execution_outcome(volume, outcome):
+    root, client = volume
+    audit = root / "events.jsonl"
+    stages = ["work"]
+    failure = RuntimeError("primary") if outcome == "FAIL" else KeyboardInterrupt()
+    if outcome in {"FAIL", "CANCELLED"}:
+        with pytest.raises(type(failure)) as caught:
+            with events.Execution(audit, stages):
+                with events._stage(audit, "work"):
+                    raise failure
+        assert caught.value is failure
+    else:
+        with events.Execution(audit, stages):
+            status = {"PASS": "PASS", "RESOLVED": "SKIP", "INCOMPLETE": "INFO"}[outcome]
+            events._stage_event(audit, "work", status)
+    closed = str(audit.with_name(audit.name + ".events") / "closed.json")
+    assert json.loads(client.values[closed])["status"] == outcome
+
+
+def test_pending_event_prevents_closure(volume, monkeypatch):
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    def fail_event(path, contents, *, overwrite):
+        if str(path).endswith(".json") and not str(path).endswith("closed.json"):
+            raise OSError("unavailable")
+        return put(path, contents, overwrite=overwrite)
+    monkeypatch.setattr(_volume_files, "_put", fail_event)
+    with pytest.raises(OSError, match="unacknowledged"):
+        with events.Execution(audit, []) as writer:
+            with pytest.raises(OSError):
+                writer.write_event(audit, {"item": 1})
+    assert not any(p.endswith("closed.json") for p in client.values)
+
+
+@pytest.mark.parametrize("after_commit", [False, True])
+def test_closure_failure_is_visible_and_context_restored(volume, monkeypatch, after_commit):
+    root, _ = volume
+    audit = root / "events.jsonl"
+    finish = _volume_files.finish_audit
+    error = OSError("closure unavailable")
+    def unavailable(*args, **kwargs):
+        if after_commit:
+            finish(*args, **kwargs)
+        raise error
+    monkeypatch.setattr(_volume_files, "finish_audit", unavailable)
+    with pytest.raises(OSError) as caught:
+        with events.Execution(audit, []) as writer:
+            writer.write_event(audit, {"item": 1})
+    assert caught.value is error
+    assert events._CURRENT.get() is None
+    assert writer.thread is None or not writer.thread.is_alive()
+
+
+@pytest.mark.parametrize("after_commit", [False, True])
+def test_closure_failure_preserves_primary(volume, monkeypatch, after_commit):
+    root, _ = volume
+    audit = root / "events.jsonl"
+    finish = _volume_files.finish_audit
+    error = RuntimeError("primary")
+    def unavailable(*args, **kwargs):
+        if after_commit:
+            finish(*args, **kwargs)
+        raise OSError("closure unavailable")
+    monkeypatch.setattr(_volume_files, "finish_audit", unavailable)
+    with pytest.raises(RuntimeError) as caught:
+        with events.Execution(audit, []) as writer:
+            writer.write_event(audit, {"item": 1})
+            raise error
+    assert caught.value is error
+    assert events._CURRENT.get() is None
+    assert writer.thread is None or not writer.thread.is_alive()
+
+
+def test_child_segments_remain_sealed_by_normal_bundle_completion(volume):
+    from mlops.run_bundle import load_completed_run_bundle, open_run_bundle
+    root, client = volume
+    bundle = open_run_bundle(root / "bundles", run_id="check", task="verification")
+    child = bundle.path / "events.jsonl"
+    with events.Execution(root / "attempt.jsonl", []):
+        events._stage_event(child, "work", "START")
+        events._stage_event(child, "work", "PASS")
+        bundle.finalize(status="completed", summary={})
+        assert load_completed_run_bundle(bundle.path)["status"] == "completed"
+    assert load_completed_run_bundle(bundle.path)["status"] == "completed"
+    assert len(read_execution_events(child)) == 2
+    last = sorted(p for p in client.values if str(child) + ".events/" in p)[-1]
+    del client.values[last]
+    with pytest.raises(ValueError):
+        load_completed_run_bundle(bundle.path)
+
+
+@pytest.mark.parametrize("member", ["event", "closure"])
+@pytest.mark.parametrize("value", [None, [], 1, "invalid"])
+def test_audit_records_require_json_objects(volume, member, value):
+    root, client = volume
+    audit = audit_bundle(root, client)
+    directory = str(audit) + ".events/"
+    if member == "closure":
+        client.values[directory + "closed.json"] = json.dumps(value).encode()
+    else:
+        part = next(p for p in client.values if p.startswith(directory)
+                    and not p.endswith("closed.json"))
+        del client.values[part]
+        payload = json.dumps(value).encode()
+        name = "000000000000-" + hashlib.sha256(payload).hexdigest() + ".json"
+        client.values[directory + name] = payload
+    with pytest.raises(ValueError, match="sequence or writer|closure"):
+        read_execution_events(audit)
+
+
+@pytest.mark.parametrize("schema", ["missing", "autoforecast.audit-segments.v2", "typo",
+                                    None, True, 0, 1.5, [], {},
+                                    ("invalid-json", b"{broken"),
+                                    ("scalar", b"false"), ("array", b"[]")])
+@pytest.mark.parametrize("operation", ["read", "read_offline", "append"])
+def test_segment_sidecar_refuses_invalid_descriptor(volume, schema, operation, monkeypatch):
+    root, client = volume
+    audit = root / "audit.jsonl"
+    with events.Execution(audit, []) as writer:
+        writer.write_event(audit, {"stage": "work", "status": "PASS"})
+    descriptor = json.loads(client.values[str(audit)])
+    if isinstance(schema, tuple):
+        client.values[str(audit)] = schema[1]
+    else:
+        if schema == "missing":
+            descriptor.pop("schema")
+        else:
+            descriptor["schema"] = schema
+        client.values[str(audit)] = json.dumps(descriptor).encode()
+    if operation == "read_offline":
+        for name, payload in client.values.items():
+            target = type(audit)(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        monkeypatch.setattr(_volume_files, "is_volume", lambda path: False)
+    if operation.startswith("read"):
+        with pytest.raises(ValueError):
+            read_execution_events(audit)
+    else:
+        before = dict(client.values)
+        with pytest.raises(OSError, match="owning execution"):
+            _volume_files.append_bytes(audit, b'\n{"stage":"foreign","status":"PASS"}\n')
+        assert client.values == before
+
+
+@pytest.mark.parametrize("status", [None, True, 1, 1.5, "", "SUCCESS", [], {},
+                                    ["PASS"], {"status": "PASS"}])
+def test_audit_closure_rejects_invalid_status_types(volume, status):
+    root, client = volume
+    audit = root / "audit.jsonl"
+    with events.Execution(audit, []) as writer:
+        writer.write_event(audit, {"stage": "work", "status": "PASS"})
+    closed = str(audit) + ".events/closed.json"
+    terminal = json.loads(client.values[closed])
+    terminal["status"] = status
+    client.values[closed] = json.dumps(terminal).encode()
+    with pytest.raises(ValueError):
+        read_execution_events(audit)
+
+
+def test_audit_formats_share_initial_writer_ownership(volume, monkeypatch):
+    root, client = volume
+    audit = root / "race.jsonl"
+    put = _volume_files._put
+    attempts = []
+    failures = []
+
+    def race_at_overwrite(path, contents, *, overwrite):
+        if path == audit and overwrite and not attempts:
+            attempts.append(True)
+            # A second thread can enter here after the legacy writer checked the
+            # path, while that writer still owns its remote .lock. Execute that
+            # precise interleaving without depending on thread scheduling.
+            try:
+                with events.Execution(audit, []):
+                    events._stage_event(audit, "segment-writer", "PASS")
+            except OSError as error:
+                failures.append(str(error))
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", race_at_overwrite)
+    events._stage_event(audit, "legacy-writer", "PASS")
+    assert attempts
+    assert len(failures) == 1, (
+        "both writers acknowledged success; the legacy overwrite erased the "
+        f"immutable descriptor: {client.values[str(audit)]!r}"
+    )
+    assert [row["stage"] for row in read_execution_events(audit)] == ["legacy-writer"]
+
+
+@pytest.mark.parametrize("operation", ["raw_append", "execution"])
+@pytest.mark.parametrize("sidecar", [False, True])
+@pytest.mark.parametrize("pretty", [False, True])
+@pytest.mark.parametrize("encoding", [
+    "utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
+    "utf-32", "utf-32-le", "utf-32-be",
+])
+@pytest.mark.parametrize("prefix", ["", " \t\r\n"])
+def test_offline_segmented_audit_cannot_be_appended(
+    volume, monkeypatch, operation, sidecar, pretty, encoding, prefix,
+):
+    from mlops import _safe_files
+
+    root, client = volume
+    audit = root / "offline.jsonl"
+    with events.Execution(audit, []):
+        events._stage_event(audit, "original", "PASS")
+    for name, payload in client.values.items():
+        if not sidecar and name != str(audit):
+            continue
+        target = type(audit)(name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    if not sidecar:
+        # The fake mount created this empty directory during the remote write.
+        # A descriptor-only copy also represents interruption before its mkdir.
+        audit.with_name(audit.name + ".events").rmdir()
+    monkeypatch.setattr(_volume_files, "is_volume", lambda path: False)
+    descriptor = json.dumps(json.loads(audit.read_bytes()), indent=2 if pretty else None)
+    audit.write_bytes((prefix + descriptor).encode(encoding))
+    before = audit.read_bytes()
+    write_error = None
+    try:
+        if operation == "raw_append":
+            _safe_files.append_audit_bytes(audit, b'{"stage":"foreign","status":"PASS"}\n')
+        else:
+            with events.Execution(audit, []):
+                events._stage_event(audit, "foreign", "PASS")
+    except OSError as error:
+        write_error = str(error)
+    try:
+        read_execution_events(audit)
+        read_error = None
+    except ValueError as error:
+        read_error = str(error)
+    assert write_error is not None, (
+        f"append acknowledged success, descriptor_changed={audit.read_bytes() != before}, "
+        f"reader={read_error!r}"
+    )
+    assert audit.read_bytes() == before
+    assert [row["stage"] for row in read_execution_events(audit)] == (
+        ["original"] if sidecar else []
+    )
+
+
+def test_local_append_inspects_one_event_in_a_growing_jsonl_log(tmp_path, monkeypatch):
+    import os
+
+    path = tmp_path / "audit.jsonl"
+    first = b'{"stage":"first","status":"START"}\n'
+    history = first + b'{"stage":"later","status":"INFO"}\n' * 100000
+    path.write_bytes(history)
+    open_file, inspected = os.fdopen, []
+
+    class Counted:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def readline(self):
+            value = self.stream.readline()
+            inspected.append(len(value))
+            return value
+
+    monkeypatch.setattr(os, "fdopen", lambda *a, **k: Counted(open_file(*a, **k)))
+    last = b'{"stage":"last","status":"PASS"}\n'
+    _safe_files.append_audit_bytes(path, last)
+    assert inspected == [len(first)]
+    assert path.read_bytes() == history + last

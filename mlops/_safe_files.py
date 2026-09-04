@@ -8,6 +8,7 @@ prevent an external process from replacing a remote directory.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pathlib
 import stat
@@ -388,15 +389,40 @@ def append_audit_bytes(path: pathlib.Path, payload: bytes) -> None:
         return
     parent = _ensure_directory_fd(path.parent)
     try:
-        flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            os.stat(path.name + ".events", dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SafeFileError("segmented audit writes require their owning execution")
+        flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
         try:
             descriptor = os.open(path.name, flags | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=parent)
         except FileExistsError:
             descriptor = os.open(path.name, flags, dir_fd=parent)
-        with os.fdopen(descriptor, "ab") as stream:
+        with os.fdopen(descriptor, "a+b") as stream:
             identity = os.fstat(stream.fileno())
             if not stat.S_ISREG(identity.st_mode) or identity.st_nlink != 1:
                 raise SafeFileError("audit destination must be a regular file with one link")
+            # Use the reader's JSON parser, including its whitespace and encoding
+            # rules. A valid JSONL audit needs only its first event inspected.
+            stream.seek(0)
+            header = stream.readline()
+            while header:
+                try:
+                    first = json.loads(header)
+                except (ValueError, UnicodeError):
+                    line = stream.readline()
+                    if not line:
+                        break
+                    header += line
+                else:
+                    if (isinstance(first, dict)
+                            and first.get("schema") == "autoforecast.audit-segments.v1"):
+                        raise SafeFileError(
+                            "segmented audit writes require their owning execution",
+                        )
+                    break
             stream.write(payload)
     finally:
         os.close(parent)
