@@ -226,6 +226,7 @@ def test_freeze_uses_the_source_bytes_whose_hash_it_records(tmp_path, spark, mon
         return
     finally:
         source.write_bytes(original_bytes)
+    assert schedule == "during_copy", "the source recheck must refuse a lasting change"
     assert injected == 1
     _, record = benchmark.verify_benchmark(study_path)
     selection = pq.read_table(benchmark.artifact_path(study_path, record, "selection")).to_pylist()
