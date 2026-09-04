@@ -167,9 +167,27 @@ def _count(value):
     return f"{value:,}" if type(value) is int else None
 
 
+def _source_records(root, definition):
+    """Return the primary, supplied stage and audit sources saved for a study."""
+    from autoforecast.study_registration import _verify_admission
+
+    source = definition.get("source") or {}
+    queries = {"primary": source}
+    for stage, record in (source.get("stages") or {}).items():
+        if isinstance(record, dict) and isinstance(record.get("source"), dict):
+            queries[stage] = record["source"]
+    admission = None
+    if isinstance(definition.get("admission_evidence"), dict):
+        admission = _verify_admission(root, definition["admission_evidence"],
+                                      inspect_artifacts=False)
+        queries.update({name: value for name, value in admission["identity"]["sources"].items()
+                        if name != "primary" and isinstance(value, dict)})
+    return queries, admission
+
+
 def study_outputs(registry, study_id: str, *, registration: dict | None = None) -> OutputsMap:
     """Describe a registered study's inputs and saved data, from its saved records."""
-    from autoforecast.study_registration import _read_saved, _verify_admission
+    from autoforecast.study_registration import _read_saved
 
     if registration is None:
         registration = _read_saved(registry._registration_path(study_id))
@@ -177,10 +195,7 @@ def study_outputs(registry, study_id: str, *, registration: dict | None = None) 
     host, root = _workspace_host(), pathlib.Path(registry.root)
     spark = getattr(registry, "spark", None)
     source = definition.get("source") or {}
-    admission = None
-    if isinstance(definition.get("admission_evidence"), dict):
-        admission = _verify_admission(root, definition["admission_evidence"],
-                                      inspect_artifacts=False)
+    queries, admission = _source_records(root, definition)
     facts = [("data", "Study ID", study_id)]
     series = [f"{_count(source.get('starting_series'))} found"
               if _count(source.get("starting_series")) else None,
@@ -191,19 +206,15 @@ def study_outputs(registry, study_id: str, *, registration: dict | None = None) 
     if any(series):
         facts.append(("data", "Series", " · ".join(part for part in series if part)))
     items = []
-    queries = {"primary": source}
-    if admission is not None:
-        queries.update({name: value for name, value in admission["identity"]["sources"].items()
-                        if name != "primary" and isinstance(value, dict)})
     seen = set()
     for query, record in queries.items():
         tables = record.get("tables") or {}
         for alias, pin in sorted(tables.items()):
             name = pin.get("table") if isinstance(pin, dict) else None
-            if not name or name in seen:
+            version = pin.get("version") if isinstance(pin, dict) else None
+            if not name or (name, version) in seen:
                 continue
-            seen.add(name)
-            version = pin.get("version")
+            seen.add((name, version))
             items.append(OutputItem(
                 "data", "Read (pinned versions)", alias,
                 f"{name} (version {version})" if version is not None else name,
@@ -221,6 +232,8 @@ def study_outputs(registry, study_id: str, *, registration: dict | None = None) 
         from autoforecast.integrations.delta import DESCRIPTIONS
 
         for kind in ("studies", "study_data_issues"):
+            if kind not in tables:
+                continue
             description = DESCRIPTIONS[kind][0]
             if kind == "studies":
                 description += f"; this study's row has study_id {study_id}"
@@ -287,9 +300,12 @@ def workflow_outputs(result) -> OutputsMap:
             "training", "Parameter search", "Search report", str(search / "report.html"),
             "Trials compared side by side, with the selected one marked",
             _volume_link(host, search)))
+    tuned = result.tuning_path is not None
     items.append(OutputItem(
-        "training", "Parameter search", "Selected settings", str(result.selected_config),
-        "The selected parameters and the search profile they came from",
+        "training", "Parameter search" if tuned else "Model configuration", "Selected settings",
+        str(result.selected_config),
+        "The selected parameters and the search profile they came from" if tuned
+        else "The model parameters and configuration",
         _volume_link(host, result.selected_config)))
     for stage, evidence in (("validation", result.validation), ("test", result.testing)):
         if evidence is None:

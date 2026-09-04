@@ -489,19 +489,22 @@ def export_run_bundle(
             return RunMLflowLink(tracking_uri, experiment.experiment_id, active.info.run_id)
 
 
-def _study_source_tables(workflow) -> dict[str, int | None]:
+def _study_source_tables(workflow) -> list[tuple[str, int | None]]:
     """Source tables and pinned Delta versions from the study's saved registration."""
+    from autoforecast.outputs import _source_records
     from autoforecast.study_registration import _read_saved, _record_path
 
     root = pathlib.Path(workflow.provenance["study"]["path"]).parents[2]
     for study_id in (workflow.study_id, workflow.parent_study_id):
         path = _record_path(root / "registrations", study_id) if study_id else None
         if path is not None:
-            source = _read_saved(path)["definition"].get("source") or {}
-            return {pin["table"]: pin.get("version")
-                    for pin in (source.get("tables") or {}).values()
-                    if isinstance(pin, dict) and isinstance(pin.get("table"), str)}
-    return {}
+            records, _ = _source_records(root, _read_saved(path)["definition"])
+            tables = {(pin["table"], pin.get("version"))
+                      for record in records.values()
+                      for pin in (record.get("tables") or {}).values()
+                      if isinstance(pin, dict) and isinstance(pin.get("table"), str)}
+            return sorted(tables, key=lambda item: (item[0], -1 if item[1] is None else item[1]))
+    return []
 
 
 def _log_study_inputs(client, run_id: str, workflow, outputs) -> None:
@@ -521,12 +524,18 @@ def _log_study_inputs(client, run_id: str, workflow, outputs) -> None:
                         source=DeltaDatasetSource(delta_table_name=table,
                                                   delta_table_version=version).to_json()),
                 tags=[InputTag("mlflow.data.context", "source")],
-            ) for table, version in sorted(tables.items())])
-        client.set_tag(run_id, "autoforecast.study_id", workflow.study_id)
-        if outputs is not None:
-            client.log_dict(run_id, outputs.to_dict(), "autoforecast/outputs.json")
+            ) for table, version in tables])
     except Exception as error:
-        note("MLflow inputs not recorded", error_type=type(error).__name__)
+        note("MLflow datasets not recorded", error_type=type(error).__name__)
+    try:
+        client.set_tag(run_id, "autoforecast.study_id", workflow.study_id)
+    except Exception as error:
+        note("MLflow study tag not recorded", error_type=type(error).__name__)
+    if outputs is not None:
+        try:
+            client.log_dict(run_id, outputs.to_dict(), "autoforecast/outputs.json")
+        except Exception as error:
+            note("MLflow outputs map not recorded", error_type=type(error).__name__)
 
 
 @reported("Export completed workflow to MLflow")

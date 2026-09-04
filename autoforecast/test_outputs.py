@@ -101,6 +101,8 @@ def test_study_map_comes_from_the_saved_registration(tmp_path):
     assert all(item.link is None for item in outputs.items)
     with pytest.raises(FileNotFoundError):
         study_outputs(registry, "e" * 64)
+    registry.store.tables = {"studies": "cat.me.af_studies"}
+    assert "studies" in {item.name for item in study_outputs(registry, STUDY_ID).items}
 
 
 def test_databricks_links_point_to_catalog_explorer_and_mlflow(tmp_path, monkeypatch):
@@ -144,6 +146,10 @@ def test_training_map_lists_search_models_forecasts_scores_and_mlflow(tmp_path):
     assert combined.facts[0] == ("data", "Study ID", STUDY_ID)
     assert _result(tmp_path, data_outputs=data).outputs("training").select("data").facts == ()
     assert _result(tmp_path).outputs("data").items == ()
+    fixed = workflow_outputs(_result(tmp_path, tuning_path=None))
+    selected = next(item for item in fixed.items if item.name == "Selected settings")
+    assert selected.group == "Model configuration"
+    assert "search profile" not in selected.description
 
 
 def test_show_logs_plain_text_outside_a_notebook(caplog):
@@ -179,4 +185,53 @@ def test_mlflow_runs_record_source_tables_study_and_outputs(tmp_path):
         raise RuntimeError("not supported")
 
     client.log_inputs = refused
+    calls.clear()
     run_mlflow._log_study_inputs(client, "r2", workflow, outputs)
+    assert calls == [
+        ("tag", "r2", "autoforecast.study_id", STUDY_ID),
+        ("dict", "r2", "autoforecast/outputs.json", outputs.to_dict()),
+    ]
+
+
+def test_mlflow_sources_include_auxiliary_queries(tmp_path, monkeypatch):
+    from autoforecast import run_mlflow, study_registration
+
+    _registry(tmp_path)
+    registration = tmp_path / "registrations" / f"{STUDY_ID}.json"
+    saved = json.loads(registration.read_text())
+    saved["definition"]["admission_evidence"] = {"path": "checks/admission.json"}
+    registration.write_text(json.dumps(saved))
+    monkeypatch.setattr(study_registration, "_verify_admission", lambda *_args, **_kwargs: {
+        "identity": {"sources": {"population": {"tables": {
+            "products": {"table": "cat.core.products", "version": 7},
+        }}}},
+    })
+    workflow = SimpleNamespace(
+        provenance={"study": {"path": str(tmp_path / "benchmarks" / STUDY_ID / "benchmark.json")}},
+        study_id=STUDY_ID, parent_study_id=None)
+    assert run_mlflow._study_source_tables(workflow) == [
+        ("cat.core.products", 7), ("cat.gold.sales", 1036), ("cat.silver.shops", 300),
+    ]
+
+
+def test_supplied_delta_stage_tables_appear_in_study_and_mlflow_maps(tmp_path):
+    from autoforecast import run_mlflow
+
+    registry = _registry(tmp_path)
+    registration = tmp_path / "registrations" / f"{STUDY_ID}.json"
+    saved = json.loads(registration.read_text())
+    saved["definition"]["source"] = {"kind": "supplied_stages", "stages": {
+        "training": {"source": {"tables": {
+            "train": {"table": "cat.gold.sales", "version": 4}}}},
+        "testing": {"source": {"tables": {
+            "test": {"table": "cat.gold.sales", "version": 5}}}},
+    }}
+    registration.write_text(json.dumps(saved))
+    workflow = SimpleNamespace(
+        provenance={"study": {"path": str(tmp_path / "benchmarks" / STUDY_ID / "benchmark.json")}},
+        study_id=STUDY_ID, parent_study_id=None)
+    assert run_mlflow._study_source_tables(workflow) == [
+        ("cat.gold.sales", 4), ("cat.gold.sales", 5),
+    ]
+    locations = {item.location for item in study_outputs(registry, STUDY_ID).items}
+    assert {"cat.gold.sales (version 4)", "cat.gold.sales (version 5)"} <= locations
