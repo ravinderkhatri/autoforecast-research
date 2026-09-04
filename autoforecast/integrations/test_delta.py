@@ -3,6 +3,7 @@
 import datetime as dt
 import json
 import os
+import pathlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -732,6 +733,15 @@ def test_tracking_publication_matrix_and_retry(store, tmp_path, monkeypatch, tra
     else:
         result = run_study(study_id, model, **arguments)
     assert calls == ["validation", "refit"]
+    if tracking == "mlflow":
+        # Each stage's run carries the study ID and the outputs map; the result links them.
+        assert set(result.tracking) == {"validation", "test"}
+        for link in result.tracking.values():
+            assert client.get_run(link["run_id"]).data.tags["autoforecast.study_id"] == study_id
+            saved = json.loads(pathlib.Path(client.download_artifacts(
+                link["run_id"], "autoforecast/outputs.json", str(tmp_path / link["run_id"]),
+            )).read_text())
+            assert {item["name"] for item in saved["items"]} >= {"Frozen study data", "Forecasts"}
     if tracking == "mlflow" and not publish:
         import dataclasses
 

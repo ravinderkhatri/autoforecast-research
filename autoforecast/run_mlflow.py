@@ -489,17 +489,59 @@ def export_run_bundle(
             return RunMLflowLink(tracking_uri, experiment.experiment_id, active.info.run_id)
 
 
+def _study_source_tables(workflow) -> dict[str, int | None]:
+    """Source tables and pinned Delta versions from the study's saved registration."""
+    from autoforecast.study_registration import _read_saved, _record_path
+
+    root = pathlib.Path(workflow.provenance["study"]["path"]).parents[2]
+    for study_id in (workflow.study_id, workflow.parent_study_id):
+        path = _record_path(root / "registrations", study_id) if study_id else None
+        if path is not None:
+            source = _read_saved(path)["definition"].get("source") or {}
+            return {pin["table"]: pin.get("version")
+                    for pin in (source.get("tables") or {}).values()
+                    if isinstance(pin, dict) and isinstance(pin.get("table"), str)}
+    return {}
+
+
+def _log_study_inputs(client, run_id: str, workflow, outputs) -> None:
+    """Record the run's source tables, study ID and outputs map; never fail the export."""
+    from autoforecast._execution import note
+
+    try:
+        from mlflow.data.delta_dataset_source import DeltaDatasetSource
+        from mlflow.entities import Dataset, DatasetInput, InputTag
+
+        tables = _study_source_tables(workflow)
+        if tables:
+            client.log_inputs(run_id, datasets=[DatasetInput(
+                Dataset(name=table,
+                        digest=hashlib.sha256(f"{table}@{version}".encode()).hexdigest()[:8],
+                        source_type="delta_table",
+                        source=DeltaDatasetSource(delta_table_name=table,
+                                                  delta_table_version=version).to_json()),
+                tags=[InputTag("mlflow.data.context", "source")],
+            ) for table, version in sorted(tables.items())])
+        client.set_tag(run_id, "autoforecast.study_id", workflow.study_id)
+        if outputs is not None:
+            client.log_dict(run_id, outputs.to_dict(), "autoforecast/outputs.json")
+    except Exception as error:
+        note("MLflow inputs not recorded", error_type=type(error).__name__)
+
+
 @reported("Export completed workflow to MLflow")
 def export_forecast_workflow(
     bundle_path: str | pathlib.Path,
     *,
     tracking_uri: str,
     experiment_id: str,
+    outputs=None,
 ) -> dict[str, RunMLflowLink]:
     """Export verified validation/test evidence to an existing experiment, retryably.
 
-    The immutable workflow remains authoritative. A single local publisher holds
-    a lock outside it; remote identity tags recover an upload interrupted after run
+    ``outputs`` is the study data map built by the run; it is saved with the training
+    map on each MLflow run. The immutable workflow remains authoritative. A single local
+    publisher holds a lock outside it; remote identity tags recover an upload interrupted after run
     creation. Retries reuse one run ID per configured stage and never fit or score. This is a
     completed-workflow exporter, not live tracking of partially fitted workflows.
     """
@@ -583,6 +625,11 @@ def export_forecast_workflow(
                     client.log_dict(run_id, evidence["score"], "checked_score.json")
                     client.log_dict(run_id, workflow.parameters, "model_config.json")
                     client.log_dict(run_id, workflow.provenance, "workflow_provenance.json")
+                    # Input tables, study ID and the outputs map; ``outputs`` adds the data
+                    # section that only the run knows.
+                    _log_study_inputs(client, run_id, workflow, (
+                        outputs.merge(workflow.outputs("training"))
+                        if outputs is not None else workflow.outputs("training")))
                     client.log_dict(
                         run_id, evidence["evaluation_contract"], "evaluation_contract.json"
                     )

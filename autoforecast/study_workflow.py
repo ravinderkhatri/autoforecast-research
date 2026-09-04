@@ -93,6 +93,20 @@ class ForecastWorkflowResult:
     selected_config: pathlib.Path
     search_config: pathlib.Path
     publication: dict = dataclasses.field(default_factory=lambda: {"status": "not_requested"})
+    tracking: dict = dataclasses.field(default_factory=dict)
+    data_outputs: object = dataclasses.field(default=None, compare=False, repr=False)
+
+    def outputs(self, section: str = "all"):
+        """Where everything captured so far is, and what each item holds.
+
+        ``section`` is "data" (inputs read and study data saved), "training" (search,
+        models, forecasts, scores and MLflow runs) or "all". A reloaded result has no
+        data section; use ``StudyRegistry.outputs(study_id)`` for it.
+        """
+        from autoforecast.outputs import OutputsMap, workflow_outputs
+
+        data = self.data_outputs if isinstance(self.data_outputs, OutputsMap) else OutputsMap()
+        return data.merge(workflow_outputs(self)).select(section)
 
     @property
     def study_id(self) -> str:
@@ -152,6 +166,23 @@ class ForecastWorkflowResult:
                 },
                 "validation": self.validation_metrics, "testing": self.testing_metrics,
                 "coverage": self.coverage, "publication": self.publication}
+
+
+def _data_outputs(registry, study_id, registered):
+    """Build and show the study data map; a failure here never stops the run."""
+    import logging
+
+    from autoforecast.outputs import show, study_outputs
+
+    try:
+        outputs = study_outputs(registry, study_id, registration=registered)
+    except Exception as error:
+        note("Study data map unavailable", error_type=type(error).__name__)
+        return None
+    note("Study data ready", study_id=study_id, items=len(outputs.items))
+    with suppress(Exception):
+        show(outputs, logging.getLogger("autoforecast.stages"))
+    return outputs
 
 
 @worker_inputs
@@ -522,6 +553,8 @@ def run_study(
                                 "registered loading requires its authenticated binding"
                             )
                         registration_sha = registered["sha256"]
+                    # Show where the inputs and saved study data are before training starts.
+                    data_outputs = _data_outputs(registry, study_id, registered)
                     if model == "seasonal_naive" and model_config is None:
                         folder = pathlib.Path(
                             stack.enter_context(
@@ -618,6 +651,7 @@ def run_study(
                             result.path,
                             tracking_uri=settings["tracking_uri"],
                             experiment_id=experiment_id,
+                            outputs=data_outputs,
                         )
                         outcome["links"] = {
                             stage: link.as_record() for stage, link in links.items()
@@ -653,9 +687,12 @@ def run_study(
                 )
                 # Save the events still uploading, so a failure keeps the recovery fields.
                 execution.flush_audit(audit)
+                from autoforecast.outputs import tracking_records
+
                 return dataclasses.replace(
                     result,
                     publication={**publication, "audit_path": str(audit)},
+                    tracking=tracking_records(links), data_outputs=data_outputs,
                 )
             except BaseException as error:
                 with suppress(BaseException):

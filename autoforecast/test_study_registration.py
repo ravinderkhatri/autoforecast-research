@@ -133,6 +133,15 @@ def test_study_info_creates_once_then_reuses_frozen_data(
                       if event["stage"] == "registration" and event["status"] == "PASS")
     fitting = next(i for i, event in enumerate(audit) if event["stage"] == "workflow")
     assert registered < fitting
+    # The data map is built from the saved records before training starts.
+    ready = next(i for i, event in enumerate(audit) if event["stage"] == "Study data ready")
+    assert registered < ready < fitting
+    outputs = result.outputs()
+    names = {(item.group, item.name) for item in outputs.items}
+    assert {("Saved study", "Frozen study data"), ("Saved study", "Registration record"),
+            ("Test", "Trained model"), ("Test", "Forecasts")} <= names
+    assert dict((label, value) for _, label, value in outputs.facts)["Study ID"] == result.study_id
+    assert result.tracking == {}
     (tmp_path / "source.parquet").unlink()
     path.unlink()
     reused = run_study(study_info={"study_id": result.study_id, "create_study": False,
@@ -140,6 +149,8 @@ def test_study_info_creates_once_then_reuses_frozen_data(
                        model_config=profile, implementation=implementation())
     assert calls == [result.study_id] and reused.study_id == result.study_id
     assert reused.testing_metrics == result.testing_metrics
+    # Reusing a study shows the same data map without registering again.
+    assert reused.outputs("data") == result.outputs("data")
 
 
 def test_study_info_fit_failure_retains_registered_id(spark, tmp_path):
