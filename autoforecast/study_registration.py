@@ -38,6 +38,7 @@ from pyspark.sql.types import StringType, StructField, StructType
 from autoforecast import _logical_hash
 from autoforecast._exact_yaml import loads_record, read_record, record_bytes
 from autoforecast._execution import (
+    _CURRENT,
     Execution,
     _emit,
     _safe,
@@ -47,6 +48,7 @@ from autoforecast._execution import (
     operation,
     record_result,
     reported,
+    resolve_display,
     resolve_level,
     standalone_attempt,
 )
@@ -377,9 +379,11 @@ def _scalar_settings(value, label):
 def _runtime(value):
     from autoforecast.implementation import source_scope
 
-    _fields(value, (), {"tracking", "publish", "log_level", "tracking_uri",
+    _fields(value, (), {"tracking", "publish", "log_level", "display", "tracking_uri",
                         "mlflow_experiment", "implementation"},
             label="runtime")
+    if value.get("display", "both") not in {"progress", "logs", "both"}:
+        raise ValueError("display must be progress, logs or both")
     if value.get("tracking", "none") not in {"none", "mlflow"}:
         raise ValueError("tracking must be none or mlflow")
     if type(value.get("publish", False)) is not bool:
@@ -1994,6 +1998,7 @@ def register_study(
             audit,
             ("configuration", "sources", "admission", "freeze", "publication"),
             level=level,
+            display=None if _CURRENT.get() else resolve_display(value.get("runtime", {})),
             attempt_id=check_id,
         ) as execution:
             event("configuration", "START")

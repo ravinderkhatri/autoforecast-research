@@ -1035,6 +1035,15 @@
           ],
           "default": "INFO"
         },
+        "display": {
+          "enum": [
+            "progress",
+            "logs",
+            "both"
+          ],
+          "default": "both",
+          "description": "Console content: progress panel with warnings, event logs, or both. Saved audit events are unchanged."
+        },
         "tracking_uri": {
           "type": [
             "string",

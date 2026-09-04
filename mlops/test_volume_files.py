@@ -1169,16 +1169,18 @@ def test_volume_progress_reuses_inventory_bytes_and_does_not_recursively_audit(v
     payload = b'x' * (2 * 1024 * 1024 + 13)
     client.values[str(source)] = payload
     audit = root / 'progress' / 'events.jsonl'
-    with Execution(audit, ['copy']):
+    with Execution(audit, ['copy']) as execution:
         with _stage(audit, 'copy'):
             with _volume_files.local_snapshot(source.parent) as copied:
                 assert (copied / source.name).read_bytes() == payload
+            execution.flush_audit(audit)
             before = len(client.requests)
             with operation('Count loop') as update:
                 start = len(client.requests)
                 for count in range(100):
                     update(completed=count, total=100, unit='rows')
-                assert len(client.requests) == start
+                assert len(client.requests) <= start + 1  # Only the queued START upload.
+            execution.flush_audit(audit)
             assert len(client.requests) - before == 2  # One immutable write per lifecycle event.
     rows = [json.loads(line) for line in _volume_files.read_audit_bytes(audit).splitlines()]
     assert len(rows) == 6
@@ -1654,6 +1656,71 @@ def test_closure_status_matches_execution_outcome(volume, outcome):
             events._stage_event(audit, "work", status)
     closed = str(audit.with_name(audit.name + ".events") / "closed.json")
     assert json.loads(client.values[closed])["status"] == outcome
+
+
+def test_running_execution_uploads_events_without_waiting(volume, monkeypatch):
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    release = threading.Event()
+
+    def slow_event(path, contents, *, overwrite):
+        name = str(path).split("/")[-1]
+        if ".events/" in str(path) and name != "closed.json" and not name.startswith("0" * 12):
+            assert release.wait(10)
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", slow_event)
+    with events.Execution(audit, []) as writer:
+        writer.write_event(audit, {"item": 0})  # Claims the audit before returning.
+        for n in range(1, 20):
+            writer.write_event(audit, {"item": n})  # Must not wait for the blocked uploads.
+        assert not any(p.split("/")[-1].startswith("000000000019-") for p in client.values)
+        release.set()
+    rows = read_execution_events(audit)
+    assert [row["item"] for row in rows] == list(range(20))
+    closed = str(audit.with_name(audit.name + ".events") / "closed.json")
+    assert json.loads(client.values[closed])["count"] == 20
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_failed_background_upload_retries_identical_bytes(volume, monkeypatch, persistent):
+    from contextlib import suppress
+
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    failures = []
+
+    def flaky(path, contents, *, overwrite):
+        if str(path).split("/")[-1].startswith("000000000002-") and (persistent or not failures):
+            failures.append(path)
+            raise OSError("connection unavailable")
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", flaky)
+    if persistent:
+        with pytest.raises(OSError, match="unacknowledged"):
+            with events.Execution(audit, []) as writer:
+                for n in range(4):
+                    with suppress(OSError):  # A later event may see the retry fail first.
+                        writer.write_event(audit, {"item": n})
+        assert not any(p.endswith("closed.json") for p in client.values)
+        return
+    with events.Execution(audit, []) as writer:
+        for n in range(4):
+            writer.write_event(audit, {"item": n})
+    assert failures
+    assert [row["item"] for row in read_execution_events(audit)] == list(range(4))
+
+
+def test_reader_inside_execution_sees_its_own_queued_events(volume):
+    root, _ = volume
+    audit = root / "events.jsonl"
+    with events.Execution(audit, []) as writer:
+        for n in range(6):
+            writer.write_event(audit, {"item": n})
+        assert [row["item"] for row in read_execution_events(audit)] == list(range(6))
 
 
 def test_pending_event_prevents_closure(volume, monkeypatch):

@@ -609,3 +609,63 @@ def test_local_audit_reader_keeps_objects_and_ignores_blank_lines(tmp_path):
     expected = [{"stage": "first", "status": "START"}, {"stage": "first", "status": "PASS"}]
     path.write_text("\n" + "\n\n".join(json.dumps(item) for item in expected) + "\n")
     assert events.read_execution_events(path) == expected
+
+
+@pytest.mark.parametrize("display,panel,info", [
+    ("progress", True, False), ("logs", False, True), ("both", True, True),
+])
+def test_display_chooses_console_content_and_keeps_every_audit_event(
+    tmp_path, monkeypatch, display, panel, info,
+):
+    monkeypatch.setattr(events, "_DISPLAY", None)
+    stream = io.StringIO()
+    configure_logging(stream=stream, display=display,
+                      **({} if display == "logs" else {"progress": "plain"}))
+    path = tmp_path / "audit.jsonl"
+    with events.Execution(path, ["read"]):
+        with events._stage(path, "read") as outcome:
+            events.note("Checked inputs", rows=3)
+            outcome["status"] = "UNAVAILABLE"
+    output = stream.getvalue()
+    assert ("RUN {" in output) is panel
+    assert ("INFO Checked inputs" in output) is info
+    assert "UNAVAILABLE read" in output  # Warnings stay visible in every display.
+    assert [(row["stage"], row["status"]) for row in records(path)] == [
+        ("read", "START"), ("Checked inputs", "INFO"), ("read", "UNAVAILABLE"),
+    ]
+
+
+@pytest.mark.parametrize("display,progress", [
+    ("progress", "off"), ("both", "off"), ("logs", "auto"), ("logs", "plain"), ("quiet", None),
+])
+def test_contradictory_display_options_are_refused(monkeypatch, display, progress):
+    monkeypatch.setattr(events, "_DISPLAY", None)
+    with pytest.raises(ValueError, match="display"):
+        configure_logging(stream=io.StringIO(), display=display, progress=progress)
+    assert events._DISPLAY is None
+
+
+def test_display_is_fixed_when_a_run_starts(tmp_path, monkeypatch):
+    monkeypatch.setattr(events, "_DISPLAY", None)
+    stream = io.StringIO()
+    configure_logging(stream=stream, progress="plain", display="progress")
+    with events.Execution(tmp_path / "first.jsonl", ["read"]):
+        configure_logging(stream=stream, progress="plain", display="both")
+        events.note("Inside the first run")
+    with events.Execution(tmp_path / "second.jsonl", ["read"]):
+        events.note("Inside the second run")
+    assert "Inside the first run" not in stream.getvalue()
+    assert "Inside the second run" in stream.getvalue()
+
+
+def test_display_precedence_and_runtime_validation(monkeypatch):
+    monkeypatch.setattr(events, "_DISPLAY", None)
+    assert events.resolve_display({}) == "both"
+    assert events.resolve_display({"display": "logs"}) == "logs"
+    configure_logging(stream=io.StringIO(), display="progress")
+    assert events.resolve_display({"display": "logs"}) == "progress"
+    configure_logging(stream=io.StringIO(), progress="off")  # Omitting display restores the default.
+    assert events.resolve_display({}) == "both"
+    assert registration._runtime({"display": "progress"})["display"] == "progress"
+    with pytest.raises(ValueError, match="display"):
+        registration._runtime({"display": "quiet"})

@@ -137,11 +137,11 @@ def run_study(
     return run(**supplied, **options)
 
 
-def configure_logging(*, stream=None, progress="auto", interval=10.0):
-    """Customize automatic progress; see tutorials/README.md for examples."""
+def configure_logging(*, stream=None, progress=None, interval=10.0, display=None):
+    """Choose progress, logs or both, and customize progress; see tutorials/README.md."""
     from autoforecast._execution import configure_logging as configure
 
-    return configure(stream=stream, progress=progress, interval=interval)
+    return configure(stream=stream, progress=progress, interval=interval, display=display)
 
 
 def read_execution_events(path):
