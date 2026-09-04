@@ -33,6 +33,29 @@ def _java_home() -> pathlib.Path | None:
     return None
 
 
+def _campaign_diagnostics(root: pathlib.Path) -> str:
+    """Keep a failed worker's reason visible in the CI test report."""
+    sections = []
+    for name in ("stage-result.json", "stderr.log", "worker-wrapper.log"):
+        for path in sorted(root.rglob(name)):
+            sections.append(f"\n{path.relative_to(root)}\n" +
+                            path.read_text(errors="replace")[-16000:])
+    return "".join(sections)
+
+
+def test_campaign_failure_report_includes_worker_reason(tmp_path):
+    attempt = tmp_path / "stages/t00/attempt-0001"
+    attempt.mkdir(parents=True)
+    (attempt / "stage-result.json").write_text('{"status":"failed","exit_code":2}')
+    (attempt / "stderr.log").write_text("worker setup failed")
+    (attempt / "worker-wrapper.log").write_text("wrapper could not start the process")
+    (attempt / "unrelated.txt").write_text("unrelated content")
+    report = _campaign_diagnostics(tmp_path)
+    assert '"exit_code":2' in report and "worker setup failed" in report
+    assert "wrapper could not start the process" in report
+    assert "stages/t00/attempt-0001" in report and "unrelated content" not in report
+
+
 @pytest.mark.skipif(_java_home() is None, reason="functional campaign requires Java 17 for Spark")
 def test_tune_then_manual_campaign_runs_two_epochs_and_finishes_replay(
     tmp_path: pathlib.Path,
@@ -263,7 +286,9 @@ study:
         text=True,
         timeout=900,
     )
-    assert outcome.returncode == 0, outcome.stdout + outcome.stderr
+    assert outcome.returncode == 0, (outcome.stdout + outcome.stderr + _campaign_diagnostics(
+        repository / ".autoforecast/parameter-campaigns",
+    ))
     assert "[preflight] data.selection:" in outcome.stderr
     assert "parameter_mode=tune (HPO on" in outcome.stderr
     assert "parameter_mode=manual (HPO off" in outcome.stderr

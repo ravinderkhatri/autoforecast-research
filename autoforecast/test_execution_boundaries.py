@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import stat
 import sys
 from contextlib import contextmanager
@@ -3222,3 +3223,190 @@ def test_registration_claims_fresh_attempt_without_reusing_evidence(
         assert calls == [True]
         audit = b"".join(writes) if native else (attempt / "audit.jsonl").read_bytes()
         assert json.loads(audit.splitlines()[0])["status"] == "START"
+
+
+@pytest.fixture
+def operation_clock(monkeypatch):
+    logger = logging.getLogger("autoforecast.stages")
+    logger.handlers = [logging.NullHandler()]
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    value = [100.0]
+    monkeypatch.setattr(events, "time", SimpleNamespace(monotonic=lambda: value[0]))
+    return value
+
+
+def _operation_elapsed_line(execution):
+    line = next(
+        line for line in execution.render().splitlines() if line.startswith("Operation: fit |")
+    )
+    return (float(re.search("elapsed=([0-9.]+)s", line).group(1)), line)
+
+
+@pytest.mark.parametrize("kind", ["planned", "nested"])
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt, SystemExit])
+def test_failed_or_cancelled_operation_elapsed_stops(tmp_path, operation_clock, kind, error_type):
+    audit = tmp_path / "audit.jsonl"
+    primary = error_type("original")
+    with events.Execution(audit, ["fit"] if kind == "planned" else ["outer"]) as execution:
+        try:
+            with events._stage(audit, "fit") if kind == "planned" else events.operation("fit"):
+                operation_clock[0] = 102.0
+                raise primary
+        except BaseException as caught:
+            assert caught is primary
+        first, _ = _operation_elapsed_line(execution)
+        terminal = [json.loads(line) for line in audit.read_text().splitlines()][-1]
+        operation_clock[0] = 120.0
+        later, text = _operation_elapsed_line(execution)
+        status = "FAIL" if issubclass(error_type, Exception) else "CANCELLED"
+        assert terminal["status"] == status and terminal["elapsed_seconds"] == 2.0
+        assert first == later == 2.0
+
+
+@pytest.mark.parametrize("phase", ["START", "PASS", "FAIL", "CANCELLED"])
+@pytest.mark.parametrize("committed", [False, True])
+def test_failed_audit_operation_elapsed_stops(
+    tmp_path, monkeypatch, operation_clock, phase, committed
+):
+    audit = tmp_path / "audit.jsonl"
+    append = _safe_files.append_audit_bytes
+    audit_error = OSError("audit interrupted")
+    primary = KeyboardInterrupt("body") if phase == "CANCELLED" else ValueError("body")
+
+    def write(path, payload):
+        row = json.loads(payload)
+        if row["stage"] == "fit" and row["status"] == phase:
+            operation_clock[0] = 102.0
+            if committed:
+                append(path, payload)
+            raise audit_error
+        return append(path, payload)
+
+    monkeypatch.setattr(_safe_files, "append_audit_bytes", write)
+    with events.Execution(audit, ["outer"]) as execution:
+        try:
+            with events.operation("fit"):
+                operation_clock[0] = 102.0
+                if phase in {"FAIL", "CANCELLED"}:
+                    raise primary
+        except BaseException as caught:
+            assert caught is (primary if phase in {"FAIL", "CANCELLED"} else audit_error)
+        else:
+            pytest.fail("audit fault must be observed")
+        first, line = _operation_elapsed_line(execution)
+        operation_clock[0] = 120.0
+        later, later_line = _operation_elapsed_line(execution)
+        status = phase if phase in {"FAIL", "CANCELLED"} else "UNVERIFIED"
+        assert line.endswith("| " + status) and execution.audit_error == "OSError"
+        assert first == later == 2.0
+
+
+@pytest.mark.parametrize("status", ["PASS", "SKIP", "UNAVAILABLE"])
+def test_committed_terminal_status_elapsed_stops_after_display_interrupt(
+    tmp_path, monkeypatch, operation_clock, status
+):
+    audit = tmp_path / "audit.jsonl"
+    interruption = KeyboardInterrupt("terminal display")
+
+    class InterruptStream(io.StringIO):
+        hit = False
+
+        def write(self, text):
+            if not self.hit and text.startswith(status + " fit |"):
+                self.hit = True
+                raise interruption
+            return super().write(text)
+
+    stream = InterruptStream()
+    logger = logging.getLogger("autoforecast.stages")
+    logger.handlers = []
+    events.configure_logging(stream=stream, progress="off", interval=3600)
+    with events.Execution(audit, ["outer"]) as execution:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            with events._stage(audit, "fit") as outcome:
+                operation_clock[0] = 102.0
+                outcome["status"] = status
+        assert caught.value is interruption and stream.hit
+        terminal = [json.loads(line) for line in audit.read_text().splitlines()][-1]
+        first, _ = _operation_elapsed_line(execution)
+        operation_clock[0] = 120.0
+        later, text = _operation_elapsed_line(execution)
+        assert terminal["status"] == status and terminal["elapsed_seconds"] == 2.0
+        assert first == later == 2.0
+
+
+def test_running_timer_continues_and_success_is_removed(tmp_path, operation_clock):
+    audit = tmp_path / "audit.jsonl"
+    with events.Execution(audit, ["outer"]) as execution:
+        with events.operation("fit"):
+            operation_clock[0] = 102.0
+            first, _ = _operation_elapsed_line(execution)
+            operation_clock[0] = 120.0
+            later, _ = _operation_elapsed_line(execution)
+            assert (first, later) == (2.0, 20.0)
+        assert not any(op["name"] == "fit" for op in execution.operations.values())
+
+
+def test_failure_timer_stops_when_secondary_event_fails_before_observation(
+    tmp_path, operation_clock
+):
+    audit = tmp_path / "audit.jsonl"
+    details = {}
+    primary = ValueError("body failure")
+    with events.Execution(audit, ["outer"]) as execution:
+        try:
+            with events.operation("fit", details=details):
+                operation_clock[0] = 102.0
+                details["cycle"] = details
+                raise primary
+        except ValueError as caught:
+            assert caught is primary
+        else:
+            pytest.fail("body failure must propagate")
+        first, _ = _operation_elapsed_line(execution)
+        rows = [json.loads(line) for line in audit.read_text().splitlines()]
+        operation_clock[0] = 120.0
+        later, line = _operation_elapsed_line(execution)
+        assert [row["status"] for row in rows] == ["START"]
+        assert line.endswith("| FAIL")
+        assert first == later == 2.0
+
+
+def test_failed_counted_operation_keeps_counts_and_frozen_elapsed(tmp_path, operation_clock):
+    audit = tmp_path / "audit.jsonl"
+    with events.Execution(audit, ["outer"]) as execution:
+        try:
+            with events.operation("fit") as update:
+                operation_clock[0] = 102.0
+                update(completed=3, total=10, unit="rows", phase="merge")
+                raise ValueError("failure")
+        except ValueError:
+            pass
+        operation_clock[0] = 120.0
+        elapsed, line = _operation_elapsed_line(execution)
+        assert "3 rows; total=10" in line and "30.0%" in line and ("merge" in line)
+        assert elapsed == 2.0
+
+
+def test_retry_removes_old_failure_and_counts_new_attempt(tmp_path, operation_clock):
+    audit = tmp_path / "audit.jsonl"
+    with events.Execution(audit, ["outer"]) as execution:
+        try:
+            with events.operation("fit"):
+                operation_clock[0] = 102.0
+                raise ValueError("first attempt")
+        except ValueError:
+            pass
+        assert len([op for op in execution.operations.values() if op["name"] == "fit"]) == 1
+        operation_clock[0] = 103.0
+        with events.operation("fit"):
+            fits = [op for op in execution.operations.values() if op["name"] == "fit"]
+            assert len(fits) == 1 and fits[0]["status"] == "START"
+            operation_clock[0] = 104.0
+            elapsed, _ = _operation_elapsed_line(execution)
+            assert elapsed == 1.0
+        assert not any(op["name"] == "fit" for op in execution.operations.values())
+    rows = [json.loads(line) for line in audit.read_text().splitlines()]
+    assert [row["status"] for row in rows] == ["START", "FAIL", "START", "PASS"]
+    assert [row["operation_attempt"] for row in rows] == [1, 1, 2, 2]

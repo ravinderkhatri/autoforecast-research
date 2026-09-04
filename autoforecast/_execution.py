@@ -272,6 +272,10 @@ class Execution:
             operation = self.operations.get(event.get("operation_id"))
             if operation is not None:
                 operation["status"] = status
+                if status != "START":
+                    elapsed = event.get("elapsed_seconds")
+                    operation.setdefault("_frozen_elapsed", elapsed if elapsed is not None
+                                         else time.monotonic() - operation["start"])
             planned = (pathlib.Path(path) == self.audit and name in self.states
                        and event.get("plan_stage", not event.get("operation_id")))
             if planned:
@@ -300,7 +304,8 @@ class Execution:
                          f"elapsed={now - self.starts[name]:.1f}s")
         for op in self.operations.values():
             done, amount, unit = op.get("completed"), op.get("total"), op.get("unit")
-            line = f"Operation: {op['name']} | elapsed={now - op['start']:.1f}s"
+            elapsed = op.get("_frozen_elapsed", now - op["start"])
+            line = f"Operation: {op['name']} | elapsed={elapsed:.1f}s"
             if done is not None:
                 line += (f" | {done} {unit}; total="
                          + (str(amount) if amount is not None else "unknown"))
@@ -537,12 +542,12 @@ def _scope(path, name, *, planned=False, **facts):
         failed = True
         if started and not terminal_attempted:
             status = "FAIL" if isinstance(error, Exception) else "CANCELLED"
+            elapsed = time.monotonic() - start
             if execution:
                 with execution.lock:
-                    execution.operations[key]["status"] = status
+                    execution.operations[key].update(status=status, _frozen_elapsed=elapsed)
             with suppress(BaseException):
-                event(status, elapsed=time.monotonic() - start,
-                      error_type=type(error).__name__)
+                event(status, elapsed=elapsed, error_type=type(error).__name__)
         raise
     finally:
         _PARENT_AUDIT.reset(path_token)
