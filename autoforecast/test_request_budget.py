@@ -136,6 +136,7 @@ def test_search_reads_each_trial_file_a_bounded_number_of_times(spark, tmp_path,
     profile.write_text(yaml.safe_dump(value))
     study = load_study(manifest.parent.name, registry_root=manifest.parent.parent,
                        spark=spark, scratch_root=scratch)
+    files.downloads.clear()  # Count only the search's reads, not loading the study.
     with study, attempts_checked_once():
         result = tune_study(study, fit_predict=many_files, config=profile,
                             implementation=implementation(), output_dir=root / "runs")
@@ -165,3 +166,13 @@ def test_search_reads_each_trial_file_a_bounded_number_of_times(spark, tmp_path,
     data = [item for item in others if not item[1].endswith(".json")]
     assert records[0][0] <= 8, records[:6]
     assert data[0][0] <= 7, data[:6]
+    # Frozen study data is checked in full by the preflight, at the search's start and on
+    # reload, and otherwise only where a fit or its scoring reads it; never around windows.
+    frozen = {str(pathlib.Path(path).relative_to(manifest.parent)): count
+              for path, count in files.downloads.items()
+              if pathlib.Path(path).is_relative_to(manifest.parent) and path.endswith(".parquet")}
+    unused = {name: count for name, count in frozen.items()
+              if name.startswith(("final_", "grids/validation", "grids/test",
+                                  "coverage/validation", "coverage/test"))}
+    assert unused and max(unused.values()) <= 5, unused
+    assert max(frozen.values()) <= 11, frozen

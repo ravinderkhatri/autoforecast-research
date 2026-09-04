@@ -438,7 +438,8 @@ def open_local_heldout_attempt(
 
 
 # Attempts fully checked within one selection, report and reload. Model code may change any
-# attempt, so forget_checked_attempts() runs before every model call inside the scope.
+# attempt, so the search clears these checks before each evaluator call; the scopes end
+# before a workflow's final fits.
 _CHECKED_ATTEMPTS: ContextVar[dict | None] = ContextVar(
     "autoforecast_checked_attempts", default=None,
 )

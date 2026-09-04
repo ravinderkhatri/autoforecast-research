@@ -31,6 +31,7 @@ from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast._execution import _stage, callable_name, note, reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
+    NATIVE_SCHEMA,
     _evaluation_contract_from_record,
     bound_input_path,
     boundary,
@@ -41,7 +42,6 @@ from autoforecast.benchmark import (
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.experiments import (
     attempts_checked_once,
-    forget_checked_attempts,
     load_completed_attempt,
     load_study_selection,
 )
@@ -534,9 +534,12 @@ class _WindowInput:
 def _prepare_window(
     study: Study, stage: str, origin: str, horizon: int, root: pathlib.Path
 ) -> _WindowInput:
+    # The contract needs the manifest; the data below comes from the study's checked copies.
+    record = study._record()
+    native = record["schema"] == NATIVE_SCHEMA
     fixed = _evaluation_contract_from_record(
-        study._path, study._record(data=True), stage=stage, origin=origin, horizon=horizon,
-        metric=study.recipe["metric"],
+        study._path, study._record(data=True) if native else record, stage=stage,
+        origin=origin, horizon=horizon, metric=study.recipe["metric"],
     )
     if fixed["study"]["sha256"] != study._sha256:
         raise HPOError("study changed before fitting")
@@ -553,7 +556,8 @@ def _prepare_window(
     training, mapping_path = root / "training", root / "series-mapping"
     frame.write.parquet(str(training))
     mapping.write.parquet(str(mapping_path))
-    study._record(data=True)
+    if native:
+        study._record(data=True)
     context = {
         "evaluation_contract": fixed,
         "stage": stage,
@@ -659,8 +663,6 @@ def _fit_window(
                         history_zero_filled=context.get("history_zero_filled", 0),
                         warnings=(["history_zero_filled"]
                                   if context.get("history_zero_filled", 0) else [])):
-                # Model code may change any attempt; later loads must check it again.
-                forget_checked_attempts()
                 note("Callback inputs", callback=callable_name(callback),
                      model_parameters=model_parameters, training_parameters=training_parameters,
                      history_through=origin, purpose=purpose)
