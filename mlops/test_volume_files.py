@@ -800,6 +800,9 @@ def test_volume_incomplete_admission_requires_recovery(volume, monkeypatch):
         def select(self, *_):
             return self
 
+        def repartition(self, *_):
+            return self
+
         def join(self, *_):
             return self
 
@@ -863,6 +866,9 @@ def test_volume_admission_seals_remote_directories_absent_from_mounted_listing(
                 Path(path).mkdir()
 
         def select(self, *_):
+            return self
+
+        def repartition(self, *_):
             return self
 
         def join(self, *_):
