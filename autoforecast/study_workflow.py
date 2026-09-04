@@ -400,7 +400,45 @@ def run_study(
             raise
 
 
-@report_workflow
+def _validate_workflow_arguments(
+    *, fit_predict, config=None, selected_config=None, reuse_tuning=None,
+    fixed_parameters=None, tuning_origin=None, validation_only=False,
+    validation_run=None, **_operational_options,
+):
+    """Reject conflicting requests before accessing a study or creating audit files."""
+    if not callable(fit_predict):
+        raise TypeError("fit_predict must be a Python callable")
+    if type(validation_only) is not bool:
+        raise TypeError("validation_only must be boolean")
+    if validation_run is not None:
+        if validation_only or any(
+            value is not None
+            for value in (
+                config,
+                selected_config,
+                reuse_tuning,
+                fixed_parameters,
+                tuning_origin,
+            )
+        ):
+            raise ValueError(
+                "validation_run cannot combine with new configuration or validation_only"
+            )
+    fixed = fixed_parameters is not None
+    if fixed and (
+        config is None
+        or any(value is not None for value in (selected_config, reuse_tuning, tuning_origin))
+    ):
+        raise ValueError("fixed_parameters requires config and cannot combine with selection reuse")
+    if fixed and not isinstance(fixed_parameters, Mapping):
+        raise TypeError("fixed_parameters must be a mapping")
+    if selected_config is not None and (reuse_tuning is not None or tuning_origin is not None):
+        raise ValueError("selected_config conflicts with reuse_tuning and tuning_origin")
+    if config is None and selected_config is None and validation_run is None:
+        raise ValueError("provide config to tune, or selected_config to skip HPO")
+
+
+@report_workflow(validate=_validate_workflow_arguments)
 def run_forecast_workflow(
     study: Study,
     *,
@@ -427,40 +465,14 @@ def run_forecast_workflow(
     """
     from autoforecast.study import load_study
 
-    if not callable(fit_predict):
-        raise TypeError("fit_predict must be a Python callable")
-    if type(validation_only) is not bool:
-        raise TypeError("validation_only must be boolean")
     previous = None
     if validation_run is not None:
-        if validation_only or any(
-            value is not None
-            for value in (
-                config,
-                selected_config,
-                reuse_tuning,
-                fixed_parameters,
-                tuning_origin,
-            )
-        ):
-            raise ValueError(
-                "validation_run cannot combine with new configuration or validation_only"
-            )
         previous = load_forecast_workflow(validation_run)
         if previous.testing is not None:
             raise HPOError("validation_run must be a validation checkpoint for this exact study")
         selected_config = previous.selected_config
     fixed = fixed_parameters is not None
-    if fixed and (
-        config is None
-        or any(value is not None for value in (selected_config, reuse_tuning, tuning_origin))
-    ):
-        raise ValueError("fixed_parameters requires config and cannot combine with selection reuse")
-    if fixed and not isinstance(fixed_parameters, Mapping):
-        raise TypeError("fixed_parameters must be a mapping")
     identity = _implementation_record(implementation) if implementation is not None else None
-    if selected_config is not None and (reuse_tuning is not None or tuning_origin is not None):
-        raise ValueError("selected_config conflicts with reuse_tuning and tuning_origin")
     saved = load_selected_configuration(selected_config) if selected_config is not None else None
     if config is not None:
         raw, spec, budget, seed, controls = _config(

@@ -460,6 +460,7 @@ class _RayRecorder:
         self.peak = 0
         self.cancelled = []
         self.submissions = []
+        self.worker_arguments = []
         self.closed = False
 
     def is_initialized(self):
@@ -481,7 +482,7 @@ class _RayRecorder:
         class Submission:
             def remote(inner, *args, **kwargs):
                 assert isinstance(kwargs["parent_attempt"], str)
-                self.latest_options["parent_attempt"] = kwargs["parent_attempt"]
+                self.worker_arguments.append((args, kwargs.copy()))
                 index = args[2]
                 self.inflight.add(index)
                 self.peak = max(self.peak, len(self.inflight))
@@ -541,7 +542,10 @@ def test_three_jobs_respect_two_job_cap(ray_phase, monkeypatch):
     ray = _RayRecorder([{"CPU": 8, "GPU": 0, "memory": 8 * 1024**3}])
     run(ray)
     assert ray.peak == 2 and len(ray.submissions) == 3 and ray.closed
+    assert len(ray.worker_arguments) == 3
+    assert all(call[1]["parent_attempt"] for call in ray.worker_arguments)
     for _, options in ray.submissions:
+        assert "parent_attempt" not in options
         assert (
             options["num_cpus"] == 1 and options["num_gpus"] == 0 and options["memory"] == 1024**3
         )

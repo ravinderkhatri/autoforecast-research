@@ -454,7 +454,10 @@ def test_snapshot_runs_storage_hashing_without_importing_installed_mlops() -> No
             target = repository / original.relative_to(source)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(original, target)
-    _git(repository, "add", "mlops", "provenance")
+    # Storage progress uses this stdlib-only module inside the frozen snapshot.
+    shutil.copyfile(source / "autoforecast/_execution.py",
+                    repository / "autoforecast/_execution.py")
+    _git(repository, "add", "mlops", "provenance", "autoforecast/_execution.py")
     _git(repository, "commit", "--quiet", "-m", "retain storage dependencies")
     authorization = subject.materialize_executable_source_snapshot(
         repository, workspace / "snapshots"

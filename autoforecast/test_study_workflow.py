@@ -2784,3 +2784,39 @@ def test_preflight_emits_required_warning_for_permitted_series_exclusion(tmp_pat
     print("PREFLIGHT_CONTEXT=" + json.dumps(passed))
     assert any(e.get("warnings") for e in passed)
     assert any(e.get("retained_series", e.get("retained_count")) == 1 for e in passed)
+
+
+@pytest.mark.parametrize("options,exception,message", [
+    ({"fit_predict": None}, TypeError, "fit_predict must be"),
+    ({"validation_only": 1}, TypeError, "validation_only must be boolean"),
+    ({"fixed_parameters": {}}, ValueError, "fixed_parameters requires config"),
+    ({"fixed_parameters": [], "config": "unused.yaml"}, TypeError,
+     "fixed_parameters must be a mapping"),
+    ({"selected_config": "unused.json", "reuse_tuning": "unused"}, ValueError,
+     "selected_config conflicts"),
+    ({"selected_config": "unused.json", "tuning_origin": "2024-01-01"}, ValueError,
+     "selected_config conflicts"),
+    ({}, ValueError, "provide config to tune"),
+])
+def test_invalid_workflow_arguments_do_not_access_study_or_write_audit(
+    tmp_path, options, exception, message,
+):
+    from autoforecast.study_workflow import run_forecast_workflow
+
+    request = {"fit_predict": lambda _: pytest.fail("invalid request must not fit"),
+               "output_dir": tmp_path / "runs", **options}
+    with pytest.raises(exception, match=message):
+        run_forecast_workflow(object(), **request)
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize("unknown", ["model_lable", "validation_rnu", "selected_confgi"])
+def test_unknown_workflow_argument_is_rejected_before_study_access(tmp_path, unknown):
+    from autoforecast.study_workflow import run_forecast_workflow
+
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        run_forecast_workflow(
+            object(), fit_predict=lambda _: pytest.fail("must not fit"), config="unused.yaml",
+            fixed_parameters={}, output_dir=tmp_path / "runs", **{unknown: "unused"},
+        )
+    assert not (tmp_path / "runs").exists()

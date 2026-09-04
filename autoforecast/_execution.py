@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import datetime as dt
 import functools
+import inspect
 import json
 import logging
 import os
@@ -628,14 +629,22 @@ def record_result(*, study_id, workflow_id=None, workflow_path=None, evidence=No
             }.items() if value is not None})
 
 
-def report_workflow(function):
-    """Give direct calls and process workers an attempt without serializing live context."""
+def report_workflow(function=None, *, validate=None):
+    """Give direct calls and process workers an attempt after argument validation."""
+    if function is None:
+        return lambda callback: report_workflow(callback, validate=validate)
+
+    signature = inspect.signature(function)
+
     @functools.wraps(function)
     def wrapped(study, *args, **kwargs):
         from autoforecast.study_tuning import _output_root
 
-        parent = _CURRENT.get()
         label = validate_model_label(kwargs.get("model_label"))
+        signature.bind(study, *args, **kwargs)
+        if validate is not None:
+            validate(*args, **kwargs)
+        parent = _CURRENT.get()
         root = _output_root(study, kwargs.get("output_dir"), "study-workflows")
         audit = root / "execution-attempts" / (uuid.uuid4().hex + ".jsonl")
         with Execution(audit, ("workflow",), level=parent.level if parent else resolve_level(),
