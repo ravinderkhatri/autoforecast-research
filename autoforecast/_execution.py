@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from contextlib import contextmanager, nullcontext, suppress
 from typing import Any
 
@@ -409,9 +410,12 @@ class Execution:
                 return
             # Record the event before submitting it, so an interruption between the two
             # leaves an unsubmitted entry that _settle uploads, never a reused sequence.
-            sequence = state["sequence"]
-            entry = state["uploads"][sequence] = [payload, None]
-            state.update(sequence=sequence + 1, previous=hashlib.sha256(payload).hexdigest())
+            # One update installs the entry and advances the sequence together: an
+            # interruption leaves neither or both, so the closure count stays right.
+            sequence, entry = state["sequence"], [payload, None]
+            previous = hashlib.sha256(payload).hexdigest()
+            state.update(uploads={**state["uploads"], sequence: entry},
+                         sequence=sequence + 1, previous=previous)
             entry[1] = self.uploader.submit(self._upload, path, state, sequence, payload)
 
     @staticmethod
@@ -439,8 +443,9 @@ class Execution:
             if future is not None and not future.done():
                 if not wait:
                     break
-                with suppress(BaseException):
-                    future.result()
+                # Wait without re-raising the worker's error, so the caller's own
+                # interruption still propagates.
+                futures_wait([future])
             if future is None or future.exception() is not None:
                 _volume_files.publish_audit_segment(path, payload, owner=state["owner"],
                                                     sequence=sequence)
@@ -554,8 +559,9 @@ class Execution:
             self.identity.setdefault("parent_attempt", parent.identity["attempt_id"])
         if self.display is None:
             self.display = parent.display if parent else resolve_display()
-        self.token = _CURRENT.set(self)
+        # Allocate before installing any context, so a failure here leaves nothing to undo.
         self.uploader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autoforecast-audit")
+        self.token = _CURRENT.set(self)
         self.level_token = _LOG_LEVEL.set(self.level)
         self.identity_token = _IDENTITY.set({})
         self.operation_token = _OPERATION.set(None)
@@ -566,20 +572,31 @@ class Execution:
                 self.thread.start()
         except BaseException:
             self.stop.set()
-            self.uploader.shutdown(wait=True)
+            # Nothing was submitted yet; keep the startup failure if shutdown is interrupted.
+            with suppress(BaseException):
+                self.uploader.shutdown(wait=True)
             self._restore_context()
             raise
         return self
 
     def __exit__(self, kind, error, traceback):
+        # A failure already on its way out (the body's, else _finish's) wins over a
+        # cleanup failure, and the context is restored whatever happens.
+        failing = kind is not None
         try:
-            with suppress(BaseException) if kind is not None else nullcontext():
+            with suppress(BaseException) if failing else nullcontext():
                 self._finish(kind)
+        except BaseException:
+            failing = True
+            raise
         finally:
             uploader, self.uploader = self.uploader, None
-            if uploader is not None:
-                uploader.shutdown(wait=True)
-            self._restore_context()
+            try:
+                with suppress(BaseException) if failing else nullcontext():
+                    if uploader is not None:
+                        uploader.shutdown(wait=True)
+            finally:
+                self._restore_context()
 
     def _restore_context(self):
         _PARENT_AUDIT.reset(self.parent_token)
@@ -608,7 +625,13 @@ class Execution:
             for path, segments in self.audit_segments.items():
                 try:
                     self._settle(path, segments, wait=True)
-                except BaseException as failure:
+                except Exception as failure:
+                    # Show that saved evidence is incomplete before reporting the failure;
+                    # an interruption propagates unchanged and leaves a valid prefix.
+                    if self.result not in {"FAIL", "CANCELLED"}:
+                        self.result = "UNVERIFIED"
+                    self.audit_error = type(failure).__name__
+                    self.refresh(force=True, final=True)
                     raise OSError("execution audit has an unacknowledged event") from failure
             state = self.audit_segments.get(self.audit)
             if state is not None:
