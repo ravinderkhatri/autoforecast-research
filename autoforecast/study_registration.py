@@ -721,12 +721,14 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
                                            "population_findings", "input_added_keys",
                                            "input_missing_keys"))]
     capture = current_capture()
-    # Source and audit captures keep the file SHA computed when they were captured, so
-    # a lasting change at any time from capture to the end of preparation fails below.
-    captured_physical = captured_physical or {}
     baselines = {p: (capture.bind(p) if capture is not None else
-                     captured_physical.get(p) or directory_digest(p, suffixes=(".parquet",)))
-                 for p in paths}
+                     directory_digest(p, suffixes=(".parquet",))) for p in paths}
+    # Source and audit captures must still have the file SHA computed when they were
+    # captured, here and again after the callback. A change that is lasting, or that is
+    # present when preparation starts and restored before it ends, then fails.
+    if capture is None and any(baselines.get(p) != digest
+                               for p, digest in (captured_physical or {}).items()):
+        raise ValueError("managed source or population changed during preparation")
     if capture is not None:
         frame = registry.spark.read.parquet(str(managed_path(root / "source")))
         audits = {name: registry.spark.read.parquet(str(managed_path(root / ("audit-" + name))))
