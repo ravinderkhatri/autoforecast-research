@@ -15,6 +15,7 @@ from pyspark.sql import functions as F
 from autoforecast._execution import reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
+    BenchmarkError,
     _evaluation_contract_from_record,
     artifact_binding,
     snapshot_bound_input,
@@ -109,7 +110,10 @@ def score_study(
         "grid": contract["grid"],
         "coverage": contract["coverage"],
     }
-    verify_input_binding(pathlib.Path(panel.path), actuals)
+    try:
+        verify_input_binding(pathlib.Path(panel.path), actuals)
+    except (BenchmarkError, LineageError) as error:
+        raise ScoreError("actuals changed before scoring") from error
     if (metrics is not None and "wrmsse" in metrics
             or contract["metric_policy"]["metric"] == "wrmsse"):
         if "scoring_references" not in study["artifacts"]:
@@ -132,7 +136,10 @@ def score_study(
             forecast_accuracy_breakdown=forecast_accuracy_breakdown,
             metrics=metrics,
         )
-    verify_input_binding(pathlib.Path(panel.path), actuals)
+    try:
+        verify_input_binding(pathlib.Path(panel.path), actuals)
+    except (BenchmarkError, LineageError) as error:
+        raise ScoreError("actuals changed during evaluation") from error
     if directory_digest(forecast.path, suffixes=(".parquet",)) != forecast_sha:
         raise ScoreError("scoring inputs changed during evaluation")
     # The first check authenticated this private contract copy for this operation.

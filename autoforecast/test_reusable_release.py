@@ -3,6 +3,7 @@
 import datetime as dt
 import json
 import os
+import shutil
 from dataclasses import replace
 
 import pyarrow as pa
@@ -303,6 +304,40 @@ def test_fixed_grid_rejects_population_changes(frozen, tmp_path, spark, defect):
                 output_dir=tmp_path / "score",
                 fixed_contract=fixed,
             )
+
+
+
+def test_changed_actuals_during_scoring_are_not_ranked(frozen, tmp_path, spark, monkeypatch):
+    """A rewrite during scoring leaves an unscored candidate, never a usable ranking."""
+    from autoforecast import study_scoring
+
+    path, _, _, _ = frozen
+    fixed = benchmark.evaluation_contract(
+        path, stage="validation", origin="2024-01-21", horizon=7, metric="rmse"
+    )
+    actuals = tmp_path / "actuals"
+    shutil.copytree(fixed["actuals"]["path"], actuals)
+    panel = load_dataset_contract(path.parent / "dataset.yaml").panel(actuals)
+    forecast = _forecast(tmp_path / "forecast", fixed["grid"]["path"])
+    score_snapshot = study_scoring._score_study_snapshot
+
+    def rewrite_after_scoring(*args, **kwargs):
+        result = score_snapshot(*args, **kwargs)
+        # Change the caller's input after the scorer has consumed its private copy.
+        part = next(actuals.glob("*.parquet"))
+        table = pq.read_table(part)
+        pq.write_table(table.slice(1), part)
+        return result
+
+    monkeypatch.setattr(study_scoring, "_score_study_snapshot", rewrite_after_scoring)
+    result = compare_run_forecasts(
+        panel, {"naive": forecast}, spark, missing_actual="no_data", metric="rmse",
+        output_dir=tmp_path / "score", fixed_contract=fixed,
+    )
+    record = json.loads(result.read_text())
+    assert record["ranking"] is None
+    assert record["candidates"][0]["status"] == "not_scored"
+    assert record["candidates"][0]["detail"] == "actuals changed during evaluation"
 
 
 def test_fixed_grid_accepts_the_explicit_month_end_alias(tmp_path, spark):
