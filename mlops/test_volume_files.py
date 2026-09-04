@@ -5,9 +5,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from databricks.sdk.errors import AlreadyExists, NotFound
+from pyspark.sql import SparkSession
 
 from mlops import _safe_files, _volume_files
 
@@ -191,7 +193,9 @@ def test_volume_delta_provisioning_holds_native_lock(volume):
         assert str(path) in client.values
         commands.append(command)
 
-    store = DeltaStudyStore(SimpleNamespace(sql=sql), namespace="neutral.studies")
+    store = DeltaStudyStore(
+        cast(SparkSession, SimpleNamespace(sql=sql)), namespace="neutral.studies",
+    )
     store.validate_destinations = lambda: None
     store.prepare(lock_path=path)
     assert len(commands) == 1 + len(store.tables)
@@ -389,7 +393,8 @@ dataset:
     monkeypatch.setattr(module, "verify_benchmark", verified)
     monkeypatch.setattr(module, "read_benchmark_manifest", verified)
     with tempfile.TemporaryDirectory() as scratch:
-        study = module.load_study("study", registry_root=root, spark=object(), scratch_root=scratch)
+        study = module.load_study("study", registry_root=root,
+                                  spark=cast(SparkSession, object()), scratch_root=scratch)
         try:
             assert study.panel.target_col == "value"
         finally:

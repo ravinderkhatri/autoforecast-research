@@ -19,6 +19,7 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from sqlglot import exp, parse
 from sqlglot.errors import ParseError
+from sqlglot.expressions.dml import DML
 
 from autoforecast.benchmark import digest, parquet_content_hash
 from autoforecast.study_results import PUBLICATION_SCHEMAS, _publication
@@ -115,7 +116,7 @@ def _bound_source_sql(sql: str, bindings: Mapping[str, str]) -> str:
     }
     replacements = []
     for node in tree.walk():
-        if isinstance(node, exp.DDL | exp.DML | exp.Command | exp.Into | exp.With
+        if isinstance(node, exp.DDL | DML | exp.Command | exp.Into | exp.With
                       | exp.Lateral | exp.QueryTransform):
             raise ValueError("source SQL contains an unsupported or writable operator")
         if isinstance(node, exp.Query):
@@ -186,7 +187,7 @@ def read_sources(spark: SparkSession, *, queries: Mapping[str, str],
             quote_table(locations[source["table"]]["read_target"]),
         ) for index, source in enumerate(versions.values())
     }
-    return {name: (spark.sql(bound_queries[name], **frames),
+    return {name: (spark.sql(bound_queries[name], args=None, **frames),
                    {"sql": sql, "tables": versions, "resolved_tables": locations})
             for name, sql in queries.items()}
 
