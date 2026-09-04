@@ -3,23 +3,18 @@
 from __future__ import annotations
 
 import dataclasses
-import datetime as dt
 import hashlib
 import json
-import logging
 import math
 import pathlib
 import re
 import tempfile
-import time
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack, contextmanager, suppress
-from contextvars import ContextVar
+from contextlib import ExitStack, suppress
 from typing import TYPE_CHECKING, cast
 
 from mlops._safe_files import (
     _platform_absolute,
-    append_audit_bytes,
     is_regular_file,
     read_path_bytes,
     read_regular_bytes,
@@ -31,6 +26,7 @@ from pyspark.sql import functions as F
 
 from autoforecast._exact_json import loads_exact_json
 from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
+from autoforecast._execution import _stage, callable_name, note, reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
     boundary,
@@ -70,40 +66,6 @@ from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 if TYPE_CHECKING:
     from autoforecast.study import Study
-
-
-_LOG_LEVEL = ContextVar("autoforecast_log_level", default=logging.INFO)
-
-
-def _stage_event(path, stage, status, *, elapsed=None, **context):
-    """Retain factual stage outcomes even when console logging is reduced."""
-    event = {"timestamp": dt.datetime.now(dt.UTC).isoformat(), "stage": stage,
-             "status": status, "elapsed_seconds": elapsed, **context}
-    path = pathlib.Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    append_audit_bytes(path, (json.dumps(event, sort_keys=True, allow_nan=False) + "\n").encode())
-    level = (logging.ERROR if status == "FAIL" else logging.WARNING
-             if status == "UNAVAILABLE" or context.get("warnings") else logging.INFO)
-    if level >= _LOG_LEVEL.get():
-        with suppress(Exception):
-            logging.getLogger("autoforecast.stages").log(level, "%s", json.dumps(event))
-
-
-@contextmanager
-def _stage(path, name, **context):
-    start = time.monotonic()
-    _stage_event(path, name, "START", **context)
-    outcome = {}
-    try:
-        yield outcome
-    except BaseException as error:
-        with suppress(Exception):
-            _stage_event(path, name, "FAIL", elapsed=time.monotonic() - start,
-                         error_type=type(error).__name__, reason=str(error), **context)
-        raise
-    else:
-        status = outcome.pop("status", "PASS")
-        _stage_event(path, name, status, elapsed=time.monotonic() - start, **context, **outcome)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -527,6 +489,7 @@ class _WindowInput:
         return context
 
 
+@reported("Prepare training window and verify inputs")
 def _prepare_window(
     study: Study, stage: str, origin: str, horizon: int, root: pathlib.Path
 ) -> _WindowInput:
@@ -586,6 +549,8 @@ def _scoring_outcome(score):
     outcome["coverage"] = score["coverage"]
     outcome["evaluation_status"] = score["evaluation_status"]
     outcome["metric_status"] = score["metric_status"]
+    outcome["scores"] = {k: v for k, v in score.items()
+                         if isinstance(v, int | float) and not isinstance(v, bool)}
     outcome["warnings"] = [
         name for name in ("zero_filled", "excluded") if score["coverage"].get(name, 0)
     ]
@@ -626,11 +591,16 @@ def _fit_window(
         try:
             with _stage(output / "events.jsonl", "fit_predict", model_id=model_id,
                         origin=origin, purpose=purpose, window=output.name,
+                        forecast_start=str(period_points(origin, panel.frequency, horizon)[0]),
+                        forecast_periods=horizon, frequency=panel.frequency,
                         study_id=context["evaluation_contract"]["study_id"],
                         run_id=run_id, trial_id=trial_id,
                         history_zero_filled=context.get("history_zero_filled", 0),
                         warnings=(["history_zero_filled"]
                                   if context.get("history_zero_filled", 0) else [])):
+                note("Callback inputs", callback=callable_name(callback),
+                     model_parameters=model_parameters, training_parameters=training_parameters,
+                     history_through=origin, purpose=purpose)
                 result = callback(
                     FitPredictRequest(
                         training_data=spark.read.parquet(panel.path),
@@ -693,7 +663,10 @@ def _fit_window(
             forecast.validate()
     fixed = context["evaluation_contract"]
     with _stage(output / "events.jsonl", "scoring", model_id=model_id,
+                metrics=metrics, breakdown=breakdown,
                 origin=origin, purpose=purpose, window=output.name,
+                        forecast_start=str(period_points(origin, panel.frequency, horizon)[0]),
+                        forecast_periods=horizon, frequency=panel.frequency,
                 study_id=context["evaluation_contract"]["study_id"],
                 run_id=run_id, trial_id=trial_id) as outcome:
         score = score_study(
@@ -771,6 +744,8 @@ class _ExternalTrialBridge:
 
         try:
             for index, inputs in enumerate(self.inputs):
+                note("CV window", window_index=index + 1, window_total=len(self.inputs),
+                     search_id=request.study.id, trial_id=request.trial_id)
                 prefix = "" if len(self.inputs) == 1 else f"windows/{index:04d}"
                 directory = request.attempt.path / prefix
                 record = _fit_window(
@@ -924,14 +899,12 @@ def tune_study(
                     "completed search differs from the requested study, "
                     "configuration or implementation"
                 )
+            note("Tuning reuse verified", search_path=str(result.path),
+                 selected_parameters=result.parameters, objective_score=result.tuning_score)
             return result
-        logging.getLogger(__name__).warning(
-            "Tuning work: %s trials x %s windows = %s fresh callback fits; %s retained series",
-            budget,
-            len(options["windows"]),
-            budget * len(options["windows"]),
-            study.n_series,
-        )
+        note("Tuning work", trial_budget=budget, windows=len(options["windows"]),
+             maximum_callback_fits=budget * len(options["windows"]),
+             retained_series=study.n_series, objective=study.recipe["metric"])
         temporary = pathlib.Path(
             stack.enter_context(tempfile.TemporaryDirectory(
                 prefix="autoforecast-inputs-", dir=study._snapshots.name,

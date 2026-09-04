@@ -21,6 +21,7 @@ from sqlglot import exp, parse
 from sqlglot.errors import ParseError
 from sqlglot.expressions.dml import DML
 
+from autoforecast._execution import note, reported
 from autoforecast.benchmark import digest, parquet_content_hash
 from autoforecast.study_results import PUBLICATION_SCHEMAS, _publication
 
@@ -158,6 +159,7 @@ def _bound_source_sql(sql: str, bindings: Mapping[str, str]) -> str:
     return "".join(parts)
 
 
+@reported("Resolve source aliases and pinned Delta versions")
 def read_sources(spark: SparkSession, *, queries: Mapping[str, str],
                  tables: Mapping[str, str]):
     """Execute declared queries against one version per physical Delta table."""
@@ -180,6 +182,9 @@ def read_sources(spark: SparkSession, *, queries: Mapping[str, str],
                             "read_target": target}
     versions = {alias: {"table": table, "version": resolved[table]}
                 for alias, table in tables.items()}
+    note("Resolved sources", aliases=[{"alias": alias, **version}
+                                     for alias, version in versions.items()], queries=list(queries),
+         version_note="Delta table versions; row-date conditions remain in the SQL evidence")
     # Pass pinned DataFrames through Spark's public SQL API. Spark Connect carries
     # their plans with the query; no caller-owned temporary view is overwritten.
     frames = {
@@ -267,6 +272,7 @@ class DeltaStudyStore:
         if len(set(self.tables.values())) != len(self.tables):
             raise ValueError("study table roles must have distinct names")
 
+    @reported("Create or validate registry tables")
     def prepare(self, *, lock_path: pathlib.Path) -> None:
         """Serialize initial DDL with the registry's shared lock.
 
@@ -334,6 +340,7 @@ class DeltaStudyStore:
         if not _same_rows(expected, after):
             raise ValueError("issue linkage differs from the checked report")
 
+    @reported("Write or verify existing Delta records")
     def append_once(self, kind: str, frame: DataFrame, *, scope: Mapping[str, str]) -> None:
         """Reuse identical logical writes; reject conflicting or incomplete scopes."""
         if not scope or any(not isinstance(v, str) or not v for v in scope.values()):
@@ -347,6 +354,7 @@ class DeltaStudyStore:
         if existing.limit(1).count():
             if not _same_rows(frame, existing):
                 raise ValueError(f"conflicting immutable {kind} records")
+            note("Delta rows reused and verified", table=self.tables[kind], scope=dict(scope))
             return
         transaction = "autoforecast-" + digest({"table": self.tables[kind], "scope": dict(scope)})
         try:
@@ -355,15 +363,20 @@ class DeltaStudyStore:
         except Exception:
             # A simultaneous identical transaction may have won. Never swallow
             # a failed write unless its complete scoped content is already present.
+            reused = False
             with suppress(Exception):
                 checked, _ = self.read(kind, scope)
-                if _same_rows(frame, checked):
-                    return
+                reused = _same_rows(frame, checked)
+            if reused:
+                note("Delta rows reused and verified", table=self.tables[kind], scope=dict(scope))
+                return
             raise
         checked, _ = self.read(kind, scope)
         if not _same_rows(frame, checked):
             raise ValueError(f"Delta readback differs from immutable {kind} submission")
+        note("Delta rows written and verified", table=self.tables[kind], scope=dict(scope))
 
+    @reported("Freeze and verify Delta observations")
     def freeze_observations(self, path: pathlib.Path, *, keys: list[str],
                             scratch_root: pathlib.Path) -> dict:
         """Store a materialized source once; verify transport and typed content."""
@@ -409,6 +422,7 @@ class DeltaStudyStore:
                 or parquet_content_hash(destination) != record["logical_sha256"]):
             raise ValueError("stored study rows differ from their protected typed snapshot")
 
+    @reported("Verify frozen Delta snapshot")
     def verify_observations(self, record: dict, *, scratch_root: pathlib.Path) -> int:
         """Verify a pinned stored snapshot; never replace expected hashes on load."""
         if record["algorithm"] != "typed-parquet-rows-v2" or record["codec"] != JSON_OPTIONS:
@@ -423,6 +437,7 @@ class DeltaStudyStore:
                                   root / "decoded")
         return version
 
+    @reported("Publish retained result tables")
     def publish_results(self, definition, study_sha, workflow_path, *, scratch_root,
                         mlflow_links=None):
         """Publish tuning windows and final scores under the same study and run IDs.

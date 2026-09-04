@@ -18,6 +18,7 @@ from mlops.run_report import new_run_id
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
+from autoforecast._execution import reported
 from autoforecast.benchmark import (
     BenchmarkError,
     artifact_path,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from autoforecast.study_workflow import ForecastWorkflowResult
 
 
+@reported("Verify study definition and frozen artifacts")
 def load_study(
     study_id: str, *, registry_root: str | pathlib.Path | None = None,
     spark: SparkSession | None = None,
@@ -314,6 +316,7 @@ class Study:
         fixed_parameters: Mapping[str, object] | None = None,
         validation_only: bool = False,
         validation_run: str | pathlib.Path | None = None,
+        model_label: str | None = None,
     ) -> ForecastWorkflowResult:
         """Tune, validate and refit, or use fixed/reused settings without HPO.
 
@@ -328,7 +331,7 @@ class Study:
             config=config, tuning_origin=tuning_origin, output_dir=output_dir,
             reuse_tuning=reuse_tuning, selected_config=selected_config,
             fixed_parameters=fixed_parameters, validation_only=validation_only,
-            validation_run=validation_run)
+            validation_run=validation_run, model_label=model_label)
 
     def run_campaign(self, *, models, output_dir=None, **execution) -> dict:
         """Compare declared external models through the existing campaign runner.

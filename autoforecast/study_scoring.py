@@ -12,6 +12,7 @@ import tempfile
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
+from autoforecast._execution import reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
     _evaluation_contract_from_record,
@@ -58,6 +59,7 @@ def verify_study_evaluation(contract: dict) -> tuple[pathlib.Path, dict]:
     return path, record
 
 
+@reported("Calculate requested scores and coverage")
 def score_study(
     panel: Panel, forecast: Forecast, spark: SparkSession, *, contract: dict,
     output_dir: pathlib.Path,

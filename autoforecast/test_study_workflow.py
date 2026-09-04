@@ -2414,8 +2414,11 @@ def test_completed_workflow_links_survive_secondary_audit_failure(tmp_path, monk
 
     native = study_workflow._stage_event
 
+    injected = []
+
     def broken_terminal_event(path, stage, status, **context):
-        if stage == "run" and status == "FAIL":
+        if stage == "run_attempt" and status == "FAIL":
+            injected.append(True)
             raise OSError("secondary audit write error")
         return native(path, stage, status, **context)
 
@@ -2430,6 +2433,7 @@ def test_completed_workflow_links_survive_secondary_audit_failure(tmp_path, monk
             implementation={},
             publish=True,
         )
+    assert injected == [True]
     print(
         "RECOVERY_LINKS="
         + json.dumps(

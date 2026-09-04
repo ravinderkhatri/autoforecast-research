@@ -16,13 +16,13 @@ import os
 import pathlib
 import shutil
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager, suppress
 from typing import Any, Protocol
 
 from mlops import _volume_files
 from mlops._safe_files import (
-    append_audit_bytes,
     path_exists,
     publish_bytes,
     read_path_bytes,
@@ -34,6 +34,17 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
 
 from autoforecast._exact_yaml import loads_record, read_record, record_bytes
+from autoforecast._execution import (
+    Execution,
+    _emit,
+    _stage_event,
+    note,
+    operation,
+    record_result,
+    reported,
+    resolve_level,
+    standalone_attempt,
+)
 from autoforecast.benchmark import (
     START_COLUMN,
     _normalise_recipe,
@@ -384,6 +395,13 @@ def _save_admission(registry, staging, identity, frozen, *, format):
                    "physical_sha256": hashlib.sha256(
                        read_regular_bytes(existing.parent, existing.name)).hexdigest()}
         _verify_admission(registry.root, binding)
+    note("Admission outcome",
+         starting=record["outcome"]["starting"],
+         application_retained=record["outcome"]["application_retained"],
+         final_retained=record["outcome"]["final_retained"], evidence=str(existing),
+         application_excluded=(record["outcome"]["starting"]
+                               - record["outcome"]["application_retained"]),
+         counts_note="Issue reasons may overlap; do not sum them as excluded series")
     return binding
 
 
@@ -416,6 +434,7 @@ def _check_key_frame(frame, template, keys, *, extra=(), label):
             raise ValueError(f"{label}.{name} requires nonblank strings")
 
 
+@reported("Save data-check findings")
 def _save_findings(registry, frame, issues_root, name, check_id):
     frame.write.parquet(str(issues_root / name))
     saved = registry.spark.read.parquet(str(issues_root / name))
@@ -427,6 +446,7 @@ def _save_findings(registry, frame, issues_root, name, check_id):
     return saved
 
 
+@reported("Business preparation and input verification")
 def _prepare_observations(hook, settings, frame, audits, population, findings, *,
                           value, root, staging, registry, issues_root, check_id):
     """Capture callback outputs, then reconcile against private managed baselines."""
@@ -763,20 +783,28 @@ class StudyRegistry:
         if writer is None:
             raise ValueError("result publication requires a destination or Delta registry")
         definition, sha = self.definition(study_id)
-        return writer.publish_results(
-            definition, sha, workflow_path, scratch_root=self.scratch_root,
-            mlflow_links=mlflow_links,
-        )
+        with standalone_attempt(self.root, "Result publication", study_id=study_id,
+                                destination=type(writer).__name__) as owns_attempt:
+            result = writer.publish_results(
+                definition, sha, workflow_path, scratch_root=self.scratch_root,
+                mlflow_links=mlflow_links,
+            )
+            if owns_attempt:
+                record_result(study_id=study_id, workflow_path=str(workflow_path))
+            return result
 
 
 def register_study(config, *, registry=None, spark=None,
-                   prepare: StudyPreparation | None = None) -> str:
+                   prepare: StudyPreparation | None = None, log_level=None) -> str:
     """Validate, report and freeze one study; never fit a model or start tracking."""
-    logger = logging.getLogger(__name__)
     check_id = uuid.uuid4().hex
-    logger.info("configuration START attempt=%s", check_id)
+    check_start = time.monotonic()
+    initial_level = resolve_level(log_level, getattr(registry, "runtime", {}))
     try:
         value, base = _configuration(config)
+        initial_level = resolve_level(log_level, value.get("runtime", {}))
+        _emit({"stage": "Preparing execution plan", "status": "START",
+               "attempt_id": check_id}, initial_level)
         settings = PreparationSettings(_bytes({
             "dataset": value["dataset"], "recipe": value["recipe"],
             "parameters": value.get("preparation", {}),
@@ -799,49 +827,97 @@ def register_study(config, *, registry=None, spark=None,
             validate_source_queries(registry.spark, queries={
                 "primary": value["source"]["sql"], **value["source"]["audit_queries"],
             }, tables=value["source"]["tables"])
-    except Exception:
-        logger.error("configuration FAIL attempt=%s", check_id)
+    except BaseException as error:
+        _emit({"stage": "Preparing execution plan",
+               "status": "FAIL" if isinstance(error, Exception) else "CANCELLED",
+               "attempt_id": check_id, "error_type": type(error).__name__}, initial_level)
         raise
     registry.root.mkdir(parents=True, exist_ok=True)
     registry.scratch_root.mkdir(parents=True, exist_ok=True)
     issues_root = registry.root / "checks" / check_id
     issues_root.mkdir(parents=True)
     phase = "configuration"
+    starts = {}
+    audit = issues_root / "audit.jsonl"
 
     def event(stage, status, **facts):
         nonlocal phase
         phase = stage
-        entry = {"attempt_id": check_id, "stage": stage, "status": status,
-                 "evidence": str(issues_root), **facts}
-        logger.info("%s %s attempt=%s %s", stage, status, check_id,
-                    " ".join(f"{name}={item}" for name, item in facts.items()))
-        append_audit_bytes(issues_root / "audit.jsonl", _bytes(entry))
+        if status == "START":
+            starts[stage] = time.monotonic()
+        _stage_event(audit, stage, status, elapsed=(time.monotonic() - starts[stage]
+                     if status != "START" and stage in starts else None),
+                     evidence=str(issues_root), **facts)
 
-    event("configuration", "START")
-    event("configuration", "PASS")
-    format = value.get("records", {}).get("format", "json")
-    try:
-        return _register_study(value, registry, prepare, settings, check_id, issues_root, event)
-    except Exception as error:
-        logger.error("%s FAIL attempt=%s exception=%s", phase, check_id, type(error).__name__)
+    level = resolve_level(log_level, value.get("runtime", {}))
+    with Execution(audit, ("configuration", "sources", "admission", "freeze", "publication"),
+                   level=level, attempt_id=check_id) as execution:
+        event("configuration", "START")
+        source, recipe = value["source"], value["recipe"]
+        note("Registration inputs", configuration=str(config) if not isinstance(config, dict)
+             else "supplied mapping", source_kind=source["kind"],
+             configuration_sha256=hashlib.sha256(_bytes(value)).hexdigest(),
+             source_aliases=list(source.get("tables", {})),
+             primary_path=source.get("path"),
+             target=value["dataset"].get("dataset", {}).get("panel", {}).get("target_col"),
+             actual_missing=recipe.get("actual_missing"),
+             final_train_cutoff=recipe.get("final_train_cutoff"),
+             validation_horizon=recipe.get("validation_horizon"),
+             final_test_horizon=recipe.get("final_test_horizon"),
+             query_sha256=[{"query": name, "sha256": hashlib.sha256(sql.encode()).hexdigest()}
+                           for name, sql in {"primary": source.get("sql", ""),
+                                             **source.get("audit_queries", {})}.items()]
+             if source["kind"] == "delta" else [],
+             audit_queries=list(source.get("audit_queries", {})),
+             population_query=source.get("population", "primary"),
+             source_keys=recipe["source_keys"], training_start=recipe["training_start"],
+             validation_origins=recipe["validation_origins"],
+             history_missing=recipe["history_missing"],
+             invalid_references=value.get("invalid_references", "error"),
+             preparation=(f"{type(prepare).__module__}.{type(prepare).__qualname__}.prepare"
+                          if prepare else "none"),
+             log_level=logging.getLevelName(level), registry=str(registry.root),
+             registry_tables=dict(getattr(registry.store, "tables", {})),
+             registration_writes="frozen data and registry records even when runtime.publish=false")
+        starts["configuration"] = check_start
+        format = value.get("records", {}).get("format", "json")
+        event("configuration", "PASS")
         try:
-            event(phase, "FAIL", exception=type(error).__name__)
-            (issues_root / ("attempt." + format)).write_bytes(record_bytes(
-                {"status": "failed", "stage": phase, "exception": type(error).__name__},
-                format=format,
-            ))
-        except Exception:
-            logger.error("failure evidence could not be saved attempt=%s", check_id)
-            error.add_note("Registration failure evidence could not be saved.")
-        raise
+            event("sources", "START")
+            study_id = _register_study(
+                value, registry, prepare, settings, check_id, issues_root, event,
+            )
+            record_result(study_id=study_id, evidence=str(issues_root))
+            note("Study registered", study_id=study_id, evidence=str(issues_root))
+            return study_id
+        except BaseException as error:
+            status = "FAIL" if isinstance(error, Exception) else "CANCELLED"
+            try:
+                failed_stage = phase if execution.states[phase] == "START" else "registration"
+                _stage_event(audit, failed_stage, status, exception=type(error).__name__,
+                             last_stage=phase, evidence=str(issues_root))
+                (issues_root / ("attempt." + format)).write_bytes(record_bytes(
+                    {"status": "failed" if status == "FAIL" else "cancelled",
+                     "stage": failed_stage, "exception": type(error).__name__,
+                     **({"last_stage": phase} if failed_stage != phase else {})},
+                    format=format,
+                ))
+            except BaseException as evidence_error:
+                message = "Registration failure evidence could not be verified."
+                error.add_note(message)
+                with suppress(BaseException):
+                    _emit({"stage": "Registration failure evidence", "status": "UNVERIFIED",
+                           "attempt_id": check_id, "error_type": type(evidence_error).__name__,
+                           "reason": message}, level)
+            raise
 
 
 def _register_study(value, registry, prepare, preparation_settings, check_id, issues_root, event):
     configuration_baseline = preparation_settings._payload
     session = registry.spark
-    event("sources", "START")
     if registry.store is not None:
-        registry.store.prepare(lock_path=registry.root / ".delta-provision.lock")
+        with operation("Create or validate registry tables", engine="Spark"):
+            registry.store.prepare(lock_path=registry.root / ".delta-provision.lock")
     with tempfile.TemporaryDirectory(prefix="af-register-", dir=registry.scratch_root) as temporary:
         root = pathlib.Path(temporary)
         contract_path = root / "dataset.yaml"
@@ -862,7 +938,8 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                 source_record.pop("resolved_tables")
             for name, (audit, provenance) in managed.items():
                 path = root / ("audit-" + name)
-                audit.write.parquet(str(path))
+                with operation("Save raw audit data", query=name, engine="Spark"):
+                    audit.write.parquet(str(path))
                 audits[name] = session.read.parquet(str(path))
                 query_records[name] = {**provenance, "logical_sha256": parquet_content_hash(path),
                                        "schema": audits[name].schema.jsonValue(),
@@ -870,15 +947,16 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         else:
             frame = session.read.parquet(source["path"])
             source_record = {"kind": "parquet"}
-        frame.write.parquet(str(root / "source"))
+        with operation("Save primary data", query="primary", engine="Spark"):
+            frame.write.parquet(str(root / "source"))
         frame = session.read.parquet(str(root / "source"))
         source_record.update({"logical_sha256": parquet_content_hash(root / "source"),
                               "schema": frame.schema.jsonValue(), "rows": frame.count()})
         keys = recipe["source_keys"]
         panel = contract.panel(root / "source")
         source_record["starting_series"] = frame.select(*keys).distinct().count()
-        event("sources", "PASS", rows=source_record["rows"],
-              starting_series=source_record["starting_series"])
+        event("sources", "PASS", primary_rows=source_record["rows"],
+              primary_series=source_record["starting_series"], query="primary")
         event("admission", "START")
         cadence = parse_frequency(recipe["frequency"])
         start = time_literal(parse_origin(recipe["training_start"], cadence), cadence)
@@ -897,6 +975,9 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             population_name = source.get("population", "primary")
             population_frame = frame if population_name == "primary" else audits[population_name]
             population = population_frame.select(*keys).distinct()
+            note("Preparation input mapping", observations="primary",
+                 audits=list(audits), starting_keys=population_name,
+                 settings="captured recipe and preparation settings")
             captured, preparation_metadata = _prepare_observations(
                 prepare, preparation_settings, frame, audits, population, findings,
                 value=value, root=root,
@@ -962,6 +1043,8 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         exclusion_findings = []
         if "references" in value:
             settings = value["references"]
+            note("Reference settings", settings=settings, history_start=recipe["training_start"],
+                 findings=str(issues_root / "references"))
             origins = [(stage, dt.date.fromisoformat(origin))
                        for stage, origin, _ in study_windows(recipe)]
             if settings.get("prepared") and "scoring_references" not in captured:
@@ -1079,6 +1162,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         library_sha = hashlib.sha256(read_path_bytes(manifest)).hexdigest()
         _, frozen = verify_benchmark(manifest, library_sha)
         event("freeze", "PASS", study_id=frozen["study_id"])
+        event("publication", "START", study_id=frozen["study_id"])
         definition = {
             "schema": "autoforecast.registration.v1", "study_id": manifest.parent.name,
             "library_sha256": library_sha,
@@ -1091,7 +1175,6 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                           "excluded_new_keys": sorted(new_keys, key=_bytes),
                           "retained_series": retained},
         }
-        event("publication", "START", study_id=frozen["study_id"])
         format = value.get("records", {}).get("format", "json")
         if admission_identity is not None:
             # Source/preparation hashes attest to captured inputs. Frozen model rows
@@ -1109,6 +1192,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             record_bytes({"study_id": definition["study_id"]}, format=format))
         study_id = registry._publish_definition(definition, format=format)
         registry.definition(study_id)
+        record_result(study_id=study_id, evidence=str(issues_root))
         _remove_staging_directory(staging)
         event("publication", "PASS", study_id=study_id, retained_series=retained)
         return study_id

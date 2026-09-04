@@ -75,29 +75,17 @@ A stopped process can leave a volume lock behind. A later run stops instead of s
 Confirm that the owning run has stopped before removing that lock; do not remove an active
 writer's lock. Existing study files and SHA mismatches are never silently replaced.
 
-### Ownership and publication
+### Keep saved runs safe
 
-Each run or attempt owns a fresh directory. Different runs can write in parallel in separate
-directories; do not share one writable run directory between notebooks. A new attempt needs
-a new ID. Reusing an existing run directory is refused. Published snapshots and completed
-results must remain unchanged; create a new version when the data or results change.
+Give each run its own folder and leave saved data and results unchanged.
 
-Files are created without overwriting existing files and are read back to check their bytes.
-Run bundles and attempts write their SHA manifest before writing `completion.json` last.
-Readers accept a completed result only after checking its manifest, file list and hashes.
-An interrupted run without a valid completion record is not a usable result. Retain its
-evidence and start a fresh attempt; never manufacture a completion record to recover it.
+For example, Monday's run and Tuesday's run use different output folders. Both can
+read the same saved study, as long as nobody edits or deletes that study.
 
-Volume operations use paths, not a pinned directory handle or a transaction across files.
-The deployment must restrict write/delete access and coordinate cleanup: no other process
-may rename, replace or delete a source snapshot or an active output directory. Library locks
-coordinate cooperating writers only. Local filesystem directory protections do not extend
-to remote volume paths, even when the mount exposes a local directory handle.
-
-Previously frozen hashes are checked when copying study snapshots and loading results.
-Calculating a new hash after copying files cannot prove that they came from one source version.
-Keep source snapshots immutable throughout reads, and do not let cleanup jobs remove them
-while a run still uses them. These ownership rules also apply to interrupted writes and retries.
+If a run stops halfway, keep its folder for troubleshooting and start a fresh attempt.
+AutoForecast checks saved results before using them. Do not edit completion files by hand.
+On shared storage, permissions and cleanup jobs must protect files that a run is still using.
+See [shared-storage examples](tutorials/README.md#keeping-saved-runs-safe) for details.
 
 ## What the library keeps
 
@@ -130,6 +118,23 @@ From the library checkout, install only what you use:
 LightGBM on macOS needs `brew install libomp`. TimesFM 2.5 uses `.[timesfm]` in a separate
 environment from TimesFM 3. Installation does not download model weights.
 See [model profiles](configs/models/) for settings.
+
+## See what is running
+
+Call `configure_logging()` once to see the current step and its progress.
+
+```python
+from autoforecast import configure_logging
+
+# Show progress in this notebook or script.
+configure_logging()
+```
+
+The display shows completed and remaining stages. A download can show bytes copied;
+a model callback with no progress counter shows elapsed time. The percentage of stages
+completed is a stage count, not an estimate of how much runtime remains.
+See the [tutorial guide](tutorials/README.md#progress-and-logs) for quiet output,
+job logs and failure details.
 
 ## Development
 

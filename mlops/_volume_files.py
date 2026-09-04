@@ -16,12 +16,13 @@ import hashlib
 import io
 import os
 import pathlib
-import shutil
 import tempfile
 import uuid
 from collections.abc import Iterable
 from contextlib import contextmanager
 from functools import lru_cache
+
+from autoforecast._execution import operation
 
 
 def is_volume(path: pathlib.Path) -> bool:
@@ -251,19 +252,30 @@ def local_snapshot(path: pathlib.Path):
         target = pathlib.Path(temporary) / path.name
         if directory:
             target.mkdir()
-        for relative, (is_directory, expected_size, _modified) in sorted(inventory.items()):
-            destination = target / relative if directory else target
-            if is_directory:
-                destination.mkdir(parents=True, exist_ok=True)
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            response = _client().files.download(str(path / relative) if directory else str(path))
-            if response.contents is None:
-                raise OSError("volume download returned no content")
-            with response.contents as source, destination.open("wb") as output:
-                shutil.copyfileobj(source, output, length=1024 * 1024)
-            if destination.stat().st_size != expected_size:
-                raise OSError("volume file changed size while it was copied")
-        if _inventory(path) != (directory, inventory):
-            raise OSError("volume directory changed while it was copied")
+        sizes = [size for directory, size, _ in inventory.values() if not directory]
+        total = sum(size for size in sizes if size is not None) if None not in sizes else None
+        copied = finished = 0
+        with operation("Download snapshot for integrity checks", dataset=str(path),
+                       engine="driver", files_total=len(sizes)) as update:
+            for relative, (is_directory, expected_size, _modified) in sorted(inventory.items()):
+                destination = target / relative if directory else target
+                if is_directory:
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                remote = str(path / relative) if directory else str(path)
+                response = _client().files.download(remote)
+                if response.contents is None:
+                    raise OSError("volume download returned no content")
+                with response.contents as source, destination.open("wb") as output:
+                    while chunk := source.read(1024 * 1024):
+                        output.write(chunk)
+                        copied += len(chunk)
+                        update(completed=copied, total=total, unit="bytes", files=finished)
+                finished += 1
+                if destination.stat().st_size != expected_size:
+                    raise OSError("volume file changed size while it was copied")
+                update(completed=copied, total=total, unit="bytes", files=finished)
+            if _inventory(path) != (directory, inventory):
+                raise OSError("volume directory changed while it was copied")
         yield target

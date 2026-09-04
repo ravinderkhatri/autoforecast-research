@@ -314,8 +314,8 @@ def test_volume_download_failure_does_not_return_partial_identity(volume, monkey
 def test_volume_retained_audit_is_sealed_and_reloadable_before_mount_refresh(volume, kind):
     import json
 
+    from autoforecast._execution import _stage_event
     from autoforecast.experiments import load_completed_attempt, open_local_attempt
-    from autoforecast.study_tuning import _stage_event
     from autoforecast.test_experiments import _metadata
 
     from mlops.run_bundle import load_completed_run_bundle, open_run_bundle
@@ -1068,3 +1068,57 @@ def test_native_selection_parameter_resolution_uses_authenticated_bytes(
     assert isinstance(parameters, dict) and isinstance(source, dict)
     assert parameters["model.hidden_size"] == 32
     assert source["selection_sha256"] == hashlib.sha256(trusted).hexdigest()
+
+
+def test_volume_progress_reuses_inventory_bytes_and_does_not_recursively_audit(volume):
+    import json
+
+    from autoforecast._execution import Execution, _stage, operation
+
+    root, client = volume
+    source = root / 'source' / 'part.parquet'
+    payload = b'x' * (2 * 1024 * 1024 + 13)
+    client.values[str(source)] = payload
+    audit = root / 'progress' / 'events.jsonl'
+    with Execution(audit, ['copy']):
+        with _stage(audit, 'copy'):
+            with _volume_files.local_snapshot(source.parent) as copied:
+                assert (copied / source.name).read_bytes() == payload
+            before = len(client.requests)
+            with operation('Count loop') as update:
+                start = len(client.requests)
+                for count in range(100):
+                    update(completed=count, total=100, unit='rows')
+                assert len(client.requests) == start
+            assert len(client.requests) - before == 4  # Two lifecycle appends, each with a lock.
+    rows = [json.loads(line) for line in client.values[str(audit)].splitlines()]
+    assert len(rows) == 6
+    assert all(row['status'] in {'START', 'PASS'} for row in rows)
+
+
+def test_download_reports_unequal_file_bytes_and_final_file_count(volume, monkeypatch):
+    import json
+
+    from autoforecast import _execution as events
+
+    root, client = volume
+    client.values[str(root / 'data' / 'small.parquet')] = b'a'
+    client.values[str(root / 'data' / 'large.parquet')] = b'b' * (1024 * 1024 + 4)
+    snapshots = []
+    original = events.progress
+    def record(**counts):
+        original(**counts)
+        snapshots.append(counts)
+    monkeypatch.setattr(events, 'progress', record)
+    audit = root / 'audit' / 'events.jsonl'
+    with events.Execution(audit, ['download']):
+        with events._stage(audit, 'download'):
+            with _volume_files.local_snapshot(root / 'data') as local:
+                assert (local / 'small.parquet').read_bytes() == b'a'
+    assert snapshots[-1]['completed'] == snapshots[-1]['total'] == 1024 * 1024 + 5
+    assert snapshots[-1]['files'] == 2
+    rows = [json.loads(line) for line in client.values[str(audit)].splitlines()]
+    finished = next(r for r in rows if r['stage'] == 'Download snapshot for integrity checks'
+                    and r['status'] == 'PASS')
+    assert finished['completed'] == 1024 * 1024 + 5 and finished['files'] == 2
+    assert len(rows) == 4

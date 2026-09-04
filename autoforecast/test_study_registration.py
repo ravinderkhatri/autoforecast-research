@@ -134,7 +134,8 @@ def test_package_facade_runs_without_hpo_and_retains_scores_after_close(spark, t
         return predict(request)
 
     result = run_study(study_id, model, registry=registry, model_config=profile,
-                       implementation=implementation(), log_level="ERROR")
+                       implementation=implementation(), log_level="ERROR",
+                       model_label="Baseline check")
     assert calls == ["validation", "refit"]
     assert result.tuning_path is None
     assert result.study_id == study_id and result.parent_study_id is None
@@ -153,6 +154,12 @@ def test_package_facade_runs_without_hpo_and_retains_scores_after_close(spark, t
         ("tracking_setup", "SKIP"), ("tracking_publication", "SKIP"), ("table_publication", "SKIP"),
     ]
     assert events[-1]["status"] == "PASS"
+    assert all(event.get("model_label") == "Baseline check" for event in events)
+    child_events = [json.loads(line) for line in (result.path / "events.jsonl")
+                    .read_text().splitlines()]
+    assert all(event.get("model_label") == "Baseline check" for event in child_events)
+    assert "model_label" not in result.parameters
+    assert "model_label" not in result.provenance.get("registration", {})
     if policy == "mask":
         def second_model(request):
             assert request.model_parameters["level"] == 10.0
@@ -856,7 +863,7 @@ def test_scoring_failure_preserves_primary_error_and_real_stage_events(spark, tm
     attempt_events = [json.loads(line)
                       for line in caught.value.audit_path.read_text().splitlines()]
     assert [(e["stage"], e["status"]) for e in attempt_events if e["status"] == "FAIL"] == [
-        ("workflow", "FAIL"), ("run", "FAIL"),
+        ("workflow", "FAIL"), ("run_attempt", "FAIL"),
     ]
     assert not any(e["stage"] in {"table_publication", "tracking_publication"}
                    for e in attempt_events)
@@ -872,17 +879,25 @@ def test_scoring_failure_preserves_primary_error_and_real_stage_events(spark, tm
 def test_secondary_audit_and_trial_retention_errors_preserve_primary(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
-    from autoforecast import study_tuning
+    from autoforecast import _execution, study_tuning
     from autoforecast.study import Study
+
+    native_event = _execution._stage_event
+    injected = []
 
     def bad_event(path, stage, status, **context):
         if status == "FAIL":
+            injected.append(status)
             raise OSError("secondary audit error")
+        return native_event(path, stage, status, **context)
 
-    monkeypatch.setattr(study_tuning, "_stage_event", bad_event)
-    with pytest.raises(RuntimeError, match="primary operation"):
+    monkeypatch.setattr(_execution, "_stage_event", bad_event)
+    primary = RuntimeError("primary operation")
+    with pytest.raises(RuntimeError, match="primary operation") as caught:
         with study_tuning._stage(tmp_path / "audit", "operation"):
-            raise RuntimeError("primary operation")
+            raise primary
+    assert caught.value is primary
+    assert injected == ["FAIL"]
 
     def bad_fit(*args, **kwargs):
         raise RuntimeError("primary fit")
@@ -1133,4 +1148,47 @@ def test_post_tuning_copy_failure_is_not_a_failed_or_executed_search(
         for e in events
     )
     assert not any(e["stage"] == "tuning" and e["status"] == "FAIL" for e in events)
-    assert any(e["stage"] == "artifact_retention" and e["status"] == "FAIL" for e in events)
+    assert any(e["stage"] == "workflow_attempt" and e["status"] == "FAIL"
+               and e["last_stage"] == "artifact_retention" for e in events)
+
+
+def test_registration_console_summary_preserves_identity_and_cancellation(spark, tmp_path, monkeypatch):
+    import io
+    import logging
+
+    from autoforecast import configure_logging
+    from autoforecast import study_registration as registration
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    original = register_study(path, registry=registry, log_level="ERROR")
+    logger = logging.getLogger("autoforecast.stages")
+    previous = logger.handlers[:], logger.level, logger.propagate
+    stream = io.StringIO()
+    try:
+        configure_logging(stream=stream, progress="plain", interval=60)
+        repeated = register_study(path, registry=registry, log_level="INFO")
+        assert repeated == original
+        text = stream.getvalue()
+        assert "population_query=primary" in text
+        assert "source_keys=['item']" in text
+        assert "training_start=2024-01-01" in text
+        assert "runtime.publish=false" in text
+        assert "5/5 (100.0% of stages completed)" in text
+        assert "Remaining (not completed): None" in text
+        final_panel = text[text.rfind("RUN "):]
+        assert original in final_panel and str(registry.root / "checks") in final_panel
+        assert "evidence:" in final_panel and "Audit location:" in final_panel
+        error = KeyboardInterrupt("cancel registration")
+        def cancel(*_args, **_kwargs):
+            raise error
+        monkeypatch.setattr(registration, "_register_study", cancel)
+        with pytest.raises(KeyboardInterrupt) as caught:
+            register_study(path, registry=registry)
+        assert caught.value is error
+        events = [json.loads(line) for audit in (registry.root / "checks").glob("*/audit.jsonl")
+                  for line in audit.read_text().splitlines()]
+        assert any(e["status"] == "CANCELLED" for e in events)
+        assert "CANCELLED" in stream.getvalue()
+    finally:
+        logger.handlers, logger.level, logger.propagate = previous

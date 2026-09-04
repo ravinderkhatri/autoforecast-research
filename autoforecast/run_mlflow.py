@@ -18,6 +18,8 @@ from typing import Any
 from mlops import ProvenanceError, load_completed_run_bundle, sanitize_web_url
 from mlops._safe_files import SafeFileError, snapshot_regular_files
 
+from autoforecast._execution import reported
+
 __all__ = [
     "LiveRunMLflow",
     "RunMLflowError",
@@ -477,6 +479,7 @@ def export_run_bundle(
             return RunMLflowLink(tracking_uri, experiment.experiment_id, active.info.run_id)
 
 
+@reported("Export completed workflow to MLflow")
 def export_forecast_workflow(
     bundle_path: str | pathlib.Path,
     *,

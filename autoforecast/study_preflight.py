@@ -21,6 +21,7 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from autoforecast import grid
+from autoforecast._execution import reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
     START_COLUMN,
@@ -91,6 +92,7 @@ def _source_key_error(frame: DataFrame, record: dict, series_col: str) -> str | 
     return None
 
 
+@reported("Check window coverage and cohort")
 def preflight_study(
     study: Study, options: dict, *, output_dir: str | pathlib.Path | None = None,
 ) -> PreflightResult:

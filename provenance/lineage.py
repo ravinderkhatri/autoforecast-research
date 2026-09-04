@@ -39,6 +39,8 @@ import stat
 from dataclasses import dataclass, field
 from typing import Literal
 
+from autoforecast._execution import progress, reported
+
 __all__ = [
     "Artifact",
     "Context",
@@ -178,6 +180,7 @@ def parquet_files(path: str | pathlib.Path) -> tuple[pathlib.Path, ...]:
     return tuple(member for _relative, member in _digest_files(path, (".parquet",)))
 
 
+@reported("Verify file and manifest SHA (driver)", dataset=True)
 def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()) -> str:
     """Hash relative filenames and contents for a stable directory artifact identity.
 
@@ -192,7 +195,7 @@ def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()
 
     if _volume_files.is_volume(pathlib.Path(path)):
         with _volume_files.local_snapshot(pathlib.Path(path)) as local:
-            return directory_digest(local, suffixes=suffixes)
+            return directory_digest.__wrapped__(local, suffixes=suffixes)
     files = _digest_files(path, suffixes)
     digest = hashlib.sha256()
     digest.update(_DIRECTORY_DIGEST_DOMAIN)
@@ -208,19 +211,22 @@ def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()
             observed_size = 0
             while chunk := handle.read(DIGEST_CHUNK):
                 digest.update(chunk)
+                progress(completed=handle.tell(), total=expected_size, unit="bytes",
+                         phase=f"file {f}")
                 observed_size += len(chunk)
         if observed_size != expected_size:
             raise LineageError(f"{f} changed size while its digest was being computed")
     return digest.hexdigest()
 
 
+@reported("Verify content SHA (driver)", dataset=True)
 def directory_content_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()) -> str:
     """Hash the multiset of file bytes without names, detecting byte-identical renamed copies."""
     from mlops import _volume_files
 
     if _volume_files.is_volume(pathlib.Path(path)):
         with _volume_files.local_snapshot(pathlib.Path(path)) as local:
-            return directory_content_digest(local, suffixes=suffixes)
+            return directory_content_digest.__wrapped__(local, suffixes=suffixes)
     files = _digest_files(path, suffixes)
     payloads: list[tuple[int, bytes]] = []
     for _relative, file_path in files:
@@ -231,6 +237,8 @@ def directory_content_digest(path: str | pathlib.Path, *, suffixes: tuple[str, .
             while chunk := handle.read(DIGEST_CHUNK):
                 file_digest.update(chunk)
                 observed_size += len(chunk)
+                progress(completed=observed_size, total=expected_size, unit="bytes",
+                         phase=f"file {file_path}")
         if observed_size != expected_size:
             raise LineageError(
                 f"{file_path} changed size while its content digest was being computed"
@@ -464,6 +472,7 @@ class Graph:
         }
 
 
+@reported("Copy and verify owned snapshot")
 def snapshot_parquet_directory(
     source: pathlib.Path,
     destination: pathlib.Path,

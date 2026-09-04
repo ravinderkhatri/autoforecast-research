@@ -21,12 +21,24 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import cast
+from contextlib import suppress
+from typing import Any, cast
 
 from mlops._safe_files import publish_bytes, read_regular_bytes
 
 from autoforecast._exact_json import load_exact_json
 from autoforecast._exact_yaml import loads_exact_yaml
+from autoforecast._execution import (
+    Execution,
+    _console,
+    _stage,
+    _stage_event,
+    configure_logging,
+    note,
+    record_result,
+    resolve_level,
+    standalone_attempt,
+)
 from autoforecast.benchmark import digest, verify_benchmark
 from autoforecast.campaign import CampaignStore, CampaignSupervisor, _write_new_json
 from autoforecast.implementation import (
@@ -514,7 +526,7 @@ def _watch_memory(stop: threading.Event, folder: pathlib.Path, limit_gib: float)
 
 def _model_job(
     request_path: str, request_sha: str, index: int, phase: str, campaign_root: str,
-    validation_record: dict | None,
+    validation_record: dict | None, parent_attempt: str | None = None,
 ) -> dict:
     """Worker boundary: inert references in, authenticated retained result out."""
     request = _read(request_path, request_sha)
@@ -523,7 +535,8 @@ def _model_job(
         raise ValueError("worker library or numerical runtime differs from the campaign")
     implementation = (worker_implementation(model["implementation_source"])
                       if model.get("implementation_source") else None)
-    if any(_module_hash(name) != expected for name, expected in model["source_modules"].items()):
+    if any(_module_hash(name) != expected
+           for name, expected in model["source_modules"].items()):
         raise ValueError("model helper code differs on worker")
     callback, _ = _entrypoint(model["entrypoint"], model["code_sha256"])
     implementation = (resolve_implementation(implementation, None, callback, model["id"])
@@ -533,99 +546,118 @@ def _model_job(
             raise ValueError(f"worker dependency differs: {package}")
     path = pathlib.Path(request["study"]["path"])
     verify_benchmark(path, request["study"]["sha256"])
-    folder = pathlib.Path(campaign_root) / "models" / f"candidate-{index}" / phase
-    folder.mkdir(parents=True, exist_ok=True)
-    completion = folder / "result.json"
-    if completion.exists():
-        return _load_model_result(
-            completion, request, model, phase, validation_record=validation_record
-        )
-    import fcntl
-
-    from autoforecast.campaign import _open_lock
-
-    with _open_lock(folder / ".job.lock") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    if _console() is None:
+        configure_logging(progress="plain")
+    # Workers receive paths and IDs, then establish their own logging context.
+    with standalone_attempt(pathlib.Path(campaign_root) / "progress", "Model job",
+                            campaign_id=pathlib.Path(campaign_root).name,
+                            request_sha256=request_sha, model_variant=model["id"],
+                            parent_attempt=parent_attempt,
+                            candidate_index=index, phase=phase, separate=True):
+        note("Configured model", model_variant=model["id"], entrypoint=model["entrypoint"],
+             phase=phase, model_parameters=model["fixed_parameters"])
+        folder = pathlib.Path(campaign_root) / "models" / f"candidate-{index}" / phase
+        folder.mkdir(parents=True, exist_ok=True)
+        completion = folder / "result.json"
         if completion.exists():
-            return _load_model_result(
+            retained = _load_model_result(
                 completion, request, model, phase, validation_record=validation_record
             )
-        # Each fit owns a new process/session; no caller Spark object crosses here.
-        from pyspark.sql import SparkSession
+            note("Model result reused and verified", workflow_path=retained["workflow_path"])
+            record_result(study_id=None, workflow_path=retained["workflow_path"])
+            return retained
+        import fcntl
 
-        from autoforecast.study import load_study
+        from autoforecast.campaign import _open_lock
 
-        os.environ["PYSPARK_PYTHON"] = sys.executable
-        os.environ["OMP_NUM_THREADS"] = "1"
-        os.environ["OPENBLAS_NUM_THREADS"] = "1"
-        stop_watch = threading.Event()
+        with _open_lock(folder / ".job.lock") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if completion.exists():
+                retained = _load_model_result(
+                    completion, request, model, phase, validation_record=validation_record
+                )
+                note("Model result reused and verified", workflow_path=retained["workflow_path"])
+                record_result(study_id=None, workflow_path=retained["workflow_path"])
+                return retained
+            # Each fit owns a new process/session; no caller Spark object crosses here.
+            from pyspark.sql import SparkSession
 
-        watcher = threading.Thread(
-            target=_watch_memory, args=(stop_watch, folder, model["memory_gib"]), daemon=True
-        )
+            from autoforecast.study import load_study
 
-        spark = None
-        started = time.time()
-        watcher.start()
-        try:
-            spark = (
-                SparkSession.builder.master(f"local[{model['cpus']}]")
-                .appName("autoforecast-model-job")
-                .config("spark.ui.enabled", "false")
-                .config("spark.sql.shuffle.partitions", str(model["cpus"]))
-                .config("spark.driver.memory", f"{max(512, int(model['memory_gib'] * 512))}m")
-                .getOrCreate()
+            os.environ["PYSPARK_PYTHON"] = sys.executable
+            os.environ["OMP_NUM_THREADS"] = "1"
+            os.environ["OPENBLAS_NUM_THREADS"] = "1"
+            stop_watch = threading.Event()
+
+            watcher = threading.Thread(
+                target=_watch_memory, args=(stop_watch, folder, model["memory_gib"]), daemon=True
             )
-            config_path = folder / "profile.json"
-            if not config_path.exists():
-                _write_new_json(config_path, model["profile"])
-            if load_exact_json(config_path) != model["profile"]:
-                raise ValueError("worker profile differs from frozen request")
-            with load_study(
-                path.parent.name, registry_root=path.parent.parent, spark=spark
-            ) as study:
-                if phase == "validation":
-                    run = study.run_forecast_workflow(
-                        fit_predict=callback,
-                        implementation=implementation,
-                        config=config_path,
-                        fixed_parameters=model["fixed_parameters"],
-                        validation_only=True,
-                        output_dir=folder / "runs",
-                    )
-                else:
-                    validation_path = folder.parent / "validation/result.json"
-                    previous = _load_model_result(validation_path, request, model, "validation")
-                    if previous != validation_record:
-                        raise ValueError("worker validation input differs from its phase handoff")
-                    run = study.run_forecast_workflow(
-                        fit_predict=callback,
-                        implementation=implementation,
-                        validation_run=previous["workflow_path"],
-                        output_dir=folder / "runs",
-                    )
-            record = {
-                "request_sha256": digest(request),
-                "model_id": model["id"],
-                "phase": phase,
-                "workflow_path": str(run.path),
-                "workflow_sha256": hashlib.sha256(
-                    (run.path / "artifact_manifest.json").read_bytes()
-                ).hexdigest(),
-                "pid": os.getpid(),
-                "host": socket.gethostname(),
-                "started": started,
-                "finished": time.time(),
-            }
-            _write_new_json(completion, record)
-            return _load_model_result(
-                completion, request, model, phase, validation_record=validation_record
-            )
-        finally:
-            stop_watch.set()
-            watcher.join(timeout=2)
-            if spark is not None:
-                spark.stop()
+
+            spark = None
+            started = time.time()
+            watcher.start()
+            try:
+                spark = (
+                    SparkSession.builder.master(f"local[{model['cpus']}]")
+                    .appName("autoforecast-model-job")
+                    .config("spark.ui.enabled", "false")
+                    .config("spark.sql.shuffle.partitions", str(model["cpus"]))
+                    .config("spark.driver.memory", f"{max(512, int(model['memory_gib'] * 512))}m")
+                    .getOrCreate()
+                )
+                config_path = folder / "profile.json"
+                if not config_path.exists():
+                    _write_new_json(config_path, model["profile"])
+                if load_exact_json(config_path) != model["profile"]:
+                    raise ValueError("worker profile differs from frozen request")
+                with load_study(
+                    path.parent.name, registry_root=path.parent.parent, spark=spark
+                ) as study:
+                    if phase == "validation":
+                        run = study.run_forecast_workflow(
+                            fit_predict=callback,
+                            implementation=implementation,
+                            config=config_path,
+                            fixed_parameters=model["fixed_parameters"],
+                            validation_only=True,
+                            output_dir=folder / "runs",
+                        )
+                    else:
+                        validation_path = folder.parent / "validation/result.json"
+                        previous = _load_model_result(validation_path, request, model, "validation")
+                        if previous != validation_record:
+                            raise ValueError(
+                                "worker validation input differs from its phase handoff")
+                        run = study.run_forecast_workflow(
+                            fit_predict=callback,
+                            implementation=implementation,
+                            validation_run=previous["workflow_path"],
+                            output_dir=folder / "runs",
+                        )
+                record_result(study_id=run.study_id, workflow_id=run.run_id,
+                              workflow_path=str(run.path))
+                record = {
+                    "request_sha256": digest(request),
+                    "model_id": model["id"],
+                    "phase": phase,
+                    "workflow_path": str(run.path),
+                    "workflow_sha256": hashlib.sha256(
+                        (run.path / "artifact_manifest.json").read_bytes()
+                    ).hexdigest(),
+                    "pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "started": started,
+                    "finished": time.time(),
+                }
+                _write_new_json(completion, record)
+                return _load_model_result(
+                    completion, request, model, phase, validation_record=validation_record
+                )
+            finally:
+                stop_watch.set()
+                watcher.join(timeout=2)
+                if spark is not None:
+                    spark.stop()
 
 
 def _run_phase(
@@ -652,147 +684,181 @@ def _run_phase(
         selected = min(comparisons)[2]
         if request["final_evaluation"] == "validation_winner":
             candidates = [selected]
-    results, failures = {}, {}
-    if request["execution"] == "sequential":
+    audit = pathlib.Path(attempt) / "progress.jsonl"
+    names = {i: f"Model {i + 1}: {request['models'][i]['id']}" for i in candidates}
+    with Execution(audit, [*names.values(), "Verify campaign results"],
+                   level=resolve_level(), attempt_id=pathlib.Path(attempt).name,
+                   campaign_id=pathlib.Path(campaign_root).name,
+                   request_sha256=request_sha, phase=phase):
+        results, failures = {}, {}
         for index in candidates:
-            try:
-                results[str(index)] = _model_job(
-                    request_path, request_sha, index, phase, campaign_root,
-                    validation_records.get(str(index)),
-                )
-            except Exception as error:
-                failures[str(index)] = str(error)
-    else:
-        import ray
-
-        if ray.is_initialized():
-            raise ValueError("campaign phase must own its Ray connection")
-        if request["execution"] == "cluster":
-            ray.init(address=request["ray_address"])
-        else:
-            cpus = min(
-                os.cpu_count() or 1,
-                sum(
-                    sorted((m["cpus"] for m in request["models"]), reverse=True)[
-                        : request["max_parallel_models"]
-                    ]
-                ),
-            )
-            ray.init(address="local", num_cpus=cpus, include_dashboard=False)
-        pending = {}
-        waiting = list(candidates)
-        deadline = time.monotonic() + request["timeout_seconds"]
-        try:
-            nodes = [node for node in ray.nodes() if node["Alive"]]
+            note("Queued model", model_variant=request["models"][index]["id"],
+                 candidate_index=index, phase=phase)
+        if request["execution"] == "sequential":
             for index in candidates:
-                model = request["models"][index]
-                if not any(
-                    model["cpus"] <= node["Resources"].get("CPU", 0)
-                    and model["gpus"] <= node["Resources"].get("GPU", 0)
-                    and model["memory_gib"] * 1024**3 <= node["Resources"].get("memory", 0)
-                    and all(
-                        node.get("Labels", {}).get(key) == value
-                        for key, value in model.get("node_labels", {}).items()
-                    )
-                    for node in nodes
-                ):
-                    raise ValueError(
-                        "no worker node can satisfy the model resources and exact node labels"
-                    )
-            # A phase can run as __main__. Import the worker by its canonical name
-            # so Ray resolves the installed module on each host instead of copying
-            # __main__ globals, including the coordinator's installation path.
-            from autoforecast.study_campaign import _model_job as remote_model_job
-
-            worker = ray.remote(max_calls=1, max_retries=0)(remote_model_job)
-            while waiting or pending:
-                while waiting and len(pending) < request["max_parallel_models"]:
-                    index = waiting.pop(0)
-                    model = request["models"][index]
-                    placement = {}
-                    if model.get("node_labels"):
-                        from ray.util.scheduling_strategies import In, NodeLabelSchedulingStrategy
-
-                        # Keep caller labels literal; selector strings parse operators.
-                        placement["scheduling_strategy"] = NodeLabelSchedulingStrategy(
-                            hard={key: In(value) for key, value in model["node_labels"].items()}
-                        )
-                    ref = worker.options(
-                        **placement,
-                        num_cpus=model["cpus"],
-                        num_gpus=model["gpus"],
-                        memory=int(model["memory_gib"] * 1024**3),
-                        runtime_env={
-                            "env_vars": {
-                                "OMP_NUM_THREADS": "1",
-                                "OPENBLAS_NUM_THREADS": "1",
-                            }
-                        },
-                    ).remote(
+                _stage_event(audit, names[index], "START")
+                try:
+                    results[str(index)] = _model_job(
                         request_path, request_sha, index, phase, campaign_root,
-                        validation_records.get(str(index)),
+                        validation_records.get(str(index)), parent_attempt=attempt,
                     )
-                    pending[ref] = index
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("campaign model jobs exceeded the phase deadline")
-                ready, _ = ray.wait(list(pending), num_returns=1, timeout=min(remaining, 1))
-                for ref in ready:
-                    index = pending.pop(ref)
-                    try:
-                        results[str(index)] = ray.get(ref)
-                    except Exception as error:
-                        failures[str(index)] = str(error)
-        finally:
-            for ref in pending:
-                ray.cancel(ref, force=True)
-            ray.shutdown()
-    for key, record in results.items():
-        retained = _load_model_result(
-            pathlib.Path(campaign_root) / "models" / f"candidate-{key}" / phase / "result.json",
-            request,
-            request["models"][int(key)],
-            phase,
-            validation_record=validation_records.get(key),
-        )
-        if record != retained:
-            raise ValueError("worker returned a different model result")
-    candidate_summary = []
-    for index, model in enumerate(request["models"]):
-        validation_file = (
-            pathlib.Path(campaign_root) / "models" / f"candidate-{index}" / "validation/result.json"
-        )
-        row = {
-            "model_id": model["id"],
-            "status": "failed" if str(index) in failures else "not_evaluated",
-        }
-        if validation_file.exists():
-            record = (
-                validation_records[str(index)] if phase == "final"
-                else _load_model_result(validation_file, request, model, "validation")
-            )
-            validation = load_forecast_workflow(record["workflow_path"])
-            row.update(validation=validation.validation["score"], parameters=validation.parameters)
-            if str(index) not in failures:
-                row["status"] = "validated"
-        if phase == "final" and str(index) in results:
-            completed = load_forecast_workflow(results[str(index)]["workflow_path"])
-            assert completed.testing is not None
-            row.update(testing=completed.testing["score"], status="completed")
-        candidate_summary.append(row)
-    summary = {
-        "phase": phase,
-        "requested_models": [m["id"] for m in request["models"]],
-        "selected_model": request["models"][selected]["id"] if selected is not None else None,
-        "final_evaluation": request["final_evaluation"],
-        "results": results,
-        "failures": failures,
-        "candidates": candidate_summary,
-        "status": "failed" if failures else "completed",
-    }
-    _write_new_json(pathlib.Path(attempt) / "summary.json", summary)
-    if failures:
-        raise RuntimeError("one or more campaign models failed; see retained summary")
+                except Exception as error:
+                    failures[str(index)] = str(error)
+                    # Keep the model failure even if its audit append cannot be verified.
+                    with suppress(BaseException):
+                        _stage_event(audit, names[index], "FAIL",
+                                     error_type=type(error).__name__)
+                else:
+                    _stage_event(audit, names[index], "PASS")
+        else:
+            import ray
+
+            if ray.is_initialized():
+                raise ValueError("campaign phase must own its Ray connection")
+            if request["execution"] == "cluster":
+                ray.init(address=request["ray_address"])
+            else:
+                cpus = min(
+                    os.cpu_count() or 1,
+                    sum(
+                        sorted((m["cpus"] for m in request["models"]), reverse=True)[
+                            : request["max_parallel_models"]
+                        ]
+                    ),
+                )
+                ray.init(address="local", num_cpus=cpus, include_dashboard=False)
+            pending = {}
+            waiting = list(candidates)
+            deadline = time.monotonic() + request["timeout_seconds"]
+            try:
+                nodes = [node for node in ray.nodes() if node["Alive"]]
+                for index in candidates:
+                    model = request["models"][index]
+                    if not any(
+                        model["cpus"] <= node["Resources"].get("CPU", 0)
+                        and model["gpus"] <= node["Resources"].get("GPU", 0)
+                        and model["memory_gib"] * 1024**3 <= node["Resources"].get("memory", 0)
+                        and all(
+                            node.get("Labels", {}).get(key) == value
+                            for key, value in model.get("node_labels", {}).items()
+                        )
+                        for node in nodes
+                    ):
+                        raise ValueError(
+                            "no worker node can satisfy the model resources and exact node labels"
+                        )
+                # A phase can run as __main__. Import the worker by its canonical name
+                # so Ray resolves the installed module on each host instead of copying
+                # __main__ globals, including the coordinator's installation path.
+                from autoforecast.study_campaign import _model_job as remote_model_job
+
+                # Ray's pinned typing overloads stop at six positional inputs; the native
+                # runtime also accepts our optional, inert parent-attempt keyword.
+                worker = cast(Any, ray.remote(max_calls=1, max_retries=0)(remote_model_job))
+                while waiting or pending:
+                    while waiting and len(pending) < request["max_parallel_models"]:
+                        index = waiting.pop(0)
+                        model = request["models"][index]
+                        placement = {}
+                        if model.get("node_labels"):
+                            from ray.util.scheduling_strategies import (
+                                In,
+                                NodeLabelSchedulingStrategy,
+                            )
+
+                            # Keep caller labels literal; selector strings parse operators.
+                            placement["scheduling_strategy"] = NodeLabelSchedulingStrategy(
+                                hard={key: In(value) for key, value in model["node_labels"].items()}
+                            )
+                        ref = worker.options(
+                            **placement,
+                            num_cpus=model["cpus"],
+                            num_gpus=model["gpus"],
+                            memory=int(model["memory_gib"] * 1024**3),
+                            runtime_env={
+                                "env_vars": {
+                                    "OMP_NUM_THREADS": "1",
+                                    "OPENBLAS_NUM_THREADS": "1",
+                                    "AUTOFORECAST_LOG_LEVEL": os.environ.get(
+                                        "AUTOFORECAST_LOG_LEVEL", "INFO"),
+                                }
+                            },
+                        ).remote(
+                            request_path, request_sha, index, phase, campaign_root,
+                            validation_records.get(str(index)), parent_attempt=attempt,
+                        )
+                        pending[ref] = index
+                        _stage_event(audit, names[index], "START")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("campaign model jobs exceeded the phase deadline")
+                    ready, _ = ray.wait(list(pending), num_returns=1, timeout=min(remaining, 1))
+                    for ref in ready:
+                        index = pending.pop(ref)
+                        try:
+                            results[str(index)] = ray.get(ref)
+                        except Exception as error:
+                            failures[str(index)] = str(error)
+                            with suppress(BaseException):
+                                _stage_event(audit, names[index], "FAIL",
+                                             error_type=type(error).__name__)
+                        else:
+                            _stage_event(audit, names[index], "PASS")
+            finally:
+                for ref in pending:
+                    ray.cancel(ref, force=True)
+                ray.shutdown()
+        with _stage(audit, "Verify campaign results"):
+            for key, record in results.items():
+                retained = _load_model_result(
+                    (pathlib.Path(campaign_root) / "models"
+                     / f"candidate-{key}" / phase / "result.json"),
+                    request,
+                    request["models"][int(key)],
+                    phase,
+                    validation_record=validation_records.get(key),
+                )
+                if record != retained:
+                    raise ValueError("worker returned a different model result")
+            candidate_summary = []
+            for index, model in enumerate(request["models"]):
+                validation_file = (
+                    pathlib.Path(campaign_root) / "models"
+                    / f"candidate-{index}" / "validation/result.json"
+                )
+                row = {
+                    "model_id": model["id"],
+                    "status": "failed" if str(index) in failures else "not_evaluated",
+                }
+                if validation_file.exists():
+                    record = (
+                        validation_records[str(index)] if phase == "final"
+                        else _load_model_result(validation_file, request, model, "validation")
+                    )
+                    validation = load_forecast_workflow(record["workflow_path"])
+                    row.update(validation=validation.validation["score"],
+                               parameters=validation.parameters)
+                    if str(index) not in failures:
+                        row["status"] = "validated"
+                if phase == "final" and str(index) in results:
+                    completed = load_forecast_workflow(results[str(index)]["workflow_path"])
+                    assert completed.testing is not None
+                    row.update(testing=completed.testing["score"], status="completed")
+                candidate_summary.append(row)
+            summary = {
+                "phase": phase,
+                "requested_models": [m["id"] for m in request["models"]],
+                "selected_model": (request["models"][selected]["id"]
+                                   if selected is not None else None),
+                "final_evaluation": request["final_evaluation"],
+                "results": results,
+                "failures": failures,
+                "candidates": candidate_summary,
+                "status": "failed" if failures else "completed",
+            }
+            _write_new_json(pathlib.Path(attempt) / "summary.json", summary)
+            if failures:
+                raise RuntimeError("one or more campaign models failed; see retained summary")
 
 
 def main() -> None:
@@ -803,6 +869,7 @@ def main() -> None:
     parser.add_argument("campaign_root")
     parser.add_argument("attempt")
     args = parser.parse_args()
+    configure_logging(progress="plain")
     import signal
 
     def cancel(_signal, _frame):

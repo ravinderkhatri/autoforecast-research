@@ -479,7 +479,9 @@ class _RayRecorder:
         self.latest_options = kwargs
 
         class Submission:
-            def remote(inner, *args):
+            def remote(inner, *args, **kwargs):
+                assert isinstance(kwargs["parent_attempt"], str)
+                self.latest_options["parent_attempt"] = kwargs["parent_attempt"]
                 index = args[2]
                 self.inflight.add(index)
                 self.peak = max(self.peak, len(self.inflight))
@@ -533,7 +535,8 @@ def ray_phase(tmp_path, monkeypatch):
     return request, run, tmp_path
 
 
-def test_three_jobs_respect_two_job_cap(ray_phase):
+def test_three_jobs_respect_two_job_cap(ray_phase, monkeypatch):
+    monkeypatch.setenv("AUTOFORECAST_LOG_LEVEL", "WARNING")
     request, run, _ = ray_phase
     ray = _RayRecorder([{"CPU": 8, "GPU": 0, "memory": 8 * 1024**3}])
     run(ray)
@@ -545,6 +548,7 @@ def test_three_jobs_respect_two_job_cap(ray_phase):
         assert options["runtime_env"]["env_vars"] == {
             "OMP_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1",
+            "AUTOFORECAST_LOG_LEVEL": "WARNING",
         }
 
 
@@ -765,7 +769,7 @@ def test_model_job_starts_monitor_before_fit_and_applies_resources(tmp_path, mon
             root = tmp_path / "workflow"
             root.mkdir()
             (root / "artifact_manifest.json").write_text("{}")
-            return SimpleNamespace(path=root)
+            return SimpleNamespace(path=root, study_id="study", run_id="workflow")
 
         yield SimpleNamespace(run_forecast_workflow=run)
 
@@ -791,7 +795,8 @@ def test_model_job_starts_monitor_before_fit_and_applies_resources(tmp_path, mon
     monkeypatch.setattr(study_campaign, "_runtime_identity", lambda: {})
     monkeypatch.setattr(study_campaign, "_entrypoint", lambda *a: (lambda r: None, "a" * 64))
     monkeypatch.setattr(study_campaign, "verify_benchmark", lambda *a: None)
-    monkeypatch.setattr(study_campaign.threading, "Thread", Monitor)
+    monkeypatch.setattr(study_campaign, "threading",
+                        SimpleNamespace(Thread=Monitor, Event=__import__("threading").Event))
     monkeypatch.setattr(SparkSession, "builder", Builder())
     monkeypatch.setattr(study, "load_study", fake_study)
     monkeypatch.setattr(
@@ -1074,7 +1079,8 @@ def test_final_selection_uses_requested_metric_when_rankings_disagree(tmp_path, 
     monkeypatch.setattr(study_campaign, "load_forecast_workflow", lambda path: workflows[path])
     calls = []
 
-    def fit(*args):
+    def fit(*args, parent_attempt):
+        assert parent_attempt == str(tmp_path)
         calls.append(str(args[2]))
         return {"workflow_path": str(args[2])}
 

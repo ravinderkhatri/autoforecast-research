@@ -10,8 +10,11 @@ from decimal import Decimal
 import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.readwriter import DataFrameWriter
 
+from autoforecast import _execution as events
 from autoforecast.integrations.delta import DeltaStudyStore, latest_delta_version
+from autoforecast.test_logging_coverage import assert_lifecycle
 
 
 @pytest.fixture(scope="module")
@@ -168,6 +171,121 @@ def test_source_query_pins_versions_and_rejects_commands_and_undeclared_tables(s
         with pytest.raises(ValueError):
             read_source(store.spark, sql=query, tables={"source": table})
     assert store.spark.table(table).count() == 2
+
+
+def test_source_resolution_reports_the_versions_used_by_both_queries(store, tmp_path):
+    from autoforecast.integrations.delta import read_sources
+
+    table = store.namespace + ".source_events"
+    store.spark.createDataFrame([(1,)], "item int").write.format("delta").saveAsTable(table)
+    queries = {"primary": "SELECT item FROM observations", "audit": "SELECT item FROM inventory"}
+    aliases = {"observations": table, "inventory": table}
+    audit = tmp_path / "source-events.jsonl"
+    with events.Execution(audit, ["host"], attempt_id="coverage-attempt"):
+        with events._stage(audit, "host"):
+            resolved = read_sources(store.spark, queries=queries, tables=aliases)
+            assert [row.item for row in resolved["primary"][0].collect()] == [1]
+            assert [row.item for row in resolved["audit"][0].collect()] == [1]
+            with pytest.raises(ValueError):
+                read_sources(store.spark, queries={"primary": "DROP TABLE observations"},
+                             tables=aliases)
+    rows = assert_lifecycle(audit, "Resolve source aliases and pinned Delta versions", [
+        ("PASS", None), ("FAIL", "ValueError"),
+    ])
+    decisions = [row for row in rows if row["stage"] == "Resolved sources"]
+    assert len(decisions) == 1
+    assert {row["alias"]: {"table": row["table"], "version": row["version"]}
+            for row in decisions[0]["aliases"]} == resolved["primary"][1]["tables"] == {
+        alias: {"table": table, "version": 0} for alias in aliases
+    }
+    assert decisions[0]["queries"] == list(queries)
+    assert decisions[0]["version_note"] == (
+        "Delta table versions; row-date conditions remain in the SQL evidence"
+    )
+    start = next(row for row in rows
+                 if row["stage"] == "Resolve source aliases and pinned Delta versions")
+    assert decisions[0]["parent_operation"] == start["operation_id"]
+
+
+def test_delta_write_events_distinguish_write_reuse_conflict_and_concurrent_reuse(
+    store, tmp_path, monkeypatch,
+):
+    from mlops import _safe_files
+
+    frame = store.spark.createDataFrame([("id", "sha", "payload")],
+                                        "study_id string,study_sha string,definition_json string")
+    scope = {"study_id": "id"}
+    audit = tmp_path / "write-events.jsonl"
+    with events.Execution(audit, ["host"], attempt_id="coverage-attempt"):
+        with events._stage(audit, "host"):
+            store.append_once("studies", frame, scope=scope)
+            store.append_once("studies", frame, scope=scope)
+            with pytest.raises(ValueError, match="conflicting immutable"):
+                store.append_once("studies", frame.withColumn("definition_json", F.lit("wrong")),
+                                  scope=scope)
+
+            # Reproduce a failed append after a concurrent identical writer won.
+            read = store.read
+            reads = 0
+
+            def stale_first_read(kind, selected):
+                nonlocal reads
+                reads += 1
+                return (frame.limit(0), None) if reads == 1 else read(kind, selected)
+
+            def failed_write(*args, **kwargs):
+                raise OSError("concurrent write won")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(store, "read", stale_first_read)
+                patch.setattr(DataFrameWriter, "saveAsTable", failed_write)
+                store.append_once("studies", frame, scope=scope)
+            assert reads == 2
+
+            reads = 0
+            with monkeypatch.context() as patch:
+                patch.setattr(store, "read", stale_first_read)
+                patch.setattr(DataFrameWriter, "saveAsTable", failed_write)
+                with pytest.raises(OSError, match="concurrent write won"):
+                    changed = frame.withColumn("definition_json", F.lit("wrong"))
+                    store.append_once("studies", changed, scope=scope)
+            assert reads == 2
+
+            reads = 0
+            append_audit = _safe_files.append_audit_bytes
+            audit_error = OSError("reuse audit unavailable")
+
+            def failed_audit(path, payload):
+                if json.loads(payload)["stage"] == "Delta rows reused and verified":
+                    raise audit_error
+                return append_audit(path, payload)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(store, "read", stale_first_read)
+                patch.setattr(DataFrameWriter, "saveAsTable", failed_write)
+                patch.setattr(_safe_files, "append_audit_bytes", failed_audit)
+                with pytest.raises(OSError) as caught:
+                    store.append_once("studies", frame, scope=scope)
+            assert reads == 2 and caught.value is audit_error
+
+    rows = assert_lifecycle(audit, "Write or verify existing Delta records", [
+        ("PASS", None), ("PASS", None), ("FAIL", "ValueError"), ("PASS", None),
+        ("FAIL", "OSError"), ("FAIL", "OSError"),
+    ])
+    decisions = [row for row in rows if row["stage"] in {
+        "Delta rows written and verified", "Delta rows reused and verified",
+    }]
+    assert [row["stage"] for row in decisions] == [
+        "Delta rows written and verified", "Delta rows reused and verified",
+        "Delta rows reused and verified",
+    ]
+    assert all(row["table"] == store.tables["studies"] and row["scope"] == scope
+               for row in decisions)
+    starts = [row for row in rows if row["stage"] == "Write or verify existing Delta records"
+              and row["status"] == "START"]
+    assert [row["parent_operation"] for row in decisions] == [
+        starts[0]["operation_id"], starts[1]["operation_id"], starts[3]["operation_id"],
+    ]
 
 
 @pytest.mark.parametrize("spelling", ["same", "qualified", "unqualified", "shared_location"])
@@ -403,11 +521,12 @@ def test_tracking_publication_matrix_and_retry(store, tmp_path, monkeypatch, tra
             run_study(study_id, model, **arguments)
         assert store.read("study_results", {"study_id": study_id})[0].count() == 0
         assert store.read("forecasts", {"study_id": study_id})[0].count() == 8
-        events = [json.loads(line) for line in caught.value.audit_path.read_text().splitlines()]
-        assert [(e["stage"], e["status"]) for e in events if e["status"] == "FAIL"] == [
-            ("table_publication", "FAIL"), ("run", "FAIL"),
+        records = [json.loads(line) for line in caught.value.audit_path.read_text().splitlines()]
+        assert [(e["stage"], e["status"]) for e in records if e["status"] == "FAIL"] == [
+            ("Publish retained result tables", "FAIL"), ("Result publication", "FAIL"),
+            ("table_publication", "FAIL"), ("run_attempt", "FAIL"),
         ]
-        assert events[-1]["status"] == "FAIL"
+        assert records[-1]["status"] == "FAIL"
         result = load_forecast_workflow(caught.value.workflow_path)
         registry.publish_results(study_id, result.path)
     else:
@@ -463,9 +582,17 @@ def test_tracking_publication_matrix_and_retry(store, tmp_path, monkeypatch, tra
 
         monkeypatch.setattr(study_scoring, "score_study", lambda *a, **k: pytest.fail("rescored"))
         monkeypatch.setattr(study_tuning, "score_study", lambda *a, **k: pytest.fail("rescored"))
-        assert registry.publish_results(
-            study_id, result.path, mlflow_links=links,
-        )["status"] == "published"
+        publication_audit = tmp_path / "publication-events.jsonl"
+        with events.Execution(publication_audit, ["host"],
+                              attempt_id="coverage-attempt") as publication_execution:
+            with events._stage(publication_audit, "host"):
+                assert registry.publish_results(
+                    study_id, result.path, mlflow_links=links,
+                )["status"] == "published"
+        assert_lifecycle(publication_audit, "Publish retained result tables", [("PASS", None)])
+        # A joined publication must not replace its enclosing attempt's result.
+        assert publication_execution.receipt == {}
+        assert str(publication_audit) in publication_execution.render()
         assert calls == ["validation", "refit"]
         assert store.read("study_results", {"study_id": study_id})[0].count() == 2
         assert store.spark.sql(store.dashboard_sql()).count() == 2
@@ -479,8 +606,14 @@ def test_tracking_publication_matrix_and_retry(store, tmp_path, monkeypatch, tra
             assert store.read("study_results", {"study_id": other_id})[0].count() == 0
             model_file = result.validation["model_artifacts"] / "constant.json"
             model_file.write_text("changed")
-            with pytest.raises(ValueError, match="not verified and completed"):
-                registry.publish_results(study_id, result.path)
+            failure_audit = tmp_path / "publication-failure-events.jsonl"
+            with events.Execution(failure_audit, ["host"], attempt_id="coverage-attempt"):
+                with events._stage(failure_audit, "host"):
+                    with pytest.raises(ValueError, match="not verified and completed"):
+                        registry.publish_results(study_id, result.path)
+            assert_lifecycle(failure_audit, "Publish retained result tables", [
+                ("FAIL", "RunMLflowError"),
+            ])
             assert store.read("study_results", {"study_id": study_id})[0].count() == 2
 
 

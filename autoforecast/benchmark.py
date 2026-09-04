@@ -16,6 +16,7 @@ from functools import partial
 from mlops._safe_files import is_regular_file, read_path_bytes
 
 from autoforecast._exact_json import loads_exact_json
+from autoforecast._execution import operation, progress, reported
 from autoforecast.column_names import validate_column_names
 from autoforecast.data_admission import _load_dataset_contract_bytes
 from autoforecast.frequency import (
@@ -167,6 +168,7 @@ def _canonical_row_value(value, dtype):
     return value
 
 
+@reported("Calculate logical row SHA (driver)", dataset=True)
 def parquet_content_hash(path: pathlib.Path) -> str:
     """Hash typed rows with bounded sort buffers and order-independent map entries.
 
@@ -179,7 +181,7 @@ def parquet_content_hash(path: pathlib.Path) -> str:
 
     if _volume_files.is_volume(path):
         with _volume_files.local_snapshot(path) as local:
-            return parquet_content_hash(local)
+            return parquet_content_hash.__wrapped__(local)
 
     dataset = ds.dataset(path, format="parquet", exclude_invalid_files=False)
     columns = sorted(dataset.schema.names)
@@ -191,6 +193,7 @@ def parquet_content_hash(path: pathlib.Path) -> str:
         root = pathlib.Path(temporary)
         rows: list[bytes] = []
         run_count = 0
+        processed = 0
         for batch in dataset.scanner(
             columns=columns, batch_size=_ROW_HASH_BATCH_SIZE,
             batch_readahead=1, fragment_readahead=1, use_threads=False,
@@ -206,23 +209,32 @@ def parquet_content_hash(path: pathlib.Path) -> str:
                     _write_hash_run(root / f"0-{run_count}", rows)
                     run_count += 1
                     rows.clear()
+            processed += batch.num_rows
+            progress(completed=processed, unit="rows", phase="hash rows")
         if rows:
             _write_hash_run(root / f"0-{run_count}", rows)
             run_count += 1
             rows.clear()
+        progress(completed=processed, unit="rows", phase="merge sorted hash runs")
         level = 0
-        while run_count > 1:
-            merged_count = 0
-            for first in range(0, run_count, _ROW_HASH_MERGE_FAN_IN):
-                paths = [root / f"{level}-{index}" for index in range(
-                    first, min(first + _ROW_HASH_MERGE_FAN_IN, run_count),
-                )]
-                _merge_hash_runs(paths, root / f"{level + 1}-{merged_count}")
-                merged_count += 1
-                for consumed in paths:
-                    consumed.unlink()
-            run_count = merged_count
-            level += 1
+        if run_count > 1:
+            with operation("Merge sorted logical-row hash runs", engine="driver"):
+                while run_count > 1:
+                    merged_count = 0
+                    total = (run_count + _ROW_HASH_MERGE_FAN_IN - 1) // _ROW_HASH_MERGE_FAN_IN
+                    for first in range(0, run_count, _ROW_HASH_MERGE_FAN_IN):
+                        paths = [root / f"{level}-{index}" for index in range(
+                            first, min(first + _ROW_HASH_MERGE_FAN_IN, run_count),
+                        )]
+                        _merge_hash_runs(paths, root / f"{level + 1}-{merged_count}")
+                        merged_count += 1
+                        progress(completed=merged_count,
+                                 total=total,
+                                 unit="runs", phase=f"merge pass {level + 1}")
+                        for consumed in paths:
+                            consumed.unlink()
+                    run_count = merged_count
+                    level += 1
         if run_count:
             with (root / f"{level}-0").open("rb") as stream:
                 for chunk in iter(partial(stream.read, 1 << 20), b""):

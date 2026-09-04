@@ -166,7 +166,10 @@ def test_formats_retry_evidence_and_offline_inputs(spark, tmp_path):
         assert study.training_data.count() == 9
         assert study.validation_data.filter("value is null").count() == 1
     audit = [json.loads(line) for line in successful_audit.read_text().splitlines()]
-    assert [(event["stage"], event["status"]) for event in audit] == [
+    assert any(e["stage"] == "Registration inputs" and e["status"] == "INFO" for e in audit)
+    assert any(e["stage"] == "Business preparation and input verification"
+               and e["status"] == "PASS" for e in audit)
+    assert [(e["stage"], e["status"]) for e in audit if e.get("plan_stage")] == [
         (stage, status) for stage in ("configuration", "sources", "admission", "freeze", "publication")
         for status in ("START", "PASS")
     ]
@@ -834,11 +837,14 @@ def test_failure_evidence_writes_preserve_original_exception_and_block_publicati
         monkeypatch.setattr(registration, 'record_bytes', fail_attempt)
         with pytest.raises(RuntimeError, match='original preparation failure') as caught:
             register_study(path, registry=registry, prepare=Fail())
-        assert caught.value.__notes__ == ['Registration failure evidence could not be saved.']
-        assert 'failure evidence could not be saved' in caplog.text
+        assert caught.value.__notes__ == ['Registration failure evidence could not be verified.']
+        assert 'Registration failure evidence could not be verified.' in caplog.text
     events = [json.loads(line) for line in next(
         (registry.root / 'checks').glob('*/audit.jsonl')).read_text().splitlines()]
-    assert [(e['stage'], e['status']) for e in events] == [
+    assert any(e['stage'] == 'Registration inputs' and e['status'] == 'INFO' for e in events)
+    assert any(e['stage'] == 'Business preparation and input verification'
+               and e['status'] == 'FAIL' for e in events)
+    assert [(e['stage'], e['status']) for e in events if e.get('plan_stage')] == [
         ('configuration', 'START'), ('configuration', 'PASS'), ('sources', 'START'),
         ('sources', 'PASS'), ('admission', 'START'), ('admission', 'FAIL'),
     ]
