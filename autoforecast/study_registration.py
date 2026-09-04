@@ -266,6 +266,10 @@ def _configuration_value(value, path, *, supplied_stages=False, connections=None
         raise ValueError("records.format must be json or yaml")
     _scalar_settings(value.get("preparation", {}), "preparation")
     _validate_storage(value["storage"])
+    if (value["storage"].get("input_identity") == "source_version"
+            and value["source"]["kind"] != "delta"):
+        raise ValueError("storage.input_identity: source_version needs a Delta source; "
+                         "other sources have no pinned version and keep row identities")
     if "snapshot_mode" in value:
         from autoforecast.snapshots import resolve_mode
 
@@ -277,7 +281,10 @@ def _configuration_value(value, path, *, supplied_stages=False, connections=None
 
 def _validate_storage(storage):
     _fields(storage, {"root"},
-            {"scratch_root", "namespace", "tables", "snapshot_mode", "snapshots"}, label="storage")
+            {"scratch_root", "namespace", "tables", "snapshot_mode", "snapshots",
+             "input_identity"}, label="storage")
+    if storage.get("input_identity", "rows") not in INPUT_IDENTITIES:
+        raise ValueError("storage.input_identity must be rows or source_version")
     from autoforecast.snapshots import resolve_mode
 
     if "snapshot_mode" in storage:
@@ -334,7 +341,8 @@ class StudyConfigValidation:
         mode = resolve_mode(value.get("snapshot_mode"), value["storage"].get("snapshot_mode"))
         return {"snapshot_mode": mode, "source_kind": value["source"]["kind"],
                 "snapshot_destination": value["storage"].get("snapshots")
-                if mode != "hash" else "inactive"}
+                if mode != "hash" else "inactive",
+                "input_identity": value["storage"].get("input_identity", "rows")}
 
 
 def validate_study_config(path: str | pathlib.Path) -> StudyConfigValidation:
@@ -455,6 +463,54 @@ def _remove_staging_directory(path):
             _volume_files.remove_tree(path)
     elif path.exists():
         shutil.rmtree(path)
+
+
+# How a registration identifies the source rows it captured. ``rows`` hashes every row.
+# ``source_version`` names a Delta read by its table IDs, pinned versions and query.
+INPUT_IDENTITIES = frozenset({"rows", "source_version"})
+
+
+def _source_version_record(path, provenance, physical=None):
+    """Identify a pinned Delta read by its tables, versions and query, not its rows.
+
+    Committed Delta versions are never rewritten, so the same table IDs, versions and
+    query text name the same rows, provided the query is deterministic. The capture's
+    file SHA stays in memory for this attempt's change checks, as with row identities.
+    """
+    import pyarrow.parquet as pq
+
+    from provenance.lineage import parquet_files
+
+    path = pathlib.Path(path)
+    with (_volume_files.local_snapshot(path, parquet_only=True)
+          if _volume_files.is_volume(path) else nullcontext(path)) as local:
+        files = parquet_files(local)
+        if not files:
+            raise ValueError("source version identity requires captured Parquet rows")
+        rows = 0
+        for file in files:
+            with pq.ParquetFile(file) as footer:
+                rows += footer.metadata.num_rows
+        physical_sha256 = directory_digest(local, suffixes=(".parquet",))
+    if physical is not None:
+        physical[path] = physical_sha256
+    resolved = provenance["resolved_tables"]
+    return {"source_version": {
+        "schema": "autoforecast.source-version.v1",
+        "sql": provenance["sql"],
+        "tables": {alias: {**pin, "table_id": resolved[pin["table"]]["id"]}
+                   for alias, pin in sorted(provenance["tables"].items())},
+        "rows": rows,
+    }}
+
+
+def _identity_rows(identity):
+    """Row count recorded by a native, row or source version identity."""
+    if "snapshot" in identity:
+        return identity["snapshot"]["rows"]
+    if "source_version" in identity:
+        return identity["source_version"]["rows"]
+    return identity["logical_hash"]["rows"]
 
 
 def _logical_record(path, spark, physical=None):
@@ -935,7 +991,8 @@ class StudyRegistry:
     def _from_storage(cls, storage, runtime, base, spark, *, use_environment=False,
                       connections=None):
         _fields(storage, set(),
-                {"root", "scratch_root", "namespace", "tables", "snapshot_mode", "snapshots"},
+                {"root", "scratch_root", "namespace", "tables", "snapshot_mode", "snapshots",
+                 "input_identity"},
                 label="storage")
         storage = dict(storage)
         if use_environment:
@@ -2229,6 +2286,12 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
     describe = (_artifact_record if retain_binding
                 else functools.partial(_logical_record, physical=physical))
     source = value["source"]
+    by_version = value["storage"].get("input_identity", "rows") == "source_version"
+    if by_version and (retain_binding or current_capture() is not None
+                       or inputs is not None or source["kind"] != "delta"):
+        raise ValueError("storage.input_identity: source_version applies to an ordinary "
+                         "registration from Delta sources in hash snapshot mode")
+    primary_version = None
     source_record: dict[str, Any]
     audits = {}
     query_records = {}
@@ -2268,6 +2331,8 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
         managed = read_sources(session, queries={"primary": source["sql"],
                                **source["audit_queries"]}, tables=source["tables"])
         frame, source_record = managed.pop("primary")
+        if by_version:
+            primary_version = dict(source_record)
         if not keep_resolved_tables:
             source_record.pop("resolved_tables")
         for name, (audit, provenance) in managed.items():
@@ -2275,11 +2340,11 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
             with operation("Save raw audit data", query=name, engine="Spark"):
                 audit.write.parquet(str(path))
             audits[name] = session.read.parquet(str(managed_path(path)))
-            logical = describe(path, session)
+            logical = (_source_version_record(path, provenance, physical) if by_version
+                       else describe(path, session))
             query_records[name] = {**provenance, **logical,
                                    "schema": audits[name].schema.jsonValue(),
-                                   "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
-                                            else logical["logical_hash"]["rows"])}
+                                   "rows": _identity_rows(logical)}
     elif source["kind"] in {"bigquery", "postgresql", "mysql", "sqlserver"}:
         from autoforecast.integrations import bigquery, mysql, postgres, sqlserver
 
@@ -2307,8 +2372,7 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
             logical = describe(destination, session)
             query_records[name] = {**provenance, **logical,
                                    "schema": audits[name].schema.jsonValue(),
-                                   "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
-                                            else logical["logical_hash"]["rows"])}
+                                   "rows": _identity_rows(logical)}
     else:
         frame = session.read.parquet(source["path"])
         source_record = {"kind": "parquet"}
@@ -2316,10 +2380,10 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
         with operation("Save primary data", query="primary", engine="Spark"):
             frame.write.parquet(str(root / "source"))
     frame = session.read.parquet(str(managed_path(root / "source")))
-    logical = describe(root / "source", session)
+    logical = (_source_version_record(root / "source", primary_version, physical)
+               if primary_version is not None else describe(root / "source", session))
     source_record.update({**logical, "schema": frame.schema.jsonValue(),
-                          "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
-                                            else logical["logical_hash"]["rows"])})
+                          "rows": _identity_rows(logical)})
     return frame, source_record, audits, query_records
 
 

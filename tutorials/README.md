@@ -58,6 +58,22 @@ The `snapshot_mode` setting chooses how those inputs are kept:
 | `table` | Separate database captures | Check the capture identity and the database's protection rules |
 | `table+hash` | Separate database captures | Also compare the row content with its recorded hash |
 
+With `hash`, registration also records an identity for each source read. By default
+(`storage.input_identity: rows`) it hashes every row, so the same rows give the same
+study ID however they were written. For Delta sources you can choose
+`storage.input_identity: source_version` instead. Each read is then named by its table
+IDs, its pinned Delta versions and its query text, and no rows are hashed, which saves
+the time of hashing large inputs. A committed Delta version never changes, so the same
+read gives the same study ID, provided the query is deterministic. A new table version
+gives a new study ID, even when its rows are unchanged. The saved input files are still
+checked against their file hashes during registration.
+
+```yaml
+storage:
+  root: /Volumes/catalog/schema/studies
+  input_identity: source_version   # Delta sources only; the default is rows
+```
+
 The source table and the saved capture are different objects. Table mode does not
 mean saving only a source table name and an upload timestamp. The saved capture
 must remain available until the study is released. A timestamp cannot recover an

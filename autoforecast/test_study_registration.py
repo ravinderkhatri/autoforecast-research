@@ -625,6 +625,24 @@ def test_zero_checkpoint_reader_uses_filled_target_and_factual_mask(spark, tmp_p
     assert window.score(np.zeros((2, 2)))["mae"] == pytest.approx(5.0)
 
 
+@pytest.mark.parametrize("identity,message", [
+    ("source_version", "needs a Delta source"), ("versions", "storage.input_identity"),
+])
+def test_input_identity_setting_is_checked_before_source_access(tmp_path, identity, message):
+    """Only Delta reads have a pinned version to name; other values are refused."""
+    from autoforecast.study_registration import validate_study_config
+
+    path = configuration(tmp_path)
+    value = yaml.safe_load(path.read_text())
+    value["storage"]["input_identity"] = identity
+    path.write_text(yaml.safe_dump(value))
+    with pytest.raises(ValueError, match=message):
+        validate_study_config(path)
+    value["storage"]["input_identity"] = "rows"
+    path.write_text(yaml.safe_dump(value))
+    assert validate_study_config(path).input_storage["input_identity"] == "rows"
+
+
 def test_outputs_are_written_in_few_files(spark, tmp_path, monkeypatch):
     """Each file costs a request on every later check, so outputs use as few as fit."""
     from autoforecast import benchmark

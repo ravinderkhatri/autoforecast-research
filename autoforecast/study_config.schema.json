@@ -900,6 +900,15 @@
           ],
           "default": "hash"
         },
+        "input_identity": {
+          "type": "string",
+          "enum": [
+            "rows",
+            "source_version"
+          ],
+          "default": "rows",
+          "description": "How a registration identifies the source rows it read. rows hashes every row; source_version names a Delta read by its table IDs, pinned versions and query."
+        },
         "snapshots": {
           "type": "object",
           "properties": {
