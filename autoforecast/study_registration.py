@@ -67,6 +67,7 @@ from autoforecast.benchmark import (
     training_cutoff,
     validate_study_panel,
     verify_benchmark,
+    write_few_files,
 )
 from autoforecast.benchmark import (
     _freeze_verified as freeze_benchmark,
@@ -537,7 +538,7 @@ def _verify_admission(root, binding, *, trusted=False, spark=None, _scratch_root
 
 def _prepare_admission(registry, staging, identity, final_keys, recipe, *, artifact_bindings=None):
     """Finish the exact cohort evidence before a native study chooses its identity."""
-    final_keys.write.parquet(str(staging / "final_keys"))
+    write_few_files(final_keys, staging / "final_keys")
     starting = registry.spark.read.parquet(str(managed_path(staging / "starting_keys")))
     retained = registry.spark.read.parquet(str(managed_path(staging / "retained_keys")))
     keys = recipe["source_keys"]
@@ -552,7 +553,7 @@ def _prepare_admission(registry, staging, identity, final_keys, recipe, *, artif
         reasons.append(frame.withColumn(EXCLUSION_REASON_COLUMN, F.lit(reason)))
     native_reasons = reasons[0].unionByName(reasons[1])
     _same_keys(native_exclusions, native_reasons, keys, "native exclusion reasons")
-    native_reasons.write.parquet(str(staging / "native_exclusions"))
+    write_few_files(native_reasons, staging / "native_exclusions")
     excluded = registry.spark.read.parquet(str(managed_path(staging / "exclusions"))).select(*keys)
     _same_keys(starting, final_keys.unionByName(excluded).unionByName(native_exclusions),
                keys, "final population")
@@ -662,7 +663,7 @@ def _check_key_frame(frame, template, keys, *, extra=(), label):
 @reported("Save data-check findings")
 def _save_findings(registry, frame, issues_root, name, check_id):
     path = issues_root / name
-    frame.write.parquet(str(path))
+    write_few_files(frame, path)
     capture = current_capture()
     if capture is not None:
         reference = capture.bind(path)["snapshot"]
@@ -687,8 +688,8 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
     """Capture callback outputs, then reconcile against private managed baselines."""
     keys = value["recipe"]["source_keys"]
     _check_key_frame(population, population, keys, label="managed population")
-    population.write.parquet(str(staging / "starting_keys"))
-    frame.select(*keys).distinct().write.parquet(str(staging / "input_keys"))
+    write_few_files(population, staging / "starting_keys")
+    write_few_files(frame.select(*keys).distinct(), staging / "input_keys")
     population = registry.spark.read.parquet(str(staging / "starting_keys"))
     primary_keys = registry.spark.read.parquet(str(staging / "input_keys"))
     if any(population.schema[k].dataType != primary_keys.schema[k].dataType for k in keys):
@@ -700,7 +701,7 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
         ("input_missing_keys", population, primary_keys, "INPUT_POPULATION_LOSS"),
     ):
         difference = left.join(right, keys, "left_anti")
-        difference.write.parquet(str(staging / name))
+        write_few_files(difference, staging / name)
         columns = {"keys": F.struct(*keys), "issue_code": F.lit(code),
                    "message": F.lit("Primary membership differs from the declared population."),
                    "status": F.lit("failed" if matching else "warning"),
@@ -711,11 +712,11 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
         ]))
     population_findings = _save_findings(registry, population_findings, issues_root,
                                           "population", check_id + "-population")
-    population_findings.write.parquet(str(staging / "population_findings"))
+    write_few_files(population_findings, staging / "population_findings")
     if matching:
         _same_keys(population, primary_keys, keys, "primary and declared population")
     findings = findings.unionByName(population_findings)
-    findings.write.parquet(str(staging / "source_findings"))
+    write_few_files(findings, staging / "source_findings")
     paths = [root / "source", *(root / ("audit-" + name) for name in audits),
              *(staging / name for name in ("starting_keys", "input_keys", "source_findings",
                                            "population_findings", "input_added_keys",
@@ -751,7 +752,7 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
             raise ValueError("application findings must use the native findings schema")
         app_findings = _save_findings(registry, result.findings, issues_root,
                                       "application", check_id + "-application")
-        app_findings.write.parquet(str(staging / "application_findings"))
+        write_few_files(app_findings, staging / "application_findings")
         if app_findings.filter(
             F.col("status").isNull() | ~F.col("status").isin("passed", "warning", "failed")
             | F.col("affected_rows").isNull() | (F.col("affected_rows") < 0)
@@ -2390,7 +2391,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                 registry, report_source_issues(frame, contract=contract, recipe=recipe),
                 issues_root, "prepared", check_id + "-prepared",
             )
-            prepared_report.write.parquet(str(staging / "prepared_findings"))
+            write_few_files(prepared_report, staging / "prepared_findings")
             if prepared_report.filter(F.col("status") == "failed").limit(1).count():
                 raise ValueError("structural prepared-data issues block registration")
             if captured.get("scoring_references") is not None and not value.get(
@@ -2444,7 +2445,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                         target_col=panel.target_col,
                         origins=origins, validate=False, **settings,
                     ))
-            refs.write.parquet(str(root / "reference-input"))
+            write_few_files(refs, root / "reference-input")
             refs = session.read.parquet(str(managed_path(root / "reference-input")))
             reference_definition = {
                 "preparation": settings if "path" not in settings else {"kind": "parquet"},
@@ -2464,7 +2465,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             report = _save_findings(registry, check_wrmsse_references(refs, origins=origins),
                                     issues_root, "references", check_id + "-references")
             if prepare is not None:
-                report.write.parquet(str(staging / "reference_findings"))
+                write_few_files(report, staging / "reference_findings")
             if report.limit(1).count():
                 if value.get("invalid_references", "error") == "error":
                     raise ValueError(f"invalid scoring references; findings: {issues_root}")
@@ -2492,7 +2493,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                         if item["keys"] not in exclusions
                     ]
             references = root / "references"
-            refs.write.parquet(str(references))
+            write_few_files(refs, references)
         retained = frame.filter(F.col(panel.time_col).between(start, origin)).select(
             *keys,
         ).distinct().count()

@@ -625,6 +625,22 @@ def test_zero_checkpoint_reader_uses_filled_target_and_factual_mask(spark, tmp_p
     assert window.score(np.zeros((2, 2)))["mae"] == pytest.approx(5.0)
 
 
+def test_outputs_are_written_in_few_files(spark, tmp_path, monkeypatch):
+    """Each file costs a request on every later check, so outputs use as few as fit."""
+    from autoforecast import benchmark
+
+    frame = spark.range(10).repartition(5)
+    benchmark.write_few_files(frame, tmp_path / "evidence")
+    monkeypatch.setattr(benchmark, "_ROWS_PER_FILE", 4)
+    benchmark.write_few_files(frame, tmp_path / "frozen", rows=10)
+    benchmark.write_few_files(spark.range(0), tmp_path / "empty")
+    files = {name: sorted((tmp_path / name).glob("*.parquet"))
+             for name in ("evidence", "frozen", "empty")}
+    assert {name: len(found) for name, found in files.items()} == {
+        "evidence": 1, "frozen": 3, "empty": 1}
+    assert sorted(spark.read.parquet(str(tmp_path / "frozen")).toPandas()["id"]) == list(range(10))
+
+
 def test_registered_load_preserves_primary_hash_error_when_close_fails(tmp_path, monkeypatch):
     import autoforecast.study_registration as registration
     registry = StudyRegistry(tmp_path, spark=object())

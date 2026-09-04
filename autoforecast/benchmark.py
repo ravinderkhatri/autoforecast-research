@@ -59,6 +59,21 @@ class _VerifiedBenchmark:
     sha256: str
 
 
+# Every file of an output costs a request each time a check downloads it, so small
+# outputs are written as one file and larger ones as files of about this many rows.
+_ROWS_PER_FILE = 2_000_000
+
+
+def write_few_files(frame, path, *, rows=None):
+    """Write Parquet in few files: one, or about ``_ROWS_PER_FILE`` rows each.
+
+    ``rows`` is the frame's known row count. Without it the output must be small
+    evidence, such as keys, findings or references, and is written as one file.
+    """
+    files = 1 if rows is None else max(1, -(-rows // _ROWS_PER_FILE))
+    frame.repartition(files).write.parquet(str(path))
+
+
 def digest(value) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -1009,15 +1024,15 @@ def _freeze_benchmark(
             "dataset": {"id": contract.id, "panel": roles, "required_series_count": final_count},
         }
         (scratch / "dataset.yaml").write_text(yaml.safe_dump(prepared_contract))
-        key_map.write.parquet(str(scratch / "source-keys"))
+        write_few_files(key_map, scratch / "source-keys")
         for name, frame in frames.items():
-            frame.write.parquet(str(scratch / name))
+            write_few_files(frame, scratch / name, rows=counts[name]["written_rows"])
         artifact_roles = [*sorted(sources), "source-keys"]
         if scoring_references is not None:
             references = _prepare_scoring_references(
                 read_paths["scoring_references"], key_map, keys, recipe, spark,
             )
-            references.write.parquet(str(scratch / "scoring_references"))
+            write_few_files(references, scratch / "scoring_references")
             artifact_roles.append("scoring_references")
         logical_hashes = {}
         physical_hashes = {}
@@ -1095,7 +1110,7 @@ def _freeze_benchmark(
             totals = per_series.agg(*[F.sum(name).alias(name) for name in names]).first()
             assert totals is not None
             coverage_path = "coverage/" + key
-            per_series.write.parquet(str(scratch / coverage_path))
+            write_few_files(per_series, scratch / coverage_path)
             coverage_identities[key] = {
                 ("snapshot" if native_inputs is not None else "content_sha256"):
                     content_hash(scratch / coverage_path, "coverage/" + key),
