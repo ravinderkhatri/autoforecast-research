@@ -438,8 +438,11 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
         or context["model_id"] != metadata["model"]["id"]
     ):
         raise HPOError("external selection budget or model differs from its context")
+    # The study SHA comes from the checked trial evidence, so every file's bytes are checked
+    # and its recorded row identity is reused instead of recalculated in Spark.
     study_path, _ = verify_benchmark(
         pathlib.Path(context["study"]["path"]), context["study"]["sha256"],
+        _reuse_verified=True,
     )
     dataset_path = study_path.parent / "dataset.yaml"
     dataset = _load_dataset_contract_bytes(read_path_bytes(dataset_path), dataset_path)

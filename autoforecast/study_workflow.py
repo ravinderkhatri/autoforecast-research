@@ -177,7 +177,9 @@ def load_forecast_workflow(path: str | pathlib.Path) -> ForecastWorkflowResult:
     if record["schema"] not in allowed_schemas:
         raise HPOError("unsupported forecast workflow result")
     source = record["provenance"]["study"]
-    verify_benchmark(pathlib.Path(source["path"]), source["sha256"])
+    # The study SHA comes from the checked workflow bundle: check every file's bytes and
+    # reuse its recorded row identity instead of recalculating it in Spark.
+    verify_benchmark(pathlib.Path(source["path"]), source["sha256"], _reuse_verified=True)
     _validate_workflow_configuration(
         root, record, _retained_json(root, "metadata/winner-config.json", manifest), manifest
     )

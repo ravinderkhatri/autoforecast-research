@@ -18,11 +18,10 @@ import yaml
 from databricks.sdk.errors import AlreadyExists, NotFound
 from mlops import _volume_files
 
-from autoforecast import experiments
-from autoforecast.experiments import attempts_checked_once
+from autoforecast import _logical_hash, experiments
 from autoforecast.panel import Forecast
 from autoforecast.study import load_study
-from autoforecast.study_tuning import FitPredictResult, load_selected_configuration, tune_study
+from autoforecast.study_tuning import FitPredictResult, tune_study
 from autoforecast.test_study_tuning import config, freeze, implementation, spark  # noqa: F401
 
 MODEL_FILES = 30
@@ -127,6 +126,14 @@ def test_search_reads_each_trial_file_a_bounded_number_of_times(spark, tmp_path,
         return check(path)
 
     monkeypatch.setattr(experiments, "_load_completed_attempt", counted)
+    recalculated = []
+    fingerprint = _logical_hash.fingerprint
+
+    def recounted(*args, **kwargs):
+        recalculated.append(args[0])
+        return fingerprint(*args, **kwargs)
+
+    monkeypatch.setattr(_logical_hash, "fingerprint", recounted)
     scratch = root / "scratch"
     scratch.mkdir()
     profile = config(root, budget=2)
@@ -136,16 +143,18 @@ def test_search_reads_each_trial_file_a_bounded_number_of_times(spark, tmp_path,
     profile.write_text(yaml.safe_dump(value))
     study = load_study(manifest.parent.name, registry_root=manifest.parent.parent,
                        spark=spark, scratch_root=scratch)
-    files.downloads.clear()  # Count only the search's reads, not loading the study.
-    with study, attempts_checked_once():
+    # Count only the search's work, not loading the study, which checks every file in full.
+    files.downloads.clear()
+    recalculated.clear()
+    with study:
         result = tune_study(study, fit_predict=many_files, config=profile,
                             implementation=implementation(), output_dir=root / "runs")
-        # The workflow loads the winner's settings in the same handoff.
-        assert load_selected_configuration(result.winner_config)["parameters"] == result.parameters
     trials = result.path / "trials"
     assert trials.is_relative_to(root)
     # Selection checks each trial in full once; the report and every reload reuse it.
     assert len(full_checks) == 2
+    # Reloads check every frozen file's bytes and reuse the recorded row identities.
+    assert recalculated == []
     reads = {pathlib.Path(path): count for path, count in files.downloads.items()
              if pathlib.Path(path).is_relative_to(trials)}
     models = {path: count for path, count in reads.items() if path.parent.name == "model"}
