@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import json
 import math
@@ -861,6 +862,22 @@ class _ExternalTrialBridge:
         return TrialOutcome(float(value), {"validation/" + context["metric"]: float(value)})
 
 
+# Path.exists() treats only "not found" errors as absent. A Unity Catalog volume mount
+# answers EINVAL for a name it refuses, such as /Volumes/benchmark.json: nothing can
+# exist there. Every other error still stops the check.
+_ABSENT = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP, errno.EINVAL})
+
+
+def _marker_exists(path: pathlib.Path) -> bool:
+    try:
+        path.stat()
+    except OSError as error:
+        if error.errno in _ABSENT:
+            return False
+        raise
+    return True
+
+
 def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -> pathlib.Path:
     root = (
         pathlib.Path(supplied).absolute()
@@ -881,7 +898,7 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
     ]
     if any(root.is_relative_to(path.resolve()) for path in protected) or any(
         any(
-            (parent / marker).exists()
+            _marker_exists(parent / marker)
             for marker in (
                 "benchmark.json",
                 "admission.json",

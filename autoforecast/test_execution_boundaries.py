@@ -1,6 +1,7 @@
 """Progress respects protected paths, context boundaries and measured work."""
 
 import dataclasses
+import errno
 import inspect
 import io
 import json
@@ -104,6 +105,31 @@ def test_workflow_never_writes_unvalidated_output_root(tmp_path, monkeypatch, ki
         )
     after = sorted(str(p.relative_to(output)) for p in output.rglob("*"))
     assert after == before
+
+
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.EACCES])
+def test_output_root_treats_a_name_the_mount_refuses_as_absent(tmp_path, monkeypatch, code):
+    """A volume mount answers EINVAL for names above its catalogs; other errors still stop."""
+    root = tmp_path / "volumes" / "catalog" / "runs"
+    root.mkdir(parents=True)
+    mount = root.parent.parent  # Stands in for /Volumes.
+    study = SimpleNamespace(_path=tmp_path / "study" / "benchmark.json", study_id="study",
+                            _record=lambda **_: {"sources": {}})
+    stat, refused = pathlib.Path.stat, []
+
+    def mount_stat(self, *args, **kwargs):
+        if self.parent == mount and not os.path.lexists(self):
+            refused.append(self.name)
+            raise OSError(code, os.strerror(code), str(self))
+        return stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "stat", mount_stat)
+    if code == errno.EINVAL:
+        assert study_tuning._output_root(study, root, "study-workflows").name == "runs"
+    else:
+        with pytest.raises(PermissionError):
+            study_tuning._output_root(study, root, "study-workflows")
+    assert refused  # The probe reached the mount.
 
 
 def test_nested_callbacks_retain_trial_window_and_resolvable_parent(tmp_path):
