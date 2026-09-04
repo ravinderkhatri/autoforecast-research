@@ -163,8 +163,15 @@ def test_study_compiles_for_shared_scorer_and_enforces_declared_adapter_support(
 
 
 
-def test_freeze_uses_the_source_bytes_whose_hash_it_records(tmp_path, spark, monkeypatch):
-    """Prepared targets must come from the exact source bytes named in provenance."""
+@pytest.mark.parametrize("schedule", ["during_copy", "after_copy"])
+def test_freeze_uses_the_source_bytes_whose_hash_it_records(tmp_path, spark, monkeypatch,
+                                                            schedule):
+    """Prepared targets must come from the exact source bytes named in provenance.
+
+    ``during_copy`` changes the source only while it is copied (A->B->A), so every
+    later digest of the source sees the original bytes; ``after_copy`` is a lasting
+    change once the copy is being read.
+    """
     from autoforecast.test_study import inputs
 
     contract, sources, recipe = inputs(tmp_path)
@@ -177,36 +184,33 @@ def test_freeze_uses_the_source_bytes_whose_hash_it_records(tmp_path, spark, mon
             row["y"] = float(row["y"]) + 100.0
     changed = pa.Table.from_pylist(rows, schema=original_table.schema)
     real_digest = benchmark.directory_digest
-    source_calls = 0
-
-    def racing_digest(path, *args, **kwargs):
-        nonlocal source_calls
-        current = pathlib.Path(path)
-        if current.resolve() != source.resolve():
-            return real_digest(path, *args, **kwargs)
-        source_calls += 1
-        if 5 <= source_calls <= 8:
-            source.write_bytes(original_bytes)
-            result = real_digest(path, *args, **kwargs)
-            pq.write_table(changed, source)
-            return result
-        if source_calls == 9:
-            source.write_bytes(original_bytes)
-            return real_digest(path, *args, **kwargs)
-        return real_digest(path, *args, **kwargs)
-
-    real_read = grid.read_time_parquet
+    real_copy = benchmark.snapshot_parquet_identity
     injected = 0
 
-    def racing_read(*args, **kwargs):
+    def transient_copy(path, *args, **kwargs):
+        nonlocal injected
+        if pathlib.Path(path).resolve() != source.resolve():
+            return real_copy(path, *args, **kwargs)
+        injected += 1
+        pq.write_table(changed, source)
+        try:
+            return real_copy(path, *args, **kwargs)
+        finally:
+            source.write_bytes(original_bytes)
+
+    real_read = grid.read_time_parquet
+
+    def lasting_read(*args, **kwargs):
         nonlocal injected
         if not injected:
             pq.write_table(changed, source)
             injected += 1
         return real_read(*args, **kwargs)
 
-    monkeypatch.setattr(grid, "read_time_parquet", racing_read)
-    monkeypatch.setattr(benchmark, "directory_digest", racing_digest)
+    if schedule == "during_copy":
+        monkeypatch.setattr(benchmark, "snapshot_parquet_identity", transient_copy)
+    else:
+        monkeypatch.setattr(grid, "read_time_parquet", lasting_read)
     try:
         study_path = benchmark.freeze_benchmark(
             contract_path=contract,
@@ -217,13 +221,12 @@ def test_freeze_uses_the_source_bytes_whose_hash_it_records(tmp_path, spark, mon
         )
     except benchmark.BenchmarkError as error:
         assert "changed" in str(error)
-        assert source_calls >= 1
+        assert injected == 1
         assert not list((tmp_path / "frozen").rglob("benchmark.json"))
         return
     finally:
         source.write_bytes(original_bytes)
     assert injected == 1
-    assert source_calls >= 1
     _, record = benchmark.verify_benchmark(study_path)
     selection = pq.read_table(benchmark.artifact_path(study_path, record, "selection")).to_pylist()
     observed = next(row["y"] for row in selection if row["id"] == "A" and row["date"].day == 1)

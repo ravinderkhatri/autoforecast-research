@@ -12,7 +12,7 @@ import pytest
 from pyspark.sql import SparkSession
 
 from autoforecast import _logical_hash as logical
-from provenance.lineage import directory_digest, parquet_files
+from provenance.lineage import directory_digest
 
 
 @pytest.fixture(autouse=True)
@@ -1294,14 +1294,15 @@ def test_offline_batches_bound_dictionary_expansion(tmp_path, spark, monkeypatch
     expected = logical.fingerprint(path, spark=spark)
     monkeypatch.setattr(logical, '_LOCAL_MAX_ROWS', 4096)
     monkeypatch.setattr(logical, '_LOCAL_MAX_BYTES', 10000)
-    offline = logical._offline
+    iter_batches = pq.ParquetFile.iter_batches
     batches = []
 
-    def recorded(path, schema, rows, batch_rows):
-        batches.append(batch_rows)
-        return offline(path, schema, rows, batch_rows)
+    def recorded(self, *args, **kwargs):
+        for batch in iter_batches(self, *args, **kwargs):  # The batches _offline decodes.
+            batches.append(batch.num_rows)
+            yield batch
 
-    monkeypatch.setattr(logical, '_offline', recorded)
+    monkeypatch.setattr(pq.ParquetFile, 'iter_batches', recorded)
     assert logical.fingerprint(path, spark=spark) == expected
     # The file holds one dictionary entry, but every decoded row repeats it in full.
     # Offline batches must stay within the byte budget; a value above it goes to Spark.
@@ -1345,20 +1346,20 @@ def test_offline_batches_bound_deep_nesting_overhead(tmp_path, monkeypatch):
     path = tmp_path / "nested.parquet"
     pq.write_table(pa.table({name: column for name in "abcd"}), path)
     monkeypatch.setattr(logical, "_LOCAL_MAX_ROWS", 250_000)
-    offline = logical._offline
+    expected = logical.fingerprint(path)
+    iter_batches = pq.ParquetFile.iter_batches
     sizes = []
 
-    def measured(path, schema, rows, batch_rows):
-        for file in parquet_files(path):
-            with pq.ParquetFile(file) as reader:
-                sizes.extend(batch.nbytes for batch in reader.iter_batches(batch_size=batch_rows))
-        return offline(path, schema, rows, batch_rows)
+    def measured(self, *args, **kwargs):
+        for batch in iter_batches(self, *args, **kwargs):  # The batches _offline decodes.
+            sizes.append(batch.nbytes)
+            yield batch
 
     class NoJobs:
         @property
         def read(self):
             raise AssertionError("a capture within the offline bound must not launch Spark")
 
-    monkeypatch.setattr(logical, "_offline", measured)
-    assert logical.fingerprint(path, spark=NoJobs()) == logical.fingerprint(path)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", measured)
+    assert logical.fingerprint(path, spark=NoJobs()) == expected
     assert sizes and max(sizes) <= logical._LOCAL_MAX_BYTES

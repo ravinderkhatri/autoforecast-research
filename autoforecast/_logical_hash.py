@@ -517,10 +517,10 @@ def _capture(path, *, spark=None):
         if not files:
             raise ValueError("logical hashing requires a Parquet schema")
         schema, rows, foreign_int96 = None, 0, False
-        # Strict upper bound on one row's decoded bytes. A decoded value is never larger
-        # than its column chunk, dictionary included; Arrow adds at most an 8-byte offset
-        # and a validity bit for each nesting level. One row of a repeated column can hold
-        # every value of the chunk beyond one per other row.
+        # Strict upper bound on one row's decoded Arrow bytes. A decoded value is never
+        # larger than its column chunk, dictionary included; Arrow adds at most an 8-byte
+        # offset and a validity bit for each nesting level. One row of a repeated column
+        # can hold every value of the chunk beyond one per other row.
         row_bytes = 0
         for file in files:
             if (
@@ -555,6 +555,11 @@ def _capture(path, *, spark=None):
         # Dictionary and repetition encoding can expand far beyond file size, so size
         # each decoded batch by the strict per-row bound instead of the file size.
         batch_rows = min(_OFFLINE_BATCH_ROWS, _LOCAL_MAX_BYTES // max(1, row_bytes))
+        # ponytail: the budget bounds Arrow batch bytes; the Python rows built from a batch
+        # take a bounded multiple (about 5x for 64 nested list levels), and flat dictionary
+        # columns get small batches (250,000 rows hash in 3.6 s rather than 1.2 s). Tighten
+        # with exact dictionary entry sizes if driver memory or hashing time shows in the
+        # Databricks stage timings; 7novtodo.md follow-ups.
         small = (rows <= _LOCAL_MAX_ROWS and batch_rows >= 1
                  and sum(file.stat().st_size for file in files) <= _LOCAL_MAX_BYTES)
         if fallback or small:
