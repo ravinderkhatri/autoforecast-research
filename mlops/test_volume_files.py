@@ -2053,8 +2053,11 @@ def test_upload_failure_found_at_close_is_shown_for_every_display(volume, monkey
     with pytest.raises(OSError, match="unacknowledged"):
         with events.Execution(root / "events.jsonl", ["work"], level=level):
             events._stage_event(root / "events.jsonl", "work", "START")
+            events.record_result(study_id="saved", workflow_path="saved-workflow")
             events._stage_event(root / "events.jsonl", "work", "PASS")
+    # The saved result stays visible, as the failed event line showed it before.
     assert "UNVERIFIED" in stream.getvalue()
+    assert "saved-workflow" in stream.getvalue()
 
 
 def test_completed_run_keeps_its_recovery_fields_when_the_last_upload_fails(volume,

@@ -485,6 +485,14 @@ class Execution:
                     self.starts[name] = time.monotonic()
             self.refresh(force=planned)
 
+    def _run_identity(self):
+        """Name the input study separately when the saved result names another one."""
+        identity = _safe(self.identity)
+        if self.receipt.get("study_id") and identity.get("study_id") != self.receipt["study_id"]:
+            if "study_id" in identity:
+                identity["input_study_id"] = identity.pop("study_id")
+        return identity
+
     def render(self):
         now = time.monotonic()
         completed = [s for s in self.stages if self.states[s] == "PASS"]
@@ -495,11 +503,7 @@ class Execution:
         def names(items):
             return " | ".join(f"Stage {self.stages.index(s) + 1}: {s}"
                               f" ({self.states[s].lower()})" for s in items) or "None"
-        identity = _safe(self.identity)
-        if self.receipt.get("study_id") and identity.get("study_id") != self.receipt["study_id"]:
-            if "study_id" in identity:
-                identity["input_study_id"] = identity.pop("study_id")
-        lines = [f"RUN {_text(identity)} | {self.result}"]
+        lines = [f"RUN {_text(self._run_identity())} | {self.result}"]
         for name in running:
             lines.append(f"Stage {self.stages.index(name) + 1}/{total}: {name} | "
                          f"elapsed={now - self.starts[name]:.1f}s")
@@ -636,10 +640,11 @@ class Execution:
                     if self.result not in {"FAIL", "CANCELLED"}:
                         self.result = "UNVERIFIED"
                     self.audit_error = type(failure).__name__
-                    # The panel may be hidden, so report it as an event line as well.
+                    # The panel may be hidden, so report it, and the saved result, as an
+                    # event line as well.
                     with suppress(BaseException):
-                        _emit(_safe({**self.identity, "stage": "Execution audit",
-                                     "status": "UNVERIFIED",
+                        _emit(_safe({**self._run_identity(), **self.receipt,
+                                     "stage": "Execution audit", "status": "UNVERIFIED",
                                      "audit_error": self.audit_error}), self.level)
                     self.refresh(force=True, final=True)
                     raise OSError("execution audit has an unacknowledged event") from failure
