@@ -11,11 +11,11 @@ import json
 import pathlib
 import tempfile
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
-from mlops import ProvenanceError, load_completed_run_bundle, sanitize_web_url
+from mlops import ProvenanceError, _volume_files, load_completed_run_bundle, sanitize_web_url
 from mlops._safe_files import SafeFileError, snapshot_regular_files
 
 from autoforecast._execution import reported
@@ -56,6 +56,16 @@ def _completed_run_snapshot(
 ) -> Iterator[tuple[pathlib.Path, dict[str, Any]]]:
     """Yield a verified private copy so remote upload cannot race mutable local paths."""
     source = pathlib.Path(bundle_path)
+    if _volume_files.is_volume(source) and scratch_root is None:
+        # One parallel download is the private copy; check that copy once and upload from it.
+        with ExitStack() as stack:
+            try:
+                snapshot = stack.enter_context(_volume_files.local_snapshot(source))
+                completion = load_completed_run_bundle(snapshot)
+            except (ProvenanceError, OSError) as error:
+                raise RunMLflowError(f"bundle is not verified and completed: {source}") from error
+            yield snapshot, completion
+        return
     try:
         source_completion = load_completed_run_bundle(source)
     except ProvenanceError as error:

@@ -687,17 +687,21 @@ def test_volume_snapshot_failure_cleans_only_its_remote_parts(volume, monkeypatc
         with pytest.raises(LineageError, match="already exists"):
             snapshot_parquet_directory(source, destination, expected_sha256=expected, label="data")
         assert client.values.pop(str(destination / "original.parquet")) == b"keep"
-        original = _safe_files.copy_regular_file
+        original = _volume_files.publish_blocks
         count = 0
+        lock = threading.Lock()
 
         def interrupted(*args):
             nonlocal count
-            count += 1
-            if count == 2:
+            with lock:
+                count += 1
+                failing = count == 2
+            if failing:
                 raise OSError("copy interrupted")
             return original(*args)
 
-        monkeypatch.setattr(_safe_files, "copy_regular_file", interrupted)
+        # Parts are published concurrently; the second publication fails.
+        monkeypatch.setattr(_volume_files, "publish_blocks", interrupted)
         with pytest.raises(OSError, match="copy interrupted"):
             snapshot_parquet_directory(source, destination, expected_sha256=expected, label="data")
         assert count == 2
@@ -2449,3 +2453,153 @@ def test_local_append_inspects_one_event_in_a_growing_jsonl_log(tmp_path, monkey
     _safe_files.append_audit_bytes(path, last)
     assert inspected == [len(first)]
     assert path.read_bytes() == history + last
+
+
+def _volume_attempt(root, files):
+    from autoforecast.experiments import open_local_attempt
+    from autoforecast.test_experiments import _metadata
+
+    attempt = open_local_attempt(
+        root, study_id="smoke", trial_id="trial1", attempt_id="attempt1",
+        metadata=_metadata(learning_rate=0.001),
+    )
+    for name, value in files.items():
+        attempt.write_bytes(name, value)
+    return attempt
+
+
+def test_volume_attempt_is_checked_from_one_owned_copy(volume, monkeypatch):
+    from autoforecast.experiments import ExperimentError, load_completed_attempt
+
+    root, client = volume
+    attempt = _volume_attempt(root, {f"model/part{n}.json": b"x" * (n + 1) for n in range(12)})
+    attempt.finalize(status="completed", summary={"test_metrics": "not_evaluated"})
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(path)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    load_completed_attempt(attempt.path)
+    files = [key for key in client.values if key.startswith(str(attempt.path) + "/")]
+    # Every file is read exactly once; the second sweep and per-file probes use the copy.
+    assert sorted(downloads) == sorted(files)
+    client.values[str(attempt.path / "model/part3.json")] = b"yyyy"  # Same size.
+    with pytest.raises(ExperimentError, match="does not match bytes"):
+        load_completed_attempt(attempt.path)
+
+
+def test_volume_manifest_hashes_files_concurrently(volume, monkeypatch):
+    from autoforecast.experiments import load_completed_attempt
+
+    root, client = volume
+    attempt = _volume_attempt(root, {f"model/part{n}.json": b"x" * (n + 1) for n in range(4)})
+    barrier = threading.Barrier(2, timeout=10)
+    download = client.download
+
+    def paired(path):
+        # One file at a time would leave each model read waiting here until the timeout.
+        if "/model/" in path:
+            barrier.wait()
+        return download(path)
+
+    monkeypatch.setattr(client, "download", paired)
+    attempt.finalize(status="completed", summary={"test_metrics": "not_evaluated"})
+    monkeypatch.setattr(client, "download", download)
+    assert load_completed_attempt(attempt.path)[1]["status"] == "completed"
+
+
+def test_volume_artifact_retention_reads_the_source_once(volume, monkeypatch):
+    from autoforecast.hpo import HPOError
+    from autoforecast.hpo_bridge import _retain_run_artifact_directory
+
+    from provenance.lineage import directory_digest
+
+    root, client = volume
+    source, destination = root / "scratch/model", root / "attempt/windows/0000/model"
+    for number in range(6):
+        client.values[str(source / f"series{number}.json")] = b"state" * (number + 1)
+    expected = directory_digest(source)
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(path)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    assert _retain_run_artifact_directory(source, destination, changed="changed") == expected
+    sources = [path for path in downloads if path.startswith(str(source) + "/")]
+    assert sorted(sources) == sorted(k for k in client.values if k.startswith(str(source) + "/"))
+    for number in range(6):
+        name = f"series{number}.json"
+        assert client.values[str(destination / name)] == client.values[str(source / name)]
+    # A copy that leaves out a file must not return the source digest.
+    publish = _volume_files.publish_files
+    monkeypatch.setattr(_volume_files, "publish_files", lambda pairs: publish(list(pairs)[1:]))
+    with pytest.raises(HPOError, match="incomplete copy"):
+        _retain_run_artifact_directory(source, root / "other", changed="incomplete copy")
+
+
+def test_volume_parquet_snapshot_reads_source_once_and_skips_destination_rehash(
+    volume, monkeypatch,
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from provenance.lineage import directory_digest, snapshot_parquet_directory
+
+    root, client = volume
+    source, destination = root / "actuals", root / "scratch/actuals"
+    destination.parent.mkdir()
+    for index in range(3):
+        output = io.BytesIO()
+        pq.write_table(pa.table({"x": [index]}), output)
+        client.values[str(source / f"part-{index:05d}.parquet")] = output.getvalue()
+    expected = directory_digest(source, suffixes=(".parquet",))
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(path)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    snapshot_parquet_directory(source, destination, expected_sha256=expected, label="actuals")
+    # The source once, and each published part once, when it is read back.
+    assert sorted(downloads) == sorted(
+        [str(source / f"part-{i:05d}.parquet") for i in range(3)]
+        + [str(destination / f"part-{i:05d}.parquet") for i in range(3)]
+    )
+    assert directory_digest(destination, suffixes=(".parquet",)) == expected
+
+
+def test_volume_bundle_export_checks_one_owned_copy(volume, monkeypatch):
+    from autoforecast import run_mlflow
+
+    from mlops.run_bundle import open_run_bundle
+
+    root, client = volume
+    bundle = open_run_bundle(root, run_id="exported", task="verification")
+    for number in range(5):
+        bundle.write_bytes(f"models/part{number}.json", b"m" * (number + 1))
+    bundle.finalize(status="completed", summary={})
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(path)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    with run_mlflow._completed_run_snapshot(bundle.path) as (snapshot, completion):  # noqa: SLF001
+        assert completion["run_id"] == "exported"
+        assert (snapshot / "models/part2.json").read_bytes() == b"mmm"
+    files = [key for key in client.values if key.startswith(str(bundle.path) + "/")]
+    assert sorted(downloads) == sorted(files)
+    client.values[str(bundle.path / "models/part2.json")] = b"xxx"
+    with pytest.raises(run_mlflow.RunMLflowError, match="not verified"):
+        with run_mlflow._completed_run_snapshot(bundle.path):  # noqa: SLF001
+            pass

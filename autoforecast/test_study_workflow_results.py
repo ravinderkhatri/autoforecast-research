@@ -1402,7 +1402,7 @@ def test_callback_artifact_copy_failure_has_retention_fail_event(tmp_path, monke
     def fail_copy(*args, **kwargs):
         raise OSError("injected artifact copy failure")
 
-    monkeypatch.setattr(study_tuning, "_copy_run_artifact_directory", fail_copy)
+    monkeypatch.setattr(study_tuning, "_retain_run_artifact_directory", fail_copy)
     with pytest.raises(OSError, match="injected artifact copy failure"):
         study_tuning._fit_window(
             spark,
@@ -1560,6 +1560,7 @@ def test_reused_validation_operation_has_current_failure_stage(tmp_path, monkeyp
     )
     window = {
         "model_artifacts": tmp_path / "model",
+        "model_sha256": "a" * 64,
         "forecasts": forecast,
         "forecast_sha256": "b" * 64,
         "evaluation_contract": {"actuals": {"path": "actuals"}},
@@ -1581,8 +1582,9 @@ def test_reused_validation_operation_has_current_failure_stage(tmp_path, monkeyp
     def copy(*args, **kwargs):
         if operation == "artifact_retention":
             raise OSError("injected selected artifact retention failure")
+        return window["model_sha256"]
 
-    monkeypatch.setattr(study_workflow, "_copy_run_artifact_directory", copy)
+    monkeypatch.setattr(study_workflow, "_retain_run_artifact_directory", copy)
     monkeypatch.setattr(
         study_workflow, "snapshot_parquet_directory", lambda source, dest, **kwargs: dest
     )

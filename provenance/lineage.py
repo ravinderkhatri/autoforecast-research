@@ -531,17 +531,11 @@ def snapshot_parquet_directory(
             error.add_note(f"Snapshot cleanup also failed: {cleanup_error}")
 
     if _volume_files.is_volume(source):
+        # Copy from these downloaded, authenticated bytes; later remote changes cannot reach them.
         with _volume_files.local_snapshot(source, parquet_only=True) as local:
-            result = snapshot_parquet_directory(
+            return snapshot_parquet_directory(
                 local, destination, expected_sha256=expected_sha256, label=label,
             )
-            try:
-                if directory_digest(source, suffixes=(".parquet",)) != expected_sha256:
-                    raise LineageError(f"{label} changed while its snapshot was copied")
-            except BaseException as error:
-                discard(error)
-                raise
-            return result
     if path_exists(destination):
         raise LineageError(f"{label} snapshot destination already exists")
     if directory_digest(source, suffixes=(".parquet",)) != expected_sha256:
@@ -549,16 +543,23 @@ def snapshot_parquet_directory(
     parts = parquet_files(source)
     destination.mkdir()
     try:
+        copies = []
         for part in parts:
             relative = pathlib.Path(part.name) if source.is_file() else part.relative_to(source)
-            target = destination / relative
+            copies.append((part, destination / relative, relative.as_posix()))
+        if _volume_files.is_volume(destination):
+            # Each part is created only if absent and read back in full as it is published.
+            _volume_files.publish_files((part, target) for part, target, _name in copies)
+            _, published = _volume_files._inventory(destination)
+            if ({name: size for name, (is_directory, size, _modified) in published.items()
+                    if not is_directory}
+                    != {name: part.stat().st_size for part, _target, name in copies}
+                    or directory_digest(source, suffixes=(".parquet",)) != expected_sha256):
+                raise LineageError(f"{label} changed while its snapshot was copied")
+            return destination
+        for part, target, _name in copies:
             target.parent.mkdir(parents=True, exist_ok=True)
-            if _volume_files.is_volume(destination):
-                from mlops._safe_files import copy_regular_file
-
-                copy_regular_file(destination, relative.as_posix(), part)
-            else:
-                shutil.copyfile(part, target, follow_symlinks=False)
+            shutil.copyfile(part, target, follow_symlinks=False)
         if (directory_digest(destination, suffixes=(".parquet",)) != expected_sha256
                 or directory_digest(source, suffixes=(".parquet",)) != expected_sha256):
             raise LineageError(f"{label} changed while its snapshot was copied")

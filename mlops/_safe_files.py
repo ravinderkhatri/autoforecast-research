@@ -15,7 +15,10 @@ import stat
 import sys
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+
+from autoforecast._execution import operation
 
 from mlops import _volume_files
 
@@ -204,6 +207,32 @@ def _regular_file_identity(path: pathlib.Path) -> tuple[str, int]:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def regular_file_identities(paths: Iterable[pathlib.Path]) -> list[tuple[str, int]]:
+    """Return (SHA-256, size) for each file, in order, reading every byte.
+
+    Volume files are fetched concurrently: each costs one round trip, so thousands of
+    small files would otherwise take minutes.
+    """
+    paths = tuple(paths)
+    if not any(_volume_files.is_volume(path) for path in paths):
+        return [_regular_file_identity(path) for path in paths]
+    _volume_files._client()  # Construct the shared client once, before worker threads use it.
+    with operation("Hash files for the manifest", engine="driver",
+                   files_total=len(paths)) as update:
+        with ThreadPoolExecutor(max_workers=_volume_files._DOWNLOAD_WORKERS) as pool:
+            futures = [pool.submit(_regular_file_identity, path) for path in paths]
+            try:
+                for count, future in enumerate(futures, start=1):
+                    future.result()
+                    if count % 100 == 0 or count == len(futures):
+                        update(completed=count, total=len(futures), unit="files")
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+            return [future.result() for future in futures]
 
 
 def _relative_parts(relative_path: str) -> tuple[str, ...]:

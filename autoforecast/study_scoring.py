@@ -15,9 +15,12 @@ from pyspark.sql import functions as F
 from autoforecast._execution import reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
+    NATIVE_SCHEMA,
     BenchmarkError,
     _evaluation_contract_from_record,
     artifact_binding,
+    bound_input_path,
+    read_benchmark_manifest,
     snapshot_bound_input,
     verify_benchmark,
     verify_input_binding,
@@ -51,15 +54,21 @@ def validate_study_metrics(metrics: object) -> tuple[str, ...]:
 def verify_study_evaluation(
     contract: dict, *, _expected_study_sha256: str | None = None,
 ) -> tuple[pathlib.Path, dict]:
-    """Resolve an existing study and rederive the complete scoring contract from its bytes."""
+    """Resolve an existing study and rederive the complete scoring contract from its bytes.
+
+    An internal handoff that names the authenticated study checks its manifest; the scorer
+    then checks every frozen file it reads as it copies it. Other callers check every file.
+    """
     contract = copy.deepcopy(contract)
     study = contract["study"]
     if _expected_study_sha256 is not None and study["sha256"] != _expected_study_sha256:
         raise ScoreError("scoring contract differs from its authenticated study identity")
-    path, record = verify_benchmark(
-        pathlib.Path(study["path"]), study["sha256"],
-        _reuse_verified=_expected_study_sha256 is not None,
-    )
+    path, record = read_benchmark_manifest(pathlib.Path(study["path"]), study["sha256"])
+    if _expected_study_sha256 is None or record["schema"] == NATIVE_SCHEMA:
+        path, record = verify_benchmark(
+            pathlib.Path(study["path"]), study["sha256"],
+            _reuse_verified=_expected_study_sha256 is not None,
+        )
     stage, origin, horizon, _frequency = contract["boundary"].split("/")
     expected = _evaluation_contract_from_record(
         path, record, stage=stage, origin=origin, horizon=int(horizon),
@@ -110,10 +119,12 @@ def score_study(
         "grid": contract["grid"],
         "coverage": contract["coverage"],
     }
-    try:
-        verify_input_binding(pathlib.Path(panel.path), actuals)
-    except (BenchmarkError, LineageError) as error:
-        raise ScoreError("actuals changed before scoring") from error
+    # Scoring reads the authenticated copy below; a different path must hold the same bytes.
+    if "snapshot" in actuals or pathlib.Path(panel.path) != bound_input_path(actuals):
+        try:
+            verify_input_binding(pathlib.Path(panel.path), actuals)
+        except (BenchmarkError, LineageError) as error:
+            raise ScoreError("actuals changed before scoring") from error
     if (metrics is not None and "wrmsse" in metrics
             or contract["metric_policy"]["metric"] == "wrmsse"):
         if "scoring_references" not in study["artifacts"]:
@@ -136,14 +147,7 @@ def score_study(
             forecast_accuracy_breakdown=forecast_accuracy_breakdown,
             metrics=metrics,
         )
-    try:
-        verify_input_binding(pathlib.Path(panel.path), actuals)
-    except (BenchmarkError, LineageError) as error:
-        raise ScoreError("actuals changed during evaluation") from error
-    if directory_digest(forecast.path, suffixes=(".parquet",)) != forecast_sha:
-        raise ScoreError("scoring inputs changed during evaluation")
-    # The first check authenticated this private contract copy for this operation.
-    verify_study_evaluation(contract, _expected_study_sha256=contract["study"]["sha256"])
+    # The score used only the authenticated copies above, so later source changes cannot reach it.
     return score
 
 

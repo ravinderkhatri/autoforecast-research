@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from mlops import _volume_files
 from mlops._safe_files import (
     SafeFileError,
     _create_fresh_directory,
@@ -23,6 +24,7 @@ from mlops._safe_files import (
     is_regular_file,
     publish_bytes,
     read_regular_bytes,
+    regular_file_identities,
     snapshot_tree_types,
 )
 from mlops.provenance import ProvenanceError
@@ -145,16 +147,14 @@ class RunBundle:
             for file, kind in descendants.items()
             if kind == "file" and file not in {manifest_path, completion_path}
         )
-        artifacts = []
-        for file in files:
-            digest, size = _file_identity(file)
-            artifacts.append(
-                {
-                    "path": file.relative_to(self.path).as_posix(),
-                    "sha256": digest,
-                    "bytes": size,
-                }
-            )
+        try:
+            identities = regular_file_identities(files)
+        except SafeFileError as exc:
+            raise ProvenanceError(f"cannot read regular bundle artifacts: {self.path}") from exc
+        artifacts = [
+            {"path": file.relative_to(self.path).as_posix(), "sha256": digest, "bytes": size}
+            for file, (digest, size) in zip(files, identities, strict=True)
+        ]
         terminal_payload = {
             "schema": "mlops.run-bundle.v2",
             "run_id": self.run_id,
@@ -235,8 +235,25 @@ def load_completed_run_bundle(path: str | pathlib.Path) -> dict[str, Any]:
     A completed bundle is not trusted merely because its completion file exists: its manifest,
     every declared byte, and the set of files on disk must agree.  This is deliberately generic
     so an LLM fine-tune and a forecast run receive the same tamper/corruption detection.
+    A volume bundle is checked from one owned local copy: every file is downloaded once, in
+    parallel, and the remote listing must not change while it is copied.
     """
     root = pathlib.Path(path)
+    if _volume_files.is_volume(root):
+        if not (is_regular_file(root / "completion.json")
+                and is_regular_file(root / "artifact_manifest.json")):
+            raise ProvenanceError(f"completed bundle is missing terminal records: {root}")
+        try:
+            with _volume_files.local_snapshot(root) as local:
+                return _load_completed_run_bundle(local)
+        except ProvenanceError:
+            raise
+        except Exception as error:
+            raise ProvenanceError(f"cannot inspect completed bundle: {root}") from error
+    return _load_completed_run_bundle(root)
+
+
+def _load_completed_run_bundle(root: pathlib.Path) -> dict[str, Any]:
     completion_path = root / "completion.json"
     manifest_path = root / "artifact_manifest.json"
     if (

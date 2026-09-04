@@ -33,8 +33,9 @@ from autoforecast._execution import (
     validate_model_label,
 )
 from autoforecast.benchmark import bound_input_path, digest, verify_benchmark
+from autoforecast.experiments import attempts_checked_once
 from autoforecast.hpo import HPOError
-from autoforecast.hpo_bridge import _copy_run_artifact_directory
+from autoforecast.hpo_bridge import _retain_run_artifact_directory
 from autoforecast.implementation import (
     CapturedImplementation,
     resolve_implementation,
@@ -923,21 +924,24 @@ def run_forecast_workflow(
                 if reuse_tuning is not None:
                     tuning_path = pathlib.Path(reuse_tuning).absolute()
                 phase = "tuning"
-                with _stage(bundle.path / "events.jsonl", "tuning", study_id=study.study_id,
-                            run_id=bundle.path.name, reuse=reuse_tuning is not None):
-                    selection = tune_study(
-                        study,
-                        fit_predict=fit_predict,
-                        config=retained_config,
-                        implementation=implementation,
-                        tuning_origin=tuning_origin,
-                        output_dir=root / "hpo",
-                        reuse_tuning=reuse_tuning,
-                    )
-                phase = "artifact_retention"
-                tuning_path = selection.path
-                bundle.write_json("metadata/tuning-reference.json", {"path": str(tuning_path)})
-                saved = load_selected_configuration(selection.winner_config)
+                # The search checks each trial once; loading the winner reuses those checks.
+                with attempts_checked_once():
+                    with _stage(bundle.path / "events.jsonl", "tuning", study_id=study.study_id,
+                                run_id=bundle.path.name, reuse=reuse_tuning is not None):
+                        selection = tune_study(
+                            study,
+                            fit_predict=fit_predict,
+                            config=retained_config,
+                            implementation=implementation,
+                            tuning_origin=tuning_origin,
+                            output_dir=root / "hpo",
+                            reuse_tuning=reuse_tuning,
+                        )
+                    phase = "artifact_retention"
+                    tuning_path = selection.path
+                    bundle.write_json("metadata/tuning-reference.json",
+                                      {"path": str(tuning_path)})
+                    saved = load_selected_configuration(selection.winner_config)
             else:
                 _stage_event(bundle.path / "events.jsonl", "tuning", "SKIP",
                              reason="saved configuration", run_id=bundle.path.name)
@@ -1069,16 +1073,17 @@ def run_forecast_workflow(
                                 window=stage, origin=origin, run_id=bundle.path.name):
                         selection = load_tuning_result(selection.path)
                         window = selection.windows[0]
-                        _copy_run_artifact_directory(window["model_artifacts"], directory / "model")
+                        changed = "selected model changed during retention"
+                        if _retain_run_artifact_directory(
+                            window["model_artifacts"], directory / "model", changed=changed,
+                        ) != window["model_sha256"]:
+                            raise HPOError(changed)
                         if window.get("artifacts") is not None:
-                            _copy_run_artifact_directory(
-                                window["artifacts"], directory / "artifacts"
-                            )
-                            if (directory_digest(directory / "artifacts")
-                                    != window["artifacts_sha256"]):
-                                raise HPOError(
-                                "selected callback artifacts changed during retention"
-                            )
+                            changed = "selected callback artifacts changed during retention"
+                            if _retain_run_artifact_directory(
+                                window["artifacts"], directory / "artifacts", changed=changed,
+                            ) != window["artifacts_sha256"]:
+                                raise HPOError(changed)
                         forecast = window["forecasts"]
                         retained = snapshot_parquet_directory(
                             pathlib.Path(forecast.path),

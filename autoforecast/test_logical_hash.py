@@ -12,7 +12,7 @@ import pytest
 from pyspark.sql import SparkSession
 
 from autoforecast import _logical_hash as logical
-from provenance.lineage import directory_digest
+from provenance.lineage import LineageError, directory_digest
 
 
 @pytest.fixture(autouse=True)
@@ -800,12 +800,18 @@ def test_scoring_contract_reuses_only_separately_authenticated_study_sha(tmp_pat
     altered["study"]["sha256"] = "f" * 64
     with pytest.raises(ValueError):
         verify_study_evaluation(altered, _expected_study_sha256=protected_sha)
-    # Reuse still authenticates physical bytes before any scoring can use them.
+    # An authenticated handoff checks the manifest; the scorer checks each file it reads,
+    # and a caller without that handoff still checks every file.
     target = path.parent / record["role_paths"]["final_score"]
     file = next(target.glob("*.parquet"))
     pq.write_table(pq.read_table(file).slice(1), file)
+    assert verify_study_evaluation(contract, _expected_study_sha256=protected_sha)[1] == record
+    assert contract["actuals"]["role"] == "final_score"
+    with pytest.raises(LineageError, match="changed before its snapshot"):
+        benchmark.snapshot_bound_input(contract["actuals"], tmp_path / "scored-actuals")
+    monkeypatch.undo()  # A caller without the handoff recalculates logical identities.
     with pytest.raises(benchmark.BenchmarkError, match="artifact changed"):
-        verify_study_evaluation(contract, _expected_study_sha256=protected_sha)
+        verify_study_evaluation(contract)
 
 
 @pytest.mark.parametrize("cache_mode", ["cache", "persist", "catalog", "sql", "sql_lazy"])

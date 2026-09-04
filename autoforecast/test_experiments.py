@@ -754,3 +754,35 @@ def test_report_reads_only_current_execution_metrics(tmp_path, spelling):
         "<td>4.000</td><td>3000</td>")
     assert expected in table
     assert "246.912" not in table and "7654321" not in table
+
+
+def test_checked_attempt_is_reused_only_until_model_code_may_run(tmp_path: pathlib.Path) -> None:
+    from autoforecast import experiments
+
+    attempt = open_local_attempt(
+        tmp_path, study_id="smoke", trial_id="trial1", attempt_id="attempt1",
+        metadata=_metadata(learning_rate=0.001),
+    )
+    attempt.write_bytes("model/weights.bin", b"weights")
+    attempt.finalize(status="completed", summary={"test_metrics": "not_evaluated"})
+    weights = attempt.path / "model/weights.bin"
+    with experiments.attempts_checked_once():
+        first = experiments.load_completed_attempt(attempt.path)
+        weights.chmod(0o644)
+        weights.write_bytes(b"changed")
+        # Within the scope nothing else runs, so the earlier full check stands.
+        assert experiments.load_completed_attempt(attempt.path) == first
+        experiments.forget_checked_attempts()
+        with pytest.raises(ExperimentError, match="does not match bytes"):
+            experiments.load_completed_attempt(attempt.path)
+    weights.write_bytes(b"weights")
+    with experiments.attempts_checked_once():
+        experiments.load_completed_attempt(attempt.path)
+        completion = attempt.path / "completion.json"
+        completion.chmod(0o644)
+        record = json.loads(completion.read_text())
+        completion.write_text(json.dumps({**record, "summary": {"replaced": True}}))
+        with pytest.raises(ExperimentError, match="changed after it was checked"):
+            experiments.load_completed_attempt(attempt.path)
+    with pytest.raises(ExperimentError):
+        experiments.load_completed_attempt(attempt.path)
