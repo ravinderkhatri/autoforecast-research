@@ -93,7 +93,7 @@ def test_direct_registration_workflow_and_replay(spark, tmp_path, validation):
     assert reopened.publication["status"] == "not_requested"
     # Recomputing file hashes must not disguise a changed validation contract.
     from autoforecast.study_tuning import HPOError, load_selected_configuration
-    from autoforecast.test_study_workflow import _reseal_attempt
+    from autoforecast.test_study_workflow_results import _reseal_attempt
 
     for defect in ("validation", "parameters"):
         changed = tmp_path / defect / result.path.name
@@ -580,7 +580,7 @@ def _assert_resealed_contracts_rejected(result, definition, sha, registry, tmp_p
     from autoforecast.study_results import _publication, read_workflow_results
     from autoforecast.study_tuning import load_selected_configuration
     from autoforecast.study_workflow import load_forecast_workflow
-    from autoforecast.test_study_workflow import _reseal_attempt
+    from autoforecast.test_study_workflow_results import _reseal_attempt
     from provenance.lineage import directory_digest
 
     manifest = pathlib.Path(result.provenance["study"]["path"])

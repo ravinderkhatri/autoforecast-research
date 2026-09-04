@@ -853,7 +853,8 @@ def test_model_job_starts_monitor_before_fit_and_applies_resources(tmp_path, mon
 
 @pytest.fixture(scope="module")
 def retained_handoff(spark, tmp_path_factory):
-    from autoforecast.test_study_workflow import register, workflow_evidence
+    from autoforecast.test_study_workflow import register
+    from autoforecast.test_study_workflow_results import workflow_evidence
 
     # Exactly A/B from the shared synthetic fixture; no series are excluded.
     manifest = register(tmp_path_factory.mktemp("handoff-study"), spark, count=1)

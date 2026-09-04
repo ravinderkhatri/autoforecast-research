@@ -16,7 +16,7 @@ from autoforecast.study_scoring import score_study
 from autoforecast.test_study_tuning import open_study
 from autoforecast.test_study_workflow import profile
 
-pytest_plugins = ["autoforecast.test_study_workflow"]
+pytest_plugins = ["autoforecast.test_study_workflow_results"]
 
 
 def assert_lifecycle(audit, name, outcomes):

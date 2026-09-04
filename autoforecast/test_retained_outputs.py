@@ -351,7 +351,7 @@ def test_failed_search_and_later_workflow_failure_keep_analysis_navigation(
         read_tuning_results(search)
     retained_context.write_bytes(original)
 
-    from autoforecast.test_study_workflow import _reseal_attempt
+    from autoforecast.test_study_workflow_results import _reseal_attempt
 
     for target, replacement in (
         (retained_context, json.dumps({**json.loads(original), "context": {
