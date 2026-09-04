@@ -55,7 +55,9 @@ def configuration(root, *, actual_missing="mask"):
 
 
 @pytest.mark.parametrize("policy", ["mask", "zero"])
-def test_registration_retries_and_raw_actuals_remain_distinct_from_fit(spark, tmp_path, policy):
+def test_registration_retries_and_raw_actuals_remain_distinct_from_fit(
+    spark, tmp_path, policy, monkeypatch,
+):
     path = configuration(tmp_path, actual_missing=policy)
     if policy == "zero":
         source = tmp_path / "source.parquet"
@@ -78,12 +80,23 @@ def test_registration_retries_and_raw_actuals_remain_distinct_from_fit(spark, tm
         [{"item": "late"}] if policy == "zero" else []
     )
     (tmp_path / "source.parquet").unlink()
+    from autoforecast import _logical_hash
+
+    def no_row_scan(*args, **kwargs):
+        pytest.fail("registered unchanged files must reuse the authenticated logical identity")
+
+    monkeypatch.setattr(_logical_hash, "fingerprint", no_row_scan)
+    monkeypatch.setattr(_logical_hash, "_capture", no_row_scan)
     with registry.load_study(study_id) as study:
         assert study.training_data.filter("value is null").count() == 0
         assert study.validation_data.filter("value is null").count() == 1
         assert study.refit_data.filter("value is null").count() == 0
         assert study.training_data.count() == 9  # B starts on day 2, never day 1.
         assert study.policies["history_missing"] == "zero"
+        from autoforecast.study_tuning import _prepare_window
+
+        prepared = _prepare_window(study, "validation", "2024-01-05", 2, tmp_path / "window")
+        assert prepared.verify()["evaluation_contract"]["study"]["sha256"] == study._sha256
     baseline = registry.root / "registrations" / (study_id + ".json")
     record = json.loads(baseline.read_text())
     record["definition"]["admission"]["retained_series"] = 17

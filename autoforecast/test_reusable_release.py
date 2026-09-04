@@ -440,7 +440,7 @@ def test_benchmark_identity_rejects_replacement_with_updated_checksums(frozen, t
         benchmark.verify_benchmark(path)
 
 
-def test_benchmark_parses_the_bytes_it_authenticated(frozen, tmp_path, monkeypatch):
+def test_benchmark_rejects_manifest_replaced_after_authentication(frozen, tmp_path, monkeypatch):
     import hashlib
     import shutil
 
@@ -457,8 +457,8 @@ def test_benchmark_parses_the_bytes_it_authenticated(frozen, tmp_path, monkeypat
         return original(authenticated)
 
     monkeypatch.setattr(benchmark, "loads_exact_json", replace_after_authentication)
-    _, result = benchmark.verify_benchmark(path, hashlib.sha256(payload).hexdigest())
-    assert result["benchmark_id"] == json.loads(payload)["benchmark_id"]
+    with pytest.raises(benchmark.BenchmarkError, match="manifest changed"):
+        benchmark.verify_benchmark(path, hashlib.sha256(payload).hexdigest())
 
 
 def test_benchmark_identity_survives_parquet_layout_changes(frozen, tmp_path):

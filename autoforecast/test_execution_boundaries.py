@@ -420,7 +420,7 @@ def test_reused_campaign_model_is_labelled_verified(tmp_path, monkeypatch, after
     monkeypatch.setattr(study_campaign, "_read", lambda *a: request)
     monkeypatch.setattr(study_campaign, "_runtime_identity", lambda: {})
     monkeypatch.setattr(study_campaign, "_entrypoint", lambda *a: (lambda _: None, "a" * 64))
-    monkeypatch.setattr(study_campaign, "verify_benchmark", lambda *a: None)
+    monkeypatch.setattr(study_campaign, "verify_benchmark", lambda *a, **kw: None)
     monkeypatch.setattr(
         study_campaign,
         "_load_model_result",
@@ -2614,7 +2614,7 @@ def test_audit_directory_symlink_does_not_write_inside_protected_tree(tmp_path, 
             monkeypatch.setattr(campaign, "_read", lambda *_: request)
             monkeypatch.setattr(campaign, "_runtime_identity", lambda: {"ok": True})
             monkeypatch.setattr(campaign, "_entrypoint", lambda *_: (lambda _: None, None))
-            monkeypatch.setattr(campaign, "verify_benchmark", lambda *_: None)
+            monkeypatch.setattr(campaign, "verify_benchmark", lambda *a, **kw: None)
 
             def stop(*args, **kwargs):
                 raise marker

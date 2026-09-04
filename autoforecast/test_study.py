@@ -87,7 +87,7 @@ def test_study_freezes_unequal_starts_original_missingness_and_complete_grids(
 ):
     path = freeze(tmp_path, spark, actual_missing=policy)
     _, record = benchmark.verify_benchmark(path)
-    assert record["schema"] == benchmark.STUDY_SCHEMA
+    assert record["schema"] == benchmark.DISTRIBUTED_SCHEMA
     assert record["study_id"] == record["benchmark_id"]
     assert record["source_series_count"] == 3
     assert record["excluded_new_series"] == 1

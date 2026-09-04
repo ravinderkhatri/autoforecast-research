@@ -189,3 +189,50 @@ def test_native_window_preserves_missing_targets_and_frozen_identity(physical):
         changed[0, 0] = invalid
         with pytest.raises(ValueError, match="finite integer counts"):
             ValidationWindow.from_study("2024-01-01", dataclasses.replace(study, target=changed))
+
+
+def test_checkpoint_read_rejects_self_pinned_rebound_actuals(tmp_path):
+    import pathlib
+
+    import pyarrow as pa
+
+    from autoforecast.test_logical_hash import _versioned_example
+    from provenance.lineage import directory_digest
+
+    path, record = _versioned_example(tmp_path)
+    study_id = record["study_id"]
+    origin = record["recipe"]["validation_origins"][0]
+
+    def write_handoff():
+        contract = benchmark._evaluation_contract_from_record(
+            path, record, stage="validation", origin=origin, horizon=7, metric="rmse",
+        )
+        file = tmp_path / "checkpoint-evaluation.json"
+        file.write_text(json.dumps(contract))
+        return file, hashlib.sha256(file.read_bytes()).hexdigest(), contract
+
+    file, sha, contract = write_handoff()
+    panel = load_dataset_contract(path.parent / "dataset.yaml").panel(contract["actuals"]["path"])
+    series = tuple(pq.read_table(benchmark.artifact_path(path, record, "source-keys"))[
+        "__af_series_id"
+    ].to_pylist())
+    args = dict(panel=panel, origin=origin, horizon=7, series_ids=series)
+    original = StudyValidation.read(file, sha, **args)
+    assert original.target.shape == (len(series), 7)
+    target = pathlib.Path(contract["actuals"]["path"])
+    part = next(target.glob("*.parquet"))
+    table = pq.read_table(part)
+    rows = table.to_pylist()
+    for row in rows:
+        row["units"] += 1000
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), part)
+    record["artifacts"][contract["actuals"]["role"]] = directory_digest(
+        target, suffixes=(".parquet",),
+    )
+    path.write_text(json.dumps(record))
+    file, sha, changed = write_handoff()
+    assert changed["study_id"] == study_id
+    assert changed["study"]["sha256"] != contract["study"]["sha256"]
+    # Both caller-provided checksums now match the changed files, but the rows do not.
+    with pytest.raises(ValueError, match="frozen logical identity changed"):
+        StudyValidation.read(file, sha, **args)

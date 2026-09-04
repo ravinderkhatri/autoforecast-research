@@ -7,6 +7,7 @@ promotion still uses the multi-origin ``ranking`` protocol and a held-out accept
 
 from __future__ import annotations
 
+import copy
 import html
 import json
 import pathlib
@@ -142,6 +143,8 @@ def compare_run_forecasts(
     fixed_contract: Mapping[str, object] | None = None,
 ) -> pathlib.Path:
     """Score one request's forecasts on the exact common emitted cells and publish evidence."""
+    if fixed_contract is not None:
+        fixed_contract = copy.deepcopy(dict(fixed_contract))
     if metric not in ("rmse", "mae", "wape", "wrmsse"):
         raise EvaluationError(f"unsupported run comparison metric: {metric!r}")
     if not forecasts:
@@ -206,6 +209,7 @@ def compare_run_forecasts(
                 score = score_study(
                     panel, forecast, spark, contract=dict(fixed_contract),
                     output_dir=out / f"candidate-{len(candidates):04d}",
+                    _expected_study_sha256=cast(dict, fixed_contract["study"])["sha256"],
                 )
             elif metric == "wrmsse":
                 # This is explicitly the M5 convention: the metric owns M5's 12 hierarchy

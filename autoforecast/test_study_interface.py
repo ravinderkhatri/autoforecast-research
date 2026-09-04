@@ -349,7 +349,7 @@ def test_study_interface_supplied_session_takes_precedence(frozen, spark, monkey
 def test_study_interface_rejects_identity_changed_while_loading(frozen, spark, monkeypatch):
     _, manifest, _ = frozen
     verified_path, record = benchmark.verify_benchmark(manifest)
-    def changed(path, expected_sha256):
+    def changed(path, expected_sha256, **kwargs):
         assert path == manifest
         assert expected_sha256 == hashlib.sha256(manifest.read_bytes()).hexdigest()
         return verified_path, {**record, "study_id": "b" * 64}

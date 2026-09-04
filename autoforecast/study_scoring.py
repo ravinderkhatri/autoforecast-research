@@ -45,10 +45,18 @@ def validate_study_metrics(metrics: object) -> tuple[str, ...]:
     return tuple(metrics)
 
 
-def verify_study_evaluation(contract: dict) -> tuple[pathlib.Path, dict]:
+def verify_study_evaluation(
+    contract: dict, *, _expected_study_sha256: str | None = None,
+) -> tuple[pathlib.Path, dict]:
     """Resolve an existing study and rederive the complete scoring contract from its bytes."""
+    contract = copy.deepcopy(contract)
     study = contract["study"]
-    path, record = verify_benchmark(pathlib.Path(study["path"]), study["sha256"])
+    if _expected_study_sha256 is not None and study["sha256"] != _expected_study_sha256:
+        raise ScoreError("scoring contract differs from its authenticated study identity")
+    path, record = verify_benchmark(
+        pathlib.Path(study["path"]), study["sha256"],
+        _reuse_verified=_expected_study_sha256 is not None,
+    )
     stage, origin, horizon, _frequency = contract["boundary"].split("/")
     expected = _evaluation_contract_from_record(
         path, record, stage=stage, origin=origin, horizon=int(horizon),
@@ -66,6 +74,7 @@ def score_study(
     forecast_accuracy_breakdown: ForecastAccuracyBreakdown = "none",
     metrics: tuple[str, ...] | None = None,
     scratch_root: str | pathlib.Path | None = None,
+    _expected_study_sha256: str | None = None,
 ) -> dict:
     """Score the full frozen grid and retain per-series coverage and unavailable scores."""
     validate_forecast_accuracy_breakdown(forecast_accuracy_breakdown)
@@ -77,7 +86,9 @@ def score_study(
         forecast.validate()
     except ForecastError as error:
         raise ScoreError(str(error)) from error
-    path, study = verify_study_evaluation(contract)
+    path, study = verify_study_evaluation(
+        contract, _expected_study_sha256=_expected_study_sha256,
+    )
     actuals = contract["actuals"]
     dataset_path = path.parent / "dataset.yaml"
     dataset_bytes = dataset_path.read_bytes()
@@ -123,7 +134,8 @@ def score_study(
     if (directory_digest(panel.path, suffixes=(".parquet",)) != actuals["sha256"]
             or directory_digest(forecast.path, suffixes=(".parquet",)) != forecast_sha):
         raise ScoreError("scoring inputs changed during evaluation")
-    verify_study_evaluation(contract)
+    # The first check authenticated this private contract copy for this operation.
+    verify_study_evaluation(contract, _expected_study_sha256=contract["study"]["sha256"])
     return score
 
 

@@ -793,3 +793,70 @@ def test_plot_matches_exported_values_and_preserves_missing_predictions(
     )
     assert len({label for _, _, label in observed}) == 2
     assert (tmp_path / "comparison.png").stat().st_size > 0
+
+
+@pytest.mark.parametrize("reader", ["campaign", "tables"])
+@pytest.mark.parametrize("artifact", ["source-keys", "selection", "final_score", "grids", "coverage"])
+def test_results_reject_self_pinned_rebound_study_artifacts(tmp_path, reader, artifact):
+    import pyarrow.parquet as pq
+
+    from autoforecast import benchmark
+    from autoforecast.study_results import _tables
+    from autoforecast.test_logical_hash import _versioned_example
+    from provenance.lineage import directory_digest
+
+    path, record = _versioned_example(tmp_path)
+    study_id = record["study_id"]
+    benchmark.verify_benchmark(path)
+    if artifact in {"grids", "coverage"}:
+        name = next(iter(record[artifact]))
+        target = path.parent / record[artifact][name]["path"]
+    else:
+        target = benchmark.artifact_path(path, record, artifact)
+    part = next(target.glob("*.parquet"))
+    table = pq.read_table(part)
+    rows = table.to_pylist()
+    if artifact == "source-keys":
+        rows[0]["shop"] = "changed-shop"
+    elif artifact == "grids":
+        rows[0]["date"] += dt.timedelta(days=1)
+    elif artifact == "coverage":
+        rows[0]["scored"] += 1
+    else:
+        rows[0]["units"] += 1000
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), part)
+    physical = directory_digest(target, suffixes=(".parquet",))
+    if artifact in {"grids", "coverage"}:
+        record[artifact][name]["sha256"] = physical
+    else:
+        record["artifacts"][artifact] = physical
+    path.write_text(json.dumps(record))
+    study = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    # Editing byte checksums does not change the claimed logical study identity.
+    assert benchmark.read_benchmark_manifest(path, study["sha256"])[1]["study_id"] == study_id
+    if reader == "tables":
+        with pytest.raises(ValueError, match="frozen logical identity changed"):
+            _tables([], [], {"study": study})
+        return
+    resolved = tmp_path / "resolved-rebound.json"
+    resolved.write_text(json.dumps({
+        "schema": "autoforecast.forecast-campaign-resolved.v4", "source": {},
+        "selection": {"metric": "rmse"}, "temporal": {"frequency": "D"}, "children": [],
+        "benchmark": {**study, "id": study_id, "evaluations": {}},
+    }))
+    plan = tmp_path / "reader-plan.yaml"
+    plan.write_text(yaml.safe_dump({
+        "schema_version": 1, "campaign": {"name": "unrun-reader", "stages": [{
+            "id": "probe", "command": [sys.executable, "-c", "pass", "--resolved", str(resolved),
+                                        "--resolved-sha256",
+                                        hashlib.sha256(resolved.read_bytes()).hexdigest()],
+            "needs": [], "timeout_seconds": 10, "max_attempts": 1, "retry_mode": "restart",
+            "required_outputs": [],
+            "resources": {"device": "cpu", "memory_gib": 0.5, "min_free_disk_gib": 0.01},
+        }]},
+    }))
+    store = CampaignStore.open_or_create(
+        plan, output_root=tmp_path / "reader-campaigns", working_directory=tmp_path,
+    )
+    with pytest.raises(ValueError, match="frozen logical identity changed"):
+        read_results(store.root)

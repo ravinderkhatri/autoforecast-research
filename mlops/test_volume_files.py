@@ -273,6 +273,38 @@ def test_volume_hashing_keeps_reader_visible_file_checks(volume):
         directory_digest(root, suffixes=(".parquet",))
 
 
+def test_volume_logical_reuse_downloads_once_and_ignores_stale_mount(volume, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from autoforecast import _logical_hash
+
+    from provenance.lineage import directory_digest
+
+    root, client = volume
+    folder = root / "frozen"
+    folder.mkdir()
+    output = io.BytesIO()
+    pq.write_table(pa.table({"x": [1, 2]}), output)
+    _safe_files.publish_bytes(folder, "part.parquet", output.getvalue())
+    expected = _logical_hash.fingerprint(folder)
+    physical = directory_digest(folder, suffixes=(".parquet",))
+    (folder / "part.parquet").write_bytes(b"stale mounted content")
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(path)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    assert _logical_hash.verify_files(folder, physical_sha256=physical, logical=expected,
+                                      trusted=True) == expected["sha256"]
+    assert downloads == [str(folder / "part.parquet")]
+    client.values[str(folder / "part.parquet")] = b"changed remote content"
+    with pytest.raises(ValueError, match="bytes or inventory changed"):
+        _logical_hash.verify_files(folder, physical_sha256=physical, logical=expected, trusted=True)
+
+
 def test_volume_identity_reads_current_remote_bytes(volume):
     import hashlib
 
@@ -367,7 +399,7 @@ def test_volume_study_load_and_panel_use_native_bytes(volume, monkeypatch):
     import autoforecast.study as module
 
     root, client = volume
-    folder = root / "study"
+    folder = root / ("a" * 64)
     folder.mkdir()
     manifest = folder / "benchmark.json"
     manifest.write_bytes(b"stale manifest")
@@ -384,19 +416,19 @@ dataset:
     target_estimand: observed_nonnegative
 '''
     client.values[str(folder / "dataset.yaml")] = contract
-    record = {"recipe": {"validation_origins": ["2024-01-05"]}, "study_id": "study",
+    record = {"recipe": {"validation_origins": ["2024-01-05"]}, "study_id": "a" * 64,
               "dataset_sha256": hashlib.sha256(contract).hexdigest(),
               "role_paths": {"selection": "selection"}, "artifacts": {"selection": "0" * 64}}
-    monkeypatch.setattr(module, "resolve_study", lambda *_: (manifest, record))
+    monkeypatch.setattr(module, "resolve_study", lambda *_, **__: (manifest, record))
 
-    def verified(path, sha):
+    def verified(path, sha, **kwargs):
         assert path == manifest and sha == hashlib.sha256(b"current manifest").hexdigest()
         return path, record
 
     monkeypatch.setattr(module, "verify_benchmark", verified)
     monkeypatch.setattr(module, "read_benchmark_manifest", verified)
     with tempfile.TemporaryDirectory() as scratch:
-        study = module.load_study("study", registry_root=root,
+        study = module.load_study("a" * 64, registry_root=root,
                                   spark=cast(SparkSession, object()), scratch_root=scratch)
         try:
             assert study.panel.target_col == "value"
@@ -651,7 +683,7 @@ def test_volume_tuning_reload_passes_native_contract_to_parser(volume, monkeypat
         {"schema": "autoforecast.external-trial.v2", "context": context}))
     monkeypatch.setattr(module, "_retained_bytes", lambda *_: profile)
     monkeypatch.setattr(module, "verify_retained", lambda *_: None)
-    monkeypatch.setattr(module, "verify_benchmark", lambda *_: (root / "benchmark.json", {}))
+    monkeypatch.setattr(module, "verify_benchmark", lambda *a, **kw: (root / "benchmark.json", {}))
 
     class ReachedParser(Exception):
         pass
@@ -761,8 +793,13 @@ def test_volume_admission_seals_remote_directories_absent_from_mounted_listing(
             return 1
 
     frame = Frame()
-    registry = SimpleNamespace(root=root, spark=SimpleNamespace(
+    registry = SimpleNamespace(root=root, scratch_root=root, spark=SimpleNamespace(
         read=SimpleNamespace(parquet=lambda _: frame)))
+    # This fixture models native storage only; use the same offline hash format
+    # while the real Spark encoder is exercised by the logical hash tests.
+    capture = registration._logical_hash._capture
+    monkeypatch.setattr(registration._logical_hash, "_capture",
+                        lambda path, *, spark=None: capture(path))
     monkeypatch.setattr(registration, "_same_keys", lambda *_: None)
     monkeypatch.setattr(registration, "F", SimpleNamespace(lit=lambda value: value))
     rename = registration.os.rename
@@ -1122,3 +1159,199 @@ def test_download_reports_unequal_file_bytes_and_final_file_count(volume, monkey
                     and r['status'] == 'PASS')
     assert finished['completed'] == 1024 * 1024 + 5 and finished['files'] == 2
     assert len(rows) == 4
+
+
+@pytest.mark.parametrize("mutate", [False, True])
+def test_volume_capture_returns_binding_and_rechecks_remote_bytes(volume, monkeypatch, mutate):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from autoforecast import _logical_hash
+    from autoforecast.study_registration import _artifact_record
+
+    root, client = volume
+    folder = root / "capture"
+    folder.mkdir()
+    output = io.BytesIO()
+    pq.write_table(pa.table({"x": [1, 2]}), output)
+    _safe_files.publish_bytes(folder, "part.parquet", output.getvalue())
+    download = client.download
+    downloads = []
+
+    def counted(path):
+        downloads.append(path)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    offline = _logical_hash._offline
+
+    def calculate(*args):
+        result = offline(*args)
+        if mutate:
+            # The final read must see a remote change, even with an unchanged mount.
+            client.values[str(folder / "part.parquet")] = b"changed captured bytes"
+        return result
+
+    monkeypatch.setattr(_logical_hash, "_offline", calculate)
+    if mutate:
+        with pytest.raises(ValueError, match="changed during logical hashing"):
+            _artifact_record(folder)
+    else:
+        record = _artifact_record(folder)
+        assert record["logical_hash"]["rows"] == 2
+        assert len(record["physical_sha256"]) == 64
+    assert downloads == [str(folder / "part.parquet")] * 2
+
+
+def test_standalone_volume_load_pins_native_manifest_before_full_verification(volume, monkeypatch):
+    import hashlib
+
+    from autoforecast import study as api
+    from autoforecast.benchmark import BenchmarkError
+
+    root, client = volume
+    study_id = "a" * 64
+    path = root / study_id / "benchmark.json"
+    client.values[str(path)] = b"original native manifest"
+    assert not path.exists()
+    original_sha = hashlib.sha256(client.values[str(path)]).hexdigest()
+
+    def resolved(registry, identity, **kwargs):
+        assert registry == root and identity == study_id
+        client.values[str(path)] = b"replacement after full verification"
+        return path, {}
+
+    def verified(manifest, expected_sha256, **kwargs):
+        assert manifest == path
+        assert expected_sha256 == original_sha
+        assert kwargs["_reuse_verified"]
+        raise BenchmarkError("benchmark manifest changed")
+
+    monkeypatch.setattr(api, "resolve_study", resolved)
+    monkeypatch.setattr(api, "verify_benchmark", verified)
+    with pytest.raises(BenchmarkError, match="manifest changed"):
+        api.load_study(study_id, registry_root=root, spark=cast(SparkSession, object()))
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_untrusted_volume_hash_uses_native_bytes_even_with_spark(volume, monkeypatch, changed):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from autoforecast import _logical_hash
+
+    from provenance.lineage import directory_digest
+
+    root, client = volume
+    folder = root / "existing"
+    folder.mkdir()
+    output = io.BytesIO()
+    pq.write_table(pa.table({"x": [1, 2]}), output)
+    _safe_files.publish_bytes(folder, "part.parquet", output.getvalue())
+    expected = _logical_hash.fingerprint(folder)
+    if changed:
+        replacement = io.BytesIO()
+        pq.write_table(pa.table({"x": [7, 8]}), replacement)
+        client.values[str(folder / "part.parquet")] = replacement.getvalue()
+    # The editable manifest can claim today's physical SHA, while the mount
+    # still exposes the original rows. A fresh digest is not trusted authority.
+    physical = directory_digest(folder, suffixes=(".parquet",))
+    fingerprint = _logical_hash.fingerprint
+    seen = []
+
+    def private_download(path, *, spark=None):
+        assert spark is None
+        assert not _volume_files.is_volume(path)
+        seen.append(path)
+        return fingerprint(path)
+
+    monkeypatch.setattr(_logical_hash, "fingerprint", private_download)
+    options = dict(physical_sha256=physical, logical=expected, trusted=False, spark=object())
+    if changed:
+        with pytest.raises(ValueError, match="logical identity changed"):
+            _logical_hash.verify_files(folder, **options)
+    else:
+        assert _logical_hash.verify_files(folder, **options) == expected["sha256"]
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("native_storage", [False, True])
+def test_delta_capture_cleans_native_files_and_preserves_primary_failure(
+    volume, monkeypatch, outcome, cleanup_fails, native_storage,
+):
+    import shutil
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from autoforecast.integrations.delta import DeltaStudyStore
+
+    from provenance.lineage import directory_digest
+
+    root, client = volume
+    if not native_storage:
+        monkeypatch.setattr(_volume_files, "is_volume", lambda path: False)
+    source = root / "source"
+    source.mkdir()
+    output = io.BytesIO()
+    pq.write_table(pa.table({"item": ["A", "B"], "value": [1, 2]}), output)
+    _safe_files.publish_bytes(source, "part.parquet", output.getvalue())
+    expected = directory_digest(source, suffixes=(".parquet",))
+    original = dict(client.values)
+    store = DeltaStudyStore(cast(SparkSession, object()), namespace="example")
+    primary = RuntimeError("freeze failed") if outcome == "error" else KeyboardInterrupt()
+    captured = []
+
+    def freeze(path, *, keys, scratch_root):
+        captured.append(path)
+        assert keys == ["item"] and path.parent == scratch_root
+        assert directory_digest(path, suffixes=(".parquet",)) == expected
+        # This emulator deliberately keeps native files absent from the mount.
+        assert (path / "part.parquet").exists() is not native_storage
+        if outcome != "success":
+            raise primary
+        return {"status": "captured"}
+
+    monkeypatch.setattr(store, "_freeze_captured_observations", freeze)
+    remove = _volume_files.remove_tree
+    cleaned = []
+
+    def cleanup(path):
+        cleaned.append(path)
+        if cleanup_fails:
+            raise OSError("snapshot cleanup failed")
+        remove(path)
+
+    monkeypatch.setattr(_volume_files, "remove_tree", cleanup)
+    filesystem_remove = shutil.rmtree
+
+    def filesystem_cleanup(path, *args, **kwargs):
+        if Path(path).name.startswith("af-delta-source-"):
+            if native_storage:
+                raise OSError("mounted cleanup must not run after native cleanup")
+            cleaned.append(Path(path))
+            if cleanup_fails:
+                raise OSError("snapshot cleanup failed")
+        return filesystem_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", filesystem_cleanup)
+    if outcome != "success":
+        with pytest.raises(type(primary)) as caught:
+            store.freeze_observations(source, keys=["item"], scratch_root=root)
+        assert caught.value is primary
+        if cleanup_fails:
+            assert "snapshot cleanup failed" in " ".join(primary.__notes__)
+    elif cleanup_fails:
+        with pytest.raises(OSError, match="snapshot cleanup failed"):
+            store.freeze_observations(source, keys=["item"], scratch_root=root)
+    else:
+        assert store.freeze_observations(source, keys=["item"], scratch_root=root) == {
+            "status": "captured",
+        }
+    assert len(captured) == 1 and cleaned == [captured[0].parent]
+    # The native API is authoritative even while its mounted listing is stale.
+    if not native_storage and not cleanup_fails:
+        assert not captured[0].parent.exists()
+    assert _safe_files.read_regular_bytes(source, "part.parquet") == output.getvalue()
+    assert {key: client.values[key] for key in original} == original
+    if not cleanup_fails:
+        assert client.values == original

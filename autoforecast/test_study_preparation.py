@@ -103,7 +103,8 @@ def test_formats_retry_evidence_and_offline_inputs(spark, tmp_path):
 
     changed_id = register_study(json_path, registry=registry, prepare=DifferentPolicy())
     assert changed_id != study_id
-    from autoforecast.benchmark import digest, parquet_content_hash
+    from autoforecast._logical_hash import fingerprint
+    from autoforecast.benchmark import digest
 
     record_path.write_bytes(b"\n" + original)
     with pytest.raises(ValueError, match="bytes differ"):
@@ -126,7 +127,7 @@ def test_formats_retry_evidence_and_offline_inputs(spark, tmp_path):
     before = artifact.read_bytes()
     pq.write_table(pq.read_table(artifact), artifact, compression="gzip")
     try:
-        assert parquet_content_hash(artifact.parent) == admission["artifacts"]["starting_keys"]["logical_sha256"]
+        assert fingerprint(artifact.parent) == admission["artifacts"]["starting_keys"]["logical_hash"]
         assert artifact.read_bytes() != before
         with pytest.raises(ValueError, match="artifact differs"):
             registry.load_study(study_id)
@@ -933,3 +934,154 @@ def test_preparation_preserves_native_initial_cohort(spark, tmp_path, route, app
     with registry.load_study(study_id) as study:
         assert {row.item for row in study.training_data.select("item").distinct().collect()} == (
             {"A"} if app_exclude else {"A", "B"})
+
+
+@pytest.mark.parametrize("winner_timing", ["interrupted", "concurrent"])
+def test_unregistered_admission_winner_rejects_replaced_rows_and_updated_physical_hash(
+    spark, tmp_path, monkeypatch, winner_timing,
+):
+    """An unpublished record cannot authorize its own changed cohort evidence."""
+    from contextlib import contextmanager
+
+    from autoforecast import study_registration as registration
+    from provenance.lineage import directory_digest
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+
+    def interrupt(*args, **kwargs):
+        raise OSError("registration interrupted before publishing its protected binding")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(registry, "_publish_definition", interrupt)
+        with pytest.raises(OSError, match="registration interrupted"):
+            register_study(path, registry=registry, prepare=SensorPreparation())
+    admission_path = next((registry.root / "admissions").glob("*/admission.json"))
+    record = json.loads(admission_path.read_bytes())
+    artifact = admission_path.parent / "starting_keys"
+    part = next(artifact.glob("*.parquet"))
+    table = pq.read_table(part)
+    field = table.schema.field("item")
+    changed = table.set_column(table.schema.get_field_index("item"), field,
+                               pa.array(["replacement"] * len(table), type=field.type))
+    pq.write_table(changed, part)
+    part.with_name("." + part.name + ".crc").unlink(missing_ok=True)
+    # Keep the old logical identity while replacing its editable physical binding.
+    record["artifacts"]["starting_keys"]["physical_sha256"] = directory_digest(
+        artifact, suffixes=(".parquet",),
+    )
+    admission_path.write_text(json.dumps(record))
+    if winner_timing == "concurrent":
+        destination = admission_path.parent
+        held = tmp_path / "concurrent-winner"
+        destination.rename(held)
+        original_lock = registration._publication_lock
+
+        @contextmanager
+        def publish_winner_at_lock(root):
+            with original_lock(root):
+                if held.exists():
+                    held.rename(destination)
+                yield
+
+        monkeypatch.setattr(registration, "_publication_lock", publish_winner_at_lock)
+    observed = []
+    fingerprint = registration._logical_hash.fingerprint
+
+    def trace(path, *, spark=None):
+        if path.name == "data" and path.parent.name.startswith("af-verify-hash-"):
+            # An existing winner must be checked through a new owned copy,
+            # never through a Spark plan cached for the old artifact path.
+            if directory_digest(path, suffixes=(".parquet",)) == record["artifacts"]["starting_keys"]["physical_sha256"]:
+                assert path != artifact
+                observed.append(spark)
+        return fingerprint(path, spark=spark)
+
+    monkeypatch.setattr(registration._logical_hash, "fingerprint", trace)
+    with pytest.raises(ValueError, match="admission artifact differs"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert observed == [spark]
+    assert not list((registry.root / "registrations").glob("*.*"))
+
+
+def test_preparation_reuses_verified_owned_artifact_bindings(spark, tmp_path, monkeypatch):
+    """Each prepared capture is hashed once and its exact bytes are checked on reuse."""
+    from collections import Counter
+
+    from autoforecast import study_registration as registration
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    captures = Counter()
+    capture = registration._logical_hash._capture
+
+    def trace(path, *, spark=None):
+        if "admission-staging" in path.parts:
+            captures[str(path)] += 1
+        return capture(path, spark=spark)
+
+    monkeypatch.setattr(registration._logical_hash, "_capture", trace)
+    study_id = register_study(path, registry=registry, prepare=SensorPreparation())
+    assert captures and all(count == 1 for count in captures.values())
+    assert any(path.endswith("/prepared") for path in captures)
+    assert any(path.endswith("/retained_keys") for path in captures)
+
+    def no_row_scan(*args, **kwargs):
+        pytest.fail("protected admission evidence must reuse its verified binding")
+
+    monkeypatch.setattr(registration._logical_hash, "_capture", no_row_scan)
+    monkeypatch.setattr(registration._logical_hash, "fingerprint", no_row_scan)
+    assert registry.definition(study_id)[0]["study_id"] == study_id
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_hash_failure_or_cancellation_never_publishes_registration(
+    spark, tmp_path, monkeypatch, failure,
+):
+    from autoforecast import study_registration as registration
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    reached = []
+
+    def fail_capture(path, *, spark=None):
+        reached.append(path)
+        raise failure("logical capture interrupted")
+
+    monkeypatch.setattr(registration._logical_hash, "_capture", fail_capture)
+    with pytest.raises(failure, match="logical capture interrupted"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert reached
+    assert not list((registry.root / "registrations").glob("*.*"))
+    assert not list((registry.root / "admissions").glob("*/admission.*"))
+
+
+def test_admission_manifest_replacement_during_verification_is_rejected(tmp_path, monkeypatch):
+    import hashlib
+
+    from autoforecast import study_registration as registration
+
+    folder = tmp_path / "admissions" / "study"
+    names = ("starting_keys", "retained_keys", "exclusions", "final_keys", "native_exclusions")
+    artifacts = {}
+    for name in names:
+        path = folder / name
+        path.mkdir(parents=True)
+        pq.write_table(pa.table({"item": ["sensor-001"]}), path / "part.parquet")
+        artifacts[name] = registration._artifact_record(path)
+    record = {"schema": "autoforecast.admission.v1", "artifacts": artifacts}
+    path = folder / "admission.json"
+    payload = registration.record_bytes(record, format="json")
+    path.write_bytes(payload)
+    binding = {"path": str(path.relative_to(tmp_path)), "sha256": registration.digest(record),
+               "physical_sha256": hashlib.sha256(payload).hexdigest()}
+    verify = registration._verify_artifact
+
+    def replace_after_artifact(*args, **kwargs):
+        result = verify(*args, **kwargs)
+        path.write_bytes(payload + b"\n")
+        return result
+
+    monkeypatch.setattr(registration, "_verify_artifact", replace_after_artifact)
+    with pytest.raises(ValueError, match="admission record bytes changed during verification"):
+        registration._verify_admission(tmp_path, binding, trusted=True)

@@ -721,7 +721,8 @@ def test_preflight_checks_exact_ids_and_duplicates_before_any_fit(
     for name, target in record["role_paths"].items():
         if target == relative:
             record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
-            record["logical_snapshots"][name] = benchmark.parquet_content_hash(path)
+            record["logical_hashes"][name] = benchmark._logical_hash.fingerprint(path)
+            record["logical_snapshots"][name] = record["logical_hashes"][name]["sha256"]
     identity = benchmark.digest(benchmark._identity(record))
     record["study_id"] = record["benchmark_id"] = identity
     (copied / "benchmark.json").write_text(json.dumps(record))
@@ -890,7 +891,10 @@ def _copy_and_corrupt_coverage(
     path.mkdir(parents=True)
     pq.write_table(type(table).from_pylist(rows, schema=table.schema), path / "part.parquet")
     record["coverage"][key]["sha256"] = directory_digest(path, suffixes=(".parquet",))
-    record["coverage_identities"][key]["content_sha256"] = benchmark.parquet_content_hash(path)
+    record["logical_hashes"]["coverage/" + key] = benchmark._logical_hash.fingerprint(path)
+    record["coverage_identities"][key]["content_sha256"] = (
+        record["logical_hashes"]["coverage/" + key]["sha256"]
+    )
     return _publish_changed_record(copied, record)
 
 
@@ -1084,7 +1088,8 @@ def test_preflight_report_names_every_integrity_failure(complete, spark, tmp_pat
         for name, target_path in record["role_paths"].items():
             if target_path == relative:
                 record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
-                record["logical_snapshots"][name] = benchmark.parquet_content_hash(path)
+                record["logical_hashes"][name] = benchmark._logical_hash.fingerprint(path)
+                record["logical_snapshots"][name] = record["logical_hashes"][name]["sha256"]
         defects.append(relative)
     manifest = _publish_changed_record(copied, record)
     cfg_root = tmp_path / "report-config"
@@ -1329,7 +1334,8 @@ def test_preflight_checks_source_key_and_start_mapping(complete, spark, tmp_path
     for name, target in record["role_paths"].items():
         if target == relative:
             record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
-            record["logical_snapshots"][name] = benchmark.parquet_content_hash(path)
+            record["logical_hashes"][name] = benchmark._logical_hash.fingerprint(path)
+            record["logical_snapshots"][name] = record["logical_hashes"][name]["sha256"]
     manifest = _publish_changed_record(copied, record)
     cfg = profile(tmp_path, selection={"stage": "validation"})
     with open_study(manifest, spark) as study:
@@ -1570,7 +1576,8 @@ def test_collected_integrity_issues_mark_affected_role_blocked(spark, tmp_path):
     for name, target in record["role_paths"].items():
         if target == relative:
             record["artifacts"][name] = directory_digest(path, suffixes=(".parquet",))
-            record["logical_snapshots"][name] = benchmark.parquet_content_hash(path)
+            record["logical_hashes"][name] = benchmark._logical_hash.fingerprint(path)
+            record["logical_snapshots"][name] = record["logical_hashes"][name]["sha256"]
     changed = _publish_changed_record(copied, record)
     cfg = profile(tmp_path, selection={"stage": "validation"})
     with open_study(changed, spark) as study, pytest.raises(StudyPreflightError) as caught:
@@ -1832,6 +1839,30 @@ def test_empty_fixed_parameters_use_profile_defaults_and_seed(workflow_evidence)
     assert (
         checkpoint.parameters == completed.parameters == {"model.level": 4.0, "training.offset": 3}
     )
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_workflow_reload_rejects_changed_frozen_inputs(workflow_evidence, completed):
+    result = workflow_evidence[int(completed)]
+    source = result.provenance["study"]
+    path, record = benchmark.read_benchmark_manifest(pathlib.Path(source["path"]), source["sha256"])
+    folders = {benchmark.artifact_path(path, record, role) for role in record["artifacts"]}
+    folders.update(path.parent / item["path"] for group in ("grids", "coverage")
+                   for item in record[group].values())
+    files = [next(folder.glob("*.parquet")) for folder in sorted(folders)]
+    files.append(path.parent / "dataset.yaml")
+    for part in files:
+        original = part.read_bytes()
+        try:
+            part.write_bytes(original + b"changed")
+            with pytest.raises(benchmark.BenchmarkError):
+                load_forecast_workflow(result.path)
+            part.unlink()
+            with pytest.raises((benchmark.BenchmarkError, OSError)):
+                load_forecast_workflow(result.path)
+        finally:
+            part.write_bytes(original)
+    assert load_forecast_workflow(result.path).parameters == result.parameters
 
 
 @pytest.mark.parametrize("evidence", ["series_scores", "series_sums"])

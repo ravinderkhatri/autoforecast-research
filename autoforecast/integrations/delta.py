@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import pathlib
+import shutil
 import tempfile
 from collections.abc import Mapping
 from contextlib import ExitStack, suppress
@@ -22,9 +23,11 @@ from sqlglot import exp, parse
 from sqlglot.errors import ParseError
 from sqlglot.expressions.dml import DML
 
+from autoforecast import _logical_hash
 from autoforecast._execution import note, reported
 from autoforecast.benchmark import digest, parquet_content_hash
 from autoforecast.study_results import PUBLICATION_SCHEMAS, _publication
+from provenance.lineage import directory_digest, snapshot_parquet_directory
 
 SCHEMAS = {
     "studies": "study_id string, study_sha string, definition_json string",
@@ -418,15 +421,43 @@ class DeltaStudyStore:
     def freeze_observations(self, path: pathlib.Path, *, keys: list[str],
                             scratch_root: pathlib.Path) -> dict:
         """Store a materialized source once; verify transport and typed content."""
+        expected = directory_digest(path, suffixes=(".parquet",))
+        root = pathlib.Path(tempfile.mkdtemp(prefix="af-delta-source-", dir=scratch_root))
+        failure = None
+        try:
+            captured = snapshot_parquet_directory(
+                path, root / "source", expected_sha256=expected, label="Delta observations",
+            )
+            return self._freeze_captured_observations(captured, keys=keys, scratch_root=root)
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            try:
+                if _volume_files.is_volume(root):
+                    if _volume_files.directory_exists(root):
+                        _volume_files.remove_tree(root)
+                else:
+                    shutil.rmtree(root)
+            except Exception as error:
+                if failure is None:
+                    raise
+                failure.add_note(f"Delta snapshot cleanup also failed: {error}")
+
+    def _freeze_captured_observations(self, path: pathlib.Path, *, keys: list[str],
+                                     scratch_root: pathlib.Path) -> dict:
+        """Read only this operation's fresh copy, independent of caller Spark caches."""
         frame = self.spark.read.parquet(str(path))
         _transport_type(frame.schema)
         if self.spark.conf.get("spark.sql.session.timeZone") != "UTC":
             raise ValueError("study storage requires spark.sql.session.timeZone=UTC")
+        logical = _logical_hash.fingerprint(path, spark=self.spark)
         record = {
-            "algorithm": "typed-parquet-rows-v2", "schema": frame.schema.jsonValue(),
+            "algorithm": "typed-parquet-rows-v3", "schema": frame.schema.jsonValue(),
             "columns": frame.columns, "source_keys": list(keys),
-            "logical_sha256": parquet_content_hash(path),
-            "rows": frame.count(), "series": frame.select(*keys).distinct().count(),
+            "logical_sha256": logical["sha256"],
+            "logical_hash": logical,
+            "rows": logical["rows"], "series": frame.select(*keys).distinct().count(),
             "codec": dict(JSON_OPTIONS),
         }
         record["snapshot_id"] = digest(record)
@@ -438,7 +469,8 @@ class DeltaStudyStore:
             root = pathlib.Path(temporary)
             encoded.write.parquet(str(root / "encoded"))
             encoded = self.spark.read.parquet(str(root / "encoded"))
-            record["transport_sha256"] = parquet_content_hash(root / "encoded")
+            record["transport_hash"] = _logical_hash.fingerprint(root / "encoded", spark=self.spark)
+            record["transport_sha256"] = record["transport_hash"]["sha256"]
             self._decode_verified(encoded, record, root / "decoded")
             submitted = encoded.withColumn("snapshot_id", F.lit(record["snapshot_id"])).select(
                 "snapshot_id", "row_json",
@@ -457,19 +489,36 @@ class DeltaStudyStore:
                 or checked.schema.jsonValue() != record["schema"]
                 or checked.count() != record["rows"]
                 or checked.select(*record["source_keys"]).distinct().count() != record["series"]
-                or parquet_content_hash(destination) != record["logical_sha256"]):
+                or self._content_hash(destination, record, "logical") != record["logical_sha256"]):
             raise ValueError("stored study rows differ from their protected typed snapshot")
+
+    def _content_hash(self, path, record, kind):
+        if record["algorithm"] == "typed-parquet-rows-v2":
+            return parquet_content_hash(path)
+        if record["algorithm"] != "typed-parquet-rows-v3":
+            raise ValueError("unsupported study snapshot format")
+        expected = record[kind + "_hash"]
+        _logical_hash.validate_metadata(expected)
+        observed = _logical_hash.fingerprint(path, spark=self.spark)
+        if observed != expected:
+            label = "rows differ from their protected typed snapshot" if kind == "logical" else (
+                "transport differs from its protected snapshot"
+            )
+            raise ValueError(f"stored study {label}")
+        return observed["sha256"]
 
     @reported("Verify frozen Delta snapshot")
     def verify_observations(self, record: dict, *, scratch_root: pathlib.Path) -> int:
         """Verify a pinned stored snapshot; never replace expected hashes on load."""
-        if record["algorithm"] != "typed-parquet-rows-v2" or record["codec"] != JSON_OPTIONS:
+        if (record["algorithm"] not in {"typed-parquet-rows-v2", "typed-parquet-rows-v3"}
+                or record["codec"] != JSON_OPTIONS):
             raise ValueError("unsupported study snapshot format")
         frame, version = self.read("frozen_observations", {"snapshot_id": record["snapshot_id"]})
         with tempfile.TemporaryDirectory(prefix="af-delta-read-", dir=scratch_root) as temporary:
             root = pathlib.Path(temporary)
             frame.select("row_json").write.parquet(str(root / "encoded"))
-            if parquet_content_hash(root / "encoded") != record["transport_sha256"]:
+            if (self._content_hash(root / "encoded", record, "transport")
+                    != record["transport_sha256"]):
                 raise ValueError("stored study transport differs from its protected snapshot")
             self._decode_verified(self.spark.read.parquet(str(root / "encoded")), record,
                                   root / "decoded")

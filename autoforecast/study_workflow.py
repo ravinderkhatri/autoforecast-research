@@ -29,7 +29,7 @@ from autoforecast._execution import (
     resolve_level,
     validate_model_label,
 )
-from autoforecast.benchmark import digest
+from autoforecast.benchmark import digest, verify_benchmark
 from autoforecast.hpo import HPOError
 from autoforecast.hpo_bridge import _copy_run_artifact_directory
 from autoforecast.implementation import (
@@ -168,6 +168,8 @@ def load_forecast_workflow(path: str | pathlib.Path) -> ForecastWorkflowResult:
         allowed_schemas.add("autoforecast.forecast-workflow.v2")
     if record["schema"] not in allowed_schemas:
         raise HPOError("unsupported forecast workflow result")
+    source = record["provenance"]["study"]
+    verify_benchmark(pathlib.Path(source["path"]), source["sha256"])
     _validate_workflow_configuration(
         root, record, _retained_json(root, "metadata/winner-config.json", manifest), manifest
     )
@@ -597,6 +599,7 @@ def run_forecast_workflow(
                         registry_root=preflight.study_path.parent.parent,
                         spark=study._spark,
                         scratch_root=study._snapshots.name,
+                        _expected_sha256=preflight.study_sha256,
                     )
                 )
             selection = None
@@ -812,6 +815,7 @@ def run_forecast_workflow(
                             metrics=tuple(options["metrics"]),
                             forecast_accuracy_breakdown=options["workflow_breakdown"],
                             scratch_root=temporary,
+                            _expected_study_sha256=study._sha256,
                         )
                         outcome.update(_scoring_outcome(score))
                     result = {

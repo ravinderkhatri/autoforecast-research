@@ -1046,7 +1046,9 @@ def _hpo_study_evaluation(study: HPOStudySpec, benchmark: dict, metric: str) -> 
     """Require the inner HPO window to be an authenticated, pre-frozen study boundary."""
     from autoforecast.benchmark import _evaluation_contract_from_record, verify_benchmark
 
-    path, record = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+    path, record = verify_benchmark(
+        pathlib.Path(benchmark["path"]), benchmark["sha256"], _reuse_verified=True,
+    )
     cadence = parse_frequency(record["recipe"].get("frequency", "D"))
     start, end = (parse_origin(value, cadence)
                   for value in cast(list[str], study.data["validation_target_date_range"]))
@@ -2506,7 +2508,9 @@ def _fixed_evaluation(resolved: dict, stage: str, origin: str, horizon: int) -> 
         return None
     from autoforecast.benchmark import _evaluation_contract_from_record, boundary, verify_benchmark
     benchmark = resolved["benchmark"]
-    path, record = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+    path, record = verify_benchmark(
+        pathlib.Path(benchmark["path"]), benchmark["sha256"], _reuse_verified=True,
+    )
     cadence = _resolved_cadence(resolved)
     contract = benchmark["evaluations"][boundary(stage, origin, horizon, cadence.code)]
     if contract != _evaluation_contract_from_record(
@@ -2526,7 +2530,9 @@ def _load_resolved(path: pathlib.Path, expected_sha: str) -> dict[str, object]:
     if "benchmark" in resolved:
         from autoforecast.benchmark import verify_benchmark
         benchmark = cast(dict, resolved["benchmark"])
-        _, record = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+        _, record = verify_benchmark(
+            pathlib.Path(benchmark["path"]), benchmark["sha256"], _reuse_verified=True,
+        )
         if resolved.get("study_id") != record.get("study_id"):
             raise ForecastCampaignError("shared study identity differs from the benchmark")
     return resolved

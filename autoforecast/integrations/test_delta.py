@@ -93,6 +93,68 @@ def test_snapshot_verifier_rejects_changed_transport_and_preserves_other_scopes(
     with pytest.raises(ValueError, match="conflicting immutable"):
         store.freeze_observations(source, keys=["item"], scratch_root=tmp_path)
     assert store.spark.table(store.tables["studies"]).count() == 0
+    assert not list(tmp_path.glob("af-delta-source-*"))
+
+
+@pytest.mark.parametrize("typed_cache,cache_mode", [(False, "cache"), *(
+    (True, mode) for mode in ("cache", "persist", "disk", "catalog", "sql", "sql_lazy")
+)])
+def test_snapshot_capture_uses_current_bytes_without_clearing_caller_cache(
+    store, tmp_path, typed_cache, cache_mode,
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from autoforecast import _logical_hash as logical
+
+    source = tmp_path / "source"
+    source.mkdir()
+    part = source / "part.parquet"
+    pq.write_table(pa.table({"item": ["A", "B"], "value": [1, 2]}), part)
+    original = logical.fingerprint(source)
+    frames = [store.spark.read.parquet(str(source))]
+    if typed_cache:
+        frames.append(store.spark.read.schema(logical._spark_type({"struct": original["schema"]}))
+                      .option("datetimeRebaseMode", "CORRECTED")
+                      .option("int96RebaseMode", "CORRECTED").parquet(str(source)))
+    cached = []
+    try:
+        for index, frame in enumerate(frames):
+            name = f"delta_capture_cached_input_{index}"
+            if cache_mode in {"cache", "persist"}:
+                frame = getattr(frame, cache_mode)()
+            elif cache_mode == "disk":
+                from pyspark import StorageLevel
+
+                frame = frame.persist(StorageLevel.DISK_ONLY)
+            else:
+                frame.createOrReplaceTempView(name)
+                if cache_mode == "catalog":
+                    store.spark.catalog.cacheTable(name)
+                else:
+                    lazy = "LAZY " if cache_mode == "sql_lazy" else ""
+                    store.spark.sql(f"CACHE {lazy}TABLE {name}")
+                frame = store.spark.table(name)
+            cached.append((frame, name))
+            assert sorted(row.value for row in frame.collect()) == [1, 2]
+        pq.write_table(pa.table({"item": ["A", "B"], "value": [7, 8]}), part)
+        expected = logical.fingerprint(source)
+        record = store.freeze_observations(source, keys=["item"], scratch_root=tmp_path)
+        assert record["logical_hash"] == expected != original
+        rows, _ = store.read("frozen_observations", {"snapshot_id": record["snapshot_id"]})
+        assert sorted(json.loads(row.row_json)["value"] for row in rows.collect()) == [7, 8]
+        for frame, name in cached:
+            assert (frame.is_cached if cache_mode in {"cache", "persist", "disk"}
+                    else store.spark.catalog.isCached(name))
+            assert sorted(row.value for row in frame.collect()) == [1, 2]
+        assert not list(tmp_path.glob("af-delta-source-*"))
+    finally:
+        for frame, name in cached:
+            if cache_mode in {"cache", "persist", "disk"}:
+                frame.unpersist(blocking=True)
+            else:
+                store.spark.catalog.uncacheTable(name)
+                store.spark.catalog.dropTempView(name)
 
 
 @pytest.mark.parametrize("conflict", [False, True])
@@ -370,8 +432,23 @@ def test_prepared_registration_owns_audit_query_evidence_and_links_before_public
     path.write_text(yaml.safe_dump(value))
     registry = StudyRegistry(tmp_path / "registry", spark=store.spark, namespace=store.namespace)
 
+    from autoforecast import _logical_hash
+
+    fingerprint = _logical_hash.fingerprint
+    audit_hashes = []
+
+    def captured_hash(path, *, spark=None):
+        if path.name == "audit-population":
+            assert spark is store.spark
+            assert path.exists()
+            audit_hashes.append(path)
+        return fingerprint(path, spark=spark)
+
+    monkeypatch.setattr(_logical_hash, "fingerprint", captured_hash)
+
     class SensorAudit(SensorPreparation):
         def prepare(self, context):
+            assert audit_hashes, "raw audit must be hashed in Spark before preparation"
             assert set(context.audits) == {"population"}
             assert context.audits["population"].count() == 2
             return dataclasses.replace(
@@ -770,6 +847,59 @@ def test_typed_snapshot_verification_does_not_trust_transport_hash_alone(store, 
         with pytest.raises(ValueError, match="unsupported study snapshot"):
             store.verify_observations({**record, field: value}, scratch_root=tmp_path)
     assert store.spark.table(store.tables["frozen_observations"]).count() == 2
+
+
+
+def test_delta_rejects_changed_decoded_values_after_valid_transport(store, tmp_path, monkeypatch):
+    source = tmp_path / "decode-source"
+    store.spark.createDataFrame([("A", 1), ("B", 2)], "item string,value int").write.parquet(
+        str(source),
+    )
+    record = store.freeze_observations(source, keys=["item"], scratch_root=tmp_path)
+    from_json = F.from_json
+    content_hash = store._content_hash
+    checked = []
+
+    def changed_decoder(*args, **kwargs):
+        # Keep the same nullable integer type and keys while changing the decoded values.
+        decoded = from_json(*args, **kwargs)
+        return decoded.withField("value", decoded["value"] + F.lit(1))
+
+    def tracked_hash(path, expected, kind):
+        checked.append(kind)
+        return content_hash(path, expected, kind)
+
+    monkeypatch.setattr(F, "from_json", changed_decoder)
+    monkeypatch.setattr(store, "_content_hash", tracked_hash)
+    with pytest.raises(ValueError, match="protected typed snapshot"):
+        store.verify_observations(record, scratch_root=tmp_path)
+    # Reaching the logical check proves that transport, schema, row and key counts passed.
+    assert checked == ["transport", "logical"]
+    assert store.spark.table(store.tables["frozen_observations"]).count() == 2
+
+def test_legacy_typed_snapshot_keeps_original_hash_reader(store, tmp_path, monkeypatch):
+    from autoforecast.benchmark import digest, parquet_content_hash
+
+    source = tmp_path / "source"
+    store.spark.createDataFrame([("A", 1), ("B", 2)], "item string,value int").write.parquet(
+        str(source),
+    )
+    current = store.freeze_observations(source, keys=["item"], scratch_root=tmp_path)
+    record = {k: v for k, v in current.items()
+              if k not in {"logical_hash", "transport_hash", "snapshot_id", "transport_sha256"}}
+    record["algorithm"] = "typed-parquet-rows-v2"
+    record["logical_sha256"] = parquet_content_hash(source)
+    record["snapshot_id"] = digest(record)
+    encoded, version = store.read("frozen_observations", {"snapshot_id": current["snapshot_id"]})
+    encoded.select("row_json").write.parquet(str(tmp_path / "encoded"))
+    record["transport_sha256"] = parquet_content_hash(tmp_path / "encoded")
+
+    def legacy_read(kind, scope):
+        assert kind == "frozen_observations" and scope == {"snapshot_id": record["snapshot_id"]}
+        return encoded.withColumn("snapshot_id", F.lit(record["snapshot_id"])), version
+
+    monkeypatch.setattr(store, "read", legacy_read)
+    assert store.verify_observations(record, scratch_root=tmp_path) == version
 
 
 def test_unsupported_transport_and_non_utc_session_never_append(store, tmp_path):

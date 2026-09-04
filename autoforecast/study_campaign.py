@@ -554,7 +554,7 @@ def _model_job(
         if importlib.metadata.version(package) != version:
             raise ValueError(f"worker dependency differs: {package}")
     path = pathlib.Path(request["study"]["path"])
-    verify_benchmark(path, request["study"]["sha256"])
+    verify_benchmark(path, request["study"]["sha256"], _reuse_verified=True)
     if _console() is None:
         configure_logging(progress="plain")
     # Workers receive paths and IDs, then establish their own logging context.
@@ -620,7 +620,8 @@ def _model_job(
                 if load_exact_json(config_path) != model["profile"]:
                     raise ValueError("worker profile differs from frozen request")
                 with load_study(
-                    path.parent.name, registry_root=path.parent.parent, spark=spark
+                    path.parent.name, registry_root=path.parent.parent, spark=spark,
+                    _expected_sha256=request["study"]["sha256"],
                 ) as study:
                     if phase == "validation" or not request.get("validation_configured", True):
                         run = study.run_forecast_workflow(

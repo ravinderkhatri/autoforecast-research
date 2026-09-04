@@ -32,7 +32,6 @@ from autoforecast.benchmark import (
     _evaluation_contract_from_record,
     boundary,
     digest,
-    evaluation_contract,
     read_benchmark_manifest,
     verify_benchmark,
 )
@@ -418,7 +417,7 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
     ):
         raise HPOError("external selection budget or model differs from its context")
     study_path, _ = verify_benchmark(
-        pathlib.Path(context["study"]["path"]), context["study"]["sha256"]
+        pathlib.Path(context["study"]["path"]), context["study"]["sha256"],
     )
     dataset_path = study_path.parent / "dataset.yaml"
     dataset = _load_dataset_contract_bytes(read_path_bytes(dataset_path), dataset_path)
@@ -486,7 +485,8 @@ class _WindowInput:
     def verify(self) -> dict:
         context = json.loads(self.context_bytes)
         identity = context["evaluation_contract"]["study"]
-        verify_benchmark(pathlib.Path(identity["path"]), identity["sha256"])
+        verify_benchmark(pathlib.Path(identity["path"]), identity["sha256"],
+                         _reuse_verified=True)
         for key, path in (
             ("training_sha256", self.panel.path),
             ("mapping_sha256", self.mapping_path),
@@ -500,8 +500,9 @@ class _WindowInput:
 def _prepare_window(
     study: Study, stage: str, origin: str, horizon: int, root: pathlib.Path
 ) -> _WindowInput:
-    fixed = evaluation_contract(
-        study._path, stage=stage, origin=origin, horizon=horizon, metric=study.recipe["metric"]
+    fixed = _evaluation_contract_from_record(
+        study._path, study._record(data=True), stage=stage, origin=origin, horizon=horizon,
+        metric=study.recipe["metric"],
     )
     if fixed["study"]["sha256"] != study._sha256:
         raise HPOError("study changed before fitting")
@@ -685,6 +686,7 @@ def _fit_window(
             metrics=tuple(metrics),
             forecast_accuracy_breakdown=breakdown,
             scratch_root=pathlib.Path(inputs.panel.path).parent,
+            _expected_study_sha256=context["evaluation_contract"]["study"]["sha256"],
         )
         outcome.update(_scoring_outcome(score))
     inputs.verify()
@@ -890,6 +892,7 @@ def tune_study(
                     registry_root=preflight.study_path.parent.parent,
                     spark=study._spark,
                     scratch_root=study._snapshots.name,
+                    _expected_sha256=preflight.study_sha256,
                 )
             )
         record, recipe = study._record(data=True), study.recipe

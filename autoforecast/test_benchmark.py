@@ -546,3 +546,40 @@ def test_logical_hash_rejects_duplicate_map_keys_and_corrupt_members(tmp_path):
     (path / "corrupt.parquet").write_bytes(b"not parquet")
     with pytest.raises(pa.ArrowInvalid):
         benchmark.parquet_content_hash(path)
+
+
+@pytest.mark.parametrize("parameters", [
+    [True, 0], [1, False], [True, False], [1.0, 0], [1, 0.0], [1.0, 0.0],
+    [1, True], [True, 1], [10**100, 0], [-(10**100), 0], [1, 10**100],
+    [1, -(10**100)], [1e100, 0], [1, 1e100], [0, 0], [39, 0], [1, 2],
+])
+def test_logical_metadata_rejects_decimal_aliases_and_overflow(tmp_path, parameters):
+    from autoforecast import _logical_hash
+    from autoforecast.test_logical_hash import _versioned_example
+
+    wrappers = [
+        lambda spec: spec,
+        lambda spec: {"array": spec},
+        lambda spec: {"struct": [["amount", spec]]},
+        lambda spec: {"map": [spec, "string"]},
+        lambda spec: {"map": ["string", {"array": spec}]},
+    ]
+    for wrap in wrappers:
+        metadata = {
+            "algorithm": _logical_hash.ALGORITHM, "encoding": _logical_hash.ENCODING,
+            "bucket_count": 256, "rows": 0, "sha256": "0" * 64,
+            "schema": [["x", wrap({"decimal": [1, 0]})]],
+        }
+        _logical_hash.validate_metadata(metadata)
+        metadata["schema"] = [["x", wrap({"decimal": parameters})]]
+        with pytest.raises(ValueError, match="invalid logical hash schema"):
+            _logical_hash.validate_metadata(metadata)
+
+    # The public verifier must report its established validation error, not
+    # expose Arrow conversion overflows or accept Python's bool/int aliases.
+    path, record = _versioned_example(tmp_path)
+    first = next(iter(record["logical_hashes"].values()))
+    first["schema"] = [["x", {"array": {"decimal": parameters}}]]
+    path.write_text(json.dumps(record))
+    with pytest.raises(benchmark.BenchmarkError, match="invalid logical hash schema"):
+        benchmark.verify_benchmark(path)

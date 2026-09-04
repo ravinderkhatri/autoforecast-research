@@ -106,6 +106,10 @@ Your model can use the supplied training data, dates, parameters and random seed
 Source retention records files; it cannot prove which notebook cells or hidden state were used.
 Keep relevant helper code in the configured source roots and settings in the model profile.
 
+New studies calculate data fingerprints across Spark workers. When a protected study is
+reopened, AutoForecast checks its frozen files and reuses the verified fingerprint. Changing
+a frozen file still fails the check. Existing studies keep their original hash format.
+
 ## Install other models
 
 From the library checkout, install only what you use:

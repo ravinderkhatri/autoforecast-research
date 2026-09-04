@@ -677,6 +677,41 @@ def test_worker_study_digest_mismatch_stops_before_job(spark, tmp_path, monkeypa
     assert not (tmp_path / "outputs").exists()
 
 
+def test_worker_rejects_changed_v6_payload_before_callback(spark, tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from autoforecast.benchmark import artifact_path
+
+    manifest = freeze(tmp_path / "study", spark)
+    record = json.loads(manifest.read_bytes())
+    assert record["schema"] == "autoforecast.frozen-benchmark.v6"
+    monkeypatch.setattr(study_campaign, "_runtime_identity", lambda: {})
+    monkeypatch.setattr(
+        study_campaign, "_entrypoint", lambda *a: (lambda r: pytest.fail("callback"), "a" * 64)
+    )
+    model = {
+        "source_modules": {},
+        "entrypoint": "unused:fit",
+        "code_sha256": "a" * 64,
+        "implementation": {"dependencies": {}},
+    }
+    path, sha = _worker_request(tmp_path, {
+        "runtime": {}, "models": [model],
+        "study": {"path": str(manifest),
+                  "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()},
+    })
+    part = next(artifact_path(manifest, record, "final_score").glob("*.parquet"))
+    table = pq.read_table(part)
+    rows = table.to_pylist()
+    assert rows
+    rows[0]["units"] += 1
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), part)
+    with pytest.raises(ValueError, match="bytes or inventory changed"):
+        study_campaign._model_job(path, sha, 0, "validation", str(tmp_path / "outputs"), None)
+    assert not (tmp_path / "outputs").exists()
+
+
 @pytest.mark.parametrize("defect", ["metric", "policy", "windows", "model_id"])
 def test_incompatible_comparison_rejected_before_preflight(tmp_path, monkeypatch, defect):
     from autoforecast import study_preflight
@@ -799,7 +834,10 @@ def test_model_job_starts_monitor_before_fit_and_applies_resources(tmp_path, mon
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     monkeypatch.setattr(study_campaign, "_runtime_identity", lambda: {})
     monkeypatch.setattr(study_campaign, "_entrypoint", lambda *a: (lambda r: None, "a" * 64))
-    monkeypatch.setattr(study_campaign, "verify_benchmark", lambda *a: None)
+    def verified_study(path, expected_sha256, *, _reuse_verified=False):
+        assert path == tmp_path / "registry/study/benchmark.json"
+        assert expected_sha256 == "a" * 64 and _reuse_verified is True
+    monkeypatch.setattr(study_campaign, "verify_benchmark", verified_study)
     monkeypatch.setattr(study_campaign, "threading",
                         SimpleNamespace(Thread=Monitor, Event=__import__("threading").Event))
     monkeypatch.setattr(SparkSession, "builder", Builder())

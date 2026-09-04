@@ -28,7 +28,7 @@ def rescore_campaign(
     campaign_root, study_path = campaign_root.resolve(), study_path.resolve()
     original = read_results(campaign_root)
     study_sha = hashlib.sha256(study_path.read_bytes()).hexdigest()
-    study_path, study = verify_benchmark(study_path, study_sha)
+    study_path, study = verify_benchmark(study_path, study_sha, spark=spark)
     if study["schema"] not in STUDY_SCHEMAS:
         raise ValueError("rescoring requires an explicitly frozen version-3 study")
     dataset_path = study_path.parent / "dataset.yaml"
@@ -96,7 +96,7 @@ def rescore_campaign(
         refreshed = read_results(campaign_root)
         if refreshed.metadata != original.metadata or refreshed.runs != original.runs:
             raise ValueError("original campaign changed during rescoring")
-        verify_benchmark(study_path, study_sha)
+        verify_benchmark(study_path, study_sha, _reuse_verified=True)
         record = {
             "schema": "autoforecast.posthoc-rescore.v1", "evidence_role": "posthoc_rescore",
             "original_campaign": str(campaign_root.resolve()),

@@ -159,7 +159,9 @@ def _read_results(campaign_root: str | pathlib.Path, snapshots: pathlib.Path) ->
     source_keys = None
     contract_frequency = None
     if benchmark:
-        path, frozen = verify_benchmark(pathlib.Path(benchmark["path"]), benchmark["sha256"])
+        path, frozen = verify_benchmark(
+            pathlib.Path(benchmark["path"]), benchmark["sha256"],
+        )
         if frozen["benchmark_id"] != benchmark["id"]:
             raise ValueError("campaign benchmark identity conflict")
         from autoforecast.data_admission import _load_dataset_contract_bytes

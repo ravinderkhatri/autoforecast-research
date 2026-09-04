@@ -34,6 +34,7 @@ from autoforecast.benchmark import (
     boundary,
     digest,
     parquet_content_hash,
+    read_benchmark_manifest,
     study_source_roles,
     study_windows,
     training_cutoff,
@@ -165,6 +166,7 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
             registry_root=parent_path.parent.parent,
             spark=study._spark,
             scratch_root=study._snapshots.name,
+            _expected_sha256=record["parent"]["sha256"],
         ) as parent:
             result = _preflight(parent, options, report, output)
         if result.study_id != record["study_id"]:
@@ -648,11 +650,17 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
         path = _derive(
             study, record, retained, resolved, coverage_rows, role_counts, minimum, policy
         )
-    _, effective = verify_benchmark(path)
+    effective_sha = (study._sha256 if path == study._path
+                     else hashlib.sha256(read_path_bytes(path)).hexdigest())
+    _, effective = verify_benchmark(
+        path, study._sha256 if path == study._path else None, spark=study._spark,
+        _reuse_verified=path == study._path, _scratch_root=study._snapshots.name,
+    )
+    read_benchmark_manifest(path, effective_sha)
     report.update(
         status="passed",
         effective_study_id=effective["study_id"],
-        effective_study_sha256=hashlib.sha256(read_path_bytes(path)).hexdigest(),
+        effective_study_sha256=effective_sha,
     )
     return PreflightResult(
         path, effective["study_id"], report["effective_study_sha256"], output, report
@@ -661,7 +669,16 @@ def _preflight(study: Study, options: dict, report: dict, output: pathlib.Path) 
 
 def _derive(study, original, retained, windows, coverage_rows, role_counts, minimum, policy):
     """Publish one content-addressed definition; unchanged role Parquet stays in the parent."""
+    from autoforecast import _logical_hash
+
     record = copy.deepcopy(original)
+
+    def content_hash(path, name):
+        if "logical_hashes" not in record:
+            return parquet_content_hash(path)
+        record["logical_hashes"][name] = _logical_hash.fingerprint(path, spark=study._spark)
+        return record["logical_hashes"][name]["sha256"]
+
     original_ids = sorted(
         r[study.panel.series_col]
         for r in _rows(artifact_path(study._path, original, "source-keys"))
@@ -715,7 +732,7 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
                 pq.write_table(table, scratch / role / "part.parquet")
                 record["role_paths"][role] = role
                 record["artifacts"][role] = directory_digest(scratch / role, suffixes=(".parquet",))
-                record["logical_snapshots"][role] = parquet_content_hash(scratch / role)
+                record["logical_snapshots"][role] = content_hash(scratch / role, role)
                 record["inherited_roles"].remove(role)
             for role, counts in role_counts.items():
                 record["counts"][role] = {
@@ -744,7 +761,7 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
                 n_cells=len(table),
             )
             record["grid_identities"][key] = {
-                "content_sha256": parquet_content_hash(path),
+                "content_sha256": content_hash(path, "grids/" + key),
                 "logical_sha256": logical,
                 "n_cells": len(table),
             }
@@ -753,7 +770,7 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
             pq.write_table(pa.Table.from_pylist(coverage_rows[key]), path / "part.parquet")
             record["coverage"][key]["sha256"] = directory_digest(path, suffixes=(".parquet",))
             record["coverage_identities"][key] = {
-                "content_sha256": parquet_content_hash(path),
+                "content_sha256": content_hash(path, "coverage/" + key),
                 "counts": {
                     name: sum(row[name] for row in coverage_rows[key])
                     for name in (
@@ -769,7 +786,7 @@ def _derive(study, original, retained, windows, coverage_rows, role_counts, mini
         record.update(study_id=identity, benchmark_id=identity)
         _write_json(scratch / "benchmark.json", record)
         destination = study._path.parent.parent / identity
-        _publish_frozen_benchmark(scratch, destination, identity)
+        _publish_frozen_benchmark(scratch, destination, identity, spark=study._spark)
         return destination / "benchmark.json"
     finally:
         if scratch.exists():

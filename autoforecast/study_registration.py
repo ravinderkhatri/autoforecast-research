@@ -34,6 +34,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
 
+from autoforecast import _logical_hash
 from autoforecast._exact_yaml import loads_record, read_record, record_bytes
 from autoforecast._execution import (
     Execution,
@@ -56,7 +57,7 @@ from autoforecast.benchmark import (
     artifact_path,
     digest,
     freeze_benchmark,
-    parquet_content_hash,
+    read_benchmark_manifest,
     study_source_roles,
     study_windows,
     training_cutoff,
@@ -382,12 +383,35 @@ def _remove_staging_directory(path):
         shutil.rmtree(path)
 
 
-def _artifact_record(path):
-    return {"logical_sha256": parquet_content_hash(path),
-            "physical_sha256": directory_digest(path, suffixes=(".parquet",))}
+def _logical_record(path, spark):
+    logical = _logical_hash.fingerprint(path, spark=spark)
+    return {"logical_sha256": logical["sha256"], "logical_hash": logical}
 
 
-def _verify_admission(root, binding):
+def _artifact_record(path, spark=None, *, expected=None):
+    if expected is not None:
+        if not _verify_artifact(path, expected):
+            raise ValueError("prepared materialization changed before publication")
+        return expected
+    logical, physical = _logical_hash._capture(path, spark=spark)
+    return {"logical_sha256": logical["sha256"], "logical_hash": logical,
+            "physical_sha256": physical}
+
+
+def _verify_artifact(path, expected, *, trusted=True, spark=None, _scratch_root=None):
+    try:
+        observed = _logical_hash.verify_files(
+            path, physical_sha256=expected["physical_sha256"],
+            logical=expected.get("logical_hash"), trusted=trusted, spark=spark,
+            _scratch_root=_scratch_root,
+        )
+    except ValueError:
+        return False
+    return observed == expected["logical_sha256"]
+
+
+def _verify_admission(root, binding, *, trusted=False, spark=None, _scratch_root=None):
+    """Reuse only a protected registration binding or this operation's owned capture."""
     if (not isinstance(binding, dict) or set(binding) != {"path", "sha256", "physical_sha256"}
             or pathlib.Path(binding["path"]).is_absolute()
             or ".." in pathlib.Path(binding["path"]).parts):
@@ -407,16 +431,22 @@ def _verify_admission(root, binding):
     if set(record["artifacts"]) != {p.name for p in _staging_directories(path.parent)}:
         raise ValueError("admission artifact directory set differs from its baseline")
     for name, expected in record["artifacts"].items():
-        if not name.isidentifier() or _artifact_record(path.parent / name) != expected:
+        if not name.isidentifier() or not _verify_artifact(
+            path.parent / name, expected, trusted=trusted, spark=spark,
+            _scratch_root=_scratch_root,
+        ):
             raise ValueError("admission artifact differs from its baseline")
+    if read_regular_bytes(path.parent, path.name) != payload:
+        raise ValueError("admission record bytes changed during verification")
     return record
 
 
-def _save_admission(registry, staging, identity, frozen, *, format):
+def _save_admission(registry, staging, identity, frozen, *, format, artifact_bindings=None):
     """Publish immutable evidence once; retries retain the first bytes and encoding."""
     study_id = frozen["study_id"]
+    protected_binding = None
     if _record_path(registry.root / "registrations", study_id) is not None:
-        registry.definition(study_id)
+        protected_binding = registry.definition(study_id)[0]["admission_evidence"]
     final_keys = registry.spark.read.parquet(str(artifact_path(
         registry.root / "benchmarks" / study_id / "benchmark.json", frozen, "source-keys",
     ))).select(*frozen["recipe"]["source_keys"])
@@ -444,10 +474,13 @@ def _save_admission(registry, staging, identity, frozen, *, format):
               "outcome": {"starting": starting.count(), "application_retained": retained.count(),
                           "final_retained": final_keys.count(),
                           "native_admission": frozen["recipe"]},
-              "artifacts": {p.name: _artifact_record(p) for p in _staging_directories(staging)}}
+              "artifacts": {p.name: _artifact_record(
+                  p, registry.spark, expected=(artifact_bindings or {}).get(p),
+              ) for p in _staging_directories(staging)}}
     destination = registry.root / "admissions" / study_id
     with _publication_lock(registry.root):
         existing = _record_path(destination, "admission")
+        fresh = existing is None
         if existing is None:
             destination.parent.mkdir(parents=True, exist_ok=True)
             if path_exists(destination):
@@ -467,7 +500,12 @@ def _save_admission(registry, staging, identity, frozen, *, format):
         binding = {"path": str(existing.relative_to(registry.root)), "sha256": digest(record),
                    "physical_sha256": hashlib.sha256(
                        read_regular_bytes(existing.parent, existing.name)).hexdigest()}
-        _verify_admission(registry.root, binding)
+        if protected_binding is not None and binding != protected_binding:
+            raise ValueError("admission record differs from its protected registration")
+        _verify_admission(
+            registry.root, binding, trusted=fresh or protected_binding is not None,
+            spark=registry.spark, _scratch_root=registry.scratch_root,
+        )
     note("Admission outcome",
          starting=record["outcome"]["starting"],
          application_retained=record["outcome"]["application_retained"],
@@ -607,7 +645,8 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
             raise ValueError(f"preparation {name} must be a Spark DataFrame")
         output.write.parquet(str(staging / name))
     captured = {name: registry.spark.read.parquet(str(staging / name)) for name in frames}
-    output_baselines = {staging / name: _artifact_record(staging / name) for name in frames}
+    output_baselines = {staging / name: _artifact_record(staging / name, registry.spark)
+                        for name in frames}
     if settings._payload != settings_baseline or any(
         directory_digest(p, suffixes=(".parquet",)) != sha for p, sha in baselines.items()
     ):
@@ -657,9 +696,9 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
             ], key=lambda item: _bytes(item["keys"]))
     if "reference_input" in captured and "scoring_references" in captured:
         raise ValueError("provide reference input or precomputed references, not both")
-    if any(_artifact_record(p) != baseline for p, baseline in output_baselines.items()):
+    if any(not _verify_artifact(p, baseline) for p, baseline in output_baselines.items()):
         raise ValueError("prepared materialization changed during admission checks")
-    return captured, metadata
+    return captured, metadata, output_baselines
 
 
 class StudyRegistry:
@@ -782,7 +821,7 @@ class StudyRegistry:
             self.scratch_root.mkdir(parents=True, exist_ok=True)
             self.store.verify_observations(definition["snapshot"], scratch_root=self.scratch_root)
         manifest = self.root / "benchmarks" / study_id / "benchmark.json"
-        _, record = verify_benchmark(manifest, definition["library_sha256"])
+        _, record = verify_benchmark(manifest, definition["library_sha256"], _reuse_verified=True)
         if record["study_id"] != study_id:
             raise ValueError("registered library study identity differs")
         binding = record.get("admission_identity", {})
@@ -796,7 +835,9 @@ class StudyRegistry:
               or definition["source"].get("kind") == "supplied_stages"):
             raise ValueError("supplied stage provenance is missing its frozen identity")
         elif "admission_evidence" in definition:
-            admission = _verify_admission(self.root, definition["admission_evidence"])
+            admission = _verify_admission(
+                self.root, definition["admission_evidence"], trusted=True,
+            )
             if (record.get("admission_identity") != {
                 "schema": "autoforecast.admission-identity.v1",
                 "sha256": digest(admission["identity"]),
@@ -811,7 +852,8 @@ class StudyRegistry:
         definition, sha = self.definition(study_id)
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         study = load_study(study_id, registry_root=self.root / "benchmarks", spark=self.spark,
-                           scratch_root=self.scratch_root)
+                           scratch_root=self.scratch_root,
+                           _expected_sha256=definition["library_sha256"])
         if study._sha256 != definition["library_sha256"]:
             with suppress(Exception):
                 study.close()
@@ -847,7 +889,10 @@ class StudyRegistry:
         """Register an existing preflight-derived identity, reusing its parent snapshot."""
         parent, parent_sha = self.definition(parent_id)
         raw = read_path_bytes(pathlib.Path(manifest))
-        _, record = verify_benchmark(pathlib.Path(manifest), hashlib.sha256(raw).hexdigest())
+        _, record = verify_benchmark(
+            pathlib.Path(manifest), spark=self.spark, _scratch_root=self.scratch_root,
+        )
+        read_benchmark_manifest(pathlib.Path(manifest), hashlib.sha256(raw).hexdigest())
         expected = self.root / "benchmarks" / record["study_id"] / "benchmark.json"
         if pathlib.Path(manifest).resolve() != expected.resolve():
             raise ValueError("derived study must be created within the configured registry")
@@ -1101,6 +1146,7 @@ def _capture_stages(inputs, value, registry, root):
             note("Starting population", definition="distinct keys in supplied training data",
                  series_count=captured.select(*keys).distinct().count())
         frames[name] = captured
+        logical = _logical_hash.fingerprint(path, spark=registry.spark)
         evidence[name] = {"kind": "delta" if name in pinned else "dataframe",
                           "planned_range": list(ranges[name]), "columns": selected,
                           "schema": captured.schema.jsonValue(), "rows": count,
@@ -1108,7 +1154,8 @@ def _capture_stages(inputs, value, registry, root):
                           "observed_range": [str(observed["first"]), str(observed["last"])],
                           "frozen_role": {"training": "selection", "validation": "validation_score",
                                           "testing": "final_score"}[name],
-                          "snapshot_sha256": parquet_content_hash(path),
+                          "snapshot_sha256": logical["sha256"],
+                          "logical_hash": logical,
                           **({"source": pinned[name][1]} if name in pinned else {})}
     combined = frames["training"]
     for name in ("validation", "testing"):
@@ -1350,17 +1397,19 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                 with operation("Save raw audit data", query=name, engine="Spark"):
                     audit.write.parquet(str(path))
                 audits[name] = session.read.parquet(str(path))
-                query_records[name] = {**provenance, "logical_sha256": parquet_content_hash(path),
+                logical = _logical_record(path, session)
+                query_records[name] = {**provenance, **logical,
                                        "schema": audits[name].schema.jsonValue(),
-                                       "rows": audits[name].count()}
+                                       "rows": logical["logical_hash"]["rows"]}
         else:
             frame = session.read.parquet(source["path"])
             source_record = {"kind": "parquet"}
         with operation("Save primary data", query="primary", engine="Spark"):
             frame.write.parquet(str(root / "source"))
         frame = session.read.parquet(str(root / "source"))
-        source_record.update({"logical_sha256": parquet_content_hash(root / "source"),
-                              "schema": frame.schema.jsonValue(), "rows": frame.count()})
+        logical = _logical_record(root / "source", session)
+        source_record.update({**logical, "schema": frame.schema.jsonValue(),
+                              "rows": logical["logical_hash"]["rows"]})
         keys = recipe["source_keys"]
         panel = contract.panel(root / "source")
         source_record["starting_series"] = frame.select(*keys).distinct().count()
@@ -1379,6 +1428,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
         staging = issues_root / "admission-staging"
         preparation_metadata = None
         prepared_baseline = None
+        artifact_bindings = {}
         if prepare is not None:
             staging.mkdir()
             population_name = source.get("population", "primary")
@@ -1387,13 +1437,13 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             note("Preparation input mapping", observations="primary",
                  audits=list(audits), starting_keys=population_name,
                  settings="captured recipe and preparation settings")
-            captured, preparation_metadata = _prepare_observations(
+            captured, preparation_metadata, artifact_bindings = _prepare_observations(
                 prepare, preparation_settings, frame, audits, population, findings,
                 value=value, root=root,
                 staging=staging, registry=registry, issues_root=issues_root, check_id=check_id,
             )
             frame = captured["prepared"]
-            prepared_baseline = _artifact_record(staging / "prepared")
+            prepared_baseline = artifact_bindings[staging / "prepared"]
             # Apply declared application eligibility before native cohort-count checks.
             if contract.required_series_count is not None:
                 original_candidates = session.read.parquet(str(root / "source")).filter(
@@ -1471,7 +1521,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             refs = session.read.parquet(str(root / "reference-input"))
             reference_definition = {
                 "preparation": settings if "path" not in settings else {"kind": "parquet"},
-                "logical_sha256": parquet_content_hash(root / "reference-input"),
+                **_logical_record(root / "reference-input", session),
             }
             key_map = candidate_keys.withColumn("__af_series_id", F.to_json(F.struct(*keys)))
             normalized = _normalise_reference_frame(refs, key_map, keys)
@@ -1532,9 +1582,13 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             contract_path.write_bytes(_bytes(value["dataset"]))
         frame.write.parquet(str(root / "admitted"))
         if (prepared_baseline is not None
-                and _artifact_record(staging / "prepared") != prepared_baseline):
+                and not _verify_artifact(staging / "prepared", prepared_baseline)):
             raise ValueError("prepared observations changed before freezing")
         if prepare is not None:
+            artifact_bindings = {
+                p: _artifact_record(p, session, expected=artifact_bindings.get(p))
+                for p in _staging_directories(staging)
+            }
             admission_identity = {
                 "schema": "autoforecast.preparation-evidence.v1",
                 "configuration": json.loads(configuration_baseline),
@@ -1547,9 +1601,10 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                                   "findings": sorted(exclusion_findings, key=_bytes),
                                   "excluded_new_keys": sorted(new_keys, key=_bytes)},
                 "captured_inputs": {
-                    p.name: {"logical_sha256": parquet_content_hash(p),
+                    p.name: {"logical_sha256": binding["logical_sha256"],
+                             "logical_hash": binding["logical_hash"],
                              "schema": session.read.parquet(str(p)).schema.jsonValue()}
-                    for p in _staging_directories(staging)
+                    for p, binding in artifact_bindings.items()
                 },
             }
         event("admission", "PASS", retained_series=retained, excluded_references=len(exclusions))
@@ -1571,7 +1626,8 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
             keys=keys, scratch_root=registry.scratch_root,
         ) if registry.store is not None else None)
         library_sha = hashlib.sha256(read_path_bytes(manifest)).hexdigest()
-        _, frozen = verify_benchmark(manifest, library_sha)
+        _, frozen = verify_benchmark(manifest, spark=session, _scratch_root=root)
+        read_benchmark_manifest(manifest, library_sha)
         event("freeze", "PASS", study_id=frozen["study_id"])
         event("publication", "START", study_id=frozen["study_id"])
         definition = {
@@ -1595,6 +1651,7 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
                 _remove_staging_directory(staging / name)
             definition["admission_evidence"] = _save_admission(
                 registry, staging, admission_identity, frozen, format=format,
+                artifact_bindings=artifact_bindings,
             )
         if registry.store is not None:
             for report_id in (check_id, check_id + "-references", check_id + "-application",

@@ -219,7 +219,9 @@ def _tables(windows: list, runs: list, metadata: dict) -> CampaignResults:
             return pq.read_table(retained)
 
         study = metadata["study"]
-        study_path, frozen = verify_benchmark(pathlib.Path(study["path"]), study["sha256"])
+        study_path, frozen = verify_benchmark(
+            pathlib.Path(study["path"]), study["sha256"],
+        )
         source_keys = read(artifact_path(study_path, frozen, "source-keys"),
                            frozen["artifacts"]["source-keys"])
         frequency = frozen["recipe"]["frequency"]
@@ -266,7 +268,7 @@ def _tables(windows: list, runs: list, metadata: dict) -> CampaignResults:
                 "parameter_sha256": window["parameter_sha256"],
                 "artifacts_path": str(window["artifacts"]) if "artifacts" in window else None,
             })
-        verify_benchmark(study_path, study["sha256"])
+        verify_benchmark(study_path, study["sha256"], _reuse_verified=True)
     metadata = {**metadata, "frequency": frequency, "comparison_scope": "fixed_study",
                 "target_unit": frozen["recipe"]["target_unit"],
                 "input_retention": "frozen study snapshots referenced by evaluation contracts",

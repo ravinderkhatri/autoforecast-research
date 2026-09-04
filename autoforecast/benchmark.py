@@ -15,6 +15,7 @@ from functools import partial
 
 from mlops._safe_files import is_regular_file, read_path_bytes
 
+from autoforecast import _logical_hash
 from autoforecast._exact_json import loads_exact_json
 from autoforecast._execution import operation, progress, reported
 from autoforecast.column_names import validate_column_names
@@ -33,7 +34,8 @@ from provenance.lineage import LineageError, directory_digest, snapshot_parquet_
 
 STUDY_SCHEMA = "autoforecast.frozen-benchmark.v4"
 OPTIONAL_STAGE_SCHEMA = "autoforecast.frozen-benchmark.v5"
-STUDY_SCHEMAS = (STUDY_SCHEMA, OPTIONAL_STAGE_SCHEMA)
+DISTRIBUTED_SCHEMA = "autoforecast.frozen-benchmark.v6"
+STUDY_SCHEMAS = (STUDY_SCHEMA, OPTIONAL_STAGE_SCHEMA, DISTRIBUTED_SCHEMA)
 MISSING_COLUMN = "__af_original_missing"
 START_COLUMN = "__af_history_start"
 
@@ -269,6 +271,8 @@ def _identity(record: dict) -> dict:
         )})
     if "admission_identity" in record:
         identity["admission_identity"] = record["admission_identity"]
+    if "logical_hashes" in record:
+        identity["logical_hashes"] = record["logical_hashes"]
     return identity
 
 
@@ -365,12 +369,14 @@ def window_series_count(record: dict, key: str) -> int:
             else record["cohort_series_count"])
 
 
-def resolve_study(output_root: pathlib.Path, study_id: str) -> tuple[pathlib.Path, dict]:
+def resolve_study(
+    output_root: pathlib.Path, study_id: str, *, spark=None,
+) -> tuple[pathlib.Path, dict]:
     """Resolve an existing content-addressed study; an ID never supplies business rules."""
     if (type(study_id) is not str or len(study_id) != 64
             or any(character not in "0123456789abcdef" for character in study_id)):
         raise BenchmarkError("study_id must be a lowercase SHA-256 identity")
-    path, record = verify_benchmark(output_root / study_id / "benchmark.json")
+    path, record = verify_benchmark(output_root / study_id / "benchmark.json", spark=spark)
     if (record["schema"] not in STUDY_SCHEMAS or record.get("study_id") != study_id
             or record["benchmark_id"] != study_id):
         raise BenchmarkError("study_id must resolve to the matching current-format study")
@@ -634,7 +640,7 @@ def _freeze_benchmark(
             and scoring_references is None):
         raise BenchmarkError("wrmsse requires frozen scoring_references")
     if study_id is not None:
-        resolve_study(output_root, study_id)
+        resolve_study(output_root, study_id, spark=spark)
     keys = recipe["source_keys"]
     start = _recipe_point(recipe["training_start"], cadence)
     cutoff = _recipe_point(recipe["final_train_cutoff"], cadence)
@@ -861,7 +867,7 @@ def _freeze_benchmark(
                 "conflicting overlapping history between selection and final training"
             )
     identity = {
-        "schema": OPTIONAL_STAGE_SCHEMA if recipe["schema_version"] == 3 else STUDY_SCHEMA,
+        "schema": DISTRIBUTED_SCHEMA,
         "recipe": recipe,
         "key_types": key_types,
         "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
@@ -901,6 +907,12 @@ def _freeze_benchmark(
             )
             references.write.parquet(str(scratch / "scoring_references"))
             artifact_roles.append("scoring_references")
+        logical_hashes = {}
+
+        def content_hash(path, name):
+            logical_hashes[name] = _logical_hash.fingerprint(path, spark=spark)
+            return logical_hashes[name]["sha256"]
+
         grids = {}
         coverage = {}
         coverage_identities = {}
@@ -966,7 +978,7 @@ def _freeze_benchmark(
             coverage_path = "coverage/" + key
             per_series.write.parquet(str(scratch / coverage_path))
             coverage_identities[key] = {
-                "content_sha256": parquet_content_hash(scratch / coverage_path),
+                "content_sha256": content_hash(scratch / coverage_path, "coverage/" + key),
                 "counts": {name: int(totals[name]) for name in names},
             }
             coverage[key] = {
@@ -974,7 +986,7 @@ def _freeze_benchmark(
                 "sha256": directory_digest(scratch / coverage_path, suffixes=(".parquet",)),
             }
         authenticate_sources()
-        logical_snapshots = {name: parquet_content_hash(scratch / name) for name in artifact_roles}
+        logical_snapshots = {name: content_hash(scratch / name, name) for name in artifact_roles}
         role_paths = {name: name for name in artifact_roles}
         # Logical roles remain distinct even when their exact typed rows share storage.
         written = {}
@@ -986,11 +998,12 @@ def _freeze_benchmark(
             else:
                 written[logical] = name
         identity.update(
+            logical_hashes=logical_hashes,
             logical_snapshots=logical_snapshots,
             dataset_sha256=hashlib.sha256(read_path_bytes(scratch / "dataset.yaml")).hexdigest(),
             grid_identities={
                 key: {
-                    "content_sha256": parquet_content_hash(scratch / item["path"]),
+                    "content_sha256": content_hash(scratch / item["path"], "grids/" + key),
                     "logical_sha256": item["logical_sha256"],
                     "n_cells": item["n_cells"],
                 }
@@ -1031,7 +1044,7 @@ def _freeze_benchmark(
             "dataset_sha256": hashlib.sha256(read_path_bytes(scratch / "dataset.yaml")).hexdigest(),
         }
         (scratch / "benchmark.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
-        _publish_frozen_benchmark(scratch, destination, benchmark_id)
+        _publish_frozen_benchmark(scratch, destination, benchmark_id, spark=spark)
     finally:
         if scratch.exists():
             shutil.rmtree(scratch)
@@ -1112,7 +1125,7 @@ def _prepare_scoring_references(path, key_map, keys, recipe, spark):
 
 
 def _publish_frozen_benchmark(
-    scratch: pathlib.Path, destination: pathlib.Path, benchmark_id: str,
+    scratch: pathlib.Path, destination: pathlib.Path, benchmark_id: str, *, spark=None,
 ) -> None:
     """Publish atomically, or authenticate an identical concurrent winner."""
     try:
@@ -1121,7 +1134,9 @@ def _publish_frozen_benchmark(
         except OSError as error:
             if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
                 raise
-            _, winner = verify_benchmark(destination / "benchmark.json")
+            _, winner = verify_benchmark(
+                destination / "benchmark.json", spark=spark, _scratch_root=scratch.parent,
+            )
             if winner["benchmark_id"] != benchmark_id:
                 raise BenchmarkError(
                     "published destination has a different benchmark identity"
@@ -1172,11 +1187,13 @@ def _validate_manifest(record: object) -> dict:
     if "admission_identity" in record:
         fields.add("admission_identity")
         _validate_admission_identity(record["admission_identity"])
+    if record["schema"] == DISTRIBUTED_SCHEMA:
+        fields.add("logical_hashes")
     mapping(record, fields, "manifest")
     recipe = record["recipe"]
     validate_recipe(recipe)
     expected_schema = OPTIONAL_STAGE_SCHEMA if recipe["schema_version"] == 3 else STUDY_SCHEMA
-    if record["schema"] != expected_schema:
+    if record["schema"] not in (expected_schema, DISTRIBUTED_SCHEMA):
         raise BenchmarkError("recipe version differs from the frozen study schema")
     if (recipe != _normalise_recipe(recipe)
             or record["study_id"] != record["benchmark_id"]
@@ -1342,6 +1359,22 @@ def _validate_manifest(record: object) -> dict:
                 or totals["excluded"] != (missing if recipe["actual_missing"] == "mask" else 0)
                 or totals["scored"] != totals["expected"] - totals["excluded"]):
             raise BenchmarkError("study scoring coverage counts do not reconcile")
+    if record["schema"] == DISTRIBUTED_SCHEMA:
+        expected_hashes = {
+            **record["logical_snapshots"],
+            **{"grids/" + k: v["content_sha256"] for k, v in record["grid_identities"].items()},
+            **{"coverage/" + k: v["content_sha256"]
+               for k, v in record["coverage_identities"].items()},
+        }
+        mapping(record["logical_hashes"], expected_hashes, "logical_hashes")
+        for name, expected in expected_hashes.items():
+            metadata = record["logical_hashes"][name]
+            try:
+                _logical_hash.validate_metadata(metadata)
+            except ValueError as error:
+                raise BenchmarkError(str(error)) from error
+            if metadata["sha256"] != expected:
+                raise BenchmarkError("logical hash metadata differs from study identity")
     return record
 
 
@@ -1365,10 +1398,23 @@ def read_benchmark_manifest(
 
 
 def verify_benchmark(
-    path: pathlib.Path, expected_sha256: str | None = None
+    path: pathlib.Path, expected_sha256: str | None = None, *, spark=None,
+    _reuse_verified: bool = False, _scratch_root=None,
 ) -> tuple[pathlib.Path, dict]:
-    """Authenticate frozen outputs; original mutable sources are recorded but never re-read."""
+    """Verify frozen outputs; ordinary calls always recalculate logical identities.
+
+    Internal registered/previously verified handoffs may reuse a logical binding
+    only with their protected expected manifest SHA. A freshly calculated hash
+    of an editable manifest does not authorize that optimization.
+    """
     path, record = read_benchmark_manifest(path, expected_sha256)
+    manifest_bytes = read_path_bytes(path)
+    if loads_exact_json(manifest_bytes) != record:
+        raise BenchmarkError("benchmark manifest changed during verification")
+    pinned_manifest = hashlib.sha256(manifest_bytes).hexdigest()
+    if expected_sha256 is not None and pinned_manifest != expected_sha256:
+        raise BenchmarkError("benchmark manifest changed during verification")
+
     if "parent" in record:
         parent_path, parent = read_benchmark_manifest(
             pathlib.Path(record["parent"]["path"]), record["parent"]["sha256"],
@@ -1376,30 +1422,46 @@ def verify_benchmark(
         if ("parent" in parent or parent["study_id"] != record["parent"]["study_id"]
                 or parent["study_id"] == record["study_id"]):
             raise BenchmarkError("invalid derived study parent")
-        verify_benchmark(parent_path, record["parent"]["sha256"])
+        verify_benchmark(
+            parent_path, record["parent"]["sha256"] if expected_sha256 else None,
+            spark=spark, _reuse_verified=_reuse_verified and expected_sha256 is not None,
+            _scratch_root=_scratch_root,
+        )
         for role in record["inherited_roles"]:
             if (record["artifacts"][role] != parent["artifacts"][role]
-                    or record["logical_snapshots"][role] != parent["logical_snapshots"][role]):
+                    or record["logical_snapshots"][role] != parent["logical_snapshots"][role]
+                    or record.get("logical_hashes", {}).get(role)
+                    != parent.get("logical_hashes", {}).get(role)):
                 raise BenchmarkError("inherited artifact identity changed")
     checked = {}
+
+    def checked_hash(target, physical, name):
+        logical = record.get("logical_hashes", {}).get(name)
+        cache_key = (target, physical, digest(logical))
+        if cache_key not in checked:
+            try:
+                checked[cache_key] = _logical_hash.verify_files(
+                    target, physical_sha256=physical, logical=logical,
+                    trusted=_reuse_verified and expected_sha256 is not None, spark=spark,
+                    _scratch_root=_scratch_root,
+                )
+            except ValueError as error:
+                raise BenchmarkError(f"benchmark artifact changed: {name}: {error}") from error
+        return checked[cache_key]
+
     for name, expected in record["artifacts"].items():
         target = artifact_path(path, record, name)
         if (name not in record.get("inherited_roles", [])
                 and not target.resolve().is_relative_to(path.parent.resolve())):
             raise BenchmarkError(f"benchmark artifact escaped its directory: {name}")
-        if target not in checked:
-            physical = directory_digest(target, suffixes=(".parquet",))
-            if physical != expected:
-                raise BenchmarkError(f"benchmark artifact changed: {name}")
-            checked[target] = physical, parquet_content_hash(target)
-        if checked[target] != (expected, record["logical_snapshots"][name]):
+        if checked_hash(target, expected, name) != record["logical_snapshots"][name]:
             raise BenchmarkError(f"benchmark artifact changed: {name}")
     for key, item in record["grids"].items():
         target = path.parent / item["path"]
         if (
             not target.resolve().is_relative_to(path.parent.resolve())
-            or directory_digest(target, suffixes=(".parquet",)) != item["sha256"]
-            or parquet_content_hash(target) != record["grid_identities"][key]["content_sha256"]
+            or checked_hash(target, item["sha256"], "grids/" + key)
+            != record["grid_identities"][key]["content_sha256"]
             or item["logical_sha256"] != record["grid_identities"][key]["logical_sha256"]
             or item["n_cells"] != record["grid_identities"][key]["n_cells"]
         ):
@@ -1407,8 +1469,7 @@ def verify_benchmark(
     for key, item in record.get("coverage", {}).items():
         target = path.parent / item["path"]
         if (not target.resolve().is_relative_to(path.parent.resolve())
-                or directory_digest(target, suffixes=(".parquet",)) != item["sha256"]
-                or parquet_content_hash(target)
+                or checked_hash(target, item["sha256"], "coverage/" + key)
                 != record["coverage_identities"][key]["content_sha256"]):
             raise BenchmarkError("study scoring coverage changed")
     if (
@@ -1416,6 +1477,7 @@ def verify_benchmark(
         != record["dataset_sha256"]
     ):
         raise BenchmarkError("prepared dataset contract changed")
+    read_benchmark_manifest(path, pinned_manifest)
     return path, record
 
 

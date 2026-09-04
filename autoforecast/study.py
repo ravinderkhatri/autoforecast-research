@@ -21,8 +21,8 @@ from pyspark.sql import functions as F
 from autoforecast._execution import reported
 from autoforecast.benchmark import (
     BenchmarkError,
+    _evaluation_contract_from_record,
     artifact_path,
-    evaluation_contract,
     read_benchmark_manifest,
     resolve_study,
     training_cutoff,
@@ -51,6 +51,7 @@ def load_study(
     study_id: str, *, registry_root: str | pathlib.Path | None = None,
     spark: SparkSession | None = None,
     scratch_root: str | pathlib.Path | None = None,
+    _expected_sha256: str | None = None,
 ) -> Study:
     """Load an existing ID from the project's .autoforecast/benchmarks registry.
 
@@ -62,8 +63,27 @@ def load_study(
     """
     registry = (pathlib.Path(registry_root) if registry_root is not None else
                 project_root(pathlib.Path.cwd()) / ".autoforecast/benchmarks").absolute()
+    if (type(study_id) is not str or len(study_id) != 64
+            or any(c not in "0123456789abcdef" for c in study_id)):
+        raise BenchmarkError("study_id must be a lowercase SHA-256 identity")
+    candidate = registry / study_id / "benchmark.json"
+    # Pin the manifest before a full check, not after a mutable path was checked.
+    pinned = _expected_sha256
+    if pinned is None:
+        try:
+            pinned = hashlib.sha256(read_path_bytes(candidate)).hexdigest()
+        except FileNotFoundError:
+            pass  # resolve_study supplies the existing unknown-ID diagnostic.
+        except (OSError, ValueError) as error:
+            raise BenchmarkError(f"cannot read benchmark manifest: {error}") from error
     try:
-        path, _ = resolve_study(registry, study_id)
+        if _expected_sha256 is None:
+            path, _ = resolve_study(registry, study_id)
+        else:
+            # The registry supplies this digest from its protected registration.
+            path, _ = verify_benchmark(
+                registry / study_id / "benchmark.json", _expected_sha256, _reuse_verified=True,
+            )
     except BenchmarkError as error:
         if (isinstance(error.__cause__, FileNotFoundError)
                 and error.__cause__.filename == str(registry / study_id / "benchmark.json")):
@@ -78,8 +98,12 @@ def load_study(
                     if registry.is_dir():
                         raise FileNotFoundError(f"Unknown study_id: {study_id}") from error
         raise
-    sha = hashlib.sha256(read_path_bytes(path)).hexdigest()
-    _, record = verify_benchmark(path, sha)
+    if pinned is None:
+        raise BenchmarkError(
+            "study manifest appeared while loading; retry with its stable identity"
+        )
+    sha = pinned
+    _, record = verify_benchmark(path, sha, _reuse_verified=True)
     if record["study_id"] != study_id:
         raise BenchmarkError("study identity changed while loading")
     if len(record["recipe"]["validation_origins"]) > 1:
@@ -129,8 +153,9 @@ class Study:
     def _record(self, *, data: bool = False) -> dict:
         if self._closed or not pathlib.Path(self._snapshots.name).is_dir():
             raise ValueError("Study is closed")
-        verify = verify_benchmark if data else read_benchmark_manifest
-        return verify(self._path, self._sha256)[1]
+        if data:
+            return verify_benchmark(self._path, self._sha256, _reuse_verified=True)[1]
+        return read_benchmark_manifest(self._path, self._sha256)[1]
 
     @property
     def study_id(self) -> str:
@@ -401,8 +426,9 @@ class Study:
                     origin, horizon, recipe["frequency"],
                 ):
                     raise ValueError(f"{stage} forecast uses the wrong evaluation boundary")
-                fixed = evaluation_contract(
-                    self._path, stage=stage, origin=origin, horizon=horizon,
+                fixed = _evaluation_contract_from_record(
+                    self._path, self._record(data=True),
+                    stage=stage, origin=origin, horizon=horizon,
                     metric=recipe["metric"],
                 )
                 if fixed["study"]["sha256"] != self._sha256:
@@ -439,6 +465,7 @@ class Study:
                     forecast, self._spark, contract=fixed, output_dir=output / stage / "scores",
                     forecast_accuracy_breakdown=forecast_accuracy_breakdown,
                     scratch_root=self._snapshots.name,
+                    _expected_study_sha256=self._sha256,
                 )
                 scoring = output / stage / "score.json"
                 payload = (json.dumps(score, sort_keys=True, allow_nan=False) + "\n").encode()
