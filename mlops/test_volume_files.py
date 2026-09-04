@@ -795,7 +795,8 @@ def test_volume_incomplete_admission_requires_recovery(volume, monkeypatch):
 
     class Frame:
         schema = None
-        write = SimpleNamespace(parquet=lambda _: None)
+        write = SimpleNamespace(parquet=lambda _: None,
+                                option=lambda *_: SimpleNamespace(parquet=lambda _: None))
 
         def select(self, *_):
             return self
@@ -858,7 +859,9 @@ def test_volume_admission_seals_remote_directories_absent_from_mounted_listing(
         schema = None
 
         def __init__(self):
-            self.write = SimpleNamespace(parquet=self.materialize)
+            self.write = SimpleNamespace(
+                parquet=self.materialize,
+                option=lambda *_: SimpleNamespace(parquet=self.materialize))
 
         def materialize(self, path):
             client.values[str(Path(path) / "part.parquet")] = part
