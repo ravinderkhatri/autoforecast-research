@@ -279,6 +279,50 @@ def test_volume_hashing_keeps_reader_visible_file_checks(volume):
         directory_digest(root, suffixes=(".parquet",))
 
 
+def test_parquet_snapshot_downloads_parts_but_not_reader_ignored_markers(volume, monkeypatch):
+    import tempfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from autoforecast import _logical_hash
+
+    from provenance.lineage import directory_digest
+
+    root, client = volume
+    folder = root / "frozen"
+    folder.mkdir()
+    parts = {}
+    for index in range(12):
+        output = io.BytesIO()
+        pq.write_table(pa.table({"x": [index]}), output)
+        parts[f"part-{index:05d}.parquet"] = output.getvalue()
+    markers = {"_SUCCESS": b"", "_committed_7": b"{}", "_started_7": b"",
+               ".part-00000.parquet.crc": b"checksum"}
+    for name, value in {**parts, **markers}.items():
+        client.values[str(folder / name)] = value
+    with tempfile.TemporaryDirectory() as temporary:
+        local = Path(temporary)
+        for name, value in {**parts, **markers}.items():
+            (local / name).write_bytes(value)
+        expected = (directory_digest(local, suffixes=(".parquet",)),
+                    _logical_hash.fingerprint(local), directory_digest(local))
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(Path(path).name)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    assert directory_digest(folder, suffixes=(".parquet",)) == expected[0]
+    assert _logical_hash.fingerprint(folder) == expected[1]
+    assert set(downloads) == set(parts)
+    downloads.clear()
+    # A digest of every file still needs the marker bytes.
+    assert directory_digest(folder) == expected[2]
+    assert set(downloads) == {*parts, *markers}
+
+
 def test_volume_logical_reuse_downloads_once_and_ignores_stale_mount(volume, monkeypatch):
     import pyarrow as pa
     import pyarrow.parquet as pq

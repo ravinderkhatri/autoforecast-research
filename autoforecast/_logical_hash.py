@@ -29,10 +29,13 @@ ALGORITHM = "autoforecast.bucket-sha256.v1"
 ENCODING = "typed-ascii.v1"
 BUCKETS = 256
 _BUCKET_DOMAIN = b"autoforecast.bucket-sha256.v1/bucket\x00"
-# Evidence tables are often a few rows. Decode them without scheduling a Spark
-# job, but bound rows and a conservative encoded-value expansion estimate.
-_LOCAL_MAX_ROWS = 4096
+# Evidence tables are often small. Decode them on the driver instead of scheduling
+# Spark jobs, which cost seconds each regardless of size. The row ceiling bounds time:
+# the driver decodes about 100,000 six-column rows per second (8 November local
+# measurement). _LOCAL_MAX_BYTES bounds the file bytes and the decoded size of each batch.
+_LOCAL_MAX_ROWS = 250_000
 _LOCAL_MAX_BYTES = 8 * 1024 * 1024
+_OFFLINE_BATCH_ROWS = 8192
 
 
 def _json(value):
@@ -417,7 +420,7 @@ def _temporal_type(dtype, *, epochs):
         )
     return dtype
 
-def _offline(path, schema, rows):
+def _offline(path, schema, rows, batch_rows=_OFFLINE_BATCH_ROWS):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -429,7 +432,7 @@ def _offline(path, schema, rows):
             with pq.ParquetFile(file, coerce_int96_timestamp_unit="us") as reader:
                 yield from reader.iter_batches(
                     columns=[n for n, _ in schema],
-                    batch_size=8192,
+                    batch_size=batch_rows,
                     use_threads=False,
                 )
 
@@ -507,14 +510,17 @@ def _capture(path, *, spark=None):
 
     path = pathlib.Path(path)
     with (
-        _volume_files.local_snapshot(path) if _volume_files.is_volume(path) else nullcontext(path)
+        _volume_files.local_snapshot(path, parquet_only=True)
+        if _volume_files.is_volume(path) else nullcontext(path)
     ) as local:
         files = parquet_files(local)
         if not files:
             raise ValueError("logical hashing requires a Parquet schema")
         schema, rows, foreign_int96 = None, 0, False
-        decoded_bytes = 0
-        column_values = 0
+        # Strict upper bound on one row's decoded bytes. A decoded value is never larger
+        # than its column chunk, dictionary included, and one row of a repeated column
+        # can hold every value of the chunk beyond one per other row.
+        row_bytes = 0
         for file in files:
             if (
                 any("=" in part for part in file.relative_to(local).parts[:-1])
@@ -528,15 +534,13 @@ def _capture(path, *, spark=None):
                     raise ValueError("Parquet files have conflicting logical schemas")
                 schema = current
                 rows += footer.metadata.num_rows
-                decoded_bytes += sum(
-                    footer.metadata.row_group(i).total_byte_size
-                    for i in range(footer.metadata.num_row_groups)
-                )
-                column_values += max((
-                    footer.metadata.row_group(i).column(j).num_values
-                    for i in range(footer.metadata.num_row_groups)
-                    for j in range(footer.metadata.row_group(i).num_columns)
-                ), default=0)
+                for i in range(footer.metadata.num_row_groups):
+                    group = footer.metadata.row_group(i)
+                    row_bytes = max(row_bytes, sum(
+                        group.column(j).total_uncompressed_size
+                        * max(1, group.column(j).num_values - group.num_rows + 1)
+                        for j in range(group.num_columns)
+                    ))
                 foreign_int96 |= (
                     not (footer.metadata.created_by or "").startswith("parquet-mr")
                     and any(footer.schema.column(i).physical_type == "INT96"
@@ -546,10 +550,10 @@ def _capture(path, *, spark=None):
         fallback = foreign_int96 and spark is not None and (
             spark.conf.get("spark.sql.parquet.int96TimestampConversion", "false").lower() == "true"
         )
-        # Dictionary and repetition encoding can expand far beyond file size.
-        # Multiply by values, not only top-level rows, to keep that case on Spark.
-        expanded_bytes = decoded_bytes * max(1, rows, column_values)
-        small = (rows <= _LOCAL_MAX_ROWS and expanded_bytes <= _LOCAL_MAX_BYTES
+        # Dictionary and repetition encoding can expand far beyond file size, so size
+        # each decoded batch by the strict per-row bound instead of the file size.
+        batch_rows = min(_OFFLINE_BATCH_ROWS, _LOCAL_MAX_BYTES // max(1, row_bytes))
+        small = (rows <= _LOCAL_MAX_ROWS and batch_rows >= 1
                  and sum(file.stat().st_size for file in files) <= _LOCAL_MAX_BYTES)
         if fallback or small:
             # Spark applies this session-only conversion to foreign INT96 writers.
@@ -569,7 +573,7 @@ def _capture(path, *, spark=None):
                if small else {}),
         ):
             if spark is None:
-                result = _offline(local, schema, rows)
+                result = _offline(local, schema, rows, max(1, batch_rows))
             else:
 
                 frame = (
@@ -633,7 +637,7 @@ def verify_files(
         validate_metadata(logical)
     with operation("Verify frozen file bytes", engine="driver", dataset=str(path)):
         with (
-            _volume_files.local_snapshot(path)
+            _volume_files.local_snapshot(path, parquet_only=True)
             if _volume_files.is_volume(path)
             else nullcontext(path)
         ) as local:
