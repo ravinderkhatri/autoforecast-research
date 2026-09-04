@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, native]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, native]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -91,7 +91,7 @@ jobs:
           FORECAST_SPARK_CORES: '2'
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
-        run: python scripts/run_tests.py --shard-index ${{ matrix.shard }} --shard-count 8 --durations configs/ci/test_durations.json
+        run: python scripts/run_tests.py --shard-index ${{ matrix.shard }} --shard-count 10 --durations configs/ci/test_durations.json
       - name: Installed native model and HPO acceptance
         if: matrix.shard == 'native'
         working-directory: ${{ runner.temp }}
@@ -112,10 +112,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        input: [parquet, csv]
-        python: ['3.12']
-        frequency: ['H', 'D', 'W', 'M', 'MS', 'Y', 'YS']
         include:
+          - {input: parquet, python: '3.12', frequency: 'D'}
+          - {input: parquet, python: '3.12', frequency: 'H W'}
+          - {input: parquet, python: '3.12', frequency: 'M MS'}
+          - {input: parquet, python: '3.12', frequency: 'Y YS'}
+          - {input: csv, python: '3.12', frequency: 'H D W'}
+          - {input: csv, python: '3.12', frequency: 'M MS'}
+          - {input: csv, python: '3.12', frequency: 'Y YS'}
           - {input: parquet, python: '3.13', frequency: 'D'}
           - {input: csv, python: '3.13', frequency: 'D'}
     steps:
@@ -185,7 +189,7 @@ jobs:
           FORECAST_SPARK_MEMORY: '1g'
           SPARK_LOCAL_IP: '127.0.0.1'
           INPUT_FORMAT: ${{ matrix.input }}
-          FREQUENCY: ${{ matrix.frequency }}
+          FREQUENCIES: ${{ matrix.frequency }}
         run: |
           cd "$RUNNER_TEMP"
           timeseries-env/bin/python - <<'PY'
@@ -198,11 +202,13 @@ jobs:
                   path.chmod(0o555 if path.is_dir() else 0o444)
               package.chmod(0o555)
           PY
-          if [ "$INPUT_FORMAT" = csv ]; then
-            env -u PYTHONPATH timeseries-env/bin/python -m scripts.verify_timeseries_release "$RUNNER_TEMP/project" --frequency "$FREQUENCY" --csv
-          else
-            env -u PYTHONPATH timeseries-env/bin/python -m scripts.verify_timeseries_release "$RUNNER_TEMP/project" --frequency "$FREQUENCY"
-          fi
+          for frequency in $FREQUENCIES; do
+            if [ "$INPUT_FORMAT" = csv ]; then
+              env -u PYTHONPATH timeseries-env/bin/python -m scripts.verify_timeseries_release "$RUNNER_TEMP/project-$frequency" --frequency "$frequency" --csv
+            else
+              env -u PYTHONPATH timeseries-env/bin/python -m scripts.verify_timeseries_release "$RUNNER_TEMP/project-$frequency" --frequency "$frequency"
+            fi
+          done
       - name: Reusable study acceptance
         if: matrix.frequency == 'D' && matrix.input == 'parquet' && matrix.python == '3.12'
         working-directory: ${{ runner.temp }}

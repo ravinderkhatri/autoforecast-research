@@ -67,6 +67,7 @@ def test_ci_shards_execute_every_discovered_module_once(tmp_path, runner_project
         "checks/case_a.py", "checks/case_overlap_case.py", "checks/deep/case_b.py",
         "checks/deep/more/case_c.py", "checks/suffix_case.py", "other/case_a.py",
         "other/case_b.py", "other/deep/case_c.py", "other/deep/suffix_case.py",
+        "other/deep/case_d.py", "other/deep/case_e.py",
     }
     for name in names:
         path = tmp_path / name
@@ -243,14 +244,26 @@ def test_runner_propagates_later_failure_in_default_and_ci_shards(
 def test_ci_keeps_required_checks_and_acceptance_variants():
     jobs = workflow_jobs()
     matrix = jobs["installed-wheel"]["strategy"]["matrix"]
-    cases = set(itertools.product(matrix["python"], matrix["frequency"], matrix["input"]))
-    cases.update((row["python"], row["frequency"], row["input"]) for row in matrix["include"])
-    assert cases == {
+    cases = [(row["python"], frequency, row["input"])
+             for row in matrix["include"] for frequency in row["frequency"].split()]
+    assert len(cases) == len(set(cases)) == 16
+    assert set(cases) == {
         (python, frequency, source)
         for python in ("3.12", "3.13")
         for frequency in (("H", "D", "W", "M", "MS", "Y", "YS") if python == "3.12" else ("D",))
         for source in ("csv", "parquet")
     }
+    daily_job = {"python": "3.12", "frequency": "D", "input": "parquet"}
+    assert matrix["include"].count(daily_job) == 1
+    for name, command in {
+        "Reusable study acceptance": "-m scripts.verify_study_release",
+        "Study interface example": "-m scripts.study_example",
+    }.items():
+        step = next(step for step in jobs["installed-wheel"]["steps"]
+                    if step.get("name") == name)
+        assert step["if"] == (
+            "matrix.frequency == 'D' && matrix.input == 'parquet' && matrix.python == '3.12'")
+        assert command in step["run"] and not step.get("continue-on-error", False)
     assert set(jobs["installed-models"]["strategy"]["matrix"]["extra"]) == {"timesfm", "all-models"}
     preflight = jobs["preflight"]["steps"]
     checkout = next(
@@ -285,6 +298,52 @@ def test_ci_keeps_required_checks_and_acceptance_variants():
     for (job, name), commands in required.items():
         step = next(step for step in jobs[job]["steps"] if step.get("name") == name)
         assert all(command in step["run"] for command in commands), name
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_wheel_batches_execute_each_case_and_propagate_failure(tmp_path, fail_second):
+    job = workflow_jobs()["installed-wheel"]
+    step = next(s for s in job["steps"]
+                if s.get("name") == "Verify installed package outside checkout")
+    rows = job["strategy"]["matrix"]["include"]
+    if fail_second:
+        rows = [next(row for row in rows if len(row["frequency"].split()) >= 3)]
+    calls = []
+    for index, row in enumerate(rows):
+        folder = tmp_path / str(index)
+        executable = folder / "timeseries-env/bin/python"
+        executable.parent.mkdir(parents=True)
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "if sys.argv[1:] == ['-']: sys.exit(0)\n"
+            "assert sys.argv[1:3] == ['-m', 'scripts.verify_timeseries_release']\n"
+            "with Path('calls.jsonl').open('a') as stream:\n"
+            "    stream.write(json.dumps(sys.argv[3:]) + '\\n')\n"
+            "frequency = sys.argv[sys.argv.index('--frequency') + 1]\n"
+            "sys.exit(7 if frequency == os.environ.get('FAIL_FREQUENCY') else 0)\n"
+        )
+        executable.chmod(0o755)
+        frequencies = row["frequency"].split()
+        environment = {**os.environ, "RUNNER_TEMP": str(folder),
+                       "FAIL_FREQUENCY": frequencies[1] if fail_second else ""}
+        for key, value in step["env"].items():
+            for name, replacement in row.items():
+                value = value.replace("${{ matrix." + name + " }}", replacement)
+            environment[key] = value
+        result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=folder,
+                                env=environment, capture_output=True, text=True)
+        assert result.returncode == (7 if fail_second else 0), result.stdout + result.stderr
+        emitted = [json.loads(line) for line in (folder / "calls.jsonl").read_text().splitlines()]
+        expected = frequencies[:2] if fail_second else frequencies
+        assert [call[2] for call in emitted] == expected
+        assert len({call[0] for call in emitted}) == len(expected)
+        assert all(call[1] == "--frequency" for call in emitted)
+        assert all(call[3:] == (["--csv"] if row["input"] == "csv" else []) for call in emitted)
+        calls.extend((row["python"], frequency, row["input"]) for frequency in expected)
+    if not fail_second:
+        assert len(calls) == len(set(calls)) == 16
 
 
 def test_ci_orders_stages_and_requires_every_result():

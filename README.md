@@ -703,21 +703,24 @@ Tests live beside their modules. Install the `ci` dependency group and any model
 by your tests, then run `python scripts/run_tests.py`. Each module runs in a separate process
 so Spark sessions and runtimes cannot leak between modules.
 
-CI runs preflight checks first, then starts eight regression shards, native-model acceptance,
+CI runs preflight checks first, then starts ten regression shards, native-model acceptance,
 installed-wheel checks, and model-extra checks in parallel. Every group must pass. Superseded
 pull-request runs are cancelled automatically; a failing matrix member does not cancel its
-siblings, so one run can report failures across all supported variants.
+siblings, so one run can report failures across all supported variants. Installed-wheel jobs
+group short frequency checks in the same environment, using a fresh project directory for each
+case. This reduces runner queues while preserving every input, Python and frequency combination.
 
 The regression runner balances modules using recent timings and estimates for new or split
 modules in `configs/ci/test_durations.json`. Durations affect scheduling only: every discovered
 module still runs exactly once, modules without an entry receive a 60-second estimate, and
 stale entries do not add tests. Campaign recovery and availability checks run in a separate
-module so one long module does not hold up the entire matrix. Refresh estimates from completed
+module so one long module does not hold up the entire matrix. The real Ray placement check
+also has its own process, without a live Spark session from earlier tests. Refresh estimates from completed
 CI module timings when workloads change.
 Run one of the same shards locally with:
 
 ```sh
-python scripts/run_tests.py --shard-index 0 --shard-count 8 --durations configs/ci/test_durations.json
+python scripts/run_tests.py --shard-index 0 --shard-count 10 --durations configs/ci/test_durations.json
 ```
 
 Local Linux containers can run these same entry points with the locked dependencies, Python
