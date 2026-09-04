@@ -369,11 +369,11 @@ class _ModelFits:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.planned = None
+        self.planned: int | None = None
         self.done = 0
-        self.first_start = None
-        self.last_finish = None
-        self.current = None
+        self.first_start: float | None = None
+        self.last_finish: float | None = None
+        self.current: str | None = None
 
     def render(self):
         """Return the panel lines and the whole-run estimate text."""
@@ -393,7 +393,7 @@ class _ModelFits:
             line = f"Model fits: {done} done; total=unknown"
         if planned and done >= planned:
             estimate = "all planned model fits done; later steps are not estimated"
-        elif planned and done and last is not None:
+        elif planned and done and first is not None and last is not None:
             rate = (last - first) / done
             left = _approximate(rate * (planned - done))
             line += f" | about {left} left at {_approximate(rate)} per fit, measured"
@@ -438,8 +438,8 @@ class Execution:
         self.audit_error = None
         self.uploader = None
         # Model fits this run counts; a run that starts one workflow shares that workflow's.
-        self.fits = None
-        self.sharing = None
+        self.fits: _ModelFits | None = None
+        self.sharing: _ModelFits | None = None
 
     def write_event(self, path, event):
         """Keep one writer and ordered, retry-stable event bytes for each remote audit.
@@ -948,10 +948,10 @@ def progress(*, completed, total=None, unit="items", **facts):
             execution.refresh()
 
 
-def _fit_count():
+def _fit_count() -> tuple[Execution, _ModelFits] | None:
     execution = _CURRENT.get()
     if execution is None or _AUDITING.get():
-        return None, None
+        return None
     with execution.lock:
         if execution.fits is None:
             execution.fits = _ModelFits()
@@ -960,8 +960,9 @@ def _fit_count():
 
 def plan_model_fits(total):
     """Declare how many model fits this run will make; the first plan in a run stays."""
-    _execution, fits = _fit_count()
-    if fits is not None:
+    counted = _fit_count()
+    if counted is not None:
+        fits = counted[1]
         with fits.lock:
             if fits.planned is None:
                 fits.planned = total
@@ -970,10 +971,11 @@ def plan_model_fits(total):
 @contextmanager
 def model_fit(label, **facts):
     """Count one model fit and show what it trains on; a failed fit is not counted."""
-    execution, fits = _fit_count()
-    if fits is None:
+    counted = _fit_count()
+    if counted is None:
         yield
         return
+    execution, fits = counted
     with fits.lock:
         number, planned = fits.done + 1, fits.planned
         fits.current = label
