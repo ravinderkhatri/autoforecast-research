@@ -200,12 +200,18 @@ def test_volume_delta_provisioning_holds_native_lock(volume):
         assert str(path) in client.values
         commands.append(command)
 
+    # New tables have no comments yet, so preparing also describes every table and column.
+    catalog = SimpleNamespace(getTable=lambda _name: SimpleNamespace(description=None),
+                              listColumns=lambda _name: [])
     store = DeltaStudyStore(
-        cast(SparkSession, SimpleNamespace(sql=sql)), namespace="neutral.studies",
+        cast(SparkSession, SimpleNamespace(sql=sql, catalog=catalog)), namespace="neutral.studies",
     )
     store.validate_destinations = lambda: None
     store.prepare(lock_path=path)
-    assert len(commands) == 1 + len(store.tables)
+    # Every statement, including the comments, ran while the lock was held.
+    assert sum(command.startswith("CREATE TABLE") for command in commands) == len(store.tables)
+    assert sum(command.startswith("COMMENT ON TABLE") for command in commands) == len(store.tables)
+    assert any(command.startswith("ALTER TABLE") for command in commands)
     assert str(path) not in client.values
 
 
