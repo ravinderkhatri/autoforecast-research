@@ -63,6 +63,10 @@ class _VerifiedBenchmark:
 # Every file of an output costs a request each time a check downloads it, so small
 # outputs are written as one file and larger ones as files of about this many rows.
 _ROWS_PER_FILE = 2_000_000
+# Offline row hashing sizes its batches from the largest row group: a row group above
+# _logical_hash._LOCAL_MAX_BYTES leaves one row per batch, which took minutes for one
+# large file. Small row groups keep batches as large as many small files gave.
+_ROW_GROUP_BYTES = 256 * 1024
 
 
 def write_few_files(frame, path, *, rows=None):
@@ -72,7 +76,8 @@ def write_few_files(frame, path, *, rows=None):
     evidence, such as keys, findings or references, and is written as one file.
     """
     files = 1 if rows is None else max(1, -(-rows // _ROWS_PER_FILE))
-    frame.repartition(files).write.parquet(str(path))
+    writer = frame.repartition(files).write.option("parquet.block.size", _ROW_GROUP_BYTES)
+    writer.parquet(str(path))
 
 
 def digest(value) -> str:

@@ -657,6 +657,17 @@ def test_outputs_are_written_in_few_files(spark, tmp_path, monkeypatch):
     assert {name: len(found) for name, found in files.items()} == {
         "evidence": 1, "frozen": 3, "empty": 1}
     assert sorted(spark.read.parquet(str(tmp_path / "frozen")).toPandas()["id"]) == list(range(10))
+    # One large file must keep small row groups: offline hashing sizes its batches from
+    # the largest one, and a single large row group left one row per batch.
+    from autoforecast import _logical_hash
+
+    monkeypatch.setattr(benchmark, "_ROWS_PER_FILE", 10**9)
+    large = spark.range(400_000).selectExpr("id", "cast(id as string) as name", "id * 0.5 as value")
+    benchmark.write_few_files(large, tmp_path / "large", rows=400_000)
+    (part,) = (tmp_path / "large").glob("*.parquet")
+    metadata = pq.ParquetFile(part).metadata
+    largest = max(metadata.row_group(i).total_byte_size for i in range(metadata.num_row_groups))
+    assert metadata.num_rows == 400_000 and largest * 16 <= _logical_hash._LOCAL_MAX_BYTES
 
 
 def test_each_use_checks_every_frozen_file_once_and_every_use_checks_again(
