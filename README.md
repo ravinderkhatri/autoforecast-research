@@ -555,6 +555,24 @@ Saved records must use the current format; older formats are rejected.
 - [Installed-package checks](scripts/verify_timeseries_release.py): exercise the workflow outside the source checkout.
 
 Tests live beside their modules. Install the `ci` dependency group and any model extras required
-by your tests, then run `python scripts/run_tests.py`. CI runs fast checks first.
-Eight regression groups and native-model acceptance then run in parallel. Installed-wheel
-and model-extra checks wait for that stage to pass. Every group must pass.
+by your tests, then run `python scripts/run_tests.py`. Each module runs in a separate process
+so Spark sessions and runtimes cannot leak between modules.
+
+CI runs preflight checks first, then starts eight regression shards, native-model acceptance,
+installed-wheel checks, and model-extra checks in parallel. Every group must pass. Superseded
+pull-request runs are cancelled automatically; a failing matrix member does not cancel its
+siblings, so one run can report failures across all supported variants.
+
+The regression runner balances modules using measured durations in
+`configs/ci/test_durations.json`. Durations affect scheduling only: every discovered module
+still runs exactly once, new modules receive a 60-second estimate, and stale entries do not
+add tests. Refresh estimates from completed CI module timings when workloads change.
+Run one of the same shards locally with:
+
+```sh
+python scripts/run_tests.py --shard-index 0 --shard-count 8 --durations configs/ci/test_durations.json
+```
+
+Local Linux containers can run these same entry points with the locked dependencies, Python
+and Java versions used by CI. Match concurrency to the container's memory budget. Native ARM
+containers on Apple Silicon provide Linux checks but do not replace the x86 Linux CI matrix.

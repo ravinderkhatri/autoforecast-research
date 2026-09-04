@@ -1,6 +1,7 @@
 """The module runner must preserve pytest failures and reject empty suites."""
 
 import itertools
+import json
 import os
 import pathlib
 import shlex
@@ -87,6 +88,12 @@ def test_ci_shards_execute_every_discovered_module_once(tmp_path, runner_project
     (checks / "test_excluded.py").write_text("def test_not_selected(): assert False\n")
     (tmp_path / "outside").mkdir()
     (tmp_path / "outside/case_excluded.py").write_text("def test_not_selected(): assert False\n")
+    heavy, unknown = min(names), max(names)
+    durations = {name: (100 if name == heavy else 1) for name in names if name != unknown}
+    durations["outside/case_excluded.py"] = 1000
+    timing_path = tmp_path / "configs/ci/test_durations.json"
+    timing_path.parent.mkdir(parents=True)
+    timing_path.write_text(json.dumps(durations))
     job = workflow_jobs()["regressions"]
     step = next(s for s in job["steps"] if s.get("name") == "Unit and workflow regressions")
     assert step["if"] == "matrix.shard != 'native'"
@@ -107,11 +114,50 @@ def test_ci_shards_execute_every_discovered_module_once(tmp_path, runner_project
         )
         assert result.returncode == 0, result.stdout + result.stderr
         emitted = receipt.read_text().splitlines()[before:]
-        assert [line.split("|")[0] for line in emitted] == sorted(names)[int(shard)::8]
+        selected = [line.split("|")[0] for line in emitted]
+        assert selected == sorted(selected)
+        if shard == 0:
+            assert selected == [heavy]
+        elif shard == 1:
+            assert selected == [unknown]
+        else:
+            assert 1 <= len(selected) <= 2
     executed = [line.split("|") for line in receipt.read_text().splitlines()]
     assert {name for name, _ in executed} == names
     assert len(executed) == len(names)
     assert len({pid for _, pid in executed}) == len(names)
+
+
+@pytest.mark.parametrize("contents", ["{", "[]", '{"checks/test_one.py":true}',
+                                      '{"checks/test_one.py":0}',
+                                      '{"checks/test_one.py":-1}',
+                                      '{"checks/test_one.py":NaN}', None])
+def test_invalid_duration_profile_fails_before_execution(tmp_path, runner_project, contents):
+    runner, checks = runner_project
+    (checks / "test_one.py").write_text(
+        "def test_receipt():\n    from pathlib import Path\n    Path('executed.txt').touch()\n"
+    )
+    profile = tmp_path / "durations.json"
+    if contents is not None:
+        profile.write_text(contents)
+    result = subprocess.run(
+        [sys.executable, str(runner), "--durations", str(profile)],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not (tmp_path / "executed.txt").exists()
+
+
+def test_balancing_bounds_the_longest_shard_and_ignores_stale_entries():
+    from scripts.run_tests import balanced_shards
+
+    durations = {"a.py": 90, "b.py": 80, "c.py": 70, "d.py": 20, "e.py": 10,
+                 "not_discovered.py": 1000}
+    paths = ["a.py", "b.py", "c.py", "d.py", "e.py", "new.py"]
+    shards = balanced_shards(paths, durations, 3)
+    assert sorted(itertools.chain.from_iterable(shards)) == paths
+    assert shards == balanced_shards(list(reversed(paths)), durations, 3)
+    assert max(sum(durations.get(path, 60) for path in shard) for shard in shards) == 130
 
 
 @pytest.mark.parametrize("arguments", [
@@ -164,9 +210,10 @@ def test_runner_reports_first_failure_without_running_later_work(
     assert not (tmp_path / "later.txt").exists()
 
 
+@pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("index,count", [(0, 1), (1, 2)])
 def test_runner_propagates_later_failure_in_default_and_ci_shards(
-    tmp_path, runner_project, index, count,
+    tmp_path, runner_project, index, count, weighted,
 ):
     runner, checks = runner_project
     for number in range(3 * count):
@@ -178,8 +225,13 @@ def test_runner_propagates_later_failure_in_default_and_ci_shards(
                 "def test_later():\n    from pathlib import Path\n    Path('later.txt').touch()\n"
             )
         (checks / f"test_{number}.py").write_text(body)
+    arguments = ["--shard-index", str(index), "--shard-count", str(count)]
+    if weighted:
+        profile = tmp_path / "durations.json"
+        profile.write_text("{}")
+        arguments.extend(["--durations", str(profile)])
     result = subprocess.run(
-        [sys.executable, str(runner), "--shard-index", str(index), "--shard-count", str(count)],
+        [sys.executable, str(runner), *arguments],
         cwd=tmp_path, capture_output=True, text=True,
     )
     assert result.returncode == 1, result.stdout + result.stderr
@@ -240,7 +292,8 @@ def test_ci_orders_stages_and_requires_every_result():
     assert jobs["regressions"]["needs"] == "preflight"
     assert jobs["regressions"]["strategy"]["fail-fast"] is False
     for name in ("installed-wheel", "installed-models"):
-        assert jobs[name]["needs"] == "regressions"
+        assert jobs[name]["needs"] == "preflight"
+        assert jobs[name]["strategy"]["fail-fast"] is False
     gate = jobs["checks"]
     assert gate["if"] == "always()"
     assert set(gate["needs"]) == set(jobs) - {"checks"}
@@ -269,3 +322,12 @@ def test_ci_orders_stages_and_requires_every_result():
             env={**os.environ, **dict(zip(gate["env"], values, strict=True))},
         )
         assert (result.returncode == 0) == all(value == "success" for value in values), values
+
+
+def test_ci_cancels_superseded_pull_requests_without_cancelling_main():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    workflow = yaml.safe_load((root / ".github/workflows/ci.yaml").read_text())
+    assert workflow["concurrency"] == {
+        "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+    }
