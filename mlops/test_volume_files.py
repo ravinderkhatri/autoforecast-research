@@ -13,6 +13,7 @@ from typing import cast
 import pytest
 from autoforecast import _execution as events
 from autoforecast import read_execution_events
+from autoforecast.benchmark import DISTRIBUTED_SCHEMA
 from databricks.sdk.errors import AlreadyExists, NotFound
 from pyspark.sql import SparkSession
 
@@ -421,7 +422,8 @@ dataset:
     target_estimand: observed_nonnegative
 '''
     client.values[str(folder / "dataset.yaml")] = contract
-    record = {"recipe": {"validation_origins": ["2024-01-05"]}, "study_id": "a" * 64,
+    record = {"schema": DISTRIBUTED_SCHEMA, "recipe": {"validation_origins": ["2024-01-05"]},
+              "study_id": "a" * 64,
               "dataset_sha256": hashlib.sha256(contract).hexdigest(),
               "role_paths": {"selection": "selection"}, "artifacts": {"selection": "0" * 64}}
 
@@ -736,7 +738,8 @@ def test_volume_incomplete_admission_requires_recovery(volume, monkeypatch):
         read=SimpleNamespace(parquet=lambda _: Frame())))
     monkeypatch.setattr(module, "_same_keys", lambda *_: None)
     monkeypatch.setattr(module, "F", SimpleNamespace(lit=lambda value: value))
-    frozen = {"study_id": "study", "recipe": {"source_keys": ["item"]},
+    frozen = {"schema": DISTRIBUTED_SCHEMA, "study_id": "study",
+              "recipe": {"source_keys": ["item"]},
               "artifacts": {"source-keys": "sha"}, "role_paths": {"source-keys": "source-keys"}}
     identity = {"native_policy": {"excluded_keys": [], "excluded_new_keys": []}}
     with pytest.raises(ValueError, match="incomplete admission destination"):
@@ -818,7 +821,8 @@ def test_volume_admission_seals_remote_directories_absent_from_mounted_listing(
         client.values[str(destination / "admission.json")] = record
 
     monkeypatch.setattr(registration.os, "rename", mounted_rename)
-    frozen = {"study_id": "study", "recipe": {"source_keys": ["item"]},
+    frozen = {"schema": DISTRIBUTED_SCHEMA, "study_id": "study",
+              "recipe": {"source_keys": ["item"]},
               "artifacts": {"source-keys": "sha"}, "role_paths": {"source-keys": "source-keys"}}
     identity = {"native_policy": {"excluded_keys": [], "excluded_new_keys": []}}
     binding = registration._save_admission(registry, staging, identity, frozen, format="json")
@@ -1230,6 +1234,12 @@ def test_standalone_volume_load_pins_native_manifest_before_full_verification(vo
         assert hashlib.sha256(client.values[str(path)]).hexdigest() != expected_sha256
         raise BenchmarkError("benchmark manifest changed")
 
+    def manifest_record(manifest, expected_sha256):
+        assert manifest == path and expected_sha256 == original_sha
+        assert hashlib.sha256(client.values[str(path)]).hexdigest() == expected_sha256
+        return manifest, {"schema": DISTRIBUTED_SCHEMA}
+
+    monkeypatch.setattr(api, "read_benchmark_manifest", manifest_record)
     monkeypatch.setattr(api, "verify_benchmark", verified)
     with pytest.raises(BenchmarkError, match="manifest changed"):
         api.load_study(study_id, registry_root=root, spark=cast(SparkSession, object()))

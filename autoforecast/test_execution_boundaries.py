@@ -30,9 +30,24 @@ from autoforecast import (
 )
 from autoforecast import study_registration as registration
 from autoforecast.integrations import delta
+from autoforecast.snapshots import Connections
 from autoforecast.study_registration import StudyRegistry
 from autoforecast.tuning import loads_external_tuning_spec, materialize_runtime_parameters
 from provenance import lineage
+
+
+class _Registry(SimpleNamespace):
+    """File-mode registry double with the real input resolver and cleanup contract."""
+
+    def __init__(self, **attributes):
+        attributes.setdefault("spark", None)
+        attributes.setdefault("snapshot_mode", "hash")
+        attributes.setdefault("snapshots", None)
+        attributes.setdefault("connections", Connections(spark=attributes["spark"]))
+        super().__init__(**attributes)
+
+    _native_inputs = StudyRegistry._native_inputs
+    close = StudyRegistry.close
 
 
 @pytest.fixture(autouse=True)
@@ -281,7 +296,7 @@ def test_registration_config_quiet_level_applies_to_preparation_message(tmp_path
 
     stream = io.StringIO()
     events.configure_logging(stream=stream, progress="off")
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
     config = {
@@ -296,7 +311,7 @@ def test_registration_config_quiet_level_applies_to_preparation_message(tmp_path
         "source": {"kind": "parquet"},
         "runtime": {"log_level": "ERROR"},
     }
-    monkeypatch.setattr(registration, "_configuration", lambda _: (config, tmp_path))
+    monkeypatch.setattr(registration, "_configuration", lambda _, *, connections=None: (config, tmp_path))
     monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "study-id")
     assert registration.register_study("settings.json", registry=registry) == "study-id"
     assert stream.getvalue() == ""
@@ -372,7 +387,7 @@ def test_registration_summary_names_real_source_target_and_boundaries(tmp_path, 
     from autoforecast.test_study_registration import configuration
 
     config_path = configuration(tmp_path, actual_missing="mask")
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
     monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "study-id")
@@ -465,7 +480,8 @@ def test_publication_checks_study_before_creating_attempt(tmp_path):
     def missing(_):
         raise error
 
-    registry = SimpleNamespace(root=tmp_path / "protected", store=object(), definition=missing)
+    registry = _Registry(root=tmp_path / "protected", scratch_root=tmp_path,
+                         store=object(), definition=missing)
     with pytest.raises(FileNotFoundError) as caught:
         StudyRegistry.publish_results(registry, "unknown", tmp_path / "workflow")
     assert caught.value is error
@@ -555,7 +571,7 @@ def test_combined_registration_failure_preserves_error_and_never_fits(tmp_path, 
     from autoforecast import run_study
 
     error = RuntimeError("registration failed")
-    registry = SimpleNamespace(root=tmp_path / "registry", runtime={}, store=None)
+    registry = _Registry(root=tmp_path / "registry", runtime={}, store=None)
     def fail(**kwargs):
         raise error
     monkeypatch.setattr(registration, "register_study", fail)
@@ -612,7 +628,7 @@ def test_run_study_accepts_successful_mlflow_links(tmp_path, monkeypatch, publis
     def load_study(_study_id):
         yield SimpleNamespace(registration={"sha256": "verified"})
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={"tracking": "mlflow", "tracking_uri": "https://tracking.example"},
@@ -861,7 +877,7 @@ def test_derived_result_receipt_uses_effective_id(tmp_path, monkeypatch, kind):
                 raise OSError("publication failed")
             return {"status": "published"}
 
-        registry = SimpleNamespace(
+        registry = _Registry(
             root=tmp_path / "registry",
             scratch_root=tmp_path,
             runtime={},
@@ -910,7 +926,7 @@ def test_publication_identity_is_redacted_in_all_panel_modes(tmp_path, monkeypat
         events.configure_logging()
     else:
         events.configure_logging(stream=stream, progress="auto" if kind == "tty" else "plain")
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         store=None,
@@ -1059,9 +1075,9 @@ def test_registration_query_hash_names_are_not_redacted(tmp_path, monkeypatch, a
         },
         "runtime": {},
     }
-    monkeypatch.setattr(registration, "_configuration", lambda _: (data, tmp_path))
+    monkeypatch.setattr(registration, "_configuration", lambda _, *, connections=None: (data, tmp_path))
     monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "study-id")
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path / "scratch",
         runtime={},
@@ -1100,7 +1116,7 @@ def test_independent_nested_run_keeps_its_own_identity(tmp_path, monkeypatch):
     def load_study(_):
         yield SimpleNamespace(registration={"sha256": "verified"})
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={},
@@ -1132,7 +1148,7 @@ def test_independent_nested_run_keeps_its_own_identity(tmp_path, monkeypatch):
 def test_nested_successful_publication_does_not_become_failed_parent_result(tmp_path):
     stream = io.StringIO()
     events.configure_logging(stream=stream, progress="plain")
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         store=None,
@@ -1186,9 +1202,9 @@ def test_independent_nested_registration_has_no_parent_trial_identity(tmp_path, 
         "source": {"kind": "parquet"},
         "runtime": {},
     }
-    monkeypatch.setattr(registration, "_configuration", lambda _: (data, tmp_path))
+    monkeypatch.setattr(registration, "_configuration", lambda _, *, connections=None: (data, tmp_path))
     monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "new-study")
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
     audit = tmp_path / "parent.jsonl"
@@ -1237,7 +1253,7 @@ def test_concurrent_to_thread_run_keeps_its_own_identity(tmp_path, monkeypatch):
     def load_study(_):
         yield SimpleNamespace(registration={"sha256": "verified"})
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={},
@@ -1363,7 +1379,7 @@ def test_url_derived_path_is_not_copied_by_public_receipts(tmp_path, monkeypatch
         pq.write_table(pa.table({"x": [1]}), source)
         data["source"]["path"] = str(source)
         path.write_text(yaml.safe_dump(data))
-        registry = SimpleNamespace(
+        registry = _Registry(
             root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
         )
         monkeypatch.setattr(study_registration, "_register_study", lambda *a, **k: "study-id")
@@ -1389,7 +1405,7 @@ def test_url_derived_path_is_not_copied_by_public_receipts(tmp_path, monkeypatch
         def load(_):
             yield SimpleNamespace(registration={"sha256": "verified"})
 
-        registry = SimpleNamespace(
+        registry = _Registry(
             root=tmp_path / "registry",
             scratch_root=tmp_path,
             runtime={},
@@ -1403,7 +1419,7 @@ def test_url_derived_path_is_not_copied_by_public_receipts(tmp_path, monkeypatch
         )
         audit = pathlib.Path(result.publication["audit_path"])
     elif kind == "publication_receipt":
-        registry = SimpleNamespace(
+        registry = _Registry(
             root=tmp_path / "registry",
             scratch_root=tmp_path,
             store=None,
@@ -1445,7 +1461,7 @@ def test_invalid_uri_registration_never_logs_credentials(tmp_path, monkeypatch, 
         f"{scheme}://user:sensitive-password@example.test/data?token=sensitive-token"
     )
     path.write_text(yaml.safe_dump(value))
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
 
@@ -1468,7 +1484,7 @@ def test_invalid_uri_registration_never_logs_credentials(tmp_path, monkeypatch, 
 def test_standalone_publication_records_its_own_result(tmp_path):
     stream = io.StringIO()
     events.configure_logging(stream=stream, progress="plain")
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         store=None,
@@ -1619,7 +1635,7 @@ def test_registration_failure_after_configuration_belongs_to_sources(
     from autoforecast.test_study_registration import configuration
 
     config = configuration(tmp_path)
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
     error = error_type("source initialization stopped")
@@ -1688,7 +1704,7 @@ def test_later_registration_failure_preserves_completed_stages(
 ):
     from autoforecast.test_study_registration import configuration
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry", scratch_root=tmp_path / "scratch", runtime={}, store=None
     )
     error = error_type("later boundary stopped")
@@ -1704,7 +1720,9 @@ def test_later_registration_failure_preserves_completed_stages(
         if moment == "append" and row["stage"] == "publication" and row["status"] == "PASS":
             raise error
 
-    def body(value, registry, prepare, settings, check_id, issues_root, event, *, inputs=None):
+    def body(value, registry, prepare, settings, check_id, issues_root, event, *,
+             inputs=None, native_inputs=None):
+        assert native_inputs is None
         for stage in ("sources", "admission", "freeze", "publication"):
             if stage != "sources":
                 event(stage, "START")
@@ -1891,7 +1909,7 @@ def test_run_summary_audit_error_does_not_duplicate_run_outcome(
     def load(_):
         yield SimpleNamespace(registration={"sha256": "verified"})
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={},
@@ -2026,7 +2044,7 @@ def test_receipt_precedes_publication_and_cancellation_closes_execution(tmp_path
     def publish(*args, **kwargs):
         raise primary
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={},
@@ -2101,7 +2119,7 @@ def test_receipt_precedes_publication_and_cancellation_closes_execution(tmp_path
 def test_run_failure_audit_secondary_cancellation_does_not_replace_primary(
     tmp_path, monkeypatch, kind, committed
 ):
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={},
@@ -2291,7 +2309,6 @@ def test_audit_error_is_not_replaced_by_secondary_console_interruption(
 
 
 def test_public_run_does_not_relabel_committed_configuration_pass(tmp_path):
-    from types import SimpleNamespace
 
     from autoforecast import configure_logging, run_study
 
@@ -2312,7 +2329,7 @@ def test_public_run_does_not_relabel_committed_configuration_pass(tmp_path):
     logger.handlers = []
     stream = PublicStream()
     configure_logging(stream=stream, progress="off")
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={},
@@ -2349,7 +2366,7 @@ def test_receipt_interrupt_is_not_swallowed_by_caller_exception_context(
     def load(_):
         yield SimpleNamespace(registration={"sha256": "verified"})
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={},
@@ -2407,7 +2424,7 @@ def test_public_model_label_is_operational_metadata_only(tmp_path, monkeypatch, 
     def load(_):
         yield SimpleNamespace(registration={"sha256": "verified"})
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry", scratch_root=tmp_path, runtime={}, store=None,
         _registration_path=lambda *_: None, load_study=load,
     )
@@ -2542,7 +2559,7 @@ def test_public_run_interrupted_nested_start_has_terminal_outcome(tmp_path, erro
         with events.operation("fit"):
             pass
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=tmp_path / "registry",
         scratch_root=tmp_path,
         runtime={},
@@ -2648,14 +2665,14 @@ def test_audit_directory_symlink_does_not_write_inside_protected_tree(tmp_path, 
             )
         elif route == "publication":
             (root / "execution-attempts").symlink_to(protected, target_is_directory=True)
-            registry = SimpleNamespace(
+            registry = _Registry(
                 root=root, store=None, scratch_root=tmp_path, definition=lambda _: ({}, "sha")
             )
             writer = SimpleNamespace(publish_results=lambda *a, **k: "published")
             StudyRegistry.publish_results(registry, "s", "existing", destination=writer)
         elif route == "run":
             (root / "run-attempts").symlink_to(protected, target_is_directory=True)
-            registry = SimpleNamespace(
+            registry = _Registry(
                 root=root, runtime={}, store=None, _registration_path=lambda *_: None
             )
             run_study("s", lambda _: None, registry=registry)
@@ -3033,11 +3050,11 @@ def test_registration_initial_failure_display_preserves_primary(
     stream = FailureStream()
     events.configure_logging(stream=stream, progress="off")
 
-    def invalid(_):
+    def invalid(_, *, connections=None):
         raise primary
 
     monkeypatch.setattr(study_registration, "_configuration", invalid)
-    registry = SimpleNamespace(runtime={})
+    registry = _Registry(runtime={})
     with pytest.raises(BaseException) as caught:
         study_registration.register_study({}, registry=registry)
     assert stream.hit == 1
@@ -3065,9 +3082,9 @@ def test_registration_initial_start_interrupt_is_not_swallowed(
 
     stream = StartStream()
     events.configure_logging(stream=stream, progress="off")
-    monkeypatch.setattr(study_registration, "_configuration", lambda _: ({"runtime": {}}, tmp_path))
+    monkeypatch.setattr(study_registration, "_configuration", lambda _, *, connections=None: ({"runtime": {}}, tmp_path))
     with pytest.raises(secondary_type) as caught:
-        study_registration.register_study({}, registry=SimpleNamespace(runtime={}))
+        study_registration.register_study({}, registry=_Registry(runtime={}))
     assert stream.hit == 1 and caught.value is secondary
 
 
@@ -3247,7 +3264,7 @@ def test_registration_directory_links_cannot_create_inside_saved_data(tmp_path, 
         root = alias / "new-registry"
     else:
         scratch = alias / "new-scratch"
-    registry = SimpleNamespace(root=root, scratch_root=scratch, runtime={}, store=None)
+    registry = _Registry(root=root, scratch_root=scratch, runtime={}, store=None)
     monkeypatch.setattr(registration, "_register_study", lambda *a, **k: pytest.fail("unexpected data work"))
     with pytest.raises(OSError):
         registration.register_study(config, registry=registry)
@@ -3286,7 +3303,7 @@ def test_registration_claims_fresh_attempt_without_reusing_evidence(
         _, client = request.getfixturevalue("volume")
         monkeypatch.setattr(_volume_files, "is_volume", lambda path: path.is_relative_to(root))
         writes = client.requests
-    registry = SimpleNamespace(root=root, scratch_root=scratch, runtime={}, store=None)
+    registry = _Registry(root=root, scratch_root=scratch, runtime={}, store=None)
     if collision:
         with pytest.raises(OSError):
             registration.register_study(config, registry=registry)
@@ -3545,7 +3562,7 @@ def _combined_route(folder, monkeypatch, *, fail=None, effective=False):
         calls.append(("publish", (study_id, path, kwargs)))
         return {"status": "published"}
 
-    registry = SimpleNamespace(
+    registry = _Registry(
         root=folder / "registry",
         scratch_root=folder,
         runtime={},
@@ -4255,8 +4272,8 @@ def _registration_failure_route(tmp_path, monkeypatch, root=None):
         "source": {"kind": "parquet"},
         "runtime": {},
     }
-    monkeypatch.setattr(registration, "_configuration", lambda _: (data, tmp_path))
-    return registration, SimpleNamespace(
+    monkeypatch.setattr(registration, "_configuration", lambda _, *, connections=None: (data, tmp_path))
+    return registration, _Registry(
         root=root or tmp_path / "registry",
         scratch_root=tmp_path / "scratch",
         runtime={},

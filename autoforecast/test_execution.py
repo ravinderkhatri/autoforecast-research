@@ -413,7 +413,7 @@ def test_application_handler_quiet_is_not_bypassed_by_panel(tmp_path, level):
 def test_planning_event_visible_with_default_root_application_handler(tmp_path, monkeypatch):
     logging.getLogger().addHandler(logging.StreamHandler(io.StringIO()))
     data = {"dataset": {}, "recipe": {}, "source": {}, "runtime": {}}
-    monkeypatch.setattr(registration, "_configuration", lambda _: (data, tmp_path))
+    monkeypatch.setattr(registration, "_configuration", lambda _, *, connections=None: (data, tmp_path))
     stop = RuntimeError("stop at preparation validation")
 
     class Hook:
