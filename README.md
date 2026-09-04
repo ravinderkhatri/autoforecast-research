@@ -100,3 +100,7 @@ Local Linux containers give useful feedback; ARM containers do not replace Linux
 
 [Study API](autoforecast/study.py) · [Callback types](autoforecast/study_tuning.py) ·
 [Runnable Python example](scripts/study_example.py)
+
+## License
+
+AutoForecast is licensed under the [Apache License 2.0](LICENSE).

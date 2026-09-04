@@ -7,6 +7,8 @@ name = "autoforecast"
 version = "0.1.0"
 description = "Governed, reproducible time-series forecasting"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 # The optional AutoGluon runtime currently supports through Python 3.13. Keep the project range
 # honest so a lock cannot claim the all-model environment works on a newer interpreter.
 requires-python = ">=3.12,<3.14"
