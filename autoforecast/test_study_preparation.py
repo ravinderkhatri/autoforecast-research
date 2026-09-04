@@ -378,6 +378,40 @@ def test_bound_staged_artifact_that_disappears_blocks_registration(spark, tmp_pa
     assert not list((registry.root / "registrations").glob("*.*"))
 
 
+def test_prepared_change_restored_after_admission_write_blocks_registration(
+    spark, tmp_path, monkeypatch,
+):
+    from pyspark.sql.readwriter import DataFrameWriter
+
+    from autoforecast import study_registration
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    write, listing = DataFrameWriter.parquet, study_registration._staging_directories
+    added = []
+
+    def change_prepared_after_admission(writer, target, *args, **kwargs):
+        # Prepared differs when admitted has just been written from it.
+        write(writer, target, *args, **kwargs)
+        if pathlib.Path(target).name == "admitted" and not added:
+            prepared = next(registry.root.glob("checks/*/admission-staging/prepared"))
+            part = next(prepared.glob("part-*.parquet"))
+            added.append(shutil.copyfile(part, part.with_name("part-99999-added.parquet")))
+
+    def restore_prepared(folder):
+        # ...and is restored before the remaining staged artefacts are listed and checked.
+        if added and added[0].exists():
+            added[0].unlink()
+        return listing(folder)
+
+    monkeypatch.setattr(DataFrameWriter, "parquet", change_prepared_after_admission)
+    monkeypatch.setattr(study_registration, "_staging_directories", restore_prepared)
+    with pytest.raises(ValueError, match="materialization changed before publication"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert added
+    assert not list((registry.root / "registrations").glob("*.*"))
+
+
 def test_evidence_write_failure_and_interrupted_retry_keep_completed_baseline(
     spark, tmp_path, monkeypatch,
 ):

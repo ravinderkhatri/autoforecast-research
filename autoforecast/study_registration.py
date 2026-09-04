@@ -2499,10 +2499,15 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             contract_path.write_bytes(_bytes(value["dataset"]))
         frame.write.parquet(str(root / "admitted"))
         if prepare is not None:
-            # Verify each staged artefact once against its preparation binding, prepared
-            # included. A bound artefact that has since disappeared fails here too.
+            # Check prepared as soon as admitted has been written from it, before anything
+            # else runs, so a change restored afterwards cannot pass. Then verify every
+            # other staged artefact once; a bound artefact that has disappeared fails too.
+            prepared = staging / "prepared"
+            verified = {prepared: _artifact_record(
+                prepared, session, expected=artifact_bindings[prepared])}
             artifact_bindings = {
-                p: _artifact_record(p, session, expected=artifact_bindings.get(p))
+                p: verified[p] if p in verified
+                else _artifact_record(p, session, expected=artifact_bindings.get(p))
                 for p in dict.fromkeys([*_staging_directories(staging), *artifact_bindings])
             }
             admission_identity = {
