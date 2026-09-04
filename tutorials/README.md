@@ -59,14 +59,15 @@ The `snapshot_mode` setting chooses how those inputs are kept:
 | `table+hash` | Separate database captures | Also compare the row content with its recorded hash |
 
 With `hash`, registration also records an identity for each source read. By default
-(`storage.input_identity: rows`) it hashes every row, so the same rows give the same
-study ID however they were written. For Delta sources you can choose
+(`storage.input_identity: rows`) it hashes every source row, so rewriting the same
+rows keeps their source-data hash unchanged. For Delta sources you can choose
 `storage.input_identity: source_version` instead. Each read is then named by its table
-IDs, its pinned Delta versions and its query text, and no rows are hashed, which saves
-the time of hashing large inputs. A committed Delta version never changes, so the same
-read gives the same study ID, provided the query is deterministic. A new table version
-gives a new study ID, even when its rows are unchanged. The saved input files are still
-checked against their file hashes during registration.
+IDs, its pinned Delta versions and its query text. This skips row hashing for the raw
+source captures; the frozen model-stage data is still row-hashed. A committed Delta
+version never changes, so repeating the same read keeps its source identity, provided
+the query is deterministic. A new table version gives a new study ID, even when its
+rows are unchanged. The saved input files are still checked against their file hashes
+during registration.
 
 ```yaml
 storage:
