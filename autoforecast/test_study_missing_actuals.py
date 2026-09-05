@@ -200,7 +200,7 @@ def test_checkpoint_scores_observed_zero_and_requires_complete_forecasts(policy)
     )
     assert window.score(np.array([[2.0, 2.0], [4.0, 4.0]]))["wrmsse"] == pytest.approx(2.4)
     for prediction in (np.array([[2.0, np.nan], [4.0, 4.0]]), np.ones((2, 1))):
-        with pytest.raises(ValueError, match="finite nonnegative grid"):
+        with pytest.raises(ValueError, match="finite grid"):
             window.score(prediction)
 
 

@@ -1114,12 +1114,12 @@ def test_trainer_refusals(revision_data, monkeypatch, fault):
         "block": "factor block",
         "informative": "no informative",
         "loss": "nonfinite training loss",
-        "prediction": "nonfinite or negative",
+        "prediction": "nonfinite",
     }[fault]
     if fault == "loss":
         trainer.training_loss = lambda *args: torch.tensor(float("nan"), requires_grad=True)
     if fault == "prediction":
-        trainer.mean = lambda model, inputs: torch.full((len(inputs["history"]), 28), -1.0)
+        trainer.mean = lambda model, inputs: torch.full((len(inputs["history"]), 28), float("nan"))
         with pytest.raises(ValueError, match=message):
             trainer.predict(features.make_model(), data.cutoff.isoformat())
     else:

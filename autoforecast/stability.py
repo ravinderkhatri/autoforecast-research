@@ -54,7 +54,7 @@ class Stability:
             later origin dropped has no revision, it has a disappearance.
         mean_absolute_revision: Mean `|later - earlier|` in units. Reported because operations
             think in units, but not the number to gate on.
-        mean_relative_revision: Mean `|later - earlier| / max(earlier, 1)`. **The gating number.**
+        mean_relative_revision: Mean `|later - earlier| / max(|earlier|, 1)`. **The gating number.**
             A cell moving 2 to 3 matters more than one moving 200 to 201, and an absolute mean is
             dominated by fast movers -- exactly the cells where a swing is least disruptive.
         p95_relative_revision: The tail. A good mean with a bad tail is a model that is stable
@@ -233,9 +233,9 @@ def measure(
     both = (expected.join(a, ["series_id", "date"], "inner")
             .join(b, ["series_id", "date"], "inner"))
 
-    # Denominator floored at 1 unit: a cell moving from 0.01 to 0.02 is a 100% revision and moves
-    # nothing anybody orders. Flooring keeps the metric about decisions rather than about ratios.
-    rel = F.abs(F.col("_after") - F.col("_before")) / F.greatest(F.col("_before"), F.lit(1.0))
+    # Floor the baseline magnitude at 1 unit so tiny forecasts do not dominate the ratio.
+    rel = F.abs(F.col("_after") - F.col("_before")) / F.greatest(
+        F.abs(F.col("_before")), F.lit(1.0))
     stats = both.select(
         F.abs(F.col("_after") - F.col("_before")).alias("abs"),
         rel.alias("rel"),
@@ -304,9 +304,8 @@ def _validated_forecast_frame(
     value = F.col(value_column)
     if frame.filter(
             value.isNull() | F.isnan(value)
-            | value.isin(float("inf"), float("-inf"))
-            | (value < 0.0)).limit(1).count():
-        raise StabilityError(f"{label} forecast contains a null, non-finite, or negative yhat")
+            | value.isin(float("inf"), float("-inf"))).limit(1).count():
+        raise StabilityError(f"{label} forecast contains a null or non-finite yhat")
 
     try:
         allowed_dates = period_points(

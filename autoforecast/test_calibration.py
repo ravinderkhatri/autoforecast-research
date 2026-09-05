@@ -36,6 +36,7 @@ from autoforecast.calibration import (
 )
 from autoforecast.panel import Forecast
 from autoforecast.stability import Stability, StabilityError, compare, measure
+from provenance.lineage import directory_digest
 
 N_PATHS, N_CELLS, HORIZON = 800, 500, 28
 
@@ -343,6 +344,39 @@ def test_stability_measures_the_exact_registered_overlap() -> None:
     assert abs(out.mean_absolute_revision - 1.5) < 1e-12
 
 
+def test_stability_keeps_signed_forecasts_and_scales_by_baseline_magnitude() -> None:
+    tmp_path = pathlib.Path(tempfile.mkdtemp())
+    earlier = _forecast_artifact(tmp_path, "earlier", "2024-01-01", 5, [
+        ("s1", dt.date(2024, 1, 2), -1.0),
+        ("s1", dt.date(2024, 1, 3), -2.0),
+        ("s1", dt.date(2024, 1, 4), -6.7e-15),
+        ("s1", dt.date(2024, 1, 5), 3.0),
+        ("s1", dt.date(2024, 1, 6), 0.0),
+    ])
+    later = _forecast_artifact(tmp_path, "later", "2024-01-02", 5, [
+        ("s1", dt.date(2024, 1, 3), -3.0),
+        ("s1", dt.date(2024, 1, 4), 0.0),
+        ("s1", dt.date(2024, 1, 5), -3.0),
+        ("s1", dt.date(2024, 1, 6), -1.0),
+        ("s1", dt.date(2024, 1, 7), 9.0),
+    ])
+    overlap, digest = _overlap_artifact(
+        tmp_path, [dt.date(2024, 1, day) for day in range(3, 7)])
+    before = [directory_digest(f.path) for f in (earlier, later)]
+
+    result = measure(earlier, later, spark(), expected_overlap=overlap,
+                     expected_overlap_hash=digest)
+
+    # Shared-cell absolute changes: 1, 6.7e-15, 6, 1.
+    # Relative changes use baseline magnitudes: 1/2, 6.7e-15/1, 6/3, 1/1.
+    assert result.n_shared_cells == 4
+    assert result.mean_absolute_revision == pytest.approx((8 + 6.7e-15) / 4)
+    assert result.mean_relative_revision == pytest.approx((3.5 + 6.7e-15) / 4)
+    assert result.p95_relative_revision == pytest.approx(2.0)
+    assert result.share_moving_over_20pct == pytest.approx(0.75)
+    assert [directory_digest(f.path) for f in (earlier, later)] == before
+
+
 def test_stability_uses_the_declared_period_grid_and_refuses_frequency_mismatch() -> None:
     root = pathlib.Path(tempfile.mkdtemp())
     earlier = _forecast_artifact(root, "weekly-earlier", "2024-01-01", 3, [
@@ -492,11 +526,11 @@ def test_stability_revalidates_duplicate_date_value_and_schema_artifacts() -> No
             ("s1", dt.date(2024, 1, 4), 2.0),
             ("s1", dt.date(2024, 1, 6), 9.0),
         ], "outside"),
-        ("negative", [
+        ("negative_infinity", [
             ("s1", dt.date(2024, 1, 3), 3.0),
-            ("s1", dt.date(2024, 1, 4), -2.0),
+            ("s1", dt.date(2024, 1, 4), float("-inf")),
             ("s1", dt.date(2024, 1, 5), 9.0),
-        ], "non-negative"),
+        ], "finite"),
         ("nan", [
             ("s1", dt.date(2024, 1, 3), 3.0),
             ("s1", dt.date(2024, 1, 4), float("nan")),
