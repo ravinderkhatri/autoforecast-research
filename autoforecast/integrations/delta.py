@@ -8,8 +8,6 @@ as raw Parquet. Files still require the library's supported filesystem semantics
 
 from __future__ import annotations
 
-import hashlib
-import json
 import pathlib
 import tempfile
 from collections.abc import Mapping
@@ -21,20 +19,13 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
 from autoforecast.benchmark import digest, parquet_content_hash
+from autoforecast.study_results import PUBLICATION_SCHEMAS, _publication
 
 SCHEMAS = {
     "studies": "study_id string, study_sha string, definition_json string",
     "frozen_observations": "snapshot_id string, row_json string",
     "study_data_issues": "check_id string, study_id string, issue_json string",
-    "study_results": (
-        "study_id string, study_sha string, run_id string, stage string, model_id string, "
-        "workflow_path string, workflow_sha string, evidence_json string, model_uri string, "
-        "model_sha string, mlflow_uri string, additional_info string"
-    ),
-    "forecasts": (
-        "study_id string, study_sha string, run_id string, stage string, "
-        "series_id string, date string, yhat double"
-    ),
+    **PUBLICATION_SCHEMAS,
 }
 JSON_OPTIONS = {
     "ignoreNullFields": "false", "timeZone": "UTC",
@@ -382,88 +373,40 @@ class DeltaStudyStore:
 
     def publish_results(self, definition, study_sha, workflow_path, *, scratch_root,
                         mlflow_links=None):
-        """Publish one sealed workflow, forecasts first and discovery rows last."""
-        from autoforecast.run_mlflow import (
-            RunMLflowLink,
-            _completed_run_snapshot,
-            _mlflow,
-            _verify_workflow_export,
-        )
-        from autoforecast.study_workflow import load_forecast_workflow
+        """Publish tuning windows and final scores under the same study and run IDs.
 
+        Args:
+            definition: Verified registered study definition.
+            study_sha: Hash of that definition, supplied by the registry.
+            workflow_path: Folder containing a completed model workflow.
+            scratch_root: Folder for temporary, verified copies of run files.
+            mlflow_links: Optional verified links for validation and testing.
+
+        Returns:
+            Publication status and the study, workflow and hash identifiers.
+
+        Existing identical rows are reused on retry. Forecast rows are written
+        first; result rows make the whole run visible to the dashboard afterward.
+        No model is fitted and no score is recalculated here.
+        """
         self.validate_destinations()
-        durable = pathlib.Path(workflow_path).absolute()
-        with _completed_run_snapshot(durable, scratch_root=scratch_root) as (root, completion):
-            workflow = load_forecast_workflow(root)
-            if workflow.testing is None or completion["task"] != "forecast-workflow":
-                raise ValueError("publication requires both completed workflow stages")
-            if (workflow.study_id != definition["study_id"]
-                    or workflow.provenance["study"]["sha256"] != definition["library_sha256"]):
-                raise ValueError("workflow belongs to a different registered study")
-            binding = workflow.provenance.get("registration")
-            if binding is not None:
-                allowed = {(definition["study_id"], study_sha)}
-                if parent := definition.get("parent"):
-                    allowed.add((parent["study_id"], parent["study_sha256"]))
-                if (binding["study_id"], binding["sha256"]) not in allowed:
-                    raise ValueError("workflow registration binding differs from its baseline")
-            manifest_sha = hashlib.sha256(
-                (root / "artifact_manifest.json").read_bytes(),
-            ).hexdigest()
-            if mlflow_links is not None and set(mlflow_links) != {"validation", "test"}:
-                raise ValueError("tracking links must cover both workflow stages")
+        with _publication(definition, study_sha, workflow_path, scratch_root=scratch_root,
+                          mlflow_links=mlflow_links) as publication:
             forecasts = None
-            results = []
-            stages = (("validation", workflow.validation), ("test", workflow.testing))
-            for stage, evidence in stages:
-                link = (mlflow_links or {}).get(stage)
-                if link is not None:
-                    if not isinstance(link, RunMLflowLink):
-                        raise ValueError("tracking links must be verified MLflow run links")
-                    client = _mlflow().tracking.MlflowClient(tracking_uri=link.tracking_uri)
-                    remote = client.get_run(link.run_id)
-                    if any(remote.data.tags.get(key) != value for key, value in {
-                        "autoforecast.manifest_sha256": manifest_sha,
-                        "autoforecast.workflow_id": durable.name,
-                        "autoforecast.stage": stage,
-                        "autoforecast.study_sha256": definition["library_sha256"],
-                    }.items()):
-                        raise ValueError("tracking link belongs to different workflow evidence")
-                    _verify_workflow_export(client, link.run_id, evidence)
-                forecast = evidence["forecasts"]
-                frame = self.spark.read.parquet(forecast.path).select(
-                    F.lit(definition["study_id"]).alias("study_id"),
-                    F.lit(study_sha).alias("study_sha"), F.lit(durable.name).alias("run_id"),
-                    F.lit(stage).alias("stage"), F.col("series_id").cast("string"),
-                    F.col("date").cast("string"), F.col("yhat").cast("double"),
-                )
+            for path, labels in publication["forecasts"]:
+                frame = self.spark.read.parquet(path).select(*[
+                    (F.col(name) if name in {"series_id", "date", "yhat"}
+                     else F.lit(labels[name])).cast(dtype).alias(name)
+                    for name, dtype in (part.strip().split()
+                                        for part in SCHEMAS["forecasts"].split(","))
+                ])
                 forecasts = frame if forecasts is None else forecasts.unionByName(frame)
-                # Keep the exact retained score and its durable paths. The temporary
-                # snapshot is only an authenticated transport, never a returned link.
-                saved = json.loads((root / stage / "result.json").read_bytes())
-                additional = {
-                    "model_format": saved["model_format"],
-                    "evaluation_contract": saved["evaluation_contract"],
-                    "parameters": workflow.parameters, "provenance": workflow.provenance,
-                    "tracking": link.as_record() if link is not None else None,
-                }
-                results.append((
-                    definition["study_id"], study_sha, durable.name, stage, forecast.adapter,
-                    str(durable), manifest_sha, json.dumps(saved["score"], sort_keys=True),
-                    str(durable / stage / "model"), saved["model_sha256"],
-                    f"runs:/{link.run_id}/models" if link is not None else None,
-                    json.dumps(additional, sort_keys=True),
-                ))
-            scope = {"study_id": definition["study_id"], "study_sha": study_sha,
-                     "run_id": durable.name}
-            assert forecasts is not None  # Both validated stages were collected above.
-            self.append_once("forecasts", forecasts, scope=scope)
-            # Atomic two-stage discovery: a retry may reuse an orphan forecast append.
+            assert forecasts is not None  # A full workflow always has both final stages.
+            self.append_once("forecasts", forecasts, scope=publication["scope"])
             self.append_once("study_results", self.spark.createDataFrame(
-                results, SCHEMAS["study_results"],
-            ), scope=scope)
-        return {"status": "published", "study_id": definition["study_id"],
-                "study_sha256": study_sha, "run_id": durable.name, "workflow_sha256": manifest_sha}
+                publication["study_results"], SCHEMAS["study_results"],
+            ), scope=publication["scope"])
+            return publication["status"]
 
     def dashboard_sql(self) -> str:
         """Return a read-only join; view creation remains an explicit caller action."""

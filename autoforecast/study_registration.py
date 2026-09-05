@@ -722,12 +722,13 @@ class StudyRegistry:
         format = "json" if self._registration_path(parent_id).suffix == ".json" else "yaml"
         return self._publish_definition(definition, format=format)
 
-    def publish_results(self, study_id, workflow_path, *, mlflow_links=None):
+    def publish_results(self, study_id, workflow_path, *, destination=None, mlflow_links=None):
         """Publish already checked evidence; retries never fit or rescore."""
-        if self.store is None:
-            raise ValueError("result publication requires a configured Delta registry")
+        writer = destination if destination is not None else self.store
+        if writer is None:
+            raise ValueError("result publication requires a destination or Delta registry")
         definition, sha = self.definition(study_id)
-        return self.store.publish_results(
+        return writer.publish_results(
             definition, sha, workflow_path, scratch_root=self.scratch_root,
             mlflow_links=mlflow_links,
         )

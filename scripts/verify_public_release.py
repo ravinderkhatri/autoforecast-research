@@ -40,6 +40,18 @@ README_IMAGES = {
     "assets/03-parallel-execution.svg",
     "assets/04-run-outputs.svg",
 }
+TUTORIALS = {
+    "tutorials/06-reload-and-reuse.ipynb",
+    "tutorials/09-publish-bigquery.ipynb",
+    "tutorials/03-custom-model.ipynb",
+    "tutorials/05-read-results.ipynb",
+    "tutorials/02-register-data.ipynb",
+    "tutorials/07-publish-delta.ipynb",
+    "tutorials/04-tune-and-backtest.ipynb",
+    "tutorials/08-publish-postgresql.ipynb",
+    "tutorials/01-first-forecast.ipynb",
+}
+
 PRIVATE_PATH = re.compile(r"(^|/)(conversations?|transcripts?|sessions?|chats?)(/|[._-])", re.I)
 ATTRIBUTION = re.compile(
     r"(?im)^\s*(?:co-authored-by|generated-by|assistant-signature|ai-signature)\s*:"
@@ -72,6 +84,8 @@ def tracked_inventory(root: pathlib.Path) -> tuple[set[str], dict]:
         allowed = (
             name in ROOT_FILES
             or name in README_IMAGES
+            or name in TUTORIALS
+            or name == "tutorials/README.md"
             or (path.parts[0] in roots and path.suffix == ".py")
             or (path.parts[0] == "configs" and path.suffix in {".json", ".yaml", ".yml"})
             or (path.parent.as_posix() == ".github/workflows" and path.suffix in {".yaml", ".yml"})
@@ -84,6 +98,18 @@ def tracked_inventory(root: pathlib.Path) -> tuple[set[str], dict]:
             or (root / name).is_symlink()
         ):
             raise ValueError(f"file is outside the public inventory: {name}")
+        if name in TUTORIALS:
+            notebook = json.loads((root / name).read_text())
+            if (
+                notebook.get("nbformat") != 4
+                or not notebook.get("cells")
+                or any(
+                    cell.get("outputs") or cell.get("execution_count") is not None
+                    for cell in notebook["cells"]
+                    if cell["cell_type"] == "code"
+                )
+            ):
+                raise ValueError(f"tutorial must be an unexecuted notebook: {name}")
         if ATTRIBUTION.search((root / name).read_text()):
             raise ValueError(f"conversation or attribution marker in public file: {name}")
     messages = git(root, "log", "--all", "--format=%B").decode()

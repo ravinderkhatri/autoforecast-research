@@ -42,3 +42,14 @@ mlflow.db
 # Keep local Markdown notes out of every commit.
 *.[mM][dD]
 ![rR][eE][aA][dD][mM][eE].[mM][dD]
+
+# Only the maintained teaching notebooks are public.
+!/tutorials/01-first-forecast.ipynb
+!/tutorials/02-register-data.ipynb
+!/tutorials/03-custom-model.ipynb
+!/tutorials/04-tune-and-backtest.ipynb
+!/tutorials/05-read-results.ipynb
+!/tutorials/06-reload-and-reuse.ipynb
+!/tutorials/07-publish-delta.ipynb
+!/tutorials/08-publish-postgresql.ipynb
+!/tutorials/09-publish-bigquery.ipynb

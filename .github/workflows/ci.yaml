@@ -44,6 +44,16 @@ jobs:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, native]
+    services:
+      postgres:
+        image: postgres:18.3
+        env:
+          POSTGRES_PASSWORD: local-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -62,7 +72,7 @@ jobs:
         run: |
           uv lock --check
           uv export --frozen --no-hashes --no-emit-project --group ci \
-            --extra shallow --extra tft --extra custom-torch --extra timesfm3 --output-file "$RUNNER_TEMP/constraints.txt"
+            --extra shallow --extra tft --extra custom-torch --extra timesfm3 --extra postgres --extra bigquery --output-file "$RUNNER_TEMP/constraints.txt"
           uv pip install --system --no-deps --constraint "$RUNNER_TEMP/constraints.txt" \
             torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
@@ -71,7 +81,7 @@ jobs:
           python -m scripts.verify_public_release --wheel "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl"
           uv pip install --system --constraint "$RUNNER_TEMP/constraints.txt" \
             --build-constraints "$RUNNER_TEMP/constraints.txt" \
-            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[shallow,tft,custom-torch,timesfm3]"
+            "$RUNNER_TEMP/wheels/autoforecast-0.1.0-py3-none-any.whl[shallow,tft,custom-torch,timesfm3,postgres,bigquery]"
           uv pip check --system
           python - <<'PY'
           import importlib.metadata
@@ -87,6 +97,7 @@ jobs:
         env:
           # Tiny test jobs exchange paths, not training data, through Ray's object store.
           # Preserve enough schedulable memory for two 2 GiB model workers.
+          AUTOFORECAST_TEST_POSTGRES_DSN: postgresql://postgres:local-ci-only@localhost:5432/postgres
           RAY_DEFAULT_OBJECT_STORE_MAX_MEMORY_BYTES: '134217728'
           FORECAST_SPARK_CORES: '2'
           FORECAST_SPARK_MEMORY: '1g'

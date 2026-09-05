@@ -30,6 +30,8 @@ dependencies = [
 autoforecast = "autoforecast.cli:main"
 
 [project.optional-dependencies]
+postgres = ["psycopg[binary]==3.3.6"]
+bigquery = ["google-cloud-bigquery==3.47.0"]
 # Convenience extra combines the existing model families without duplicating their requirements.
 # Standalone TimesFM 2.5 needs a second environment because it conflicts with TimesFM 3.
 all-models = ["autoforecast[shallow,custom-torch,tft,autogluon-zoo,timesfm3]"]

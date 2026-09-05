@@ -587,20 +587,23 @@ def test_direct_registered_derived_id_can_publish(store, tmp_path, monkeypatch):
     assert second.publication["status"] == "published"
     import dataclasses
 
-    from autoforecast import study_workflow
+    from autoforecast import study_results
 
-    load = study_workflow.load_forecast_workflow
+    load = study_results.load_forecast_workflow
     for field in ("study_id", "sha256"):
-        def wrong_binding(path, field=field):
+        invoked = []
+        def wrong_binding(path, field=field, invoked=invoked):
+            invoked.append(path)
             workflow = load(path)
             binding = {**workflow.provenance["registration"], field: "wrong"}
             return dataclasses.replace(workflow, provenance={**workflow.provenance,
                                                             "registration": binding})
 
         with monkeypatch.context() as patch:
-            patch.setattr(study_workflow, "load_forecast_workflow", wrong_binding)
+            patch.setattr(study_results, "load_forecast_workflow", wrong_binding)
             with pytest.raises(ValueError, match="registration binding differs"):
                 registry.publish_results(second.study_id, second.path)
+            assert invoked
     manifest = pathlib.Path(first.provenance["study"]["path"])
     external = tmp_path / "external" / manifest.parent.name
     shutil.copytree(manifest.parent, external)
@@ -809,3 +812,224 @@ def test_issue_link_conflict_or_write_failure_never_publishes_registration(
             store.link_issues(check_id, linked_id)
     store.link_issues(check_id, linked_id)
     assert store.read("study_data_issues", {"check_id": check_id})[0].first().study_id == linked_id
+
+
+def test_publish_cross_validation_windows_with_final_stages_and_retry(store, tmp_path, monkeypatch):
+    """Two trials share three windows, one study and one parent workflow in Delta."""
+    import copy
+    import dataclasses
+    import pathlib
+    from collections import Counter
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import yaml
+
+    from autoforecast import register_study, run_study, study_results, study_scoring, study_tuning
+    from autoforecast.study_registration import StudyRegistry
+    from autoforecast.test_study_registration import configuration
+    from autoforecast.test_study_tuning import config, implementation, predict
+
+    path = configuration(tmp_path)
+    settings = yaml.safe_load(path.read_text())
+    settings['recipe']['tuning_windows'] = [
+        {'origin': f'2024-01-0{day}', 'horizon': 2 if day < 4 else 1} for day in (2, 3, 4)
+    ]
+    path.write_text(yaml.safe_dump(settings))
+    registry = StudyRegistry(tmp_path / 'registry', spark=store.spark, namespace=store.namespace)
+    study_id = register_study(path, registry=registry)
+    profile = config(tmp_path, budget=2)
+    options = yaml.safe_load(profile.read_text())
+    options['selection'] = {'stage': 'tuning', 'origins': 'all', 'aggregation': 'mean'}
+    profile.write_text(yaml.safe_dump(options))
+    calls = []
+
+    def model(request):
+        calls.append((request.purpose, request.origin))
+        output = predict(request)
+        part = pathlib.Path(output.forecasts.path) / 'part.parquet'
+        table = pq.read_table(part)
+        table = table.set_column(table.schema.get_field_index('yhat'), 'yhat',
+                                 pa.array([-(request.model_parameters['level'] + 2.5 + i) if i % 2
+                                           else -(request.model_parameters['level'] + 1) * 1e-12
+                                           for i in range(table.num_rows)]))
+        pq.write_table(table, part)
+        return output
+
+    workflow = run_study(study_id, model, registry=registry, model_config=profile,
+                         implementation=implementation(), tracking='none', publish=False)
+    assert len(calls) == 8  # Two trials * three windows, validation, then refit.
+    windows, _, _, _ = study_results._search_windows(workflow.tuning_path)
+    assert len(windows) == 6
+    first_windows = [pq.read_table(window['forecasts'].path).to_pylist()
+                     for window, trial in windows if trial['window'] == 0]
+    assert first_windows[0] != first_windows[1]  # A trial-path swap must be observable.
+    monkeypatch.setattr(study_scoring, 'score_study', lambda *a, **k: pytest.fail('rescored'))
+    monkeypatch.setattr(study_tuning, 'score_study', lambda *a, **k: pytest.fail('rescored'))
+
+    # A valid search for another model must not be attached to this workflow.
+    read_search = study_results._search_windows
+
+    def wrong_model(path):
+        frames, runs, info, sha = read_search(path)
+        info = copy.deepcopy(info)
+        info['provenance']['model_id'] = 'another-model'
+        return frames, runs, info, sha
+
+    with monkeypatch.context() as patch:
+        patch.setattr(study_results, '_search_windows', wrong_model)
+        with pytest.raises(ValueError, match='different workflow configuration'):
+            registry.publish_results(study_id, workflow.path)
+
+    # Changing verified parameters cannot be hidden by a later read of the winner file.
+    load_selected = study_results.load_tuning_result
+
+    def changed_selected(path):
+        selected = load_selected(path)
+        return dataclasses.replace(selected, parameters={'model.level': 999})
+
+    with monkeypatch.context() as patch:
+        patch.setattr(study_results, 'load_tuning_result', changed_selected)
+        with pytest.raises(ValueError, match='different workflow configuration'):
+            registry.publish_results(study_id, workflow.path)
+
+    for duplicate in (True, False):
+        def repeated_or_relocated(path, duplicate=duplicate):
+            frames, runs, info, sha = read_search(path)
+            if duplicate:
+                frames = [*frames, frames[0]]
+            else:
+                frame, trial = frames[0]
+                frames[0] = (frame, {**trial, 'path': str(path / 'copied-attempt')})
+            return frames, runs, info, sha
+
+        with monkeypatch.context() as patch:
+            patch.setattr(study_results, '_search_windows', repeated_or_relocated)
+            with pytest.raises(ValueError, match='duplicate tuning window|mismatched attempt path'):
+                registry.publish_results(study_id, workflow.path)
+
+    # A changed search between the first check and publication must also stop the write.
+    reads = 0
+
+    def changed_search(path):
+        nonlocal reads
+        frames, runs, info, sha = read_search(path)
+        reads += 1
+        return frames, runs, info, sha if reads == 1 else 'changed'
+
+    with monkeypatch.context() as patch:
+        patch.setattr(study_results, '_search_windows', changed_search)
+        with pytest.raises(ValueError, match='changed during publication'):
+            registry.publish_results(study_id, workflow.path)
+    assert store.read('forecasts', {'study_id': study_id})[0].count() == 0
+
+    # A partial publication can be retried without repeating any fit or score.
+    append = registry.store.append_once
+
+    def interrupt_results(kind, frame, *, scope):
+        if kind == 'study_results':
+            raise OSError('after forecast append')
+        # Mutate the original after collection: lazy Spark reads must use the checked copy.
+        part = next(pathlib.Path(windows[0][0]['forecasts'].path).rglob('*.parquet'))
+        original = part.read_bytes()
+        try:
+            part.write_bytes(b'changed after snapshot')
+            return append(kind, frame, scope=scope)
+        finally:
+            part.write_bytes(original)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(registry.store, 'append_once', interrupt_results)
+        with pytest.raises(OSError, match='after forecast append'):
+            registry.publish_results(study_id, workflow.path)
+    assert store.read('forecasts', {'study_id': study_id})[0].count() == 28
+    assert store.read('study_results', {'study_id': study_id})[0].count() == 0
+    for _ in range(2):
+        assert registry.publish_results(study_id, workflow.path)['status'] == 'published'
+    rows = store.read('study_results', {'study_id': study_id})[0].collect()
+    forecasts = store.read('forecasts', {'study_id': study_id})[0]
+    assert len(rows) == 8 and forecasts.count() == 28 and len(calls) == 8
+    definition, sha = registry.definition(study_id)
+    assert all(row.study_sha == sha and row.run_id == workflow.run_id for row in rows)
+    assert store.spark.sql(store.dashboard_sql()).count() == 8
+    expected = {(trial['trial_id'], trial['attempt_id'], trial['window']): window
+                for window, trial in windows}
+    chosen_windows = 0
+    for row in rows:
+        info = json.loads(row.additional_info)
+        if row.stage != 'tuning':
+            assert row.stage in {'validation', 'test'}
+            assert (row.search_id, row.trial_id, row.attempt_id, row.window_index) == (None,) * 4
+            assert row.horizon == 2
+            evidence = workflow.validation if row.stage == 'validation' else workflow.testing
+            assert json.loads(row.evidence_json) == evidence['score']
+            actual = forecasts.filter(F.col('stage') == row.stage).collect()
+            assert Counter((value.series_id, value.date, value.yhat)
+                           for value in actual) == Counter(
+                (value['series_id'], str(value['date']), value['yhat'])
+                for value in pq.read_table(evidence['forecasts'].path).to_pylist()
+            )
+            continue
+        assert row.search_id == workflow.tuning_path.name
+        window = expected[(row.trial_id, row.attempt_id, row.window_index)]
+        assert row.origin == window['forecasts'].origin
+        assert row.horizon == window['forecasts'].horizon
+        assert json.loads(row.evidence_json) == window['score']
+        assert row.model_sha == window['model_sha256']
+        assert row.model_uri == str(window['model_artifacts'])
+        assert info['trial_status'] == 'completed'
+        assert info['parameters'] and len(info['search_sha']) == 64
+        assert row.mlflow_uri is None  # No invented tracking links for trial fits.
+        chosen_windows += info['selected']
+        matching = forecasts.filter(
+            (F.col('stage') == 'tuning') & (F.col('run_id') == row.run_id)
+            & (F.col('search_id') == row.search_id) & (F.col('trial_id') == row.trial_id)
+            & (F.col('attempt_id') == row.attempt_id) & (F.col('window_index') == row.window_index)
+            & (F.col('study_sha') == row.study_sha)
+        )
+        expected_values = Counter((value['series_id'], str(value['date']), value['yhat'])
+                                  for value in pq.read_table(window['forecasts'].path).to_pylist())
+        assert Counter((value.series_id, value.date, value.yhat)
+                       for value in matching.collect()) == expected_values
+    assert chosen_windows == 3
+    analysis = study_results.read_workflow_results(workflow.path)
+    assert Counter((row['series_id'], str(row['target_date']), row['prediction'])
+                   for row in analysis.rows.to_pylist()) == Counter(
+        (row.series_id, row.date, row.yhat) for row in forecasts.collect()
+    )
+
+    # Changing retained CV evidence must fail even after an earlier successful publish.
+    model_file = next((windows[0][0]['model_artifacts']).glob('*.json'))
+    model_file.write_text('changed')
+    with pytest.raises(ValueError, match='artifact|manifest|changed'):
+        registry.publish_results(study_id, workflow.path)
+    assert store.read('study_results', {'study_id': study_id})[0].count() == 8
+    assert store.read('forecasts', {'study_id': study_id})[0].count() == 28
+
+
+def test_explicit_result_destination_overrides_delta_store(store, tmp_path, monkeypatch):
+    from autoforecast.study_registration import StudyRegistry, register_study
+    from autoforecast.test_study_registration import configuration
+
+    registry = StudyRegistry(tmp_path / "registry", spark=store.spark, namespace=store.namespace)
+    study_id = register_study(configuration(tmp_path), registry=registry)
+    definition, sha = registry.definition(study_id)
+    calls = []
+
+    class Destination:
+        def publish_results(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return {"status": "destination-selected"}
+
+    monkeypatch.setattr(registry.store, "publish_results",
+                        lambda *a, **k: pytest.fail("wrong writer"))
+    path = tmp_path / "workflow"
+    links = {"validation": object(), "test": object()}
+    assert registry.publish_results(
+        study_id, path, destination=Destination(), mlflow_links=links,
+    ) == {
+        "status": "destination-selected",
+    }
+    assert calls == [((definition, sha, path), {"scratch_root": registry.scratch_root,
+                                              "mlflow_links": links})]
+    assert registry.definition(study_id) == (definition, sha)

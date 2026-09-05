@@ -135,6 +135,10 @@ def test_public_inventory_accepts_root_readme(clean_wheel, tmp_path):
 
 def test_readme_diagrams_are_present_valid_and_approved():
     images = set(re.findall(r"!\[[^\]]*\]\(([^)]+)\)", (ROOT / "README.md").read_text()))
+    guide = (ROOT / "tutorials/README.md").read_text()
+    images.update(name.removeprefix("../") for name in re.findall(
+        r"!\[[^\]]*\]\(([^)]+)\)", guide,
+    ))
     assert images == README_IMAGES == APPROVED_README_IMAGES
     for name in images:
         assert pathlib.PurePosixPath(name).suffix == ".svg"
@@ -366,6 +370,68 @@ def test_standard_dependencies_have_no_compatibility_only_extras():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     extras = project["optional-dependencies"]
     assert set(extras) == {"all-models", "data", "custom-torch", "shallow", "tft",
-                           "autogluon-zoo", "timesfm", "timesfm3"}
+                           "autogluon-zoo", "timesfm", "timesfm3", "postgres", "bigquery"}
     core = {value.split("==")[0] for value in project["dependencies"]}
     assert {"pyspark", "pyarrow", "statsforecast", "optuna", "ray[tune]", "mlflow-skinny"} <= core
+
+
+def test_public_inventory_accepts_only_clean_teaching_notebooks(clean_wheel, tmp_path):
+    import json
+
+    from scripts.verify_public_release import TUTORIALS
+
+    original, _ = clean_wheel
+    root = tmp_path / "repo"
+    shutil.copytree(original, root)
+    for name in TUTORIALS | {"tutorials/README.md"}:
+        path = root / name
+        path.parent.mkdir(exist_ok=True)
+        shutil.copyfile(ROOT / name, path)
+        command(root, "git", "add", name)
+    assert TUTORIALS <= tracked_inventory(root)[0]
+    path = root / sorted(TUTORIALS)[0]
+    notebook = json.loads(path.read_text())
+    import copy
+
+    for mutation in ("outputs", "count", "format", "empty"):
+        changed = copy.deepcopy(notebook)
+        code = next(cell for cell in changed["cells"] if cell["cell_type"] == "code")
+        if mutation == "outputs":
+            code["outputs"] = [{"output_type": "stream", "name": "stdout", "text": "private"}]
+        elif mutation == "count":
+            code["execution_count"] = 1
+        elif mutation == "format":
+            changed["nbformat"] = 3
+        else:
+            changed["cells"] = []
+        path.write_text(json.dumps(changed))
+        with pytest.raises(ValueError, match="unexecuted notebook"):
+            tracked_inventory(root)
+        shutil.copyfile(ROOT / path.relative_to(root), path)
+    unapproved = root / "tutorials/scratch.ipynb"
+    unapproved.write_text(path.read_text())
+    command(root, "git", "add", str(unapproved.relative_to(root)))
+    with pytest.raises(ValueError, match="public inventory"):
+        tracked_inventory(root)
+
+
+def test_tutorials_explain_each_step_before_clean_code():
+    import ast
+    import json
+
+    from scripts.verify_public_release import TUTORIALS
+
+    for name in TUTORIALS:
+        notebook = json.loads((ROOT / name).read_text())
+        cells = notebook["cells"]
+        assert "## Objective" in "".join(cells[0]["source"]), name
+        for index, cell in enumerate(cells):
+            if cell["cell_type"] == "code":
+                assert index and cells[index - 1]["cell_type"] == "markdown", name
+                assert "Step" in "".join(cells[index - 1]["source"]), name
+                assert index + 1 < len(cells) and cells[index + 1]["cell_type"] == "markdown", name
+                assert "Understand the output" in "".join(cells[index + 1]["source"]), name
+                source = "".join(cell["source"])
+                assert any(line.lstrip().startswith("#") for line in source.splitlines()), name
+                assert cell["execution_count"] is None and cell["outputs"] == [], name
+                ast.parse(source)
