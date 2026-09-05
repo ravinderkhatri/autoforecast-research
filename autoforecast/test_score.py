@@ -339,37 +339,23 @@ def test_score_refuses_raw_sums_no_residual_vector_can_have() -> None:
         raise AssertionError(f"accepted impossible score sufficient statistics: {case}")
 
 
-def test_score_refuses_raw_sums_that_imply_negative_forecasts() -> None:
-    """Residual norms can agree while the implied non-negative forecast domain does not."""
-    try:
-        Score(
-            n_scored=1, n_dropped_ineligible=0, n_dropped_no_data=0, n_zero_filled=0,
-            mae=2.0, rmse=2.0, bias=-2.0, bias_pct_of_volume=-2.0, mase=None,
-            sum_abs_error=2.0, sum_squared_error=4.0, sum_error=-2.0, sum_actual=1.0,
-            sum_naive_abs_error=0.0,
-        )
-    except ValueError as exc:
-        assert "negative total forecast" in str(exc)
-        return
-    raise AssertionError("accepted raw sums whose implied total forecast is negative")
+def test_negative_forecast_scores_and_raw_sums_remain_replayable() -> None:
+    cells = [C("s", "p", str(i), f, a) for i, (f, a) in
+             enumerate(zip([-2., 1., 3.], [0., 1., 2.], strict=True))]
+    result = score(cells)
+    assert result.mae == 1.0
+    assert result.rmse == math.sqrt(5 / 3)
+    assert result.sum_error == -1.0 and result.sum_actual == 3.0
+    assert [c.forecast for c in cells] == [-2., 1., 3.]
+    negative = score([C("s", "p", "d", -1., 1.)])
+    assert negative.sum_actual + negative.sum_error == -1.0
+    assert Score.combine([negative, negative]).bias == -2.0
 
 
-def test_negative_implied_forecast_tolerance_does_not_scale_with_estate_volume() -> None:
-    """A relative tolerance must not turn 1e-12 of a huge volume into negative demand."""
-    actual = 1e15
-    error = -1e15 - 100.0
-    try:
-        Score(
-            n_scored=1, n_dropped_ineligible=0, n_dropped_no_data=0, n_zero_filled=0,
-            mae=abs(error), rmse=abs(error), bias=error,
-            bias_pct_of_volume=error / actual, mase=1.0,
-            sum_abs_error=abs(error), sum_squared_error=error * error,
-            sum_error=error, sum_actual=actual, sum_naive_abs_error=abs(error),
-        )
-    except ValueError as exc:
-        assert "negative total forecast" in str(exc)
-        return
-    raise AssertionError("accepted an implied -100 forecast behind a large-volume tolerance")
+def test_negative_prediction_survives_large_volume_arithmetic() -> None:
+    result = score([C("s", "p", "d", -100., 1e15)])
+    assert result.sum_actual + result.sum_error == -100.0
+    assert result.mae == 1e15 + 100
 
 
 def test_zero_cell_score_cannot_claim_metrics_without_raw_evidence() -> None:

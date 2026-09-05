@@ -91,6 +91,7 @@ class Study:
     _spark: SparkSession = dataclasses.field(repr=False, compare=False)
     _snapshots: tempfile.TemporaryDirectory = dataclasses.field(repr=False, compare=False)
     _registration: bytes | None = dataclasses.field(default=None, repr=False)
+    _implementation_scope: bytes | None = dataclasses.field(default=None, repr=False)
     _closed: bool = dataclasses.field(default=False, init=False, repr=False, compare=False)
 
     def __enter__(self) -> Study:
@@ -264,7 +265,7 @@ class Study:
 
     def tune(
         self, *, fit_predict: Callable[[FitPredictRequest], FitPredictResult],
-        config: str | pathlib.Path, implementation: Mapping[str, object],
+        config: str | pathlib.Path, implementation: Mapping[str, object] | None = None,
         tuning_origin: str | None = None, output_dir: str | pathlib.Path | None = None,
         reuse_tuning: str | pathlib.Path | None = None,
     ) -> TuningResult:
@@ -298,7 +299,8 @@ class Study:
 
     def run_forecast_workflow(
         self, *, fit_predict: Callable[[FitPredictRequest], FitPredictResult],
-        implementation: Mapping[str, object], config: str | pathlib.Path | None = None,
+        implementation: Mapping[str, object] | None = None,
+        config: str | pathlib.Path | None = None,
         tuning_origin: str | None = None, output_dir: str | pathlib.Path | None = None,
         reuse_tuning: str | pathlib.Path | None = None,
         selected_config: str | pathlib.Path | None = None,

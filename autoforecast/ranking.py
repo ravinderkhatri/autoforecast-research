@@ -775,9 +775,9 @@ def _validated_source_frame(forecast: Forecast, spark: SparkSession) -> DataFram
             F.col("yhat").isNull()
             | F.isnan("yhat")
             | (F.abs("yhat") == float("inf"))
-            | (F.col("yhat") < 0)).limit(1).count():
+            ).limit(1).count():
         raise SelectionError(
-            f"{forecast.adapter}/{forecast.origin}: yhat must be finite and non-negative")
+            f"{forecast.adapter}/{forecast.origin}: yhat must be finite")
     if (source.groupBy("_series_key", "date").count()
             .filter(F.col("count") != 1).limit(1).count()):
         raise SelectionError(

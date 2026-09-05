@@ -168,12 +168,9 @@ def forecast_with(
                        labelled.groupBy("_bucket").count().collect()}
         total_series = grid.select("series_id").distinct().count()
 
-        # Negative predictions are not demand. AutoETS produces them on near-zero series;
-        # clipping is a property of the TARGET (units sold cannot be negative), not a fudge of
-        # the model.
         (labelled.filter(F.col("_bucket") == EMITTED)
          .select("series_id", "date",
-                 F.greatest(F.col("_yhat"), F.lit(0.0)).alias("yhat"))
+                 F.col("_yhat").alias("yhat"))
          .write.mode("overwrite").parquet(str(out_dir)))
 
         return Forecast(adapter=model, path=str(out_dir), origin=origin, horizon=horizon,

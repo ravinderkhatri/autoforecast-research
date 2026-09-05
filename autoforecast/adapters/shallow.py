@@ -22,7 +22,6 @@ import gc
 import pathlib
 
 import lightgbm as lgb
-import numpy as np
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
@@ -427,7 +426,7 @@ def _predict(
     x = usable[list(FEATURES)].astype("float32")
     yhat = occurrence.predict(x) * size.predict(x)
     out = usable[["series_id", "date"]].copy()
-    out["yhat"] = np.maximum(yhat, 0.0)
+    out["yhat"] = yhat
 
     disposition = {EMITTED: int(len(out))}
     declined = int(len(grid) - len(out))

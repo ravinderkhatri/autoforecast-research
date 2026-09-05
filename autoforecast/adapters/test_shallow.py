@@ -172,7 +172,7 @@ def test_training_is_reproducible_when_the_input_layout_changes() -> None:
             "on row order and a gate result cannot be reproduced")
 
 
-def test_no_emitted_forecast_is_negative() -> None:
+def test_hurdle_model_emits_nonnegative_values_from_its_positive_parameterization() -> None:
     _, out = run()
     assert out.filter(F.col("yhat") < 0).count() == 0
 
@@ -213,3 +213,28 @@ def test_daily_adapter_refuses_weekly_panel_before_runtime_io() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+def test_shallow_export_keeps_model_product_unchanged(tmp_path):
+    import datetime as dt
+
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    from autoforecast.adapters.shallow import FEATURES, _predict
+
+    class Predictor:
+        def __init__(self, values):
+            self.values = values
+
+        def predict(self, frame):
+            return np.array(self.values)
+    features = spark().createDataFrame([
+        {**dict.fromkeys(FEATURES, 1.0), "series_id": "a", "date": dt.date(2024, 1, day)}
+        for day in (2, 3)
+    ])
+    result = _predict((Predictor([1., 1.]), Predictor([-2., -6.7e-15])), features,
+                      Panel(tmp_path, "id", "date", "qty"), "2024-01-01", 2,
+                      tmp_path / "forecast", spark())
+    rows = sorted(pq.read_table(result.path).to_pylist(), key=lambda row: row["date"])
+    assert [row["yhat"] for row in rows] == [-2., -6.7e-15]

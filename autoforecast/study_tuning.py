@@ -40,7 +40,13 @@ from autoforecast.frequency import (
 )
 from autoforecast.hpo import HPOError, HPOStudySpec, TrialOutcome, TrialRequest, run_hpo_study
 from autoforecast.hpo_bridge import _copy_run_artifact_directory
+from autoforecast.implementation import (
+    CapturedImplementation,
+    resolve_implementation,
+    verify_retained,
+)
 from autoforecast.panel import Forecast, Panel
+from autoforecast.project import library_revision
 from autoforecast.study_horizon_metrics import (
     ForecastAccuracyBreakdown,
     validate_forecast_accuracy_breakdown,
@@ -425,6 +431,7 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
     }:
         raise HPOError("selected attempt is not a supported external-model trial")
     context = evidence["context"]
+    verify_retained(attempt, context["implementation"], context.get("implementation_evidence"))
     if hashlib.sha256(_json_bytes(context)).hexdigest() != selection["comparability_fingerprint"]:
         raise HPOError("external selection context differs from its frozen identity")
     profile = _retained_bytes(attempt, "metadata/external-profile.yaml", manifest)
@@ -596,9 +603,12 @@ def _fit_window(
     purpose: str = "selection",
     run_id: str | None = None,
     trial_id: str | None = None,
+    implementation_capture: CapturedImplementation | None = None,
 ) -> dict:
     if purpose not in {"selection", "validation", "refit"}:
         raise ValueError("unknown fitting purpose")
+    if implementation_capture is not None:
+        implementation_capture.verify()
     context = inputs.verify()
     panel = inputs.panel
     origin, horizon = context["origin"], context["horizon"]
@@ -634,6 +644,8 @@ def _fit_window(
             with suppress(Exception):
                 _retain_callback_artifacts(work, output)
             raise
+        if implementation_capture is not None:
+            implementation_capture.verify()
         with _stage(output / "events.jsonl", "artifact_retention", model_id=model_id,
                     origin=origin, run_id=run_id, trial_id=trial_id):
             extras = _retain_callback_artifacts(work, output)
@@ -690,6 +702,8 @@ def _fit_window(
         )
         outcome.update(_scoring_outcome(score))
     inputs.verify()
+    if implementation_capture is not None:
+        implementation_capture.verify()
     record = {
         **extras,
         "boundary": fixed["boundary"],
@@ -718,10 +732,13 @@ class _ExternalTrialBridge:
     context_bytes: bytes
     profile_bytes: bytes
     report_bytes: bytes
+    implementation_capture: CapturedImplementation | None = None
 
     def __call__(self, request: TrialRequest) -> TrialOutcome:
         context = json.loads(self.context_bytes)
         records = []
+        if self.implementation_capture is not None:
+            self.implementation_capture.retain(request.attempt.path)
         request.attempt.write_bytes("metadata/external-profile.yaml", self.profile_bytes)
         request.attempt.write_bytes("metadata/preflight.json", self.report_bytes)
         def retain_evidence():
@@ -762,6 +779,7 @@ class _ExternalTrialBridge:
                     metrics=context["options"]["metrics"],
                     breakdown=context["options"]["breakdown"],
                     run_id=request.study.id, trial_id=request.trial_id,
+                    implementation_capture=self.implementation_capture,
                 )
                 value = record["score"].get(context["metric"])
                 if type(value) not in (int, float) or not math.isfinite(value):
@@ -849,7 +867,7 @@ def tune_study(
     *,
     fit_predict: Callable[[FitPredictRequest], FitPredictResult],
     config: str | pathlib.Path,
-    implementation: Mapping[str, object],
+    implementation: Mapping[str, object] | None = None,
     tuning_origin: str | None = None,
     output_dir: str | pathlib.Path | None = None,
     reuse_tuning: str | pathlib.Path | None = None,
@@ -861,8 +879,18 @@ def tune_study(
         raise TypeError("fit_predict must be a Python callable")
     if tuning_origin is not None and (type(tuning_origin) is not str or not tuning_origin.strip()):
         raise ValueError("tuning_origin must be a nonblank frozen origin string")
-    implementation_record = _implementation_record(implementation)
+    implementation_record = (
+        _implementation_record(implementation) if implementation is not None else None
+    )
     raw, tuning, budget, seed, controls = _config(pathlib.Path(config))
+    scope_bytes = getattr(study, "_implementation_scope", None) if implementation is None else None
+    implementation = resolve_implementation(
+        implementation, json.loads(scope_bytes) if scope_bytes else None,
+        fit_predict, tuning.model_id,
+    )
+    if implementation_record is None:
+        implementation_record = _implementation_record(implementation)
+    capture = implementation if isinstance(implementation, CapturedImplementation) else None
     options = _resolve_options(study, controls, tuning_origin)
     root = _output_root(study, output_dir, "study-tuning")
     preflight = preflight_study(study, options, output_dir=root / "preflight")
@@ -911,6 +939,7 @@ def tune_study(
         first = contexts[0]
         context = {
             "schema": "autoforecast.external-tuning.v2",
+            "library": library_revision(),
             "study": first["evaluation_contract"]["study"],
             "study_id": record["study_id"],
             "model_id": tuning.model_id,
@@ -925,6 +954,9 @@ def tune_study(
             "backend": "optuna",
             **first,
         }
+        context["implementation_evidence"] = (
+            capture.binding if capture is not None else {"mode": "declared"}
+        )
         context_bytes = _json_bytes(context)
         frequency = study.panel.frequency
         test_dates = tuple(
@@ -971,7 +1003,8 @@ def tune_study(
             source_sha256=tuning.source_sha256,
         )
         bridge = _ExternalTrialBridge(
-            study._spark, fit_predict, inputs, context_bytes, raw, _json_bytes(preflight.report)
+            study._spark, fit_predict, inputs, context_bytes, raw, _json_bytes(preflight.report),
+            capture,
         )
         search_path = root / "studies" / identifier
         try:

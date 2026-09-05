@@ -50,7 +50,6 @@ CONTEXT_DAYS = TIMESFM_2P5_CONTEXT_DAYS
 BATCH_SIZE = TIMESFM_2P5_BATCH_SIZE
 
 EMITTED = "emitted"
-EMITTED_CLIPPED = "emitted_clipped_negative"
 DECLINED_ALL_UNOBSERVED = "declined_all_unobserved"
 
 _OUTPUT_SCHEMA = pa.schema([
@@ -457,18 +456,14 @@ def _write_batch(
     origin: dt.date,
     horizon: int,
     statistic: str,
-) -> tuple[int, int]:
+) -> int:
     ids: list[str] = []
     dates: list[dt.date] = []
     values: list[float] = []
     labels: list[str] = []
-    clipped = 0
     for sid, forecast in zip(series_ids, forecasts, strict=True):
         for step in range(horizon):
             value = forecast[step]
-            if value < 0.0:
-                value = 0.0
-                clipped += 1
             ids.append(sid)
             dates.append(origin + dt.timedelta(days=step + 1))
             values.append(value)
@@ -479,7 +474,7 @@ def _write_batch(
         pa.array(values, type=pa.float64()),
         pa.array(labels, type=pa.string()),
     ], schema=_OUTPUT_SCHEMA))
-    return len(values) - clipped, clipped
+    return len(values)
 
 
 def fit_predict(
@@ -574,14 +569,13 @@ def fit_predict(
         dir=target.parent, prefix=f".{target.name}.timesfm."))
     writer = pq.ParquetWriter(temporary / "part-00000.parquet", _OUTPUT_SCHEMA)
     emitted = 0
-    clipped = 0
     declined_series = 0
     seen: set[str] = set()
     batch_ids: list[str] = []
     batch_contexts: list[tuple[float, ...]] = []
 
     def flush() -> None:
-        nonlocal emitted, clipped, provider
+        nonlocal emitted, provider
         if not batch_ids:
             return
         if provider is None:
@@ -598,10 +592,8 @@ def fit_predict(
             horizon=horizon,
             statistic=forecast_statistic,
         )
-        ordinary, clipped_now = _write_batch(
+        emitted += _write_batch(
             writer, batch_ids, selected, origin_day, horizon, forecast_statistic)
-        emitted += ordinary
-        clipped += clipped_now
         batch_ids.clear()
         batch_contexts.clear()
 
@@ -631,8 +623,6 @@ def fit_predict(
     disposition: dict[str, int] = {}
     if emitted:
         disposition[EMITTED] = emitted
-    if clipped:
-        disposition[EMITTED_CLIPPED] = clipped
     if declined_series:
         disposition[DECLINED_ALL_UNOBSERVED] = declined_series * horizon
     return Forecast(

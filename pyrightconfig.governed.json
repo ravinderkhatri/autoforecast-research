@@ -2,6 +2,7 @@
   "extends": "./pyrightconfig.json",
   "include": [
     "autoforecast/adapter_contracts.py",
+    "autoforecast/implementation.py",
     "autoforecast/benchmark.py",
     "autoforecast/study.py",
     "autoforecast/study_tuning.py",

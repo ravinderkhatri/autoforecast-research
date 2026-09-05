@@ -193,13 +193,11 @@ def test_croston_is_flat_across_the_horizon_which_is_what_croston_is() -> None:
     assert spread < 1e-6, f"Croston varied by {spread} across the horizon"
 
 
-def test_no_emitted_forecast_is_negative() -> None:
-    """Units sold cannot be negative. AutoETS produces negative point forecasts on near-zero
-    series, and a negative demand forecast is not a small error -- it is a nonsense the metric
-    would happily average."""
+def test_emitted_forecasts_are_finite() -> None:
+    """Prediction sign is unrestricted; every emitted value must remain finite."""
     for model in sorted(MODELS):
         _, out = run(model, path=small_store() if model == "auto_ets" else STORE)
-        assert out.filter(F.col("yhat") < 0).count() == 0, f"{model} emitted a negative forecast"
+        assert out.filter(F.isnan("yhat") | (F.abs("yhat") == float("inf"))).count() == 0
 
 
 def test_auto_ets_runs_on_real_intermittent_series() -> None:
@@ -350,3 +348,31 @@ def test_a_missing_executor_interpreter_is_named_rather_than_left_to_spark() -> 
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+def test_classical_adapter_preserves_provider_negative_values(tmp_path, monkeypatch):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "panel.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"id": "a", "date": dt.date(2024, 1, day), "qty": float(day)}
+        for day in range(1, 4)
+    ]), path)
+    class Provider:
+        def __init__(self, **kwargs):
+            pass
+
+        def forecast(self, *, h, df):
+            return spark().createDataFrame([
+                ("a", dt.date(2024, 1, 4), -2.0),
+                ("a", dt.date(2024, 1, 5), -6.7e-15),
+            ], "unique_id string, ds date, CrostonClassic double")
+    monkeypatch.setattr(classical, "StatsForecast", Provider)
+    result = forecast_with("croston", Panel(path, "id", "date", "qty", season_length=1),
+                           "2024-01-03", 2, spark=spark(), out_dir=tmp_path / "forecast")
+    rows = sorted(pq.read_table(result.path).to_pylist(), key=lambda row: row["date"])
+    assert [row["yhat"] for row in rows] == [-2.0, -6.7e-15]
+    assert result.n_emitted == 2

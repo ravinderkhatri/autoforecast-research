@@ -154,6 +154,23 @@ def installed_library_identity() -> LibraryIdentity:
     return LibraryIdentity(distribution.version, digest, build)
 
 
+def library_revision() -> dict:
+    """Record package files and their installed-wheel or checkout revision."""
+    if (LIBRARY_ROOT / "autoforecast/_build.json").is_file():
+        return installed_library_identity().as_record()
+    from mlops.provenance import capture_source_identity
+
+    source = capture_source_identity(LIBRARY_ROOT, require_clean=False).as_record()
+    files = {
+        path.relative_to(LIBRARY_ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for package in ("autoforecast", "forecast", "mlops", "observability", "provenance",
+                        "scripts", "spec")
+        for path in sorted((LIBRARY_ROOT / package).rglob("*.py"))
+    }
+    return {"schema": "autoforecast.checkout-library.v1", "source": source,
+            "code_sha256": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()}
+
+
 def installed_dependencies() -> tuple[tuple[str, str], ...]:
     """Record the actual environment without capturing credentials or private index URLs."""
     return tuple(

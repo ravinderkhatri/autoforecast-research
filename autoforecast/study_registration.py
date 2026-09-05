@@ -217,7 +217,10 @@ def _scalar_settings(value, label):
 
 
 def _runtime(value):
-    _fields(value, (), {"tracking", "publish", "log_level", "tracking_uri", "mlflow_experiment"},
+    from autoforecast.implementation import source_scope
+
+    _fields(value, (), {"tracking", "publish", "log_level", "tracking_uri",
+                        "mlflow_experiment", "implementation"},
             label="runtime")
     if value.get("tracking", "none") not in {"none", "mlflow"}:
         raise ValueError("tracking must be none or mlflow")
@@ -231,7 +234,10 @@ def _runtime(value):
             not isinstance(value[name], str) or not value[name].strip()
         ):
             raise ValueError(f"{name} must be a nonblank string or null")
-    return dict(value)
+    result = dict(value)
+    if "implementation" in result:
+        result["implementation"] = source_scope(result["implementation"])
+    return result
 
 
 def _record_path(root, name):
@@ -549,6 +555,12 @@ class StudyRegistry:
         self.spark: SparkSession = session
         self.scratch_root = pathlib.Path(scratch_root or self.root / "scratch").absolute()
         self.runtime = _runtime(runtime or {})
+        if "implementation" in self.runtime:
+            from autoforecast.implementation import source_scope
+
+            self.runtime["implementation"] = source_scope(
+                self.runtime["implementation"], pathlib.Path.cwd(),
+            )
         self.store = None
         if namespace is not None:
             from autoforecast.integrations.delta import DeltaStudyStore
@@ -589,6 +601,11 @@ class StudyRegistry:
                 if not str(settings[key]).strip() or "://" in str(settings[key]):
                     raise ValueError("storage roots require nonempty POSIX filesystem paths")
                 settings[key] = base / settings[key]
+        runtime = _runtime(runtime)
+        if "implementation" in runtime:
+            from autoforecast.implementation import source_scope
+
+            runtime["implementation"] = source_scope(runtime["implementation"], base)
         return cls(**settings, runtime=runtime, spark=spark)
 
     @classmethod
@@ -661,7 +678,9 @@ class StudyRegistry:
                 study.close()
             raise ValueError("library manifest changed during registered loading")
         return dataclasses.replace(study, _registration=_bytes({"definition": definition,
-                                                               "sha256": sha}))
+                                                               "sha256": sha}),
+                                   _implementation_scope=_bytes(self.runtime["implementation"])
+                                   if "implementation" in self.runtime else None)
 
     def _publish_definition(self, definition, *, format="json"):
         study_id = definition["study_id"]

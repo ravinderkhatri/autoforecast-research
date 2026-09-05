@@ -815,8 +815,8 @@ def test_forecast_validate_refuses_duplicate_keys_and_manifest_row_disagreement(
             raise AssertionError("accepted a Parquet row count that disagrees with n_emitted")
 
 
-def test_forecast_validate_refuses_nonfinite_or_negative_predictions() -> None:
-    for value in (float("nan"), float("inf"), -0.01):
+def test_forecast_validate_refuses_nonfinite_predictions() -> None:
+    for value in (float("nan"), float("inf"), -float("inf")):
         with tempfile.TemporaryDirectory() as d:
             root = _write_forecast(pathlib.Path(d) / "forecast", [
                 {"series_id": "a", "date": dt.date(2016, 4, 25), "yhat": value},
@@ -825,9 +825,23 @@ def test_forecast_validate_refuses_nonfinite_or_negative_predictions() -> None:
                 Forecast("model", root, "2016-04-24", 1, 1,
                          {"emitted": 1}).validate()
             except ForecastError as e:
-                assert "finite and non-negative" in str(e)
+                assert "must be finite" in str(e)
                 continue
             raise AssertionError(f"accepted invalid yhat={value!r}")
+
+
+@pytest.mark.parametrize("value", [-2.0, -6.7e-15, -0.0, 0.0, 3.0])
+def test_forecast_validation_preserves_finite_model_values(tmp_path, value):
+    from provenance.lineage import directory_digest
+
+    root = _write_forecast(tmp_path / "forecast", [
+        {"series_id": "a", "date": dt.date(2016, 4, 25), "yhat": value},
+    ])
+    before = directory_digest(root, suffixes=(".parquet",))
+    forecast = Forecast("model", root, "2016-04-24", 1, 1, {"emitted": 1}).validate()
+    assert Forecast.from_record(forecast.as_record()).validate() == forecast
+    assert pq.read_table(root)["yhat"].to_pylist() == [value]
+    assert directory_digest(root, suffixes=(".parquet",)) == before
 
 
 def test_forecast_validate_refuses_an_existing_artifact_with_the_wrong_schema() -> None:

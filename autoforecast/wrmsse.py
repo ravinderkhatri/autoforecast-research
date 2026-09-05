@@ -327,9 +327,9 @@ def score(
                 | F.col("_yhat").isNull()
                 | F.isnan("_yhat")
                 | (F.abs("_yhat") == float("inf"))
-                | (F.col("_yhat") < 0)).limit(1).count():
+                ).limit(1).count():
             raise WrmsseError(
-                "forecast contains an invalid key/date or a non-finite/negative prediction")
+                "forecast contains an invalid key/date or a non-finite prediction")
         if (preds.groupBy("_sid", "_d").count()
                 .filter(F.col("count") != 1).limit(1).count()):
             raise WrmsseError("forecast contains duplicate (series_id, date) keys")

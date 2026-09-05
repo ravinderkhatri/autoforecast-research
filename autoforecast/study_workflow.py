@@ -21,6 +21,12 @@ from mlops.run_report import new_run_id
 from autoforecast.benchmark import digest
 from autoforecast.hpo import HPOError
 from autoforecast.hpo_bridge import _copy_run_artifact_directory
+from autoforecast.implementation import (
+    CapturedImplementation,
+    resolve_implementation,
+    verify_retained,
+)
+from autoforecast.project import library_revision
 from autoforecast.study_preflight import preflight_study
 from autoforecast.study_scoring import score_study
 from autoforecast.study_tuning import (
@@ -151,6 +157,8 @@ def load_forecast_workflow(path: str | pathlib.Path) -> ForecastWorkflowResult:
     _validate_workflow_configuration(
         root, record, _retained_json(root, "metadata/winner-config.json", manifest), manifest
     )
+    verify_retained(root, record["provenance"]["implementation"],
+                    record["provenance"].get("implementation_evidence"))
     stages = {"validation": _window_result(root, record["validation"])}
     testing = _window_result(root, record["testing"]) if "testing" in record else None
     return ForecastWorkflowResult(
@@ -235,8 +243,8 @@ def run_study(
                     fixed_parameters = model.fixed_parameters
             elif callable(model):
                 callback = model
-                if implementation is None or model_config is None:
-                    raise ValueError("callbacks require implementation= and model_config=")
+                if model_config is None:
+                    raise ValueError("callbacks require model_config=")
             elif model == "seasonal_naive":
                 from autoforecast.adapters import naive
 
@@ -354,7 +362,7 @@ def run_forecast_workflow(
     study: Study,
     *,
     fit_predict: Callable[[FitPredictRequest], FitPredictResult],
-    implementation: Mapping[str, object],
+    implementation: Mapping[str, object] | None = None,
     config: str | pathlib.Path | None = None,
     tuning_origin: str | None = None,
     output_dir: str | pathlib.Path | None = None,
@@ -405,12 +413,10 @@ def run_forecast_workflow(
         raise ValueError("fixed_parameters requires config and cannot combine with selection reuse")
     if fixed and not isinstance(fixed_parameters, Mapping):
         raise TypeError("fixed_parameters must be a mapping")
-    identity = _implementation_record(implementation)
+    identity = _implementation_record(implementation) if implementation is not None else None
     if selected_config is not None and (reuse_tuning is not None or tuning_origin is not None):
         raise ValueError("selected_config conflicts with reuse_tuning and tuning_origin")
     saved = load_selected_configuration(selected_config) if selected_config is not None else None
-    if saved is not None and saved["implementation"] != identity:
-        raise HPOError("saved configuration uses a different model implementation")
     if config is not None:
         raw, spec, budget, seed, controls = _config(
             pathlib.Path(config), require_hpo=not (fixed or saved is not None)
@@ -434,6 +440,16 @@ def run_forecast_workflow(
         seed = saved["seed"]
     else:
         raise ValueError("provide config to tune, or selected_config to skip HPO")
+    scope_bytes = getattr(study, "_implementation_scope", None) if implementation is None else None
+    implementation = resolve_implementation(
+        implementation, json.loads(scope_bytes) if scope_bytes else None,
+        fit_predict, spec.model_id,
+    )
+    if identity is None:
+        identity = _implementation_record(implementation)
+    capture = implementation if isinstance(implementation, CapturedImplementation) else None
+    if saved is not None and saved["implementation"] != identity:
+        raise HPOError("saved configuration uses a different model implementation")
     if fixed:
         assert fixed_parameters is not None
         manual = materialize_manual_parameters(spec, dict(fixed_parameters))
@@ -452,6 +468,8 @@ def run_forecast_workflow(
     root = _output_root(study, output_dir, "study-workflows")
     task = "forecast-validation" if validation_only else "forecast-workflow"
     bundle = open_run_bundle(root, run_id=new_run_id("workflow"), task=task)
+    if capture is not None:
+        capture.retain(bundle.path)
     phase = "preflight"
     tuning_path = None
     try:
@@ -551,7 +569,7 @@ def run_forecast_workflow(
                         study,
                         fit_predict=fit_predict,
                         config=retained_config,
-                        implementation=identity,
+                        implementation=implementation,
                         tuning_origin=tuning_origin,
                         output_dir=root / "hpo",
                         reuse_tuning=reuse_tuning,
@@ -568,6 +586,7 @@ def run_forecast_workflow(
             bundle.write_json("metadata/winner-config.json", saved)
             bundle.write_bytes("metadata/search-config.yaml", saved["profile_text"].encode("utf-8"))
             provenance = {
+                "library": library_revision(),
                 "study": {"path": str(study._path.resolve()), "sha256": study._sha256},
                 "implementation": identity,
                 "configuration_source": saved["source"],
@@ -584,6 +603,9 @@ def run_forecast_workflow(
                 "seed": seed,
                 "work_estimate": estimate,
             }
+            provenance["implementation_evidence"] = (
+                capture.binding if capture is not None else {"mode": "declared"}
+            )
             if registration is not None:
                 provenance["registration"] = json.loads(_json_bytes(dict(registration)))
             if previous is not None:
@@ -737,6 +759,7 @@ def run_forecast_workflow(
                         breakdown=options["workflow_breakdown"],
                         purpose="validation" if stage == "validation" else "refit",
                         run_id=bundle.path.name,
+                        implementation_capture=capture,
                     )
                 phase = "artifact_retention"
                 result["forecast"]["path"] = stage + "/forecasts"
@@ -747,6 +770,8 @@ def run_forecast_workflow(
                 bundle.write_json(stage + "/result.json", result)
                 inputs.verify()
             study._record(data=True)
+            if capture is not None:
+                capture.verify()
             result = {
                 "schema": "autoforecast." + task + ".v1",
                 "status": stages["validation" if validation_only else "testing"]["score"][

@@ -543,7 +543,7 @@ def test_tft_retry_adopts_a_complete_post_link_publication(tmp_path, monkeypatch
     input_path = tmp_path / "input.parquet"
     input_path.write_bytes(b"immutable source panel")
     origin = dt.date(2024, 4, 9)
-    rows = [("a", origin + dt.timedelta(days=step), 1.0) for step in range(1, 29)]
+    rows = [("a", origin + dt.timedelta(days=step), -2.0) for step in range(1, 29)]
     panel = Panel(
         str(input_path), "id", "date", "qty", known_future=("price",), price_col="price"
     )
@@ -629,6 +629,7 @@ def test_tft_retry_adopts_a_complete_post_link_publication(tmp_path, monkeypatch
     assert forecast.n_series == 1 and forecast.disposition == {"emitted": 28}
     assert not (destination / ".v6-pending").exists()
     assert checkpoint.is_file() and pq.read_table(destination).num_rows == 28
+    assert set(pq.read_table(destination)["yhat"].to_pylist()) == {-2.0}
     assert tft_q.fit_predict(**options) == forecast
     with pytest.raises(ValueError, match="differs from the requested run"):
         tft_q.fit_predict(**{**options, "seed": 1})

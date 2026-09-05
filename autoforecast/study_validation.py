@@ -53,9 +53,8 @@ class StudyValidation:
     def score(self, prediction: np.ndarray) -> dict[str, float | int | None]:
         """Match study cell errors and flat weighted RMSSE, including unavailable scores."""
         prediction = np.asarray(prediction, dtype=np.float64)
-        if (prediction.shape != self.target.shape or not np.isfinite(prediction).all()
-                or np.any(prediction < 0)):
-            raise ValueError("study checkpoint predictions must cover the finite nonnegative grid")
+        if prediction.shape != self.target.shape or not np.isfinite(prediction).all():
+            raise ValueError("study checkpoint predictions must cover the finite grid")
         policy = json.loads(self.contract_json)["metric_policy"]
         if policy["actual_missing"] not in {"error", "mask", "zero"}:
             raise ValueError("actual_missing must be error, mask or zero")

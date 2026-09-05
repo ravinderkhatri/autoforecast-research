@@ -110,8 +110,8 @@ def read_forecast_grid(
     if np.any(days < 0) or np.any(days >= horizon) or len(np.unique(flat)) != len(flat):
         raise ValueError("grid has duplicate or out-of-window cells")
     values = table[value_col].to_numpy().astype(np.float64)
-    if not np.isfinite(values).all() or np.any(values < 0):
-        raise ValueError("grid values must be finite nonnegative numbers")
+    if not np.isfinite(values).all() or filter_actuals and np.any(values < 0):
+        raise ValueError("grid values must be finite; actual targets must be nonnegative")
     result = np.empty((len(series_ids), horizon), np.float64)
     result[rows, days] = values
     return result
@@ -247,10 +247,9 @@ class HierarchyMetric:
             or prediction.shape[1] == 0
             or not np.isfinite(prediction).all()
             or not np.isfinite(target).all()
-            or np.any(prediction < 0)
             or np.any(target < 0)
         ):
-            raise ValueError("score requires complete finite nonnegative matching forecast grids")
+            raise ValueError("score requires matching finite grids and nonnegative targets")
         per_level, counts = {}, {}
         error = prediction.astype(np.float64) - target.astype(np.float64)
         for name, codes, scales, weights in zip(
@@ -297,10 +296,9 @@ class HierarchyMetric:
         if (
             not torch.isfinite(prediction).all()
             or not torch.isfinite(target).all()
-            or (prediction < 0).any()
             or (target < 0).any()
         ):
-            raise ValueError("hierarchy loss needs finite nonnegative inputs")
+            raise ValueError("hierarchy loss needs finite inputs and nonnegative targets")
         error = prediction - target
         terms = []
         for codes, scales, weights in zip(self.codes, self.scales, self.weights, strict=True):
@@ -379,11 +377,10 @@ class TorchHierarchyMetric:
             or prediction.shape[1] == 0
             or not torch.isfinite(prediction).all()
             or not torch.isfinite(target).all()
-            or (prediction < 0).any()
             or (target < 0).any()
         ):
             raise ValueError(
-                "Torch score requires matching complete finite nonnegative grids on its device"
+                "Torch score requires matching finite grids on its device and nonnegative targets"
             )
         error = prediction.double() - target.double()
         terms = []

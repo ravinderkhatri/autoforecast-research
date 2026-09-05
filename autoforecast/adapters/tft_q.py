@@ -333,7 +333,7 @@ def fit_predict(
                 for series, values in zip(ids, output, strict=True):
                     if series in predictions:
                         raise ValueError("study TFT prediction duplicated a series")
-                    predictions[series] = np.maximum(values, 0.0)
+                    predictions[series] = values
             if set(predictions) != set(study.series_ids):
                 raise ValueError("study TFT prediction changed the frozen population")
             return np.stack([predictions[series] for series in study.series_ids])
@@ -441,11 +441,10 @@ def fit_predict(
         (
             str(series_id),
             origin_day + dt.timedelta(days=step + 1),
-            float(max(
+            float(
                 output[position, step, median_index]
-                if loss_kind == "quantile" else output[position, step],
-                0.0,
-            )),
+                if loss_kind == "quantile" else output[position, step]
+            ),
         )
         for position, series_id in enumerate(index["series_id"].to_numpy())
         for step in range(horizon)
@@ -752,7 +751,6 @@ def _adopt_completed_forecast(
         or pc.min(table["date"]).as_py() != origin_day + dt.timedelta(days=1)
         or pc.max(table["date"]).as_py() != origin_day + dt.timedelta(days=horizon)
         or not pc.all(pc.is_finite(table["yhat"])).as_py()
-        or pc.min(table["yhat"]).as_py() < 0
     ):
         raise ValueError(
             "TFT-Q/TFT-HNB pending checkpoint or forecast differs from the requested run"

@@ -29,6 +29,12 @@ from autoforecast._exact_json import load_exact_json
 from autoforecast._exact_yaml import loads_exact_yaml
 from autoforecast.benchmark import digest, verify_benchmark
 from autoforecast.campaign import CampaignStore, CampaignSupervisor, _write_new_json
+from autoforecast.implementation import (
+    CapturedImplementation,
+    resolve_implementation,
+    verify_retained,
+    worker_implementation,
+)
 from autoforecast.study_tuning import (
     FitPredictRequest,
     FitPredictResult,
@@ -51,8 +57,8 @@ class StudyModel:
     """
 
     entrypoint: str
-    implementation: Mapping[str, object]
-    config: str | pathlib.Path
+    implementation: Mapping[str, object] | None = None
+    config: str | pathlib.Path | None = None
     fixed_parameters: Mapping[str, object] | None = None
     cpus: int = 1
     memory_gib: float = 4.0
@@ -199,11 +205,29 @@ def run_study_campaign(
         labels = dict(model.node_labels or {})
         if labels and execution != "cluster":
             raise ValueError("node_labels require an explicitly supplied cluster")
+        if model.config is None:
+            raise ValueError("StudyModel requires config")
         raw, spec, _, _, controls = _config(
             pathlib.Path(model.config), require_hpo=model.fixed_parameters is None
         )
-        identity = _implementation_record(model.implementation)
-        _, code_sha = _entrypoint(model.entrypoint)
+        callback, code_sha = _entrypoint(model.entrypoint)
+        implementation = resolve_implementation(
+            model.implementation, json.loads(study._implementation_scope)
+            if model.implementation is None and getattr(study, "_implementation_scope", None)
+            else None, callback, spec.model_id,
+        )
+        identity = _implementation_record(implementation)
+        source_record = None
+        if isinstance(implementation, CapturedImplementation):
+            source_root = _output_root(study, output_dir, "study-campaigns") / "sources" / (
+                identity["source_sha256"] + "-" + implementation.binding["evidence_sha256"]
+            )
+            source_root.mkdir(parents=True, exist_ok=True)
+            implementation.retain(source_root)
+            verify_retained(source_root, identity, implementation.binding)
+            source_record = {"path": str(source_root), "identity": identity,
+                             "binding": implementation.binding,
+                             "scope": json.loads(implementation.scope_bytes)}
         # Fixed candidates participate in the same study-wide admission but do not search.
         selection_controls = controls
         if model.fixed_parameters is not None:
@@ -218,6 +242,7 @@ def run_study_campaign(
                 "entrypoint": model.entrypoint,
                 "code_sha256": code_sha,
                 "implementation": identity,
+                "implementation_source": source_record,
                 "profile": loads_exact_yaml(raw),
                 "original_profile_sha256": hashlib.sha256(raw).hexdigest(),
                 "original_profile_text": raw.decode("utf-8"),
@@ -496,9 +521,13 @@ def _model_job(
     model = request["models"][index]
     if _runtime_identity() != request["runtime"]:
         raise ValueError("worker library or numerical runtime differs from the campaign")
+    implementation = (worker_implementation(model["implementation_source"])
+                      if model.get("implementation_source") else None)
     if any(_module_hash(name) != expected for name, expected in model["source_modules"].items()):
         raise ValueError("model helper code differs on worker")
     callback, _ = _entrypoint(model["entrypoint"], model["code_sha256"])
+    implementation = (resolve_implementation(implementation, None, callback, model["id"])
+                      if implementation is not None else model["implementation"])
     for package, version in model["implementation"]["dependencies"].items():
         if importlib.metadata.version(package) != version:
             raise ValueError(f"worker dependency differs: {package}")
@@ -558,7 +587,7 @@ def _model_job(
                 if phase == "validation":
                     run = study.run_forecast_workflow(
                         fit_predict=callback,
-                        implementation=model["implementation"],
+                        implementation=implementation,
                         config=config_path,
                         fixed_parameters=model["fixed_parameters"],
                         validation_only=True,
@@ -571,7 +600,7 @@ def _model_job(
                         raise ValueError("worker validation input differs from its phase handoff")
                     run = study.run_forecast_workflow(
                         fit_predict=callback,
-                        implementation=model["implementation"],
+                        implementation=implementation,
                         validation_run=previous["workflow_path"],
                         output_dir=folder / "runs",
                     )

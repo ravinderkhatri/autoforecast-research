@@ -192,9 +192,9 @@ def score_forecast(
     yhat = F.expr("try_cast(yhat as double)")
     bad_value = (fc.filter(yhat.isNull() | F.isnan(yhat)
                            | (F.abs(yhat) == float("inf"))
-                           | (yhat < 0)).limit(1).count())
+                           ).limit(1).count())
     if bad_value:
-        raise ScoreError(f"{forecast.adapter}: yhat must be finite and non-negative")
+        raise ScoreError(f"{forecast.adapter}: yhat must be finite")
     fc = fc.withColumn("yhat", yhat)
 
     start, end = allowed_dates[0], allowed_dates[-1]

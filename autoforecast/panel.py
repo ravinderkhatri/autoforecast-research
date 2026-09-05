@@ -817,9 +817,9 @@ class Forecast:
                         raise ForecastError(
                             f"{self.adapter!r}: yhat must be numeric, got {value!r} at {key!r}"
                         ) from exc
-                    if not math.isfinite(number) or number < 0.0:
+                    if not math.isfinite(number):
                         raise ForecastError(
-                            f"{self.adapter!r}: yhat must be finite and non-negative, got "
+                            f"{self.adapter!r}: yhat must be finite, got "
                             f"{value!r} at {key!r}"
                         )
         except ForecastError:

@@ -179,27 +179,7 @@ class Score:
                                          rel_tol=tolerance, abs_tol=tolerance)):
                 raise ValueError(
                     "RMSE cannot exceed sqrt(n_scored) * MAE for any residual vector")
-            # Forecasts and actuals are non-negative at both scorer entry points. Their aggregate
-            # forecast is recoverable from these sufficient statistics:
-            #
-            #     sum(forecast) = sum(actual) + sum(forecast - actual).
-            #
-            # The other norm inequalities do not imply this constraint: one cell with actual=1,
-            # error=-2 satisfies all of them while requiring forecast=-1. Allow only the tiny
-            # cancellation noise possible when two large independently reduced sums should meet at
-            # zero; a materially negative implied forecast proves the record was fabricated or
-            # corrupted. A relative tolerance is wrong here: at an estate-scale volume of 1e15,
-            # ``rel_tol=1e-12`` accepted an impossible -100 aggregate forecast. Bound only the
-            # final cancellation noise in ULPs of the two stored operands. This stays a small
-            # number of representable values at every scale instead of admitting a fixed fraction
-            # of estate volume.
-            implied_forecast = self.sum_actual + self.sum_error
-            cancellation_slack = 4.0 * max(
-                math.ulp(self.sum_actual), math.ulp(self.sum_error))
-            if implied_forecast < -cancellation_slack:
-                raise ValueError(
-                    "sum_actual + sum_error implies a negative total forecast, impossible for "
-                    "non-negative forecast cells")
+
         else:
             if any(value != 0 for value in (
                     self.sum_abs_error, self.sum_squared_error, self.sum_error, self.sum_actual,
@@ -290,8 +270,8 @@ def _validate_cells(cells: list[Cell]) -> None:
         seen.add(key)
         if not isinstance(c.eligible, bool):
             raise ValueError(f"cell {key} needs explicit boolean exposure eligibility")
-        if not is_finite_real(c.forecast) or c.forecast < 0:
-            raise ValueError(f"cell {key} has invalid non-negative forecast: {c.forecast!r}")
+        if not is_finite_real(c.forecast):
+            raise ValueError(f"cell {key} has invalid finite forecast: {c.forecast!r}")
         if c.actual is not None and (not is_finite_real(c.actual) or c.actual < 0):
             raise ValueError(f"cell {key} has invalid non-negative actual: {c.actual!r}")
         if c.actual_state not in ("observed", "sparse_zero", "no_data"):

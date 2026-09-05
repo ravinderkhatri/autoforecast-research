@@ -1300,10 +1300,9 @@ class RollingTrainer:
                 if (
                     prediction.shape != y.shape
                     or not torch.isfinite(prediction).all()
-                    or (prediction < 0).any()
                     or not torch.isfinite(nll_sum)
                 ):
-                    raise ValueError("nonfinite/negative validation prediction or NLL")
+                    raise ValueError("nonfinite validation prediction or NLL")
                 sync()
                 timings["prediction_assembly_seconds"] = time.perf_counter() - assembly_started
                 shared_study = holdout is not None and holdout.study is not None
@@ -1410,8 +1409,8 @@ class RollingTrainer:
                     for r in self.chunks()
                 ]
             result = np.concatenate(pieces)
-            if not np.isfinite(result).all() or np.any(result < 0):
-                raise ValueError("model emitted nonfinite or negative forecasts")
+            if not np.isfinite(result).all():
+                raise ValueError("model emitted nonfinite forecasts")
             return result
         finally:
             for module, flag in flags:

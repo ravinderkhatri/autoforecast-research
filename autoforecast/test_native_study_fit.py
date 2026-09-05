@@ -174,6 +174,23 @@ def test_lightning_study_selection_refit_and_saved_score(
 
     if device == "mps" and not torch.backends.mps.is_available():
         pytest.skip("MPS is not available")
+    force_negative = adapter_name == "tft_q" and device == "cpu"
+    if force_negative:
+        from pytorch_forecasting import TemporalFusionTransformer
+
+        original_from_dataset = TemporalFusionTransformer.from_dataset.__func__
+
+        def negative_from_dataset(cls, dataset, **kwargs):
+            model = original_from_dataset(cls, dataset, **kwargs)
+            with torch.no_grad():
+                model.output_layer.weight.zero_()
+                model.output_layer.bias.fill_(-2.0)
+            model.output_layer.requires_grad_(False)
+            return model
+
+        monkeypatch.setattr(
+            TemporalFusionTransformer, "from_dataset", classmethod(negative_from_dataset),
+        )
     path, record = lightning_study
     recipe = record["recipe"]
     origin, horizon = recipe["validation_origins"][0], recipe["validation_horizon"]
@@ -227,6 +244,8 @@ def test_lightning_study_selection_refit_and_saved_score(
         evaluation_contract_sha256=evaluation_sha, **options,
     )
     forecast = fit(**selection_args)
+    if force_negative:
+        np.testing.assert_array_equal(pq.read_table(forecast.path)["yhat"].to_numpy(), -2.0)
     saved = torch.load(tmp_path / "selected.pt", map_location="cpu", weights_only=True)
     training = saved["training"]
     assert forecast.n_emitted == 56 and forecast.n_declined == 0
@@ -282,6 +301,8 @@ def test_lightning_study_selection_refit_and_saved_score(
         out_dir=tmp_path / "refit", checkpoint_out=tmp_path / "refit.pt",
         training_mode="fixed_refit", fixed_update_budget=updates, **options,
     )
+    if force_negative:
+        np.testing.assert_array_equal(pq.read_table(final.path)["yhat"].to_numpy(), -2.0)
     refit = torch.load(tmp_path / "refit.pt", map_location="cpu", weights_only=True)["training"]
     assert refit["validation"] == [] and "study_evaluation" not in refit["training_contract"]
     _verify_fixed_refit_budget(

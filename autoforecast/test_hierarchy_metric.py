@@ -72,7 +72,7 @@ def test_metric_refuses_zero_dollars_and_bad_differentiable_inputs():
     metric = example_metric()
     for prediction, target, epsilon in ((torch.ones(1, 2), torch.ones(1, 2), 1e-8),
                                         (torch.ones(2, 2), torch.ones(2, 2), 0.),
-                                        (-torch.ones(2, 2), torch.ones(2, 2), 1e-8),
+                                        (torch.ones(2, 2), -torch.ones(2, 2), 1e-8),
                                         (torch.ones(2, 2), torch.full((2, 2), float("nan")), 1e-8)):
         with pytest.raises(ValueError):
             metric.loss(prediction, target, epsilon=epsilon)
@@ -164,7 +164,7 @@ def test_finite_inputs_cannot_publish_overflowed_metric_values():
 
 
 @pytest.mark.parametrize("prediction", [np.ones((1, 2)), np.full((2, 2), np.nan),
-                                       -np.ones((2, 2)), np.ones((2, 0))])
+                                       np.full((2, 2), np.inf), np.ones((2, 0))])
 def test_hierarchy_score_refuses_bad_grid(prediction):
     with pytest.raises(ValueError, match="grid"):
         example_metric().score(prediction, np.ones_like(prediction))
@@ -519,3 +519,81 @@ assert metric.n_bottom == 2
 assert not any(name == 'pyarrow' or name.startswith('pyarrow.') for name in sys.modules)
 """
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+def test_negative_predictions_keep_numpy_torch_loss_and_grid_parity(tmp_path):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from autoforecast.hierarchy_metric import TorchHierarchyMetric
+
+    metric = example_metric()
+    prediction = np.array([[-2., -6.7e-15], [0., 3.]])
+    target = np.array([[0., 1.], [2., 3.]])
+    before = prediction.copy()
+    # Independent per-level arithmetic using the fixture's frozen scales and weights.
+    total = np.sqrt(np.mean((prediction.sum(0) - target.sum(0)) ** 2) / 3)
+    bottom = ((5 / 11) * np.sqrt(np.mean((prediction[0] - target[0]) ** 2) / 2.5)
+              + (6 / 11) * np.sqrt(np.mean((prediction[1] - target[1]) ** 2) / (5 / 3)))
+    expected = (total + bottom) / 2
+    assert metric.score(prediction, target)["wrmsse"] == pytest.approx(expected)
+    tensor = torch.tensor(prediction, requires_grad=True)
+    truth = torch.tensor(target)
+    assert TorchHierarchyMetric(metric, "cpu").score(tensor, truth)["wrmsse"] \
+        == pytest.approx(expected)
+    loss = metric.loss(tensor, truth, epsilon=1e-12)
+    assert loss.item() == pytest.approx(expected)
+    loss.backward()
+    assert torch.isfinite(tensor.grad).all()
+    np.testing.assert_array_equal(prediction, before)
+    path = tmp_path / "forecast.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"id": sid, "date": dt.date(2024, 1, 2 + step), "value": float(value)}
+        for row, sid in enumerate(("a", "b")) for step, value in enumerate(prediction[row])
+    ]), path)
+    actual = read_forecast_grid(str(path), ("a", "b"), "2024-01-01", 2,
+                                series_col="id", time_col="date", value_col="value")
+    np.testing.assert_array_equal(actual, before)
+    with pytest.raises(ValueError, match="nonnegative"):
+        read_forecast_grid(str(path), ("a", "b"), "2024-01-01", 2,
+                           series_col="id", time_col="date", value_col="value", filter_actuals=True)
+    with pytest.raises(ValueError):
+        metric.score(target, prediction)
+    with pytest.raises(ValueError):
+        TorchHierarchyMetric(metric, "cpu").score(truth, tensor)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_rolling_validation_and_prediction_keep_negative_values(backend):
+    from types import SimpleNamespace
+
+    from autoforecast.rolling_training import RollingTrainer
+
+    trainer = object.__new__(RollingTrainer)
+    trainer.config = SimpleNamespace(device="cpu", validation_backend=backend, batch_size=1)
+    target = np.array([[0., 1., 2.]])
+    trainer.data = SimpleNamespace(position=lambda origin: 0, series_ids=("a",))
+    trainer.training_contract = SimpleNamespace(fixed_validation=SimpleNamespace(
+        origin="2024-01-01", target=target, observed=np.ones_like(target, dtype=bool),
+        objective_mask=None, study=None,
+    ))
+    trainer._validation_targets = {}
+    trainer.prediction_context = None
+    trainer.validation_values = None
+    trainer.performance_profiler = None
+    trainer.batch = lambda *args: (torch.tensor([[-2., 1., 3.]]),)
+    trainer.mean = lambda model, inputs: inputs
+    model = torch.nn.Linear(1, 1)
+    model.train()
+    result = trainer.validate(model, "2024-01-01", None)
+    assert result["rmse"] == pytest.approx(np.sqrt(5 / 3))
+    np.testing.assert_array_equal(trainer.predict(model, "2024-01-01"), [[-2., 1., 3.]])
+    assert model.training
+    trainer.mean = lambda model, inputs: inputs * float("nan")
+    with pytest.raises(ValueError, match="nonfinite"):
+        trainer.validate(model, "2024-01-01", None)
+    with pytest.raises(ValueError, match="nonfinite"):
+        trainer.predict(model, "2024-01-01")
+    assert model.training

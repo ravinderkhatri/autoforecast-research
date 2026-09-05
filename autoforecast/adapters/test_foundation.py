@@ -345,15 +345,14 @@ def test_public_adapter_validates_provider_shape_values_and_publishes_atomically
         raise AssertionError(f"accepted malformed TimesFM output: {result!r}")
 
 
-def test_public_adapter_clips_negative_model_output_and_records_every_clipped_cell() -> None:
+def test_public_adapter_preserves_negative_model_output_and_counts_every_cell() -> None:
     forecast, rows = _run(_panel(_rows()), RecordingBackend(negative_mean=True))
     assert forecast.disposition == {
-        "emitted": 3,
-        "emitted_clipped_negative": 3,
+        "emitted": 6,
         "declined_all_unobserved": 2,
     }
-    assert sum(row["yhat"] == 0.0 for row in rows) == 3
-    assert all(row["yhat"] >= 0.0 for row in rows)
+    assert sum(row["yhat"] == -1.0 for row in rows) == 3
+    assert all(row["yhat"] != 0.0 for row in rows)
 
 
 def test_public_provider_boundary_is_offline_pinned_and_defaults_to_1024_context() -> None:

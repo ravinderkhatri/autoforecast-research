@@ -81,12 +81,28 @@ def test_checkpoint_empty_coverage_and_zero_volume_remain_unavailable():
 
 
 @pytest.mark.parametrize("prediction", [
-    [[1, -1], [1, 1]], [[1, float("nan")], [1, 1]],
+    [[1, float("nan")], [1, 1]],
     [[1, float("inf")], [1, 1]], [[1, 1]],
 ])
 def test_checkpoint_requires_every_prediction_even_when_actual_is_masked(prediction):
-    with pytest.raises(ValueError, match="finite nonnegative grid"):
+    with pytest.raises(ValueError, match="finite grid"):
         window().score(np.array(prediction))
+
+
+def test_checkpoint_scores_negative_predictions_without_modifying_them():
+    prediction = np.array([[-2.0, 1.0, 3.0]])
+    original = prediction.copy()
+    study = StudyValidation(
+        json.dumps({"metric_policy": {"metric": "wrmsse", "actual_missing": "error"}}),
+        "a" * 64, ("a",), np.array([[0.0, 1.0, 2.0]]), np.ones((1, 3), dtype=bool),
+        np.array([1.0]), np.array([4.0]),
+    )
+    score = study.score(prediction)
+    assert score["mae"] == 1.0
+    assert score["rmse"] == pytest.approx(math.sqrt(5 / 3))
+    assert score["wape"] == 1.0
+    assert score["wrmsse"] == pytest.approx(math.sqrt(5 / 12))
+    np.testing.assert_array_equal(prediction, original)
 
 
 def test_checkpoint_rejects_overflow_in_errors_or_actual_volume():
