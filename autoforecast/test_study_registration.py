@@ -625,6 +625,108 @@ def test_zero_checkpoint_reader_uses_filled_target_and_factual_mask(spark, tmp_p
     assert window.score(np.zeros((2, 2)))["mae"] == pytest.approx(5.0)
 
 
+@pytest.mark.parametrize("identity,message", [
+    ("source_version", "needs a Delta source"), ("versions", "storage.input_identity"),
+])
+def test_input_identity_setting_is_checked_before_source_access(tmp_path, identity, message):
+    """Only Delta reads have a pinned version to name; other values are refused."""
+    from autoforecast.study_registration import validate_study_config
+
+    path = configuration(tmp_path)
+    value = yaml.safe_load(path.read_text())
+    value["storage"]["input_identity"] = identity
+    path.write_text(yaml.safe_dump(value))
+    with pytest.raises(ValueError, match=message):
+        validate_study_config(path)
+    value["storage"]["input_identity"] = "rows"
+    path.write_text(yaml.safe_dump(value))
+    assert validate_study_config(path).input_storage["input_identity"] == "rows"
+
+
+def test_source_version_claim_requires_its_frozen_identity(spark, tmp_path):
+    """A saved definition cannot claim a source identity the frozen study never bound."""
+    from autoforecast.benchmark import digest
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    study_id = register_study(path, registry=registry)
+    saved = registry._registration_path(study_id)
+    envelope = json.loads(saved.read_bytes())
+    # Older source-version writers could save this claim without a frozen binding.
+    envelope["definition"]["source"]["source_version"] = {
+        "schema": "autoforecast.source-version.v1", "sql": "SELECT * FROM measurements",
+        "tables": {"measurements": {"table": "synthetic.measurements", "version": 0,
+                                     "table_id": "source-table-id"}},
+        "rows": envelope["definition"]["source"]["rows"],
+    }
+    envelope["sha256"] = digest(envelope["definition"])
+    saved.write_text(json.dumps(envelope))
+    with pytest.raises(ValueError, match="source version provenance"):
+        registry.load_study(study_id)
+
+
+def test_outputs_are_written_in_few_files(spark, tmp_path, monkeypatch):
+    """Each file costs a request on every later check, so outputs use as few as fit."""
+    from autoforecast import benchmark
+
+    frame = spark.range(10).repartition(5)
+    benchmark.write_few_files(frame, tmp_path / "evidence")
+    monkeypatch.setattr(benchmark, "_ROWS_PER_FILE", 4)
+    benchmark.write_few_files(frame, tmp_path / "frozen", rows=10)
+    benchmark.write_few_files(spark.range(0), tmp_path / "empty")
+    files = {name: sorted((tmp_path / name).glob("*.parquet"))
+             for name in ("evidence", "frozen", "empty")}
+    assert {name: len(found) for name, found in files.items()} == {
+        "evidence": 1, "frozen": 3, "empty": 1}
+    assert sorted(spark.read.parquet(str(tmp_path / "frozen")).toPandas()["id"]) == list(range(10))
+    # One large file must keep small row groups: offline hashing sizes its batches from
+    # the largest one, and a single large row group left one row per batch.
+    from autoforecast import _logical_hash
+
+    monkeypatch.setattr(benchmark, "_ROWS_PER_FILE", 10**9)
+    large = spark.range(400_000).selectExpr("id", "cast(id as string) as name", "id * 0.5 as value")
+    benchmark.write_few_files(large, tmp_path / "large", rows=400_000)
+    (part,) = (tmp_path / "large").glob("*.parquet")
+    metadata = pq.ParquetFile(part).metadata
+    largest = max(metadata.row_group(i).total_byte_size for i in range(metadata.num_row_groups))
+    assert metadata.num_rows == 400_000 and largest * 16 <= _logical_hash._LOCAL_MAX_BYTES
+
+
+def test_each_use_checks_every_frozen_file_once_and_every_use_checks_again(
+    spark, tmp_path, monkeypatch,
+):
+    """A registration or a load checks each frozen file once; a later load checks again."""
+    from autoforecast import _logical_hash, benchmark
+
+    verify, checked = _logical_hash.verify_files, []
+
+    def counted(target, **kwargs):
+        checked.append((str(pathlib.Path(target).absolute()), kwargs["trusted"]))
+        return verify(target, **kwargs)
+
+    monkeypatch.setattr(_logical_hash, "verify_files", counted)
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    study_id = register_study(path, registry=registry)
+    frozen = str(registry.root / "benchmarks" / study_id)
+    registration = [item for item in checked if item[0].startswith(frozen)]
+    # The freeze's final check and the publication check share one result per file.
+    assert registration and len(registration) == len(set(registration))
+    for _ in range(2):
+        checked.clear()
+        with registry.load_study(study_id):
+            pass
+        assert checked and len(checked) == len(set(checked))
+    # A trusted result never stands in for a full check asked for in the same use.
+    manifest = registry.root / "benchmarks" / study_id / "benchmark.json"
+    sha = registry.definition(study_id)[0]["library_sha256"]
+    checked.clear()
+    with benchmark.one_use():
+        benchmark.verify_benchmark(manifest, sha, _reuse_verified=True)
+        benchmark.verify_benchmark(manifest)
+    assert {trusted for _, trusted in checked} == {True, False}
+
+
 def test_registered_load_preserves_primary_hash_error_when_close_fails(tmp_path, monkeypatch):
     import autoforecast.study_registration as registration
     registry = StudyRegistry(tmp_path, spark=object())

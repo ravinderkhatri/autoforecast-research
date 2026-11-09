@@ -542,10 +542,79 @@ def test_prepared_registration_owns_audit_query_evidence_and_links_before_public
         assert study.training_data.filter("value = 200.0").count() == 0
 
 
+@pytest.mark.parametrize("prepared", [False, True], ids=["plain", "prepared"])
+def test_source_version_identity_names_the_pinned_read_without_hashing_rows(
+    store, tmp_path, monkeypatch, prepared,
+):
+    """Delta inputs named by table ID, version and query: the same read keeps its ID."""
+    import pathlib
+
+    import yaml
+
+    from autoforecast import _logical_hash, register_study
+    from autoforecast.study_registration import StudyRegistry
+    from autoforecast.test_study_preparation import SensorPreparation
+    from autoforecast.test_study_registration import configuration
+
+    path = configuration(tmp_path)
+    table = store.namespace + ".sensors"
+    rows = store.spark.read.parquet(str(tmp_path / "source.parquet"))
+    rows.write.format("delta").saveAsTable(table)
+    (tmp_path / "primary.sql").write_text("SELECT item, day, value FROM measurements")
+    (tmp_path / "population.sql").write_text("SELECT DISTINCT item FROM inventory")
+    value = yaml.safe_load(path.read_text())
+    value["source"] = {"kind": "delta", "sql": "primary.sql",
+                       "tables": {"measurements": table}}
+    if prepared:
+        value["source"]["tables"]["inventory"] = table
+        value["source"].update(audit_queries={"population": "population.sql"},
+                               population="population")
+    value["storage"]["input_identity"] = "source_version"
+    path.write_text(yaml.safe_dump(value))
+    registry = StudyRegistry(tmp_path / "registry", spark=store.spark,
+                             namespace=store.namespace if prepared else None)
+    capture, hashed = _logical_hash._capture, []
+
+    def tracked(path, *, spark=None):
+        hashed.append(pathlib.Path(path).name)
+        return capture(path, spark=spark)
+
+    monkeypatch.setattr(_logical_hash, "_capture", tracked)
+    hook = SensorPreparation() if prepared else None
+    first = register_study(path, registry=registry, prepare=hook)
+    assert hashed and not {"source", "audit-population"} & set(hashed)
+    source = registry.definition(first)[0]["source"]
+    assert "logical_hash" not in source and source["rows"] == source["source_version"]["rows"]
+    pins = source["source_version"]["tables"]
+    table_id = store.spark.sql(f"DESCRIBE DETAIL {table}").first()["id"]
+    assert pins["measurements"] == {"table": table, "version": 0, "table_id": table_id}
+    assert source["source_version"]["sql"] == "SELECT item, day, value FROM measurements"
+    if not prepared:
+        from autoforecast.benchmark import digest
+
+        saved = registry._registration_path(first)
+        original = saved.read_bytes()
+        changed = json.loads(original)
+        changed["definition"]["source"]["source_version"]["sql"] += " "
+        changed["sha256"] = digest(changed["definition"])
+        try:
+            saved.write_text(json.dumps(changed))
+            with pytest.raises(ValueError, match="source version provenance"):
+                registry.load_study(first)
+        finally:
+            saved.write_bytes(original)
+    # The same pinned read registers the same study.
+    assert register_study(path, registry=registry, prepare=hook) == first
+    # Rewriting identical rows makes a new version, which names a different read.
+    rows.write.format("delta").mode("overwrite").saveAsTable(table)
+    assert register_study(path, registry=registry, prepare=hook) != first
+
+
 @pytest.mark.parametrize("restored", [False, True], ids=["lasting", "restored"])
 @pytest.mark.parametrize("captured", ["source", "audit-population"])
+@pytest.mark.parametrize("identity", ["rows", "source_version"])
 def test_capture_change_before_preparation_blocks_registration(
-    store, tmp_path, monkeypatch, captured, restored,
+    store, tmp_path, monkeypatch, captured, restored, identity,
 ):
     import shutil
     from pathlib import Path
@@ -568,6 +637,7 @@ def test_capture_change_before_preparation_blocks_registration(
                        "tables": {"measurements": table, "inventory": table},
                        "audit_queries": {"population": "population.sql"},
                        "population": "population"}
+    value["storage"]["input_identity"] = identity
     path.write_text(yaml.safe_dump(value))
     registry = StudyRegistry(tmp_path / "registry", spark=store.spark, namespace=store.namespace)
     prepare, write = study_registration._prepare_observations, DataFrameWriter.parquet

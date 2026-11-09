@@ -106,6 +106,7 @@ def test_configuration_infers_explicit_connection_and_reports_active_storage(
     assert checked.input_storage == {
         "snapshot_mode": mode, "source_kind": backend,
         "snapshot_destination": "inactive" if mode == "hash" else value["storage"]["snapshots"],
+        "input_identity": "rows",
     }
     assert not (tmp_path / "registry").exists()
     value["source"]["kind"] = "delta"

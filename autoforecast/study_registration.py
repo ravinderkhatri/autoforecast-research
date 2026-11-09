@@ -61,12 +61,14 @@ from autoforecast.benchmark import (
     _reference_boundaries,
     artifact_path,
     digest,
+    one_use,
     read_benchmark_manifest,
     study_source_roles,
     study_windows,
     training_cutoff,
     validate_study_panel,
     verify_benchmark,
+    write_few_files,
 )
 from autoforecast.benchmark import (
     _freeze_verified as freeze_benchmark,
@@ -264,6 +266,10 @@ def _configuration_value(value, path, *, supplied_stages=False, connections=None
         raise ValueError("records.format must be json or yaml")
     _scalar_settings(value.get("preparation", {}), "preparation")
     _validate_storage(value["storage"])
+    if (value["storage"].get("input_identity") == "source_version"
+            and value["source"]["kind"] != "delta"):
+        raise ValueError("storage.input_identity: source_version needs a Delta source; "
+                         "other sources have no pinned version and keep row identities")
     if "snapshot_mode" in value:
         from autoforecast.snapshots import resolve_mode
 
@@ -275,7 +281,10 @@ def _configuration_value(value, path, *, supplied_stages=False, connections=None
 
 def _validate_storage(storage):
     _fields(storage, {"root"},
-            {"scratch_root", "namespace", "tables", "snapshot_mode", "snapshots"}, label="storage")
+            {"scratch_root", "namespace", "tables", "snapshot_mode", "snapshots",
+             "input_identity"}, label="storage")
+    if storage.get("input_identity", "rows") not in INPUT_IDENTITIES:
+        raise ValueError("storage.input_identity must be rows or source_version")
     from autoforecast.snapshots import resolve_mode
 
     if "snapshot_mode" in storage:
@@ -332,7 +341,8 @@ class StudyConfigValidation:
         mode = resolve_mode(value.get("snapshot_mode"), value["storage"].get("snapshot_mode"))
         return {"snapshot_mode": mode, "source_kind": value["source"]["kind"],
                 "snapshot_destination": value["storage"].get("snapshots")
-                if mode != "hash" else "inactive"}
+                if mode != "hash" else "inactive",
+                "input_identity": value["storage"].get("input_identity", "rows")}
 
 
 def validate_study_config(path: str | pathlib.Path) -> StudyConfigValidation:
@@ -455,6 +465,54 @@ def _remove_staging_directory(path):
         shutil.rmtree(path)
 
 
+# How a registration identifies the source rows it captured. ``rows`` hashes every row.
+# ``source_version`` names a Delta read by its table IDs, pinned versions and query.
+INPUT_IDENTITIES = frozenset({"rows", "source_version"})
+
+
+def _source_version_record(path, provenance, physical=None):
+    """Identify a pinned Delta read by its tables, versions and query, not its rows.
+
+    Committed Delta versions are never rewritten, so the same table IDs, versions and
+    query text name the same rows, provided the query is deterministic. The capture's
+    file SHA stays in memory for this attempt's change checks, as with row identities.
+    """
+    import pyarrow.parquet as pq
+
+    from provenance.lineage import parquet_files
+
+    path = pathlib.Path(path)
+    with (_volume_files.local_snapshot(path, parquet_only=True)
+          if _volume_files.is_volume(path) else nullcontext(path)) as local:
+        files = parquet_files(local)
+        if not files:
+            raise ValueError("source version identity requires captured Parquet rows")
+        rows = 0
+        for file in files:
+            with pq.ParquetFile(file) as footer:
+                rows += footer.metadata.num_rows
+        physical_sha256 = directory_digest(local, suffixes=(".parquet",))
+    if physical is not None:
+        physical[path] = physical_sha256
+    resolved = provenance["resolved_tables"]
+    return {"source_version": {
+        "schema": "autoforecast.source-version.v1",
+        "sql": provenance["sql"],
+        "tables": {alias: {**pin, "table_id": resolved[pin["table"]]["id"]}
+                   for alias, pin in sorted(provenance["tables"].items())},
+        "rows": rows,
+    }}
+
+
+def _identity_rows(identity):
+    """Row count recorded by a native, row or source version identity."""
+    if "snapshot" in identity:
+        return identity["snapshot"]["rows"]
+    if "source_version" in identity:
+        return identity["source_version"]["rows"]
+    return identity["logical_hash"]["rows"]
+
+
 def _logical_record(path, spark, physical=None):
     """Bind a fresh capture. ``physical`` keeps its file SHA in memory, never in the record."""
     capture = current_capture()
@@ -537,7 +595,7 @@ def _verify_admission(root, binding, *, trusted=False, spark=None, _scratch_root
 
 def _prepare_admission(registry, staging, identity, final_keys, recipe, *, artifact_bindings=None):
     """Finish the exact cohort evidence before a native study chooses its identity."""
-    final_keys.write.parquet(str(staging / "final_keys"))
+    write_few_files(final_keys, staging / "final_keys")
     starting = registry.spark.read.parquet(str(managed_path(staging / "starting_keys")))
     retained = registry.spark.read.parquet(str(managed_path(staging / "retained_keys")))
     keys = recipe["source_keys"]
@@ -552,7 +610,7 @@ def _prepare_admission(registry, staging, identity, final_keys, recipe, *, artif
         reasons.append(frame.withColumn(EXCLUSION_REASON_COLUMN, F.lit(reason)))
     native_reasons = reasons[0].unionByName(reasons[1])
     _same_keys(native_exclusions, native_reasons, keys, "native exclusion reasons")
-    native_reasons.write.parquet(str(staging / "native_exclusions"))
+    write_few_files(native_reasons, staging / "native_exclusions")
     excluded = registry.spark.read.parquet(str(managed_path(staging / "exclusions"))).select(*keys)
     _same_keys(starting, final_keys.unionByName(excluded).unionByName(native_exclusions),
                keys, "final population")
@@ -662,7 +720,7 @@ def _check_key_frame(frame, template, keys, *, extra=(), label):
 @reported("Save data-check findings")
 def _save_findings(registry, frame, issues_root, name, check_id):
     path = issues_root / name
-    frame.write.parquet(str(path))
+    write_few_files(frame, path)
     capture = current_capture()
     if capture is not None:
         reference = capture.bind(path)["snapshot"]
@@ -687,8 +745,8 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
     """Capture callback outputs, then reconcile against private managed baselines."""
     keys = value["recipe"]["source_keys"]
     _check_key_frame(population, population, keys, label="managed population")
-    population.write.parquet(str(staging / "starting_keys"))
-    frame.select(*keys).distinct().write.parquet(str(staging / "input_keys"))
+    write_few_files(population, staging / "starting_keys")
+    write_few_files(frame.select(*keys).distinct(), staging / "input_keys")
     population = registry.spark.read.parquet(str(staging / "starting_keys"))
     primary_keys = registry.spark.read.parquet(str(staging / "input_keys"))
     if any(population.schema[k].dataType != primary_keys.schema[k].dataType for k in keys):
@@ -700,7 +758,7 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
         ("input_missing_keys", population, primary_keys, "INPUT_POPULATION_LOSS"),
     ):
         difference = left.join(right, keys, "left_anti")
-        difference.write.parquet(str(staging / name))
+        write_few_files(difference, staging / name)
         columns = {"keys": F.struct(*keys), "issue_code": F.lit(code),
                    "message": F.lit("Primary membership differs from the declared population."),
                    "status": F.lit("failed" if matching else "warning"),
@@ -711,11 +769,11 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
         ]))
     population_findings = _save_findings(registry, population_findings, issues_root,
                                           "population", check_id + "-population")
-    population_findings.write.parquet(str(staging / "population_findings"))
+    write_few_files(population_findings, staging / "population_findings")
     if matching:
         _same_keys(population, primary_keys, keys, "primary and declared population")
     findings = findings.unionByName(population_findings)
-    findings.write.parquet(str(staging / "source_findings"))
+    write_few_files(findings, staging / "source_findings")
     paths = [root / "source", *(root / ("audit-" + name) for name in audits),
              *(staging / name for name in ("starting_keys", "input_keys", "source_findings",
                                            "population_findings", "input_added_keys",
@@ -751,7 +809,7 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
             raise ValueError("application findings must use the native findings schema")
         app_findings = _save_findings(registry, result.findings, issues_root,
                                       "application", check_id + "-application")
-        app_findings.write.parquet(str(staging / "application_findings"))
+        write_few_files(app_findings, staging / "application_findings")
         if app_findings.filter(
             F.col("status").isNull() | ~F.col("status").isin("passed", "warning", "failed")
             | F.col("affected_rows").isNull() | (F.col("affected_rows") < 0)
@@ -933,7 +991,8 @@ class StudyRegistry:
     def _from_storage(cls, storage, runtime, base, spark, *, use_environment=False,
                       connections=None):
         _fields(storage, set(),
-                {"root", "scratch_root", "namespace", "tables", "snapshot_mode", "snapshots"},
+                {"root", "scratch_root", "namespace", "tables", "snapshot_mode", "snapshots",
+                 "input_identity"},
                 label="storage")
         storage = dict(storage)
         if use_environment:
@@ -1153,6 +1212,14 @@ class StudyRegistry:
         elif (definition["schema"] == "autoforecast.registration.v4"
               or definition["source"].get("kind") == "supplied_stages"):
             raise ValueError("supplied stage provenance is missing its frozen identity")
+        elif (binding.get("schema") == "autoforecast.source-version-identity.v1"
+              or ("source_version" in definition["source"]
+                  and "admission_evidence" not in definition)):
+            if ("source_version" not in definition["source"]
+                    or "admission_evidence" in definition
+                    or binding != {"schema": "autoforecast.source-version-identity.v1",
+                                   "sha256": digest(definition["source"])}):
+                raise ValueError("source version provenance differs from the frozen identity")
         elif "admission_evidence" in definition:
             admission = _verify_admission(
                 self.root, definition["admission_evidence"], trusted=True,
@@ -1222,11 +1289,13 @@ class StudyRegistry:
 
     def load_study(self, study_id):
         """Return the existing Study context manager after all registry checks pass."""
-        definition, sha = self.definition(study_id)
-        self.scratch_root.mkdir(parents=True, exist_ok=True)
-        study = load_study(study_id, registry_root=self.root / "benchmarks", spark=self.spark,
-                           scratch_root=self.scratch_root, connections=self.connections,
-                           _expected_sha256=definition["library_sha256"])
+        with one_use():
+            definition, sha = self.definition(study_id)
+            self.scratch_root.mkdir(parents=True, exist_ok=True)
+            study = load_study(study_id, registry_root=self.root / "benchmarks",
+                               spark=self.spark, scratch_root=self.scratch_root,
+                               connections=self.connections,
+                               _expected_sha256=definition["library_sha256"])
         if study._sha256 != definition["library_sha256"]:
             with suppress(Exception):
                 study.close()
@@ -2224,6 +2293,12 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
     describe = (_artifact_record if retain_binding
                 else functools.partial(_logical_record, physical=physical))
     source = value["source"]
+    by_version = value.get("storage", {}).get("input_identity", "rows") == "source_version"
+    if by_version and (retain_binding or current_capture() is not None
+                       or inputs is not None or source["kind"] != "delta"):
+        raise ValueError("storage.input_identity: source_version applies to an ordinary "
+                         "registration from Delta sources in hash snapshot mode")
+    primary_version = None
     source_record: dict[str, Any]
     audits = {}
     query_records = {}
@@ -2263,6 +2338,8 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
         managed = read_sources(session, queries={"primary": source["sql"],
                                **source["audit_queries"]}, tables=source["tables"])
         frame, source_record = managed.pop("primary")
+        if by_version:
+            primary_version = dict(source_record)
         if not keep_resolved_tables:
             source_record.pop("resolved_tables")
         for name, (audit, provenance) in managed.items():
@@ -2270,11 +2347,11 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
             with operation("Save raw audit data", query=name, engine="Spark"):
                 audit.write.parquet(str(path))
             audits[name] = session.read.parquet(str(managed_path(path)))
-            logical = describe(path, session)
+            logical = (_source_version_record(path, provenance, physical) if by_version
+                       else describe(path, session))
             query_records[name] = {**provenance, **logical,
                                    "schema": audits[name].schema.jsonValue(),
-                                   "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
-                                            else logical["logical_hash"]["rows"])}
+                                   "rows": _identity_rows(logical)}
     elif source["kind"] in {"bigquery", "postgresql", "mysql", "sqlserver"}:
         from autoforecast.integrations import bigquery, mysql, postgres, sqlserver
 
@@ -2302,8 +2379,7 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
             logical = describe(destination, session)
             query_records[name] = {**provenance, **logical,
                                    "schema": audits[name].schema.jsonValue(),
-                                   "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
-                                            else logical["logical_hash"]["rows"])}
+                                   "rows": _identity_rows(logical)}
     else:
         frame = session.read.parquet(source["path"])
         source_record = {"kind": "parquet"}
@@ -2311,10 +2387,10 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
         with operation("Save primary data", query="primary", engine="Spark"):
             frame.write.parquet(str(root / "source"))
     frame = session.read.parquet(str(managed_path(root / "source")))
-    logical = describe(root / "source", session)
+    logical = (_source_version_record(root / "source", primary_version, physical)
+               if primary_version is not None else describe(root / "source", session))
     source_record.update({**logical, "schema": frame.schema.jsonValue(),
-                          "rows": (logical["snapshot"]["rows"] if "snapshot" in logical
-                                            else logical["logical_hash"]["rows"])})
+                          "rows": _identity_rows(logical)})
     return frame, source_record, audits, query_records
 
 
@@ -2325,7 +2401,10 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
     if registry.store is not None:
         with operation("Create or validate registry tables", engine="Spark"):
             registry.store.prepare(lock_path=registry.root / ".delta-provision.lock")
-    with tempfile.TemporaryDirectory(prefix="af-register-", dir=registry.scratch_root) as temporary:
+    with (
+        tempfile.TemporaryDirectory(prefix="af-register-", dir=registry.scratch_root) as temporary,
+        ExitStack() as checks,
+    ):
         root = pathlib.Path(temporary)
         contract_path = root / "dataset.yaml"
         contract_path.write_bytes(_bytes(value["dataset"]))
@@ -2350,7 +2429,9 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
         findings = _save_findings(registry, findings, issues_root, "source", check_id)
         if findings.filter(F.col("status") == "failed").limit(1).count():
             raise ValueError(f"structural source issues block registration: {issues_root}")
-        admission_identity = (source_record if inputs is not None else None)
+        admission_identity = (
+            source_record if inputs is not None or "source_version" in source_record else None
+        )
         captured = {}
         staging = issues_root / "admission-staging"
         preparation_metadata = None
@@ -2390,7 +2471,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                 registry, report_source_issues(frame, contract=contract, recipe=recipe),
                 issues_root, "prepared", check_id + "-prepared",
             )
-            prepared_report.write.parquet(str(staging / "prepared_findings"))
+            write_few_files(prepared_report, staging / "prepared_findings")
             if prepared_report.filter(F.col("status") == "failed").limit(1).count():
                 raise ValueError("structural prepared-data issues block registration")
             if captured.get("scoring_references") is not None and not value.get(
@@ -2444,7 +2525,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                         target_col=panel.target_col,
                         origins=origins, validate=False, **settings,
                     ))
-            refs.write.parquet(str(root / "reference-input"))
+            write_few_files(refs, root / "reference-input")
             refs = session.read.parquet(str(managed_path(root / "reference-input")))
             reference_definition = {
                 "preparation": settings if "path" not in settings else {"kind": "parquet"},
@@ -2464,7 +2545,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             report = _save_findings(registry, check_wrmsse_references(refs, origins=origins),
                                     issues_root, "references", check_id + "-references")
             if prepare is not None:
-                report.write.parquet(str(staging / "reference_findings"))
+                write_few_files(report, staging / "reference_findings")
             if report.limit(1).count():
                 if value.get("invalid_references", "error") == "error":
                     raise ValueError(f"invalid scoring references; findings: {issues_root}")
@@ -2492,7 +2573,7 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                         if item["keys"] not in exclusions
                     ]
             references = root / "references"
-            refs.write.parquet(str(references))
+            write_few_files(refs, references)
         retained = frame.filter(F.col(panel.time_col).between(start, origin)).select(
             *keys,
         ).distinct().count()
@@ -2534,6 +2615,8 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                 },
             }
         event("admission", "PASS", retained_series=retained, excluded_references=len(exclusions))
+        # Preparation has finished. Do not reuse any checks it made before changing files.
+        checks.enter_context(one_use())
         event("freeze", "START")
         capture = current_capture()
         prepared_admission = None
@@ -2565,6 +2648,8 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             native_inventory=native_inventory if capture is not None else None,
             admission_identity=({"schema": ("autoforecast.supplied-stage-identity.v1"
                                             if inputs is not None
+                                            else "autoforecast.source-version-identity.v1"
+                                            if prepare is None and "source_version" in source_record
                                             else "autoforecast.admission-identity.v1"),
                                  "sha256": digest(admission_identity)}
                                 if admission_identity is not None else None),

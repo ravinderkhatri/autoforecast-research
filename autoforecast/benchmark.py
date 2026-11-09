@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import datetime as dt
 import errno
@@ -11,7 +12,7 @@ import json
 import pathlib
 import shutil
 import tempfile
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from functools import partial
 
 from mlops._safe_files import is_regular_file, read_path_bytes
@@ -57,6 +58,26 @@ class _VerifiedBenchmark:
 
     path: pathlib.Path
     sha256: str
+
+
+# Every file of an output costs a request each time a check downloads it, so small
+# outputs are written as one file and larger ones as files of about this many rows.
+_ROWS_PER_FILE = 2_000_000
+# Offline row hashing sizes its batches from the largest row group: a row group above
+# _logical_hash._LOCAL_MAX_BYTES leaves one row per batch, which took minutes for one
+# large file. Small row groups keep batches as large as many small files gave.
+_ROW_GROUP_BYTES = 256 * 1024
+
+
+def write_few_files(frame, path, *, rows=None):
+    """Write Parquet in few files: one, or about ``_ROWS_PER_FILE`` rows each.
+
+    ``rows`` is the frame's known row count. Without it the output must be small
+    evidence, such as keys, findings or references, and is written as one file.
+    """
+    files = 1 if rows is None else max(1, -(-rows // _ROWS_PER_FILE))
+    writer = frame.repartition(files).write.option("parquet.block.size", _ROW_GROUP_BYTES)
+    writer.parquet(str(path))
 
 
 def digest(value) -> str:
@@ -1009,15 +1030,15 @@ def _freeze_benchmark(
             "dataset": {"id": contract.id, "panel": roles, "required_series_count": final_count},
         }
         (scratch / "dataset.yaml").write_text(yaml.safe_dump(prepared_contract))
-        key_map.write.parquet(str(scratch / "source-keys"))
+        write_few_files(key_map, scratch / "source-keys")
         for name, frame in frames.items():
-            frame.write.parquet(str(scratch / name))
+            write_few_files(frame, scratch / name, rows=counts[name]["written_rows"])
         artifact_roles = [*sorted(sources), "source-keys"]
         if scoring_references is not None:
             references = _prepare_scoring_references(
                 read_paths["scoring_references"], key_map, keys, recipe, spark,
             )
-            references.write.parquet(str(scratch / "scoring_references"))
+            write_few_files(references, scratch / "scoring_references")
             artifact_roles.append("scoring_references")
         logical_hashes = {}
         physical_hashes = {}
@@ -1095,7 +1116,7 @@ def _freeze_benchmark(
             totals = per_series.agg(*[F.sum(name).alias(name) for name in names]).first()
             assert totals is not None
             coverage_path = "coverage/" + key
-            per_series.write.parquet(str(scratch / coverage_path))
+            write_few_files(per_series, scratch / coverage_path)
             coverage_identities[key] = {
                 ("snapshot" if native_inputs is not None else "content_sha256"):
                     content_hash(scratch / coverage_path, "coverage/" + key),
@@ -1314,7 +1335,8 @@ def _publish_frozen_benchmark(
 def _validate_admission_identity(value):
     if (not isinstance(value, dict) or set(value) != {"schema", "sha256"}
             or value["schema"] not in {"autoforecast.admission-identity.v1",
-                                       "autoforecast.supplied-stage-identity.v1"}
+                                       "autoforecast.supplied-stage-identity.v1",
+                                       "autoforecast.source-version-identity.v1"}
             or not isinstance(value["sha256"], str) or len(value["sha256"]) != 64
             or any(c not in "0123456789abcdef" for c in value["sha256"])):
         raise BenchmarkError("invalid admission identity binding")
@@ -1625,6 +1647,30 @@ def _validate_native_parent(record, parent):
         raise BenchmarkError("derived native input ownership identity changed")
 
 
+# Results of artifact checks shared by the back-to-back verifications of one use,
+# such as the checks that end a registration or the two passes of one study load.
+_SHARED_CHECKS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "autoforecast_shared_checks", default=None,
+)
+
+
+@contextmanager
+def one_use():
+    """Check each frozen artifact once while one registration or load runs.
+
+    Nothing reads the artifacts between the checks this scope joins. A separate use,
+    such as a later load of the study, opens its own scope and checks them again.
+    """
+    if _SHARED_CHECKS.get() is not None:
+        yield
+        return
+    token = _SHARED_CHECKS.set({})
+    try:
+        yield
+    finally:
+        _SHARED_CHECKS.reset(token)
+
+
 def verify_benchmark(
     path: pathlib.Path, expected_sha256: str | None = None, *, spark=None,
     _reuse_verified: bool = False, _scratch_root=None,
@@ -1678,16 +1724,19 @@ def verify_benchmark(
         for reference in record["snapshots"].values():
             current_inputs().inspect(reference, retained=True)
     else:
-        checked = {}
+        shared = _SHARED_CHECKS.get()
+        checked = shared if shared is not None else {}
+        trusted = _reuse_verified and expected_sha256 is not None
 
         def checked_hash(target, physical, name):
             logical = record.get("logical_hashes", {}).get(name)
-            cache_key = (target, physical, digest(logical))
+            # A trusted result never stands in for a full check that was asked for.
+            cache_key = (str(target.absolute()), physical, digest(logical), trusted)
             if cache_key not in checked:
                 try:
                     checked[cache_key] = _logical_hash.verify_files(
                         target, physical_sha256=physical, logical=logical,
-                        trusted=_reuse_verified and expected_sha256 is not None, spark=spark,
+                        trusted=trusted, spark=spark,
                         _scratch_root=_scratch_root,
                     )
                 except ValueError as error:
