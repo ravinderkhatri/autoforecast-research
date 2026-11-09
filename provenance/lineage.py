@@ -153,20 +153,30 @@ def _digest_files(
     return files
 
 
-def _parquet_member(relative: pathlib.Path) -> bool:
-    """Require every file visible to either directory reader to be a Parquet part.
+def hidden_from_readers(relative: pathlib.PurePath) -> bool:
+    """Return whether both directory readers ignore this file, so a Parquet digest never reads it.
 
     Both readers ignore dot names and ordinary underscore markers. Spark also sees
     underscore partition names containing '=' and Parquet summary metadata prefixes.
-    Those exceptions must not hide unauthenticated bytes behind an ignored suffix.
     """
-    for name in relative.parts:
-        if name.startswith(".") or (
+    return any(
+        name.startswith(".") or (
             name.startswith("_")
             and "=" not in name
             and not name.startswith(("_metadata", "_common_metadata"))
-        ):
-            return False
+        )
+        for name in relative.parts
+    )
+
+
+def _parquet_member(relative: pathlib.Path) -> bool:
+    """Require every file visible to either directory reader to be a Parquet part.
+
+    Reader-visible exceptions to the hidden-name rule must not hide unauthenticated
+    bytes behind an ignored suffix.
+    """
+    if hidden_from_readers(relative):
+        return False
     if relative.suffix != ".parquet":
         raise LineageError(
             f"reader-visible file {relative} is not a .parquet part; "
@@ -194,7 +204,9 @@ def directory_digest(path: str | pathlib.Path, *, suffixes: tuple[str, ...] = ()
     from mlops import _volume_files
 
     if _volume_files.is_volume(pathlib.Path(path)):
-        with _volume_files.local_snapshot(pathlib.Path(path)) as local:
+        with _volume_files.local_snapshot(
+            pathlib.Path(path), parquet_only=suffixes == (".parquet",),
+        ) as local:
             return directory_digest.__wrapped__(local, suffixes=suffixes)
     files = _digest_files(path, suffixes)
     digest = hashlib.sha256()
@@ -225,7 +237,9 @@ def directory_content_digest(path: str | pathlib.Path, *, suffixes: tuple[str, .
     from mlops import _volume_files
 
     if _volume_files.is_volume(pathlib.Path(path)):
-        with _volume_files.local_snapshot(pathlib.Path(path)) as local:
+        with _volume_files.local_snapshot(
+            pathlib.Path(path), parquet_only=suffixes == (".parquet",),
+        ) as local:
             return directory_content_digest.__wrapped__(local, suffixes=suffixes)
     files = _digest_files(path, suffixes)
     payloads: list[tuple[int, bytes]] = []
@@ -472,6 +486,29 @@ class Graph:
         }
 
 
+def snapshot_parquet_identity(
+    source: pathlib.Path, destination: pathlib.Path, *, label: str,
+) -> tuple[pathlib.Path, str]:
+    """Copy Parquet bytes once and return the owned copy with the digest of those bytes.
+
+    A volume source is downloaded once; the digest describes exactly the bytes copied.
+    Unlike :func:`snapshot_parquet_directory`, the source is not rechecked after the
+    copy. The caller must digest ``source`` again after its last read of it and compare
+    the result with the returned digest.
+    """
+    from mlops import _volume_files
+
+    if _volume_files.is_volume(source):
+        with _volume_files.local_snapshot(source, parquet_only=True) as local:
+            sha256 = directory_digest(local, suffixes=(".parquet",))
+            copy = snapshot_parquet_directory(local, destination, expected_sha256=sha256,
+                                              label=label)
+            return copy, sha256
+    sha256 = directory_digest(source, suffixes=(".parquet",))
+    return (snapshot_parquet_directory(source, destination, expected_sha256=sha256, label=label),
+            sha256)
+
+
 @reported("Copy and verify owned snapshot")
 def snapshot_parquet_directory(
     source: pathlib.Path,
@@ -494,7 +531,7 @@ def snapshot_parquet_directory(
             error.add_note(f"Snapshot cleanup also failed: {cleanup_error}")
 
     if _volume_files.is_volume(source):
-        with _volume_files.local_snapshot(source) as local:
+        with _volume_files.local_snapshot(source, parquet_only=True) as local:
             result = snapshot_parquet_directory(
                 local, destination, expected_sha256=expected_sha256, label=label,
             )

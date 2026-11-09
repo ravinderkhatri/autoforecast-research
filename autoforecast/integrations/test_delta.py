@@ -434,17 +434,18 @@ def test_prepared_registration_owns_audit_query_evidence_and_links_before_public
 
     from autoforecast import _logical_hash
 
-    fingerprint = _logical_hash.fingerprint
+    capture = _logical_hash._capture
     audit_hashes = []
 
     def captured_hash(path, *, spark=None):
+        # Every logical hash of a capture goes through _capture, with or without fingerprint.
         if path.name == "audit-population":
             assert spark is store.spark
             assert path.exists()
             audit_hashes.append(path)
-        return fingerprint(path, spark=spark)
+        return capture(path, spark=spark)
 
-    monkeypatch.setattr(_logical_hash, "fingerprint", captured_hash)
+    monkeypatch.setattr(_logical_hash, "_capture", captured_hash)
 
     class SensorAudit(SensorPreparation):
         def prepare(self, context):
@@ -539,6 +540,58 @@ def test_prepared_registration_owns_audit_query_evidence_and_links_before_public
     (tmp_path / "population.sql").unlink()
     with registry.load_study(study_id) as study:
         assert study.training_data.filter("value = 200.0").count() == 0
+
+
+@pytest.mark.parametrize("restored", [False, True], ids=["lasting", "restored"])
+@pytest.mark.parametrize("captured", ["source", "audit-population"])
+def test_capture_change_before_preparation_blocks_registration(
+    store, tmp_path, monkeypatch, captured, restored,
+):
+    import shutil
+    from pathlib import Path
+
+    import yaml
+
+    from autoforecast import register_study, study_registration
+    from autoforecast.study_registration import StudyRegistry
+    from autoforecast.test_study_preparation import SensorPreparation
+    from autoforecast.test_study_registration import configuration
+
+    path = configuration(tmp_path)
+    table = store.namespace + ".sensors"
+    (store.spark.read.parquet(str(tmp_path / "source.parquet")).write.format("delta")
+     .saveAsTable(table))
+    (tmp_path / "primary.sql").write_text("SELECT item, day, value FROM measurements")
+    (tmp_path / "population.sql").write_text("SELECT DISTINCT item FROM inventory")
+    value = yaml.safe_load(path.read_text())
+    value["source"] = {"kind": "delta", "sql": "primary.sql",
+                       "tables": {"measurements": table, "inventory": table},
+                       "audit_queries": {"population": "population.sql"},
+                       "population": "population"}
+    path.write_text(yaml.safe_dump(value))
+    registry = StudyRegistry(tmp_path / "registry", spark=store.spark, namespace=store.namespace)
+    prepare, write = study_registration._prepare_observations, DataFrameWriter.parquet
+    added = []
+
+    def change_after_capture(*args, root, **kwargs):
+        # Another writer adds a part after the capture was hashed, before preparation.
+        part = next((root / captured).glob("*.parquet"))
+        added.append(part.with_name("part-99999-added.parquet"))
+        shutil.copyfile(part, added[0])
+        return prepare(*args, root=root, **kwargs)
+
+    def restore_once_prepared_is_written(writer, target, *args, **kwargs):
+        # Restored: the capture is back to its captured bytes before the final check.
+        write(writer, target, *args, **kwargs)
+        if restored and Path(target).name == "prepared" and added:
+            added[0].unlink(missing_ok=True)
+
+    monkeypatch.setattr(study_registration, "_prepare_observations", change_after_capture)
+    monkeypatch.setattr(DataFrameWriter, "parquet", restore_once_prepared_is_written)
+    with pytest.raises(ValueError, match="changed during preparation"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert added
+    assert not list((registry.root / "registrations").glob("*.*"))
 
 
 @pytest.mark.parametrize("tracking,publish", [("none", False), ("none", True),

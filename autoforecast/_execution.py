@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import datetime as dt
 import functools
+import hashlib
 import inspect
 import json
 import logging
@@ -16,6 +17,8 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from contextlib import contextmanager, nullcontext, suppress
 from typing import Any
 
@@ -29,6 +32,12 @@ _OPERATION: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _AUDITING = contextvars.ContextVar("autoforecast_writing_audit", default=False)
 _SETUP_LOCK = threading.RLock()
 _FALLBACK_CONSOLE = None
+# Each remote audit event costs an upload and a readback (about 0.5 s on a volume).
+# A running execution uploads them off the main path, one at a time and in order,
+# so every saved audit is a complete prefix that readers in other processes accept.
+_DISPLAYS = ("progress", "logs", "both")
+# An explicit configure_logging(display=...) choice; otherwise runtime.display applies.
+_DISPLAY = None
 
 
 def resolve_level(explicit=None, runtime=None):
@@ -39,6 +48,14 @@ def resolve_level(explicit=None, runtime=None):
     if not isinstance(name, str) or name not in logging.getLevelNamesMapping():
         raise ValueError("log_level must be a standard logging level name")
     return logging.getLevelNamesMapping()[name]
+
+
+def resolve_display(runtime=None):
+    """Use configure_logging's display, then runtime.display, then both."""
+    display = _DISPLAY if _DISPLAY is not None else (runtime or {}).get("display", "both")
+    if display not in _DISPLAYS:
+        raise ValueError("display must be progress, logs or both")
+    return display
 
 
 def validate_model_label(value):
@@ -157,6 +174,11 @@ class _Console(logging.StreamHandler):
             self.terminal = bool(getattr(self.stream, "isatty", lambda: False)())
 
     def emit(self, record):
+        # A run copies its display when it starts; later configuration affects later runs.
+        execution = _CURRENT.get()
+        display = execution.display if execution is not None else resolve_display()
+        if display == "progress" and record.levelno < logging.WARNING:
+            return
         assert self.lock is not None
         with self.lock:
             self._sync_stream()
@@ -221,17 +243,28 @@ class _Console(logging.StreamHandler):
                 self.flush()
 
 
-def configure_logging(*, stream=None, progress="auto", interval=10.0):
+def configure_logging(*, stream=None, progress=None, interval=10.0, display=None):
     """Show library events and progress without changing the root logger.
 
     Basic operation progress appears automatically. Call this for customization.
     Repeating this call updates the same handler.
-    ``progress='plain'`` is useful for job logs; ``'off'`` keeps permanent events only.
+    ``display`` chooses the console content for runs started afterwards: ``'progress'``
+    (the panel, plus warnings and errors), ``'logs'`` (event lines, no panel) or
+    ``'both'``. Omit it to use runtime.display, or both. Saved audit events never change.
+    ``progress`` chooses the renderer: ``'auto'``, ``'plain'`` for job logs, or ``'off'``.
     Runtime log_level controls verbosity. Applications may instead configure Python logging.
     """
-    global _FALLBACK_CONSOLE
+    global _FALLBACK_CONSOLE, _DISPLAY
+    if display is not None and display not in _DISPLAYS:
+        raise ValueError("display must be progress, logs or both")
+    if progress is None:
+        progress = "off" if display == "logs" else "auto"
     if progress not in {"auto", "plain", "off"}:
         raise ValueError("progress must be auto, plain or off")
+    if display == "logs" and progress != "off":
+        raise ValueError("display='logs' shows no panel; omit progress or use progress='off'")
+    if display in {"progress", "both"} and progress == "off":
+        raise ValueError(f"display={display!r} needs progress='auto' or 'plain'")
     if isinstance(interval, bool) or not isinstance(interval, int | float) or not (
         0 < interval < float("inf")
     ):
@@ -253,6 +286,7 @@ def configure_logging(*, stream=None, progress="auto", interval=10.0):
             _FALLBACK_CONSOLE = None
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
+        _DISPLAY = display
 
 
 def _console():
@@ -297,7 +331,12 @@ def _emit(event, level, *, announce=False):
             logger.log(severity, "%s", _message(event))
             # Registration can validate source plans before it has an audit directory.
             # Show that initial step when the platform's default logger hides INFO.
-            if announce and (not logger.hasHandlers() or not logger.isEnabledFor(severity)):
+            # display='logs' has no panel, so its event lines are shown the same way.
+            execution = _CURRENT.get()
+            lines = (execution is not None and execution.display == "logs"
+                     and severity < logging.WARNING)
+            if ((announce or lines)
+                    and (not logger.hasHandlers() or not logger.isEnabledFor(severity))):
                 handler = _console()
                 if handler is not None and handler is _FALLBACK_CONSOLE:
                     handler.handle(logger.makeRecord(
@@ -308,8 +347,11 @@ def _emit(event, level, *, announce=False):
 class Execution:
     """A finite parent-stage plan. Nested work never changes its denominator."""
 
-    def __init__(self, audit, stages, *, level=logging.INFO, **identity):
+    def __init__(self, audit, stages, *, level=logging.INFO, display=None, **identity):
         self.audit = pathlib.Path(audit)
+        if display is not None and display not in _DISPLAYS:
+            raise ValueError("display must be progress, logs or both")
+        self.display = display
         self.stages = tuple(stages)
         if len(set(self.stages)) != len(self.stages):
             raise ValueError("execution stages must have distinct names")
@@ -332,9 +374,20 @@ class Execution:
         self.result = "RUNNING"
         self.receipt = {}
         self.audit_error = None
+        self.uploader = None
 
     def write_event(self, path, event):
-        """Keep one writer and ordered, retry-stable event bytes for each remote audit."""
+        """Keep one writer and ordered, retry-stable event bytes for each remote audit.
+
+        Sequence, hash link and bytes are fixed and recorded here before any upload. The
+        first event claims the audit for this writer before returning. While the execution
+        is running, later events of its own audit upload in the background, in sequence
+        order. After a failed upload nothing later is uploaded until the failed event is
+        retried with identical bytes, before the next event or at close. A hard process
+        failure can lose the unsaved tail; what was saved remains a valid prefix. Other
+        audit paths, such as a run bundle's events, stay synchronous because their owners
+        may seal them before this execution ends.
+        """
         from mlops import _volume_files
 
         with self.lock:
@@ -342,6 +395,7 @@ class Execution:
                 raise ValueError("execution audit is closed")
             state = self.audit_segments.setdefault(path, {
                 "owner": uuid.uuid4().hex, "sequence": 0, "previous": None, "pending": None,
+                "uploads": {}, "blocked": False,
             })
 
             def acknowledge():
@@ -352,9 +406,64 @@ class Execution:
 
             if state["pending"] is not None:
                 acknowledge()
+            self._settle(path, state, wait=False)
             event["audit_segment"] = {key: state[key] for key in ("owner", "sequence", "previous")}
-            state["pending"] = (json.dumps(event, sort_keys=True, allow_nan=False) + "\n").encode()
-            acknowledge()
+            payload = (json.dumps(event, sort_keys=True, allow_nan=False) + "\n").encode()
+            if state["sequence"] == 0 or self.uploader is None or path != self.audit:
+                state["pending"] = payload
+                acknowledge()
+                return
+            # Record the event before submitting it, so an interruption between the two
+            # leaves an unsubmitted entry that _settle uploads, never a reused sequence.
+            # One update installs the entry and advances the sequence together: an
+            # interruption leaves neither or both, so the closure count stays right.
+            sequence, entry = state["sequence"], [payload, None]
+            previous = hashlib.sha256(payload).hexdigest()
+            state.update(uploads={**state["uploads"], sequence: entry},
+                         sequence=sequence + 1, previous=previous)
+            entry[1] = self.uploader.submit(self._upload, path, state, sequence, payload)
+
+    @staticmethod
+    def _upload(path, state, sequence, payload):
+        from mlops import _volume_files
+
+        if state["blocked"]:
+            raise OSError("an earlier audit event is not saved yet")
+        try:
+            _volume_files.publish_audit_segment(path, payload, owner=state["owner"],
+                                                sequence=sequence)
+        except BaseException:
+            state["blocked"] = True
+            raise
+
+    def _settle(self, path, state, *, wait):
+        """Save finished or failed uploads in order; with ``wait``, save every event.
+
+        A failed or never-submitted event is retried here with identical bytes before any
+        later one, so the saved audit stays a prefix.
+        """
+        from mlops import _volume_files
+
+        for sequence, (payload, future) in sorted(state["uploads"].items()):
+            if future is not None and not future.done():
+                if not wait:
+                    break
+                # Wait without re-raising the worker's error, so the caller's own
+                # interruption still propagates.
+                futures_wait([future])
+            if future is None or future.exception() is not None:
+                _volume_files.publish_audit_segment(path, payload, owner=state["owner"],
+                                                    sequence=sequence)
+            del state["uploads"][sequence]
+        if not state["uploads"]:
+            state["blocked"] = False
+
+    def flush_audit(self, path):
+        """Finish background uploads for one audit, for a reader inside this execution."""
+        with self.lock:
+            state = self.audit_segments.get(pathlib.Path(path))
+            if state is not None:
+                self._settle(pathlib.Path(path), state, wait=True)
 
     def observe(self, path, event):
         with self.lock:
@@ -376,6 +485,14 @@ class Execution:
                     self.starts[name] = time.monotonic()
             self.refresh(force=planned)
 
+    def _run_identity(self):
+        """Name the input study separately when the saved result names another one."""
+        identity = _safe(self.identity)
+        if self.receipt.get("study_id") and identity.get("study_id") != self.receipt["study_id"]:
+            if "study_id" in identity:
+                identity["input_study_id"] = identity.pop("study_id")
+        return identity
+
     def render(self):
         now = time.monotonic()
         completed = [s for s in self.stages if self.states[s] == "PASS"]
@@ -386,11 +503,7 @@ class Execution:
         def names(items):
             return " | ".join(f"Stage {self.stages.index(s) + 1}: {s}"
                               f" ({self.states[s].lower()})" for s in items) or "None"
-        identity = _safe(self.identity)
-        if self.receipt.get("study_id") and identity.get("study_id") != self.receipt["study_id"]:
-            if "study_id" in identity:
-                identity["input_study_id"] = identity.pop("study_id")
-        lines = [f"RUN {_text(identity)} | {self.result}"]
+        lines = [f"RUN {_text(self._run_identity())} | {self.result}"]
         for name in running:
             lines.append(f"Stage {self.stages.index(name) + 1}/{total}: {name} | "
                          f"elapsed={now - self.starts[name]:.1f}s")
@@ -430,7 +543,7 @@ class Execution:
         return "\n".join(lines)
 
     def refresh(self, *, force=False, final=False):
-        if self.level > logging.INFO:
+        if self.level > logging.INFO or self.display == "logs":
             return
         handler = _console()
         now = time.monotonic()
@@ -453,6 +566,10 @@ class Execution:
         parent = _CURRENT.get()
         if parent:
             self.identity.setdefault("parent_attempt", parent.identity["attempt_id"])
+        if self.display is None:
+            self.display = parent.display if parent else resolve_display()
+        # Allocate before installing any context, so a failure here leaves nothing to undo.
+        self.uploader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autoforecast-audit")
         self.token = _CURRENT.set(self)
         self.level_token = _LOG_LEVEL.set(self.level)
         self.identity_token = _IDENTITY.set({})
@@ -464,16 +581,31 @@ class Execution:
                 self.thread.start()
         except BaseException:
             self.stop.set()
+            # Nothing was submitted yet; keep the startup failure if shutdown is interrupted.
+            with suppress(BaseException):
+                self.uploader.shutdown(wait=True)
             self._restore_context()
             raise
         return self
 
     def __exit__(self, kind, error, traceback):
+        # A failure already on its way out (the body's, else _finish's) wins over a
+        # cleanup failure, and the context is restored whatever happens.
+        failing = kind is not None
         try:
-            with suppress(BaseException) if kind is not None else nullcontext():
+            with suppress(BaseException) if failing else nullcontext():
                 self._finish(kind)
+        except BaseException:
+            failing = True
+            raise
         finally:
-            self._restore_context()
+            uploader, self.uploader = self.uploader, None
+            try:
+                with suppress(BaseException) if failing else nullcontext():
+                    if uploader is not None:
+                        uploader.shutdown(wait=True)
+            finally:
+                self._restore_context()
 
     def _restore_context(self):
         _PARENT_AUDIT.reset(self.parent_token)
@@ -499,6 +631,23 @@ class Execution:
                            if kind else "PASS" if all(v == "PASS" for v in self.states.values())
                            else "RESOLVED" if all(v in {"PASS", "SKIP"}
                                                   for v in self.states.values()) else "INCOMPLETE")
+            for path, segments in self.audit_segments.items():
+                try:
+                    self._settle(path, segments, wait=True)
+                except Exception as failure:
+                    # Show that saved evidence is incomplete before reporting the failure;
+                    # an interruption propagates unchanged and leaves a valid prefix.
+                    if self.result not in {"FAIL", "CANCELLED"}:
+                        self.result = "UNVERIFIED"
+                    self.audit_error = type(failure).__name__
+                    # The panel may be hidden, so report it, and the saved result, as an
+                    # event line as well.
+                    with suppress(BaseException):
+                        _emit(_safe({**self._run_identity(), **self.receipt,
+                                     "stage": "Execution audit", "status": "UNVERIFIED",
+                                     "audit_error": self.audit_error}), self.level)
+                    self.refresh(force=True, final=True)
+                    raise OSError("execution audit has an unacknowledged event") from failure
             state = self.audit_segments.get(self.audit)
             if state is not None:
                 if state["pending"] is not None:
@@ -575,6 +724,9 @@ def read_execution_events(path):
     """Read local JSONL or remote event segments; this does not certify run completion."""
     from mlops import _volume_files
     path = pathlib.Path(path)
+    execution = _CURRENT.get()
+    if execution is not None:
+        execution.flush_audit(path)
     payload = _volume_files.read_audit_bytes(path)
     events = [json.loads(line) for line in payload.splitlines() if line.strip()]
     if any(not isinstance(event, dict) for event in events):

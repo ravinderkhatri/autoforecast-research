@@ -31,7 +31,12 @@ from autoforecast.frequency import (
     parse_origin,
     period_points,
 )
-from provenance.lineage import LineageError, directory_digest, snapshot_parquet_directory
+from provenance.lineage import (
+    LineageError,
+    directory_digest,
+    snapshot_parquet_directory,
+    snapshot_parquet_identity,
+)
 
 STUDY_SCHEMA = "autoforecast.frozen-benchmark.v4"
 OPTIONAL_STAGE_SCHEMA = "autoforecast.frozen-benchmark.v5"
@@ -744,23 +749,19 @@ def _freeze_benchmark(
             source_references[name] = reference.record()
             read_paths[name] = owned
     else:
-        physical_sources = {
-            path: directory_digest(path, suffixes=(".parquet",))
-            for path in dict.fromkeys(all_sources.values())
-        }
-        before = {name: physical_sources[path] for name, path in all_sources.items()}
         snapshot_root = pathlib.Path(inputs.enter_context(tempfile.TemporaryDirectory(
             prefix="autoforecast-freeze-", dir=scratch_root,
         )))
-        read_paths = {}
-        physical_inputs = {}
+        # Identify each source by the bytes actually copied. Spark reads only the copies;
+        # authenticate_sources() below re-digests every source against these values.
+        physical_sources, copies = {}, {}
         for name, path in all_sources.items():
-            identity = (path.resolve(), before[name])
-            if identity not in physical_inputs:
-                physical_inputs[identity] = snapshot_parquet_directory(
-                    path, snapshot_root / name, expected_sha256=before[name], label=name,
+            if path not in copies:
+                copies[path], physical_sources[path] = snapshot_parquet_identity(
+                    path, snapshot_root / name, label=name,
                 )
-            read_paths[name] = physical_inputs[identity]
+        read_paths = {name: copies[path] for name, path in all_sources.items()}
+        before = {name: physical_sources[path] for name, path in all_sources.items()}
     frames = {}
     normalized_inputs = {}
     key_types = None

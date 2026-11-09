@@ -696,6 +696,23 @@ def test_output_root_rejects_completed_search_namespace(spark, tmp_path):
                         output_dir=selected.path / relative)
 
 
+# Every admission name the registry reader looks up (study_registration._record_path).
+@pytest.mark.parametrize("marker", ["admission.json", "admission.yaml", "admission.yml",
+                                    "capture.json"])
+def test_output_root_rejects_sealed_admission_and_capture_evidence(spark, tmp_path, marker):
+    manifest = register(tmp_path / "output-study", spark, count=1)
+    cfg = _one_trial(profile(tmp_path, selection={"stage": "validation"}))
+    sealed = tmp_path / "registry-copy" / "sealed-evidence"
+    sealed.mkdir(parents=True)
+    (sealed / marker).write_text("{}")
+    with open_study(manifest, spark) as study:
+        for relative in (".", "prepared", "runs/new"):
+            with pytest.raises(HPOError, match="overlaps"):
+                study.run_forecast_workflow(fit_predict=predict, config=cfg,
+                                            implementation=implementation(),
+                                            output_dir=sealed / relative)
+
+
 def test_schedule_rejects_impossible_count_before_enumerating(monkeypatch):
     calls = 0
     real_advance = benchmark.advance

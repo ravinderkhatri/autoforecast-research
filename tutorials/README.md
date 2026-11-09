@@ -369,6 +369,24 @@ study_id = register_study(config_path, registry=registry)
 result = run_study(study_id, "seasonal_naive", registry=registry, log_level="WARNING")
 ```
 
+Choose what the console shows with `display`. Saved audit events are the same in
+every choice.
+
+```python
+from autoforecast import configure_logging
+
+configure_logging(display="progress")  # The panel, plus warnings and errors.
+configure_logging(display="logs")      # Event lines, without a panel.
+configure_logging(display="both")      # The panel and event lines (the default).
+```
+
+A study configuration can set the same choice as `runtime.display`; an explicit
+`configure_logging(display=...)` takes precedence. A run keeps the choice it started
+with, and a registration started inside `run_study` uses the run's choice.
+Without `configure_logging`, Python logging still decides which event lines appear
+beside the panel. `display="logs"` has no panel, so it shows its event lines itself.
+`display="progress"` with `log_level="WARNING"` shows only warnings and errors.
+
 For example, `Stage 3/5` means stage three is running. It does not mean three
 stages have finished. `2/5 stages completed` means two have passed. Downloading
 all the bytes does not finish the integrity checks that follow. A skipped stage

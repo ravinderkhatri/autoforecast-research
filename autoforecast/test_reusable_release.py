@@ -210,10 +210,11 @@ def test_freeze_unknown_future_features(tmp_path, spark):
 
 def test_freeze_source_mutation(tmp_path, spark, monkeypatch):
     project, recipe, sources = _inputs(tmp_path)
-    original = benchmark.snapshot_parquet_directory
+    original = benchmark.snapshot_parquet_identity
     changed = []
 
     def changing(source, destination, **kwargs):
+        copied = original(source, destination, **kwargs)
         if source == project / "data" and not changed:
             # Change actual values after the source identity was recorded, while
             # preserving the schema and row count. Do not depend on hash-call counts.
@@ -224,10 +225,10 @@ def test_freeze_source_mutation(tmp_path, spark, monkeypatch):
                 row["units"] += 1
             pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), part)
             changed.append(part)
-        return original(source, destination, **kwargs)
+        return copied
 
-    monkeypatch.setattr(benchmark, "snapshot_parquet_directory", changing)
-    with pytest.raises(benchmark.BenchmarkError, match="changed before its snapshot"):
+    monkeypatch.setattr(benchmark, "snapshot_parquet_identity", changing)
+    with pytest.raises(benchmark.BenchmarkError, match="source changed during preparation"):
         _freeze(project, recipe, sources, spark)
     assert len(changed) == 1
     assert not list((project / "frozen").rglob("benchmark.json"))

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import functools
 import hashlib
 import json
 import logging
@@ -37,6 +38,7 @@ from pyspark.sql.types import StringType, StructField, StructType
 from autoforecast import _logical_hash
 from autoforecast._exact_yaml import loads_record, read_record, record_bytes
 from autoforecast._execution import (
+    _CURRENT,
     Execution,
     _emit,
     _safe,
@@ -46,6 +48,7 @@ from autoforecast._execution import (
     operation,
     record_result,
     reported,
+    resolve_display,
     resolve_level,
     standalone_attempt,
 )
@@ -376,9 +379,11 @@ def _scalar_settings(value, label):
 def _runtime(value):
     from autoforecast.implementation import source_scope
 
-    _fields(value, (), {"tracking", "publish", "log_level", "tracking_uri",
+    _fields(value, (), {"tracking", "publish", "log_level", "display", "tracking_uri",
                         "mlflow_experiment", "implementation"},
             label="runtime")
+    if value.get("display", "both") not in {"progress", "logs", "both"}:
+        raise ValueError("display must be progress, logs or both")
     if value.get("tracking", "none") not in {"none", "mlflow"}:
         raise ValueError("tracking must be none or mlflow")
     if type(value.get("publish", False)) is not bool:
@@ -450,12 +455,15 @@ def _remove_staging_directory(path):
         shutil.rmtree(path)
 
 
-def _logical_record(path, spark):
+def _logical_record(path, spark, physical=None):
+    """Bind a fresh capture. ``physical`` keeps its file SHA in memory, never in the record."""
     capture = current_capture()
     if capture is not None:
         binding = capture.bind(path)
         return {**binding, "rows": binding["snapshot"]["rows"]}
-    logical = _logical_hash.fingerprint(path, spark=spark)
+    logical, physical_sha256 = _logical_hash._capture(path, spark=spark)
+    if physical is not None:
+        physical[path] = physical_sha256
     return {"logical_sha256": logical["sha256"], "logical_hash": logical}
 
 
@@ -674,7 +682,8 @@ def _save_findings(registry, frame, issues_root, name, check_id):
 
 @reported("Business preparation and input verification")
 def _prepare_observations(hook, settings, frame, audits, population, findings, *,
-                          value, root, staging, registry, issues_root, check_id):
+                          value, root, staging, registry, issues_root, check_id,
+                          captured_physical=None):
     """Capture callback outputs, then reconcile against private managed baselines."""
     keys = value["recipe"]["source_keys"]
     _check_key_frame(population, population, keys, label="managed population")
@@ -714,6 +723,12 @@ def _prepare_observations(hook, settings, frame, audits, population, findings, *
     capture = current_capture()
     baselines = {p: (capture.bind(p) if capture is not None else
                      directory_digest(p, suffixes=(".parquet",))) for p in paths}
+    # Source and audit captures must still have the file SHA computed when they were
+    # captured, here and again after the callback. A change that is lasting, or that is
+    # present when preparation starts and restored before it ends, then fails.
+    if capture is None and any(baselines.get(p) != digest
+                               for p, digest in (captured_physical or {}).items()):
+        raise ValueError("managed source or population changed during preparation")
     if capture is not None:
         frame = registry.spark.read.parquet(str(managed_path(root / "source")))
         audits = {name: registry.spark.read.parquet(str(managed_path(root / ("audit-" + name))))
@@ -1985,6 +2000,7 @@ def register_study(
             audit,
             ("configuration", "sources", "admission", "freeze", "publication"),
             level=level,
+            display=None if _CURRENT.get() else resolve_display(value.get("runtime", {})),
             attempt_id=check_id,
         ) as execution:
             event("configuration", "START")
@@ -2098,6 +2114,8 @@ def register_study(
                 )
                 record_result(study_id=study_id, evidence=str(issues_root))
                 note("Study registered", study_id=study_id, evidence=str(issues_root))
+                # Save the events still uploading, so a failure keeps the evidence note.
+                execution.flush_audit(audit)
                 return study_id
             except BaseException as error:
                 status = "FAIL" if isinstance(error, Exception) else "CANCELLED"
@@ -2196,10 +2214,15 @@ def _register_study(value, registry, prepare, preparation_settings, check_id, is
 
 
 def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_tables=False,
-                           retain_binding=False):
-    """Capture one source read view and reuse it for registration or explicit retention."""
+                           retain_binding=False, physical=None):
+    """Capture one source read view and reuse it for registration or explicit retention.
+
+    ``physical`` receives the file SHA of each source and audit capture, for this
+    attempt's later change checks.
+    """
     session = registry.spark
-    describe = _artifact_record if retain_binding else _logical_record
+    describe = (_artifact_record if retain_binding
+                else functools.partial(_logical_record, physical=physical))
     source = value["source"]
     source_record: dict[str, Any]
     audits = {}
@@ -2223,6 +2246,8 @@ def _capture_source_inputs(value, registry, root, *, inputs=None, keep_resolved_
             else:
                 snapshot_parquet_directory(capture_root / binding["path"], destination,
                                            expected_sha256=binding["sha256"], label=name)
+                if physical is not None:
+                    physical[destination] = binding["sha256"]
             frames[name] = session.read.parquet(str(managed_path(destination)))
         frame = frames.pop("primary")
         source_record = {
@@ -2307,8 +2332,10 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
         contract = _load_dataset_contract_bytes(read_path_bytes(contract_path), contract_path)
         recipe = value["recipe"]
         source = value["source"]
+        captured_physical = {}
         frame, source_record, audits, query_records = _capture_source_inputs(
             value, registry, root, inputs=inputs, keep_resolved_tables=prepare is not None,
+            physical=captured_physical,
         )
         keys = recipe["source_keys"]
         panel = contract.panel(root / "source")
@@ -2327,7 +2354,6 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
         captured = {}
         staging = issues_root / "admission-staging"
         preparation_metadata = None
-        prepared_baseline = None
         artifact_bindings = {}
         if prepare is not None:
             staging.mkdir()
@@ -2339,11 +2365,10 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
                  settings="captured recipe and preparation settings")
             captured, preparation_metadata, artifact_bindings = _prepare_observations(
                 prepare, preparation_settings, frame, audits, population, findings,
-                value=value, root=root,
+                value=value, root=root, captured_physical=captured_physical,
                 staging=staging, registry=registry, issues_root=issues_root, check_id=check_id,
             )
             frame = captured["prepared"]
-            prepared_baseline = artifact_bindings[staging / "prepared"]
             # Apply declared application eligibility before native cohort-count checks.
             if contract.required_series_count is not None:
                 original_candidates = session.read.parquet(
@@ -2477,13 +2502,17 @@ def _register_captured_study(value, registry, prepare, preparation_settings, che
             value["dataset"]["dataset"]["required_series_count"] = retained
             contract_path.write_bytes(_bytes(value["dataset"]))
         frame.write.parquet(str(root / "admitted"))
-        if (prepared_baseline is not None
-                and not _verify_artifact(staging / "prepared", prepared_baseline)):
-            raise ValueError("prepared observations changed before freezing")
         if prepare is not None:
+            # Check prepared as soon as admitted has been written from it, before anything
+            # else runs, so a change restored afterwards cannot pass. Then verify every
+            # other staged artefact once; a bound artefact that has disappeared fails too.
+            prepared = staging / "prepared"
+            verified = {prepared: _artifact_record(
+                prepared, session, expected=artifact_bindings[prepared])}
             artifact_bindings = {
-                p: _artifact_record(p, session, expected=artifact_bindings.get(p))
-                for p in _staging_directories(staging)
+                p: verified[p] if p in verified
+                else _artifact_record(p, session, expected=artifact_bindings.get(p))
+                for p in dict.fromkeys([*_staging_directories(staging), *artifact_bindings])
             }
             admission_identity = {
                 "schema": "autoforecast.preparation-evidence.v1",

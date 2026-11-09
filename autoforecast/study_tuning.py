@@ -871,6 +871,8 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
     if any(path.is_symlink() for path in (root, *root.parents)):
         raise HPOError("HPO output root may not traverse a symlink")
     # Run artifacts must never become children of inputs or already sealed evidence.
+    # Published studies seal their frozen benchmark, admission evidence and retained
+    # captures; changing them is a deliberate manual step, never a library output.
     record = study._record()
     protected = [
         study._path.parent,
@@ -882,6 +884,10 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
             (parent / marker).exists()
             for marker in (
                 "benchmark.json",
+                "admission.json",
+                "admission.yaml",
+                "admission.yml",
+                "capture.json",
                 "selection.json",
                 "artifact_manifest.json",
                 "metadata/run.json",

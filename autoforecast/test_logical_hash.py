@@ -1256,11 +1256,17 @@ def test_small_capture_does_not_launch_spark_and_checks_every_schema(tmp_path, m
         def read(self):
             raise AssertionError('small evidence must not launch Spark work')
 
-    monkeypatch.setattr(logical, '_LOCAL_MAX_ROWS', 4096)
+    monkeypatch.setattr(logical, '_LOCAL_MAX_ROWS', 250_000)
     pq.write_table(pa.table({'x': pa.array([], type=pa.int64())}), tmp_path / 'empty.parquet')
     pq.write_table(pa.table({'x': [1, -1, None]}), tmp_path / 'rows.parquet')
     expected = logical.fingerprint(tmp_path)
     assert logical.fingerprint(tmp_path, spark=NoJobs()) == expected
+    # Key and finding tables of tens of thousands of rows also stay on the driver.
+    keys = tmp_path.parent / 'keys'
+    keys.mkdir()
+    pq.write_table(pa.table({'series': [f's{i}' for i in range(20000)],
+                             'date': list(range(20000))}), keys / 'part.parquet')
+    assert logical.fingerprint(keys, spark=NoJobs()) == logical.fingerprint(keys)
     pq.write_table(pa.table({'x': ['different']}), tmp_path / 'conflict.parquet')
     with pytest.raises(ValueError, match='conflicting logical schemas'):
         logical.fingerprint(tmp_path, spark=NoJobs())
@@ -1280,14 +1286,28 @@ def test_native_frame_identity_matches_file_and_offline(tmp_path, spark, empty):
     assert logical.fingerprint_frame(frame) == logical.fingerprint(path, spark=spark)
 
 
-def test_small_hash_limit_accounts_for_dictionary_expansion(tmp_path, spark, monkeypatch):
+@pytest.mark.parametrize('value_size,local', [(2048, True), (20000, False)])
+def test_offline_batches_bound_dictionary_expansion(tmp_path, spark, monkeypatch,
+                                                    value_size, local):
     path = tmp_path / 'dictionary.parquet'
-    pq.write_table(pa.table({'x': ['x' * 2048] * 64}), path, use_dictionary=True)
-    expected = logical.fingerprint(path)
+    pq.write_table(pa.table({'x': ['x' * value_size] * 64}), path, use_dictionary=True)
+    expected = logical.fingerprint(path, spark=spark)
     monkeypatch.setattr(logical, '_LOCAL_MAX_ROWS', 4096)
     monkeypatch.setattr(logical, '_LOCAL_MAX_BYTES', 10000)
-    monkeypatch.setattr(logical, '_offline', lambda *a: pytest.fail('decoded expansion is too large'))
+    iter_batches = pq.ParquetFile.iter_batches
+    batches = []
+
+    def recorded(self, *args, **kwargs):
+        for batch in iter_batches(self, *args, **kwargs):  # The batches _offline decodes.
+            batches.append(batch.num_rows)
+            yield batch
+
+    monkeypatch.setattr(pq.ParquetFile, 'iter_batches', recorded)
     assert logical.fingerprint(path, spark=spark) == expected
+    # The file holds one dictionary entry, but every decoded row repeats it in full.
+    # Offline batches must stay within the byte budget; a value above it goes to Spark.
+    assert bool(batches) is local
+    assert all(1 <= rows * value_size <= 10000 for rows in batches)
 
 
 @pytest.mark.parametrize("kind", ["physical", "repeated"])
@@ -1314,3 +1334,32 @@ def test_local_limits_are_independent(tmp_path, spark, monkeypatch, kind):
     monkeypatch.setattr(logical, "_offline", local)
     assert logical.fingerprint(path, spark=spark) == expected
     assert not calls
+
+
+def test_offline_batches_bound_deep_nesting_overhead(tmp_path, monkeypatch):
+    # Each row holds one value under 64 list levels: tiny on disk, about 1 KiB per row
+    # once Arrow materializes the offsets and validity of every level.
+    dtype, value = pa.int64(), 1
+    for _ in range(64):
+        dtype, value = pa.list_(dtype), [value]
+    column = pa.array([value] * 8192, type=dtype)
+    path = tmp_path / "nested.parquet"
+    pq.write_table(pa.table({name: column for name in "abcd"}), path)
+    monkeypatch.setattr(logical, "_LOCAL_MAX_ROWS", 250_000)
+    expected = logical.fingerprint(path)
+    iter_batches = pq.ParquetFile.iter_batches
+    sizes = []
+
+    def measured(self, *args, **kwargs):
+        for batch in iter_batches(self, *args, **kwargs):  # The batches _offline decodes.
+            sizes.append(batch.nbytes)
+            yield batch
+
+    class NoJobs:
+        @property
+        def read(self):
+            raise AssertionError("a capture within the offline bound must not launch Spark")
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", measured)
+    assert logical.fingerprint(path, spark=NoJobs()) == expected
+    assert sizes and max(sizes) <= logical._LOCAL_MAX_BYTES

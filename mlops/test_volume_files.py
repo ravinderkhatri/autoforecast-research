@@ -3,12 +3,13 @@
 import hashlib
 import io
 import json
+import logging
 import pathlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from autoforecast import _execution as events
@@ -277,6 +278,86 @@ def test_volume_hashing_keeps_reader_visible_file_checks(volume):
     _safe_files.publish_bytes(root, "unexpected.csv", b"unsafe inventory")
     with pytest.raises(LineageError, match="not a .parquet part"):
         directory_digest(root, suffixes=(".parquet",))
+
+
+def test_parquet_snapshot_downloads_parts_but_not_reader_ignored_markers(volume, monkeypatch):
+    import tempfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from autoforecast import _logical_hash
+
+    from provenance.lineage import directory_digest
+
+    root, client = volume
+    folder = root / "frozen"
+    folder.mkdir()
+    parts = {}
+    for index in range(12):
+        output = io.BytesIO()
+        pq.write_table(pa.table({"x": [index]}), output)
+        parts[f"part-{index:05d}.parquet"] = output.getvalue()
+    markers = {"_SUCCESS": b"", "_committed_7": b"{}", "_started_7": b"",
+               ".part-00000.parquet.crc": b"checksum"}
+    for name, value in {**parts, **markers}.items():
+        client.values[str(folder / name)] = value
+    with tempfile.TemporaryDirectory() as temporary:
+        local = Path(temporary)
+        for name, value in {**parts, **markers}.items():
+            (local / name).write_bytes(value)
+        expected = (directory_digest(local, suffixes=(".parquet",)),
+                    _logical_hash.fingerprint(local), directory_digest(local))
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(Path(path).name)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    assert directory_digest(folder, suffixes=(".parquet",)) == expected[0]
+    assert _logical_hash.fingerprint(folder) == expected[1]
+    assert set(downloads) == set(parts)
+    downloads.clear()
+    # A digest of every file still needs the marker bytes.
+    assert directory_digest(folder) == expected[2]
+    assert set(downloads) == {*parts, *markers}
+
+
+def test_volume_snapshot_identity_downloads_source_once_and_copies_its_bytes(volume, monkeypatch):
+    import tempfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from provenance.lineage import directory_digest, snapshot_parquet_identity
+
+    root, client = volume
+    source = root / "admitted"
+    source.mkdir()
+    parts = {}
+    for index in range(3):
+        output = io.BytesIO()
+        pq.write_table(pa.table({"x": [index]}), output)
+        parts[f"part-{index:05d}.parquet"] = output.getvalue()
+    for name, value in {**parts, "_SUCCESS": b""}.items():
+        client.values[str(source / name)] = value
+    downloads = []
+    download = client.download
+
+    def counted(path):
+        downloads.append(Path(path).name)
+        return download(path)
+
+    monkeypatch.setattr(client, "download", counted)
+    with tempfile.TemporaryDirectory() as temporary:
+        copy, sha256 = snapshot_parquet_identity(source, Path(temporary) / "copy", label="admitted")
+        # The identity describes the copied bytes; the caller rechecks the source later.
+        assert sorted(downloads) == sorted(parts)
+        assert directory_digest(copy, suffixes=(".parquet",)) == sha256
+        assert sorted(p.name for p in copy.iterdir()) == sorted(parts)
+    downloads.clear()
+    assert directory_digest(source, suffixes=(".parquet",)) == sha256
 
 
 def test_volume_logical_reuse_downloads_once_and_ignores_stale_mount(volume, monkeypatch):
@@ -1125,16 +1206,18 @@ def test_volume_progress_reuses_inventory_bytes_and_does_not_recursively_audit(v
     payload = b'x' * (2 * 1024 * 1024 + 13)
     client.values[str(source)] = payload
     audit = root / 'progress' / 'events.jsonl'
-    with Execution(audit, ['copy']):
+    with Execution(audit, ['copy']) as execution:
         with _stage(audit, 'copy'):
             with _volume_files.local_snapshot(source.parent) as copied:
                 assert (copied / source.name).read_bytes() == payload
+            execution.flush_audit(audit)
             before = len(client.requests)
             with operation('Count loop') as update:
                 start = len(client.requests)
                 for count in range(100):
                     update(completed=count, total=100, unit='rows')
-                assert len(client.requests) == start
+                assert len(client.requests) <= start + 1  # Only the queued START upload.
+            execution.flush_audit(audit)
             assert len(client.requests) - before == 2  # One immutable write per lifecycle event.
     rows = [json.loads(line) for line in _volume_files.read_audit_bytes(audit).splitlines()]
     assert len(rows) == 6
@@ -1610,6 +1693,492 @@ def test_closure_status_matches_execution_outcome(volume, outcome):
             events._stage_event(audit, "work", status)
     closed = str(audit.with_name(audit.name + ".events") / "closed.json")
     assert json.loads(client.values[closed])["status"] == outcome
+
+
+def test_running_execution_uploads_events_without_waiting(volume, monkeypatch):
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    release = threading.Event()
+
+    def slow_event(path, contents, *, overwrite):
+        name = str(path).split("/")[-1]
+        if ".events/" in str(path) and name != "closed.json" and not name.startswith("0" * 12):
+            assert release.wait(10)
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", slow_event)
+    with events.Execution(audit, []) as writer:
+        writer.write_event(audit, {"item": 0})  # Claims the audit before returning.
+        for n in range(1, 20):
+            writer.write_event(audit, {"item": n})  # Must not wait for the blocked uploads.
+        assert not any(p.split("/")[-1].startswith("000000000019-") for p in client.values)
+        release.set()
+    rows = read_execution_events(audit)
+    assert [row["item"] for row in rows] == list(range(20))
+    closed = str(audit.with_name(audit.name + ".events") / "closed.json")
+    assert json.loads(client.values[closed])["count"] == 20
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_failed_background_upload_retries_identical_bytes(volume, monkeypatch, persistent):
+    from contextlib import suppress
+
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    failures = []
+
+    def flaky(path, contents, *, overwrite):
+        if str(path).split("/")[-1].startswith("000000000002-") and (persistent or not failures):
+            failures.append(path)
+            raise OSError("connection unavailable")
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", flaky)
+    if persistent:
+        with pytest.raises(OSError, match="unacknowledged"):
+            with events.Execution(audit, []) as writer:
+                for n in range(4):
+                    with suppress(OSError):  # A later event may see the retry fail first.
+                        writer.write_event(audit, {"item": n})
+        assert not any(p.endswith("closed.json") for p in client.values)
+        return
+    with events.Execution(audit, []) as writer:
+        for n in range(4):
+            writer.write_event(audit, {"item": n})
+    assert failures
+    assert [row["item"] for row in read_execution_events(audit)] == list(range(4))
+
+
+def test_other_readers_see_a_valid_prefix_while_uploads_are_running(volume, monkeypatch):
+    import time
+
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    release = threading.Event()
+
+    def slow_second_event(path, contents, *, overwrite):
+        if str(path).split("/")[-1].startswith("000000000002-"):
+            assert release.wait(10)
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", slow_second_event)
+    with events.Execution(audit, []) as writer:
+        for n in range(6):
+            writer.write_event(audit, {"item": n})
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not any(
+            p.split("/")[-1].startswith("000000000005-") for p in client.values
+        ):
+            time.sleep(0.01)
+        # A reader in another process does not flush this execution's uploads.
+        rows = [json.loads(line) for line in
+                _volume_files.read_audit_bytes(audit).splitlines()]
+        assert [row["item"] for row in rows] == list(range(len(rows)))
+        release.set()
+    assert [row["item"] for row in read_execution_events(audit)] == list(range(6))
+
+
+def test_interruption_after_submission_keeps_a_consistent_closed_audit(volume, monkeypatch):
+    root, client = volume
+    audit = root / "events.jsonl"
+    with pytest.raises(KeyboardInterrupt):
+        with events.Execution(audit, []) as writer:
+            assert writer.uploader is not None
+            submit = writer.uploader.submit
+            calls = []
+
+            def interrupted(*args, **kwargs):
+                future = submit(*args, **kwargs)
+                calls.append(future)
+                if len(calls) == 2:
+                    raise KeyboardInterrupt("after the upload was queued")
+                return future
+
+            monkeypatch.setattr(writer.uploader, "submit", interrupted)
+            for n in range(5):
+                writer.write_event(audit, {"item": n})
+    rows = read_execution_events(audit)
+    assert [row["item"] for row in rows] == [0, 1, 2]
+    closed = str(audit.with_name(audit.name + ".events") / "closed.json")
+    assert json.loads(client.values[closed])["count"] == 3
+
+
+def test_reader_inside_execution_sees_its_own_queued_events(volume):
+    root, _ = volume
+    audit = root / "events.jsonl"
+    with events.Execution(audit, []) as writer:
+        for n in range(6):
+            writer.write_event(audit, {"item": n})
+        assert [row["item"] for row in read_execution_events(audit)] == list(range(6))
+
+
+def test_interruption_at_any_line_of_an_event_write_leaves_a_valid_closed_audit(volume):
+    import sys
+    from contextlib import suppress
+
+    root, client = volume
+    code = events.Execution.write_event.__code__
+    lines = sorted({line for _start, _end, line in code.co_lines() if line is not None})
+    for line in lines:
+        audit = root / f"interrupted-{line}.jsonl"
+
+        def trace(frame, action, _arg, line=line):
+            if frame.f_code is code and action == "line" and frame.f_lineno == line:
+                sys.settrace(None)
+                raise KeyboardInterrupt(f"line {line}")
+            return trace
+
+        with suppress(KeyboardInterrupt):  # A line this path does not reach writes normally.
+            with events.Execution(audit, []) as writer:
+                writer.write_event(audit, {"item": 0})
+                writer.write_event(audit, {"item": 1})
+                sys.settrace(trace)
+                try:
+                    writer.write_event(audit, {"item": 2})
+                finally:
+                    sys.settrace(None)
+        rows = read_execution_events(audit)
+        closed = json.loads(client.values[str(audit.with_name(audit.name + ".events")
+                                              / "closed.json")])
+        assert [row["item"] for row in rows] == list(range(len(rows))), line
+        assert closed["count"] == len(rows) >= 2, line
+
+
+def test_failed_upload_keeps_later_events_unsaved_until_it_is_retried(volume, monkeypatch):
+    from contextlib import suppress
+
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    started, release = threading.Event(), threading.Event()
+
+    def failing(path, contents, *, overwrite):
+        name = str(path).split("/")[-1]
+        if name.startswith("000000000001-"):
+            started.set()
+            assert release.wait(10)
+        if name.startswith("000000000002-"):
+            raise OSError("persistent upload error")
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", failing)
+    with pytest.raises(OSError, match="unacknowledged"):
+        with events.Execution(audit, []) as writer:
+            for n in range(6):
+                writer.write_event(audit, {"item": n})
+            assert started.wait(10)
+            release.set()
+            for _payload, future in list(writer.audit_segments[audit]["uploads"].values()):
+                with suppress(OSError):
+                    future.result(timeout=10)
+            # Event 2 failed, so events 3-5 must not be saved after the gap.
+            saved = {p.split("/")[-1][:12] for p in client.values if ".events/" in p}
+            assert saved == {"000000000000", "000000000001"}
+            rows = [json.loads(line) for line in
+                    _volume_files.read_audit_bytes(audit).splitlines()]
+            assert [row["item"] for row in rows] == [0, 1]
+    assert not any(p.endswith("closed.json") for p in client.values)
+
+
+def test_audit_writer_that_cannot_be_created_installs_no_context(volume, monkeypatch):
+    root, _ = volume
+    before = events._CURRENT.get()
+    failure = RuntimeError("cannot create the audit writer")
+
+    def cannot_create(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(events, "ThreadPoolExecutor", cannot_create)
+    with pytest.raises(RuntimeError) as caught:
+        with events.Execution(root / "events.jsonl", []):
+            pytest.fail("entry must fail")
+    assert caught.value is failure
+    assert events._CURRENT.get() is before
+
+
+def test_failed_heartbeat_start_keeps_its_error_when_cleanup_is_interrupted(volume, monkeypatch):
+    root, _ = volume
+    before = events._CURRENT.get()
+    failure = RuntimeError("heartbeat start failed")
+    create = events.ThreadPoolExecutor
+
+    def interrupted_cleanup(*args, **kwargs):
+        pool = create(*args, **kwargs)
+        shutdown = pool.shutdown
+
+        def interrupted(*args, **kwargs):
+            shutdown(*args, **kwargs)
+            raise KeyboardInterrupt("cleanup interrupted")
+
+        pool.shutdown = interrupted
+        return pool
+
+    def failed_start(self):
+        raise failure
+
+    monkeypatch.setattr(events, "ThreadPoolExecutor", interrupted_cleanup)
+    monkeypatch.setattr(events, "_console", lambda: SimpleNamespace(interval=10))
+    monkeypatch.setattr(threading.Thread, "start", failed_start)
+    with pytest.raises(RuntimeError) as caught:
+        with events.Execution(root / "events.jsonl", []):
+            pytest.fail("entry must fail")
+    assert caught.value is failure
+    assert events._CURRENT.get() is before
+
+
+@pytest.mark.parametrize("primary", [None, ValueError("body"), KeyboardInterrupt("body")],
+                         ids=["none", "error", "interrupt"])
+def test_interrupted_writer_shutdown_restores_context_and_keeps_the_primary(
+    volume, monkeypatch, primary,
+):
+    root, _ = volume
+    before = events._CURRENT.get()
+    secondary = KeyboardInterrupt("shutdown interrupted")
+    with pytest.raises(BaseException) as caught:
+        with events.Execution(root / "events.jsonl", []) as writer:
+            writer.write_event(writer.audit, {"item": 0})
+            assert writer.uploader is not None
+            shutdown = writer.uploader.shutdown
+
+            def interrupted(*args, **kwargs):
+                shutdown(*args, **kwargs)
+                raise secondary
+
+            monkeypatch.setattr(writer.uploader, "shutdown", interrupted)
+            if primary is not None:
+                raise primary
+    assert caught.value is (primary or secondary)
+    assert events._CURRENT.get() is before
+
+
+def test_interrupting_the_wait_for_an_upload_propagates(volume, monkeypatch):
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    release = threading.Event()
+
+    def slow(path, contents, *, overwrite):
+        if str(path).split("/")[-1].startswith("000000000001-"):
+            assert release.wait(10)
+        return put(path, contents, overwrite=overwrite)
+
+    def interrupted_wait(*args, **kwargs):
+        release.set()
+        raise KeyboardInterrupt("interrupted while waiting")
+
+    monkeypatch.setattr(_volume_files, "_put", slow)
+    monkeypatch.setattr(events, "futures_wait", interrupted_wait)
+    with pytest.raises(KeyboardInterrupt, match="interrupted while waiting"):
+        with events.Execution(audit, []) as writer:
+            writer.write_event(audit, {"item": 0})
+            writer.write_event(audit, {"item": 1})
+    # Not closed: what was saved stays a valid prefix.
+    assert not any(p.endswith("closed.json") for p in client.values)
+    rows = [json.loads(line) for line in _volume_files.read_audit_bytes(audit).splitlines()]
+    assert [row["item"] for row in rows] == [0, 1]
+
+
+def test_interrupted_retry_at_close_keeps_its_type(volume, monkeypatch):
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+    interruption, calls = KeyboardInterrupt("retry interrupted"), []
+
+    def failing(path, contents, *, overwrite):
+        if str(path).split("/")[-1].startswith("000000000001-"):
+            calls.append(path)
+            raise OSError("worker upload failed") if len(calls) == 1 else interruption
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", failing)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        with events.Execution(audit, []) as writer:
+            writer.write_event(audit, {"item": 0})
+            writer.write_event(audit, {"item": 1})
+    assert caught.value is interruption and len(calls) == 2
+    assert not any(p.endswith("closed.json") for p in client.values)
+
+
+def test_upload_failure_found_at_close_marks_the_run_unverified(volume, monkeypatch):
+    root, client = volume
+    audit = root / "events.jsonl"
+    put = _volume_files._put
+
+    def failing(path, contents, *, overwrite):
+        if str(path).split("/")[-1].startswith("000000000001-"):
+            raise OSError("remote unavailable")
+        return put(path, contents, overwrite=overwrite)
+
+    monkeypatch.setattr(_volume_files, "_put", failing)
+    with pytest.raises(OSError, match="unacknowledged"):
+        with events.Execution(audit, ["work"]) as writer:
+            events._stage_event(audit, "work", "START")
+            events._stage_event(audit, "work", "PASS")  # Saved in the background.
+    assert writer.result == "UNVERIFIED" and writer.audit_error
+    assert f"Audit write failed: {writer.audit_error}" in writer.render()
+    assert not any(p.endswith("closed.json") for p in client.values)
+
+
+def _fail_upload(monkeypatch, stage, status, error=OSError):
+    """Fail every upload of one event, which is saved in the background; others save."""
+    publish = _volume_files.publish_audit_segment
+
+    def unavailable(path, payload, **kwargs):
+        event = json.loads(payload)
+        if (event["stage"], event["status"]) == (stage, status):
+            raise error(f"{stage} event unavailable")
+        return publish(path, payload, **kwargs)
+
+    monkeypatch.setattr(_volume_files, "publish_audit_segment", unavailable)
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.ERROR])
+@pytest.mark.parametrize("options", [
+    {"display": "logs"}, {"display": "progress"}, {"display": "both"}, {"progress": "off"},
+])
+def test_upload_failure_found_at_close_is_shown_for_every_display(volume, monkeypatch,
+                                                                  options, level):
+    root, _ = volume
+    logger = logging.getLogger("autoforecast.stages")
+    monkeypatch.setattr(logger, "handlers", [])  # configure_logging adds to this list
+    monkeypatch.setattr(logger, "level", logger.level)
+    monkeypatch.setattr(logger, "propagate", logger.propagate)
+    monkeypatch.setattr(events, "_DISPLAY", None)
+    stream = io.StringIO()
+    events.configure_logging(stream=stream, **options)
+    _fail_upload(monkeypatch, "work", "PASS")
+    with pytest.raises(OSError, match="unacknowledged"):
+        with events.Execution(root / "events.jsonl", ["work"], level=level, study_id="input"):
+            events._stage_event(root / "events.jsonl", "work", "START")
+            events.record_result(study_id="saved", workflow_path="saved-workflow")
+            events._stage_event(root / "events.jsonl", "work", "PASS")
+    # The saved result stays visible, as the failed event line showed it before.
+    assert "UNVERIFIED" in stream.getvalue()
+    assert "saved-workflow" in stream.getvalue()
+    assert "input_study_id" in stream.getvalue()  # The run's input study keeps its own name.
+
+
+# An interruption while waiting for the last upload keeps the details, as a failure does.
+@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
+def test_completed_run_keeps_its_recovery_fields_when_the_last_upload_fails(volume,
+                                                                            monkeypatch, error):
+    import contextlib
+    import dataclasses
+
+    from autoforecast import study_workflow
+
+    root, client = volume
+    workflow = root / "completed-workflow"
+    workflow.mkdir()
+    (workflow / "artifact_manifest.json").write_text("{}")
+    (root / "model.json").write_text("{}")
+
+    @dataclasses.dataclass
+    class Result:
+        path: Path
+        study_id: str = "registered"
+        run_id: str = "completed"
+        status: str = "completed"
+
+    @contextlib.contextmanager
+    def load_study(_):
+        yield SimpleNamespace(registration={"sha256": "a" * 64})
+
+    registry = SimpleNamespace(root=root, runtime={}, store=None, load_study=load_study,
+                               _registration_path=lambda _: None)
+    monkeypatch.setattr(study_workflow, "run_forecast_workflow", lambda *a, **k: Result(workflow))
+    _fail_upload(monkeypatch, "run", "PASS", error)
+    with pytest.raises(error, match="run event unavailable") as caught:
+        study_workflow.run_study("registered", cast(Any, lambda _: None), registry=registry,
+                                 model_config=root / "model.json", implementation={})
+    recovery = vars(caught.value)
+    assert (recovery["workflow_path"], recovery["study_id"], recovery["registered_study_id"]) == (
+        workflow, "registered", "registered")
+    assert recovery["audit_path"] is not None
+    assert not any(p.endswith("closed.json") for p in client.values)
+
+
+@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
+def test_completed_registration_keeps_its_evidence_note_when_the_last_upload_fails(
+        volume, monkeypatch, error):
+    from autoforecast import study_registration as registration
+    from autoforecast.test_execution_boundaries import _Registry
+    from autoforecast.test_study_registration import configuration
+
+    root, _ = volume
+    registry = _Registry(root=root / "registry", scratch_root=root / "scratch", runtime={},
+                         store=None)
+    monkeypatch.setattr(registration, "_register_study", lambda *a, **k: "a" * 64)
+    _fail_upload(monkeypatch, "Study registered", "INFO", error)
+    with pytest.raises(error, match="Study registered event unavailable") as caught:
+        registration.register_study(configuration(root / "input"), registry=cast(Any, registry))
+    assert any(note.startswith("Registration attempt evidence: ")
+               for note in getattr(caught.value, "__notes__", []))
+
+
+def test_download_progress_advances_while_a_large_file_is_still_arriving(volume, monkeypatch):
+    import contextlib
+    import time
+
+    root, client = volume
+    folder = root / "large"
+    folder.mkdir()
+    client.values[str(folder / "part.parquet")] = b"x" * (2 * 1024 * 1024)
+    stalled, release, updates = threading.Event(), threading.Event(), []
+
+    class Stalling(io.BytesIO):
+        def read(self, size=-1):
+            if self.tell() == 1024 * 1024:
+                stalled.set()
+                assert release.wait(10)
+            return super().read(size)
+
+    @contextlib.contextmanager
+    def recorded(*args, **kwargs):
+        yield lambda **state: updates.append(state)
+
+    def copy():
+        with _volume_files.local_snapshot(folder):
+            pass
+
+    monkeypatch.setattr(client, "download", lambda path: SimpleNamespace(
+        contents=Stalling(client.values[path])))
+    monkeypatch.setattr(_volume_files, "operation", recorded)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        copied = pool.submit(copy)
+        try:
+            assert stalled.wait(10)
+            deadline = time.monotonic() + 5
+            while not updates and time.monotonic() < deadline:
+                time.sleep(0.01)
+            during = list(updates)
+        finally:
+            release.set()
+        copied.result(timeout=10)
+    assert during and during[-1]["completed"] == 1024 * 1024 and during[-1]["files"] == 0
+    assert updates[-1] == {"completed": 2 * 1024 * 1024, "total": 2 * 1024 * 1024,
+                           "unit": "bytes", "files": 1}
+
+
+def test_volume_snapshot_downloads_files_concurrently(volume, monkeypatch):
+    root, client = volume
+    folder = root / "parts"
+    folder.mkdir()
+    for n in range(2):
+        client.values[str(folder / f"part-{n}.parquet")] = b"part %d" % n
+    together = threading.Barrier(2, timeout=5)
+    download = client.download
+
+    def overlapping(path):
+        together.wait()  # Breaks unless both downloads are in flight at once.
+        return download(path)
+
+    monkeypatch.setattr(client, "download", overlapping)
+    with _volume_files.local_snapshot(folder) as copy:
+        assert sorted(p.read_bytes() for p in copy.iterdir()) == [b"part 0", b"part 1"]
 
 
 def test_pending_event_prevents_closure(volume, monkeypatch):

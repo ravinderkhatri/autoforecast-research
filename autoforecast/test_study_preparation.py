@@ -4,6 +4,8 @@ import dataclasses
 import datetime as dt
 import json
 import os
+import pathlib
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -329,6 +331,85 @@ def test_failed_or_mutating_preparation_retains_evidence_without_publication(
     if case == "native_failure":
         report = spark.read.parquet(str(next((registry.root / "checks").glob("*/prepared"))))
         assert report.filter("issue_code = 'DUPLICATE_DATE' AND status = 'failed'").count() > 0
+
+
+def test_source_change_between_capture_and_preparation_blocks_registration(
+    spark, tmp_path, monkeypatch,
+):
+    from autoforecast import study_registration
+
+    path = configuration(tmp_path)
+    report = study_registration.report_source_issues
+
+    def change_captured_source(frame, **kwargs):
+        # A lasting change after the source was captured and hashed, before preparation:
+        # one more part file. Frames already planned keep their file listing.
+        findings = report(frame, **kwargs)
+        part = pathlib.Path(unquote(urlparse(frame.inputFiles()[0]).path))
+        shutil.copyfile(part, part.with_name("part-99999-added.parquet"))
+        return findings
+
+    monkeypatch.setattr(study_registration, "report_source_issues", change_captured_source)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    with pytest.raises(ValueError, match="changed during preparation"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert not list((registry.root / "registrations").glob("*.*"))
+
+
+def test_bound_staged_artifact_that_disappears_blocks_registration(spark, tmp_path, monkeypatch):
+    from autoforecast import study_registration
+
+    path = configuration(tmp_path)
+    listing = study_registration._staging_directories
+    removed = []
+
+    def lose_bound_artifact(folder):
+        # The first listing after preparation is the admission binding loop.
+        if folder.name == "admission-staging" and not removed:
+            shutil.rmtree(folder / "declared_starting")
+            removed.append(folder / "declared_starting")
+        return listing(folder)
+
+    monkeypatch.setattr(study_registration, "_staging_directories", lose_bound_artifact)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    with pytest.raises(ValueError, match="materialization changed before publication"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert removed
+    assert not list((registry.root / "registrations").glob("*.*"))
+
+
+def test_prepared_change_restored_after_admission_write_blocks_registration(
+    spark, tmp_path, monkeypatch,
+):
+    from pyspark.sql.readwriter import DataFrameWriter
+
+    from autoforecast import study_registration
+
+    path = configuration(tmp_path)
+    registry = StudyRegistry.from_config(path, spark=spark)
+    write, listing = DataFrameWriter.parquet, study_registration._staging_directories
+    added = []
+
+    def change_prepared_after_admission(writer, target, *args, **kwargs):
+        # Prepared differs when admitted has just been written from it.
+        write(writer, target, *args, **kwargs)
+        if pathlib.Path(target).name == "admitted" and not added:
+            prepared = next(registry.root.glob("checks/*/admission-staging/prepared"))
+            part = next(prepared.glob("part-*.parquet"))
+            added.append(shutil.copyfile(part, part.with_name("part-99999-added.parquet")))
+
+    def restore_prepared(folder):
+        # ...and is restored before the remaining staged artefacts are listed and checked.
+        if added and added[0].exists():
+            added[0].unlink()
+        return listing(folder)
+
+    monkeypatch.setattr(DataFrameWriter, "parquet", change_prepared_after_admission)
+    monkeypatch.setattr(study_registration, "_staging_directories", restore_prepared)
+    with pytest.raises(ValueError, match="materialization changed before publication"):
+        register_study(path, registry=registry, prepare=SensorPreparation())
+    assert added
+    assert not list((registry.root / "registrations").glob("*.*"))
 
 
 def test_evidence_write_failure_and_interrupted_retry_keep_completed_baseline(

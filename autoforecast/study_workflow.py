@@ -19,6 +19,7 @@ from mlops.run_bundle import load_completed_run_bundle, open_run_bundle
 from mlops.run_report import new_run_id
 
 from autoforecast._execution import (
+    _CURRENT,
     Execution,
     _stage,
     _stage_event,
@@ -27,6 +28,7 @@ from autoforecast._execution import (
     note,
     record_result,
     report_workflow,
+    resolve_display,
     resolve_level,
     validate_model_label,
 )
@@ -388,12 +390,13 @@ def run_study(
             audit,
             plan,
             level=level,
+            display=None if _CURRENT.get() else resolve_display(settings),
             attempt_id=audit.stem,
             study_id=study_id,
             study_action="create" if create else "reuse",
             publish_results=settings["publish"],
             **({"model_label": model_label} if model_label is not None else {}),
-        ):
+        ) as execution:
             result = None
             try:
                 with _stage(audit, "configuration", study_id=study_id) as outcome:
@@ -645,6 +648,8 @@ def run_study(
                     run_id=result.run_id,
                     evaluation_status=result.status,
                 )
+                # Save the events still uploading, so a failure keeps the recovery fields.
+                execution.flush_audit(audit)
                 return dataclasses.replace(
                     result,
                     publication={**publication, "audit_path": str(audit)},
