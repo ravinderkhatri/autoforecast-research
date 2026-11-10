@@ -332,6 +332,23 @@ def _inventory(path: pathlib.Path):
     return True, entries
 
 
+def child_directories(path: pathlib.Path) -> list[pathlib.Path]:
+    """List the directories directly below a volume directory, or none if it is absent."""
+    from databricks.sdk.errors import NotFound
+
+    try:
+        entries = list(_client().files.list_directory_contents(os.path.abspath(path)))
+    except NotFound:
+        return []
+    directories = []
+    for entry in entries:
+        if entry.path is None or type(entry.is_directory) is not bool:
+            raise OSError("volume listing has an incomplete entry")
+        if entry.is_directory:
+            directories.append(pathlib.Path(entry.path))
+    return sorted(directories)
+
+
 def remove_tree(path: pathlib.Path) -> None:
     """Remove an operation-owned directory, including parts absent from the mount.
 
@@ -354,9 +371,10 @@ def remove_tree(path: pathlib.Path) -> None:
     files.delete_directory(str(path))
 
 
-# Each Files API download costs about 0.2 s of request overhead regardless of size,
-# so a snapshot of many small parts is bound by round trips, not bandwidth.
-_DOWNLOAD_WORKERS = 8
+# Each Files API request costs about 0.2 s of overhead regardless of size, so many small
+# files are bound by round trips, not bandwidth. On serverless, 3,545 files took 93 s
+# with 8 workers and 30 s with 32.
+_DOWNLOAD_WORKERS = 32
 
 
 def _download(remote: str, destination: pathlib.Path, copied: list[int], slot: int) -> None:
@@ -368,6 +386,38 @@ def _download(remote: str, destination: pathlib.Path, copied: list[int], slot: i
         while chunk := source.read(1024 * 1024):
             output.write(chunk)
             copied[slot] += len(chunk)
+
+
+def _local_blocks(path: pathlib.Path):
+    with path.open("rb") as source:
+        while block := source.read(1024 * 1024):
+            yield block
+
+
+def publish_files(pairs: Iterable[tuple[pathlib.Path, pathlib.Path]]) -> None:
+    """Publish local files as new volume files concurrently.
+
+    Each pair is (local source, volume destination). Every file is created only if absent
+    and read back in full before it counts as published.
+    """
+    pairs = list(pairs)
+    _client()  # Construct the shared client once, before worker threads use it.
+    with operation("Copy files to the volume", engine="driver", files_total=len(pairs)) as update:
+        with ThreadPoolExecutor(max_workers=_DOWNLOAD_WORKERS) as pool:
+            running = {pool.submit(publish_blocks, remote, _local_blocks(local))
+                       for local, remote in pairs}
+            finished = 0
+            try:
+                while running:
+                    done, running = wait(running, timeout=1.0, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        future.result()
+                        finished += 1
+                    update(completed=finished, total=len(pairs), unit="files")
+            except BaseException:
+                for future in running:
+                    future.cancel()
+                raise
 
 
 @contextmanager

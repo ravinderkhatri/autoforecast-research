@@ -31,6 +31,7 @@ from autoforecast._exact_yaml import ExactYAMLError, loads_exact_yaml
 from autoforecast._execution import _stage, callable_name, note, reported
 from autoforecast.benchmark import (
     MISSING_COLUMN,
+    NATIVE_SCHEMA,
     _evaluation_contract_from_record,
     bound_input_path,
     boundary,
@@ -39,14 +40,18 @@ from autoforecast.benchmark import (
     verify_benchmark,
 )
 from autoforecast.data_admission import _load_dataset_contract_bytes
-from autoforecast.experiments import load_completed_attempt, load_study_selection
+from autoforecast.experiments import (
+    attempts_checked_once,
+    load_completed_attempt,
+    load_study_selection,
+)
 from autoforecast.frequency import (
     TimePoint,
     canonical_origin,
     period_points,
 )
 from autoforecast.hpo import HPOError, HPOStudySpec, TrialOutcome, TrialRequest, run_hpo_study
-from autoforecast.hpo_bridge import _copy_run_artifact_directory
+from autoforecast.hpo_bridge import _retain_run_artifact_directory
 from autoforecast.implementation import (
     CapturedImplementation,
     resolve_implementation,
@@ -433,8 +438,11 @@ def load_tuning_result(path: str | pathlib.Path) -> TuningResult:
         or context["model_id"] != metadata["model"]["id"]
     ):
         raise HPOError("external selection budget or model differs from its context")
+    # The study SHA comes from the checked trial evidence, so every file's bytes are checked
+    # and its recorded row identity is reused instead of recalculated in Spark.
     study_path, _ = verify_benchmark(
         pathlib.Path(context["study"]["path"]), context["study"]["sha256"],
+        _reuse_verified=True,
     )
     dataset_path = study_path.parent / "dataset.yaml"
     dataset = _load_dataset_contract_bytes(read_path_bytes(dataset_path), dataset_path)
@@ -500,16 +508,22 @@ class _WindowInput:
     context_bytes: bytes
 
     def verify(self) -> dict:
+        """Check the study identity and this window's inputs around model code.
+
+        The callback reads only this window's prepared training and mapping copies. Scoring
+        checks the frozen files it reads, and each later stage checks its own inputs.
+        """
         context = json.loads(self.context_bytes)
         identity = context["evaluation_contract"]["study"]
-        verify_benchmark(pathlib.Path(identity["path"]), identity["sha256"],
-                         _reuse_verified=True)
         if "native_inputs" in context:
             from autoforecast.benchmark import verify_input_binding
 
+            verify_benchmark(pathlib.Path(identity["path"]), identity["sha256"],
+                             _reuse_verified=True)
             for role, path in (("training", self.panel.path), ("mapping", self.mapping_path)):
                 verify_input_binding(pathlib.Path(path), context["native_inputs"][role])
             return context
+        read_benchmark_manifest(pathlib.Path(identity["path"]), identity["sha256"])
         for key, path in (
             ("training_sha256", self.panel.path),
             ("mapping_sha256", self.mapping_path),
@@ -523,9 +537,12 @@ class _WindowInput:
 def _prepare_window(
     study: Study, stage: str, origin: str, horizon: int, root: pathlib.Path
 ) -> _WindowInput:
+    # The contract needs the manifest; the data below comes from the study's checked copies.
+    record = study._record()
+    native = record["schema"] == NATIVE_SCHEMA
     fixed = _evaluation_contract_from_record(
-        study._path, study._record(data=True), stage=stage, origin=origin, horizon=horizon,
-        metric=study.recipe["metric"],
+        study._path, study._record(data=True) if native else record, stage=stage,
+        origin=origin, horizon=horizon, metric=study.recipe["metric"],
     )
     if fixed["study"]["sha256"] != study._sha256:
         raise HPOError("study changed before fitting")
@@ -542,7 +559,8 @@ def _prepare_window(
     training, mapping_path = root / "training", root / "series-mapping"
     frame.write.parquet(str(training))
     mapping.write.parquet(str(mapping_path))
-    study._record(data=True)
+    if native:
+        study._record(data=True)
     context = {
         "evaluation_contract": fixed,
         "stage": stage,
@@ -585,10 +603,10 @@ def _retain_callback_artifacts(work, output):
                 or any(kind not in {"file", "directory"} for kind in kinds.values())):
             raise HPOError("callback artifacts may not contain symlinks or special files")
         if "file" in kinds.values():
-            artifact_sha = directory_digest(artifact_source)
-            _copy_run_artifact_directory(artifact_source, output / "artifacts")
-            if directory_digest(output / "artifacts") != artifact_sha:
-                raise HPOError("callback artifacts changed while retaining files")
+            artifact_sha = _retain_run_artifact_directory(
+                artifact_source, output / "artifacts",
+                changed="callback artifacts changed while retaining files",
+            )
             return {"artifacts_path": "artifacts", "artifacts_sha256": artifact_sha}
     return {}
 
@@ -628,8 +646,8 @@ def _fit_window(
 ) -> dict:
     if purpose not in {"selection", "validation", "refit"}:
         raise ValueError("unknown fitting purpose")
-    if implementation_capture is not None:
-        implementation_capture.verify()
+    # The source capture is checked when a trial starts and after each callback; nothing
+    # else here can change it.
     context = inputs.verify()
     panel = inputs.panel
     origin, horizon = context["origin"], context["horizon"]
@@ -698,10 +716,10 @@ def _fit_window(
             model_source = work / "model"
             if not model_source.is_dir() or not any(p.is_file() for p in model_source.rglob("*")):
                 raise HPOError("external trial requires saved model files beneath output_dir/model")
-            model_sha = directory_digest(model_source)
-            _copy_run_artifact_directory(model_source, output / "model")
-            if directory_digest(output / "model") != model_sha:
-                raise HPOError("external model changed while retaining artifacts")
+            model_sha = _retain_run_artifact_directory(
+                model_source, output / "model",
+                changed="external model changed while retaining artifacts",
+            )
             forecast_sha = directory_digest(forecast.path, suffixes=(".parquet",))
             retained = snapshot_parquet_directory(
                 pathlib.Path(forecast.path),
@@ -731,9 +749,6 @@ def _fit_window(
             _expected_study_sha256=context["evaluation_contract"]["study"]["sha256"],
         )
         outcome.update(_scoring_outcome(score))
-    inputs.verify()
-    if implementation_capture is not None:
-        implementation_capture.verify()
     record = {
         **extras,
         "boundary": fixed["boundary"],
@@ -784,13 +799,12 @@ class _ExternalTrialBridge:
                 "training_attestation": "caller_supplied",
                 "test_metrics": "not_evaluated",
             }
+            # Each window record carries its own model and forecast digests.
             if len(self.inputs) == 1 and records:
                 evidence.update({
                     "forecast_sha256": records[0]["forecast_sha256"],
                     "model_sha256": records[0]["model_sha256"],
                 })
-            elif (request.attempt.path / "windows").is_dir():
-                evidence["windows_sha256"] = directory_digest(request.attempt.path / "windows")
             request.attempt.write_json("evaluation/external-run.json", evidence)
 
         try:
@@ -830,8 +844,6 @@ class _ExternalTrialBridge:
         else:
             retain_evidence()
         value = math.fsum(record["score"][context["metric"]] for record in records) / len(records)
-        for inputs in self.inputs:
-            inputs.verify()
         parameters = {
             **{"model." + k: v for k, v in request.model_parameters.items()},
             **{"training." + k: v for k, v in request.training_parameters.items()},
@@ -951,6 +963,8 @@ def tune_study(
     root = _output_root(study, output_dir, "study-tuning")
     preflight = preflight_study(study, options, output_dir=root / "preflight")
     with ExitStack() as stack:
+        # Selection, the search report and the reload below check each trial once.
+        stack.enter_context(attempts_checked_once())
         if preflight.study_id != study.study_id:
             study = stack.enter_context(
                 load_study(

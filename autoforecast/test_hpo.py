@@ -634,3 +634,33 @@ def test_manifest_failure_preserves_original_error_and_terminates_tracking(
     else:
         assert not (attempts[0] / "completion.json").exists()
         assert any("secondary failure retention error" in note for note in failure.__notes__)
+
+
+def test_search_checks_each_trial_once_and_clears_checks_before_model_code(monkeypatch) -> None:
+    pytest.importorskip("optuna")
+    from autoforecast import experiments
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        spec = load_hpo_study(_write_study(root), project_root=root)
+        checked = []
+        original = experiments._load_completed_attempt
+
+        def counted(path):
+            checked.append(path)
+            return original(path)
+
+        monkeypatch.setattr(experiments, "_load_completed_attempt", counted)
+        reusable = []
+
+        def evaluator(request):
+            reusable.append(dict(experiments._CHECKED_ATTEMPTS.get()))
+            return smoke_evaluator(request)
+
+        with experiments.attempts_checked_once():
+            experiments._CHECKED_ATTEMPTS.get()["stale"] = ({}, {})
+            run_hpo_study(spec, root / "artifacts", evaluator)
+        # Model code never runs while an earlier check could be reused.
+        assert reusable == [{}, {}]
+        # Selection checks both trials; the report and its selection reload reuse those checks.
+        assert len(checked) == 2

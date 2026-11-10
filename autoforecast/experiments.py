@@ -15,7 +15,10 @@ import os
 import pathlib
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -29,6 +32,7 @@ from mlops._safe_files import (
     is_regular_file,
     publish_bytes,
     read_regular_bytes,
+    regular_file_identities,
     snapshot_tree_types,
 )
 from mlops.run_report import _discard_unsealed_guide, run_guide
@@ -39,6 +43,8 @@ from autoforecast.frequency import FrequencyError, TimePoint, parse_origin
 __all__ = [
     "ExperimentError",
     "LocalAttempt",
+    "attempts_checked_once",
+    "forget_checked_attempts",
     "load_completed_attempt",
     "load_study_selection",
     "open_local_heldout_attempt",
@@ -263,16 +269,14 @@ class LocalAttempt:
             for path, kind in descendants.items()
             if kind == "file" and path not in {artifact_manifest, self.path / "completion.json"}
         )
-        artifacts = []
-        for path in files:
-            digest, size = _file_identity(path)
-            artifacts.append(
-                {
-                    "path": path.relative_to(self.path).as_posix(),
-                    "sha256": digest,
-                    "bytes": size,
-                }
-            )
+        try:
+            identities = regular_file_identities(files)
+        except SafeFileError as exc:
+            raise ExperimentError(f"cannot read regular attempt artifacts: {self.path}") from exc
+        artifacts = [
+            {"path": path.relative_to(self.path).as_posix(), "sha256": digest, "bytes": size}
+            for path, (digest, size) in zip(files, identities, strict=True)
+        ]
         terminal_payload = {
             "schema": _COMPLETION_SCHEMA,
             "study_id": self.study_id,
@@ -433,8 +437,71 @@ def open_local_heldout_attempt(
     )
 
 
+# Attempts fully checked within one selection, report and reload. Model code may change any
+# attempt, so the search clears these checks before each evaluator call; the scopes end
+# before a workflow's final fits.
+_CHECKED_ATTEMPTS: ContextVar[dict | None] = ContextVar(
+    "autoforecast_checked_attempts", default=None,
+)
+
+
+@contextmanager
+def attempts_checked_once() -> Iterator[None]:
+    """Check each completed attempt's bytes once while one search is selected and reloaded.
+
+    A later check in the scope re-reads the terminal records and requires the same sealed
+    manifest. A separate load, such as reusing the search in another run, checks every byte.
+    """
+    if _CHECKED_ATTEMPTS.get() is not None:
+        yield
+        return
+    token = _CHECKED_ATTEMPTS.set({})
+    try:
+        yield
+    finally:
+        _CHECKED_ATTEMPTS.reset(token)
+
+
+def forget_checked_attempts() -> None:
+    """Discard reused attempt checks before model code runs."""
+    checked = _CHECKED_ATTEMPTS.get()
+    if checked is not None:
+        checked.clear()
+
+
 def load_completed_attempt(path: pathlib.Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Read a completed attempt for renderers, refusing partial or malformed records."""
+    """Read a completed attempt for renderers, refusing partial or malformed records.
+
+    A volume attempt is checked from one owned local copy: every file is downloaded once, in
+    parallel, and the remote listing must not change while it is copied.
+    """
+    path = pathlib.Path(path)
+    checked = _CHECKED_ATTEMPTS.get()
+    key = os.path.abspath(path)
+    if checked is not None and key in checked:
+        metadata, completion = checked[key]
+        if (
+            _load_attempt_json(path, "completion.json") != completion
+            or _sha256(path / "artifact_manifest.json") != completion["artifact_manifest_sha256"]
+        ):
+            raise ExperimentError(f"attempt changed after it was checked: {path}")
+        return deepcopy(metadata), deepcopy(completion)
+    if _volume_files.is_volume(path):
+        try:
+            with _volume_files.local_snapshot(path) as local:
+                metadata, completion = _load_completed_attempt(local)
+        except ExperimentError:
+            raise
+        except Exception as error:
+            raise ExperimentError(f"cannot inspect completed attempt: {path}") from error
+    else:
+        metadata, completion = _load_completed_attempt(path)
+    if checked is not None:
+        checked[key] = (deepcopy(metadata), deepcopy(completion))
+    return metadata, completion
+
+
+def _load_completed_attempt(path: pathlib.Path) -> tuple[dict[str, Any], dict[str, Any]]:
     terminal_paths = (
         path / "completion.json",
         path / "metadata" / "attempt.json",
@@ -592,14 +659,13 @@ def _selection_candidates(
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     if _volume_files.is_volume(study_root):
-        # Discover attempts from the same remote tree whose bytes we verify below.
-        _, entries = _volume_files._inventory(study_root)
-        attempt_paths = []
-        for name, (is_directory, _size, _modified) in entries.items():
-            parts = pathlib.PurePosixPath(name).parts
-            if (not is_directory and len(parts) == 5 and parts[0] == "trials"
-                    and parts[2] == "attempts" and parts[4] == "completion.json"):
-                attempt_paths.append((study_root / name).parent)
+        # Discover attempts natively, listing only the trial and attempt levels; each
+        # attempt's own files are listed when it is checked below.
+        attempt_paths = [
+            attempt
+            for trial in _volume_files.child_directories(study_root / "trials")
+            for attempt in _volume_files.child_directories(trial / "attempts")
+        ]
     else:
         attempt_paths = study_root.glob("trials/*/attempts/*")
     for attempt_path in sorted(attempt_paths):

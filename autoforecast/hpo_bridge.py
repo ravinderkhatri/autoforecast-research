@@ -13,7 +13,12 @@ import shutil
 from dataclasses import dataclass, field
 from typing import cast
 
-from mlops import ProvenanceError, load_completed_run_bundle, validate_data_reference
+from mlops import (
+    ProvenanceError,
+    _volume_files,
+    load_completed_run_bundle,
+    validate_data_reference,
+)
 
 from autoforecast._exact_json import ExactJSONError, load_exact_json
 from autoforecast._numeric import is_finite_real
@@ -537,6 +542,39 @@ def _copy_run_artifact_directory(source: pathlib.Path, destination: pathlib.Path
             raise HPOError(f"HPO trial artifact destination is already populated: {destination}")
         destination.rmdir()
     shutil.copytree(source, destination, dirs_exist_ok=False)
+
+
+def _retain_run_artifact_directory(
+    source: pathlib.Path, destination: pathlib.Path, *, changed: str,
+) -> str:
+    """Copy one governed artifact directory and return the digest of exactly the copied bytes.
+
+    On a volume the source is downloaded once into an owned local copy, which is hashed and
+    then published file by file; every published file is read back in full. Elsewhere both
+    sides are hashed around an ordinary copy.
+    """
+    if not (_volume_files.is_volume(source) and _volume_files.is_volume(destination)):
+        digest = directory_digest(source)
+        _copy_run_artifact_directory(source, destination)
+        if directory_digest(destination) != digest:
+            raise HPOError(changed)
+        return digest
+    if destination.exists():
+        if not destination.is_dir() or any(destination.iterdir()):
+            raise HPOError(f"HPO trial artifact destination is already populated: {destination}")
+        destination.rmdir()
+    with _volume_files.local_snapshot(source) as local:
+        digest = directory_digest(local)
+        files = sorted(item for item in local.rglob("*") if item.is_file())
+        expected = {item.relative_to(local).as_posix(): item.stat().st_size for item in files}
+        _volume_files.publish_files(
+            (item, destination / item.relative_to(local)) for item in files
+        )
+    _, published = _volume_files._inventory(destination)
+    if {name: size for name, (is_directory, size, _modified) in published.items()
+            if not is_directory} != expected:
+        raise HPOError(changed)
+    return digest
 
 
 def _incomplete_run_message(

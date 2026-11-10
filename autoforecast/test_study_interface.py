@@ -222,10 +222,12 @@ def test_study_interface_unknown_access_and_changed_artifacts_are_distinct(froze
         payload = part.read_bytes()
         try:
             part.write_bytes(b"changed")
-            # Lazy actions consume the authenticated private copy, not the replaced source.
+            # The open study reads only its checked private copy, so the replaced source
+            # cannot reach it; the next load checks every registry file and refuses it.
             assert frame.count() == 8
+            assert study.training_data.count() == 8
             with pytest.raises(benchmark.BenchmarkError, match="artifact changed"):
-                _ = study.training_data
+                load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark)
         finally:
             part.write_bytes(payload)
         raw = manifest.read_bytes()
@@ -532,24 +534,18 @@ def test_closed_study_cannot_reopen_or_remove_a_reused_directory(frozen, spark):
 @pytest.mark.parametrize("role,property_name", [
     ("selection", "training_data"), ("source-keys", "series_starts"),
 ])
-def test_study_interface_authenticates_private_bytes_after_spark_read(
-    frozen, spark, monkeypatch, role, property_name,
+def test_study_interface_refuses_a_changed_private_copy_before_reuse(
+    frozen, spark, role, property_name,
 ):
     _, manifest, _ = frozen
-    original = DataFrameReader.parquet
-    observed = []
-    def changed(reader, *paths, **kwargs):
-        frame = original(reader, *paths, **kwargs)
-        path = pathlib.Path(paths[0])
-        if path.name == role:
-            observed.append(path)
-            next(path.rglob("*.parquet")).write_bytes(b"changed during reader callback")
-        return frame
-    monkeypatch.setattr(DataFrameReader, "parquet", changed)
     with load_study(manifest.parent.name, registry_root=manifest.parent.parent, spark=spark) as study:
+        getattr(study, property_name)
+        private = pathlib.Path(study._snapshots.name)
+        part = next(path for path in private.rglob("*.parquet")
+                    if role in path.relative_to(private).parts)
+        part.write_bytes(b"changed after the copy was checked")
         with pytest.raises(benchmark.BenchmarkError, match="snapshot changed"):
             getattr(study, property_name)
-    assert observed
 
 
 def test_study_interface_captures_both_forecasts_before_either_score(frozen, spark, tmp_path, monkeypatch):
@@ -717,9 +713,10 @@ def test_frame_checks_selected_role_and_reuses_owned_copy(saved, spark, monkeypa
         assert len(copies) == 1
 
 
-@pytest.mark.parametrize("change", ["source", "manifest"])
+# A changed registry source no longer fails the open study, which reads only its checked
+# private copy; the next load refuses it (test_study_interface_unknown_access_...).
+@pytest.mark.parametrize("change", ["manifest"])
 def test_frame_rechecks_original_bindings_after_reader_callback(saved, spark, monkeypatch, change):
-    from pyspark.sql.readwriter import DataFrameReader
     with study_api.load_study(saved.parent.name, registry_root=saved.parent.parent, spark=spark) as study:
         record = json.loads(saved.read_text())
         part = next(benchmark.artifact_path(saved, record, "source-keys").glob("*.parquet"))

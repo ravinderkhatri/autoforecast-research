@@ -1402,7 +1402,7 @@ def test_callback_artifact_copy_failure_has_retention_fail_event(tmp_path, monke
     def fail_copy(*args, **kwargs):
         raise OSError("injected artifact copy failure")
 
-    monkeypatch.setattr(study_tuning, "_copy_run_artifact_directory", fail_copy)
+    monkeypatch.setattr(study_tuning, "_retain_run_artifact_directory", fail_copy)
     with pytest.raises(OSError, match="injected artifact copy failure"):
         study_tuning._fit_window(
             spark,
@@ -1496,6 +1496,62 @@ def test_workflow_seal_failure_never_announces_workflow_pass(tmp_path, monkeypat
     assert not any(e["stage"] == "workflow" and e["status"] == "PASS" for e in events)
 
 
+def test_workflow_loads_the_winner_with_the_search_checks(tmp_path, monkeypatch):
+    """The winner's settings reuse the trial checks made by the search, in one scope."""
+    from autoforecast import experiments, study_workflow
+    from autoforecast.test_study_tuning import config, implementation
+
+    manifest = tmp_path / "benchmarks" / "known" / "benchmark.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    recipe = {
+        "metric": "mae",
+        "frequency": "D",
+        "validation_origins": ["2024-01-05"],
+        "validation_horizon": 2,
+        "final_train_cutoff": "2024-01-07",
+        "final_test_horizon": 2,
+    }
+    study = SimpleNamespace(
+        study_id="known",
+        _path=manifest,
+        _sha256="a" * 64,
+        _snapshots=SimpleNamespace(name=str(scratch)),
+        _spark=object(),
+        recipe=recipe,
+        _record=lambda **_: {"sources": {}},
+    )
+    preflight = SimpleNamespace(
+        study_id="known", study_path=manifest, study_sha256="a" * 64, report={}
+    )
+    preflight.report_path = tmp_path / "preflight-report.json"
+    preflight.report_path.write_text(json.dumps(preflight.report))
+    monkeypatch.setattr(study_workflow, "preflight_study", lambda *args, **kwargs: preflight)
+    scopes = []
+    selected = SimpleNamespace(path=tmp_path / "search", winner_config=tmp_path / "winner.json")
+
+    def tune(*args, **kwargs):
+        scopes.append(experiments._CHECKED_ATTEMPTS.get())
+        return selected
+
+    def load(path):
+        scopes.append(experiments._CHECKED_ATTEMPTS.get())
+        raise OSError("stop after loading the winner")
+
+    monkeypatch.setattr(study_workflow, "tune_study", tune)
+    monkeypatch.setattr(study_workflow, "load_selected_configuration", load)
+    profile = config(tmp_path, budget=1)
+    profile.write_text(profile.read_text() + "selection:\n  stage: validation\n")
+    with pytest.raises(OSError, match="stop after loading the winner"):
+        study_workflow.run_forecast_workflow(
+            study, fit_predict=lambda _: None, implementation=implementation(),
+            config=profile, output_dir=tmp_path / "runs",
+        )
+    assert len(scopes) == 2 and scopes[0] is not None and scopes[0] is scopes[1]
+
+
 @pytest.mark.parametrize("operation", ["artifact_retention", "scoring"])
 def test_reused_validation_operation_has_current_failure_stage(tmp_path, monkeypatch, operation):
     import yaml
@@ -1560,6 +1616,7 @@ def test_reused_validation_operation_has_current_failure_stage(tmp_path, monkeyp
     )
     window = {
         "model_artifacts": tmp_path / "model",
+        "model_sha256": "a" * 64,
         "forecasts": forecast,
         "forecast_sha256": "b" * 64,
         "evaluation_contract": {"actuals": {"path": "actuals"}},
@@ -1581,8 +1638,9 @@ def test_reused_validation_operation_has_current_failure_stage(tmp_path, monkeyp
     def copy(*args, **kwargs):
         if operation == "artifact_retention":
             raise OSError("injected selected artifact retention failure")
+        return window["model_sha256"]
 
-    monkeypatch.setattr(study_workflow, "_copy_run_artifact_directory", copy)
+    monkeypatch.setattr(study_workflow, "_retain_run_artifact_directory", copy)
     monkeypatch.setattr(
         study_workflow, "snapshot_parquet_directory", lambda source, dest, **kwargs: dest
     )

@@ -27,6 +27,7 @@ from autoforecast._numeric import is_finite_real
 from autoforecast.experiment_report import render_study_report
 from autoforecast.experiments import (
     LocalAttempt,
+    forget_checked_attempts,
     load_completed_attempt,
     load_study_selection,
     open_local_attempt,
@@ -435,13 +436,13 @@ def _require_trial_evidence(
             ) + "\n").encode()
             if hashlib.sha256(context_bytes).hexdigest() != external_fingerprint:
                 raise HPOError("external trial context differs from frozen inputs")
-            if record["schema"].endswith("v2"):
-                if record.get("windows_sha256") != directory_digest(attempt.path / "windows"):
-                    raise HPOError("external window artifacts changed")
-            elif (record.get("model_sha256") != directory_digest(attempt.path / "model")
-                    or record.get("forecast_sha256") != directory_digest(
-                        attempt.path / "forecasts", suffixes=(".parquet",),
-                    )):
+            # Multi-window evidence is checked window by window below.
+            if not record["schema"].endswith("v2") and (
+                record.get("model_sha256") != directory_digest(attempt.path / "model")
+                or record.get("forecast_sha256") != directory_digest(
+                    attempt.path / "forecasts", suffixes=(".parquet",),
+                )
+            ):
                 raise HPOError("external trial evidence differs from frozen artifacts")
         except (OSError, ValueError) as error:
             raise HPOError("external trial evidence is missing, invalid or changed") from error
@@ -537,6 +538,8 @@ def _evaluate(
                     "run_kind": "hpo_candidate",
                 }
         grouped = materialize_trial_parameters(study.tuning, parameters)
+        # The evaluator is model code and may change earlier attempts.
+        forget_checked_attempts()
         outcome = evaluator(
             TrialRequest(
                 study=study,
@@ -880,6 +883,7 @@ def run_heldout_evaluation(
         },
     )
     try:
+        forget_checked_attempts()
         outcome = evaluator(
             HeldoutRequest(
                 study=study,

@@ -276,15 +276,16 @@ class Study:
         if native:
             destination = source
         else:
-            if directory_digest(source, suffixes=(".parquet",)) != expected:
-                raise BenchmarkError(f"benchmark artifact changed: {role}")
             # Keep operation-owned bytes alive for Spark's deferred reads. Never return a
-            # dataframe whose plan points at a mutable registry artifact.
+            # dataframe whose plan points at a mutable registry artifact. Spark reads only
+            # this checked copy, so the registry original is checked once, when copied.
             destination = pathlib.Path(self._snapshots.name) / record["role_paths"][role]
             if destination.exists():
                 if directory_digest(destination, suffixes=(".parquet",)) != expected:
                     raise BenchmarkError("study snapshot changed")
             else:
+                if directory_digest(source, suffixes=(".parquet",)) != expected:
+                    raise BenchmarkError(f"benchmark artifact changed: {role}")
                 snapshot_parquet_directory(
                     source, destination,
                     expected_sha256=expected, label=role,
@@ -306,11 +307,6 @@ class Study:
         if native:
             assert self._native_inputs is not None
             self._native_inputs.inspect(expected)
-        else:
-            if directory_digest(destination, suffixes=(".parquet",)) != expected:
-                raise BenchmarkError("study snapshot changed")
-            if directory_digest(source, suffixes=(".parquet",)) != expected:
-                raise BenchmarkError(f"benchmark artifact changed: {role}")
         self._record()
         return frame
 
