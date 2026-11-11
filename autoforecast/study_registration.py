@@ -1163,6 +1163,16 @@ class StudyRegistry:
                     raise ValueError("captured table mode changed")
         return record, path, hashlib.sha256(raw).hexdigest()
 
+    def outputs(self, study_id: str, section: str = "data"):
+        """Where this study's inputs and saved data are, and what each one holds.
+
+        Reads only the saved registration and admission records. Use the workflow
+        result's ``outputs()`` for training results.
+        """
+        from autoforecast.outputs import study_outputs
+
+        return study_outputs(self, study_id).select(section)
+
     def _registration_path(self, study_id):
         if not isinstance(study_id, str) or not study_id or pathlib.Path(study_id).name != study_id:
             raise ValueError("invalid study ID")

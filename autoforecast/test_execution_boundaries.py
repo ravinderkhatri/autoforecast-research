@@ -591,6 +591,8 @@ class FakeResult:
     study_id: str = "study-1"
     publication: object = None
     provenance: object = None
+    tracking: object = None
+    data_outputs: object = None
 
 
 def test_combined_registration_failure_preserves_error_and_never_fits(tmp_path, monkeypatch):
@@ -865,6 +867,8 @@ class DerivedResult:
     status: str = "completed"
     run_id: str = "workflow-1"
     publication: object = None
+    tracking: object = None
+    data_outputs: object = None
 
 
 @pytest.mark.parametrize(
@@ -1129,6 +1133,8 @@ class NestedResult:
     status: str = "completed"
     run_id: str = "child-workflow"
     publication: object = None
+    tracking: object = None
+    data_outputs: object = None
 
 
 def test_independent_nested_run_keeps_its_own_identity(tmp_path, monkeypatch):
@@ -1420,6 +1426,8 @@ def test_url_derived_path_is_not_copied_by_public_receipts(tmp_path, monkeypatch
             status: str = "completed"
             run_id: str = "workflow-id"
             publication: object = None
+            tracking: object = None
+            data_outputs: object = None
 
         config = (sensitive if kind == "model_config" else tmp_path) / "model.json"
         config.write_text('{"model":{"id":"example"}}')
@@ -1918,6 +1926,8 @@ class RunSummaryResult:
     run_id: str = "workflow-1"
     study_id: str = "study-1"
     publication: object = None
+    tracking: object = None
+    data_outputs: object = None
 
 
 @pytest.mark.parametrize("status", ["completed", "pending_actuals"])

@@ -35,6 +35,67 @@ SCHEMAS = {
     "study_data_issues": "check_id string, study_id string, issue_json string",
     **PUBLICATION_SCHEMAS,
 }
+_SHARED_COLUMNS = {
+    "study_id": "Study ID: SHA-256 that names the frozen study",
+    "study_sha": "SHA-256 of the saved study definition",
+    "run_id": "Workflow run that produced the row",
+    "stage": "Workflow stage: tuning, validation or test",
+    "search_id": "Parameter search that produced the row, for tuning windows",
+    "trial_id": "Search trial, for tuning windows",
+    "attempt_id": "Trial attempt, for tuning windows",
+    "window_index": "Tuning window number, for tuning windows",
+    "origin": "Last date of history used for the forecast",
+    "horizon": "Number of periods forecast",
+}
+# Catalog descriptions, so Catalog Explorer explains every AutoForecast table and column.
+DESCRIPTIONS = {
+    "studies": ("AutoForecast studies: one row per registered study with its frozen definition", {
+        "study_id": _SHARED_COLUMNS["study_id"], "study_sha": _SHARED_COLUMNS["study_sha"],
+        "definition_json": "Frozen study definition as JSON: sources with pinned versions, "
+                           "business rules and evaluation windows",
+    }),
+    "frozen_observations": (
+        "AutoForecast frozen input rows for studies saved in table mode: one row per observation",
+        {"snapshot_id": "Frozen snapshot the row belongs to",
+         "row_json": "One frozen input row as JSON"},
+    ),
+    "study_data_issues": (
+        "AutoForecast data-check findings: one row per issue found while registering a study",
+        {"check_id": "Registration check that found the issue",
+         "study_id": "Study the check registered; empty when registration did not complete",
+         "issue_json": "The finding as JSON: issue code, series keys, stage and dates"},
+    ),
+    "study_results": (
+        "AutoForecast published results: one row per workflow stage or tuning window, "
+        "with scores and links to the saved model and evidence",
+        {**{name: _SHARED_COLUMNS[name] for name in (
+            "study_id", "study_sha", "run_id", "stage", "search_id", "trial_id", "attempt_id",
+            "window_index", "origin", "horizon")},
+         "model_id": "Model that produced the forecasts",
+         "workflow_path": "Folder holding the workflow's saved evidence",
+         "workflow_sha": "SHA-256 of the workflow's artifact manifest",
+         "evidence_json": "Scores, coverage and evaluation contract as JSON",
+         "model_uri": "Folder holding the saved model",
+         "model_sha": "SHA-256 of the saved model folder",
+         "mlflow_uri": "MLflow run for the stage, when tracking was on",
+         "additional_info": "Further details as JSON"},
+    ),
+    "forecasts": (
+        "AutoForecast published forecasts: one row per series, date and workflow stage",
+        {**{name: _SHARED_COLUMNS[name] for name in (
+            "study_id", "study_sha", "run_id", "stage", "search_id", "trial_id", "attempt_id",
+            "window_index", "origin", "horizon")},
+         "series_id": "Series the forecast is for",
+         "date": "Forecast date",
+         "yhat": "Point forecast"},
+    ),
+}
+
+
+def _sql_text(value: str) -> str:
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
 JSON_OPTIONS = {
     "ignoreNullFields": "false", "timeZone": "UTC",
     "timestampFormat": "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX",
@@ -345,7 +406,26 @@ class DeltaStudyStore:
                     f"({schema}) USING DELTA"
                 )
                 self.spark.sql(command)
+                self._describe(kind)
             self.validate_destinations()
+
+    def _describe(self, kind: str) -> None:
+        """Set the table and column comments that differ; a described table is unchanged.
+
+        Comments are documentation, so a catalog that refuses them is noted, never fatal.
+        """
+        name, (comment, columns) = self.tables[kind], DESCRIPTIONS[kind]
+        try:
+            if (self.spark.catalog.getTable(name).description or "") != comment:
+                self.spark.sql(f"COMMENT ON TABLE {quote_table(name)} IS {_sql_text(comment)}")
+            current = {column.name: column.description or ""
+                       for column in self.spark.catalog.listColumns(name)}
+            for column, text in columns.items():
+                if current.get(column) != text:
+                    self.spark.sql(f"ALTER TABLE {quote_table(name)} ALTER COLUMN `{column}` "
+                                   f"COMMENT {_sql_text(text)}")
+        except Exception as error:
+            note("Table descriptions not written", table=name, error_type=type(error).__name__)
 
     def validate_destinations(self) -> None:
         """Read-only precheck; a model run never silently provisions tables."""

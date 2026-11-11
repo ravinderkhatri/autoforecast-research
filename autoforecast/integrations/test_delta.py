@@ -3,6 +3,7 @@
 import datetime as dt
 import json
 import os
+import pathlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -732,6 +733,15 @@ def test_tracking_publication_matrix_and_retry(store, tmp_path, monkeypatch, tra
     else:
         result = run_study(study_id, model, **arguments)
     assert calls == ["validation", "refit"]
+    if tracking == "mlflow":
+        # Each stage's run carries the study ID and the outputs map; the result links them.
+        assert set(result.tracking) == {"validation", "test"}
+        for link in result.tracking.values():
+            assert client.get_run(link["run_id"]).data.tags["autoforecast.study_id"] == study_id
+            saved = json.loads(pathlib.Path(client.download_artifacts(
+                link["run_id"], "autoforecast/outputs.json", str(tmp_path / link["run_id"]),
+            )).read_text())
+            assert {item["name"] for item in saved["items"]} >= {"Frozen study data", "Forecasts"}
     if tracking == "mlflow" and not publish:
         import dataclasses
 
@@ -827,6 +837,50 @@ def test_simultaneous_initial_table_provisioning_is_retryable(spark, tmp_path):
             ))
         for store in stores:
             store.validate_destinations()
+    finally:
+        spark.sql(f"DROP SCHEMA IF EXISTS `{namespace}` CASCADE")
+
+
+def test_registry_tables_are_described_once_in_the_catalog(spark, tmp_path, monkeypatch):
+    from autoforecast.integrations.delta import DESCRIPTIONS, SCHEMAS, latest_delta_version
+
+    namespace = "described_" + tmp_path.name.replace("-", "_")
+    try:
+        # Tables created by an earlier release have no comments; preparing describes them.
+        spark.sql(f"CREATE SCHEMA `{namespace}`")
+        for kind, schema in SCHEMAS.items():
+            spark.sql(f"CREATE TABLE `{namespace}`.`{kind}` ({schema}) USING DELTA")
+        store = DeltaStudyStore(spark, namespace=namespace)
+        # A catalog that refuses comments is noted per table and never stops provisioning.
+        sql = spark.sql
+
+        def refuse_comments(statement, *args, **kwargs):
+            if "COMMENT" in statement:
+                raise PermissionError("comments are not allowed here")
+            return sql(statement, *args, **kwargs)
+
+        audit = tmp_path / "describe-events.jsonl"
+        with monkeypatch.context() as patch:
+            patch.setattr(spark, "sql", refuse_comments)
+            with events.Execution(audit, ["host"], attempt_id="coverage-attempt"):
+                with events._stage(audit, "host"):
+                    store.prepare(lock_path=tmp_path / "provision.lock")
+        refused = [json.loads(line) for line in audit.read_text().splitlines()]
+        refused = [row for row in refused if row["stage"] == "Table descriptions not written"]
+        assert sorted(row["table"] for row in refused) == sorted(store.tables.values())
+        assert {row["error_type"] for row in refused} == {"PermissionError"}
+        assert not any(spark.catalog.getTable(name).description
+                       for name in store.tables.values())
+        store.prepare(lock_path=tmp_path / "provision.lock")
+        for kind, (comment, columns) in DESCRIPTIONS.items():
+            name = store.tables[kind]
+            assert spark.catalog.getTable(name).description == comment
+            assert {c.name: c.description for c in spark.catalog.listColumns(name)} == columns
+        # Described tables are left alone: preparing again adds no table version.
+        versions = {kind: latest_delta_version(spark, name) for kind, name in store.tables.items()}
+        store.prepare(lock_path=tmp_path / "provision.lock")
+        assert {kind: latest_delta_version(spark, name)
+                for kind, name in store.tables.items()} == versions
     finally:
         spark.sql(f"DROP SCHEMA IF EXISTS `{namespace}` CASCADE")
 
