@@ -410,9 +410,30 @@ all the bytes does not finish the integrity checks that follow. A skipped stage
 is listed separately. Failed or cancelled work stays in the remaining list.
 
 Progress uses counters the work already has. If a total is unknown, the display
-says so. There is no estimated whole-run finish time. A panel that keeps showing
-elapsed time means the reporting thread is alive; it does not prove the model
-is making progress. Updates normally happen every ten seconds.
+says so.
+
+During training the panel counts model fits. One fit trains the model for every
+series on one window, then forecasts and scores that window. A search of 5 trials
+over 3 windows, plus a validation fit and a test fit, makes 17 fits. Each fit names
+its trial, its window and its periods in the study's own frequency:
+
+```text
+Model fits: 7/17 [========>...........] 41% | about 1 h left at 6 min per fit, measured
+Now fitting: Parameter search · trial 3 of 5 · window 2 of 3 · Training period 2023-01-02 to 2026-06-28 · Validation period 2026-06-29 to 2026-07-12 (14 days)
+```
+
+The parameter search uses only validation periods. The test period appears once,
+on the last fit, with a note when its actual values are missing or incomplete. The
+dates are period labels from the data's time column; with weekly data the last date
+labels the last week.
+
+The time left appears after the first fit and is updated after each one: the fits
+left, multiplied by the measured time per fit so far. It is approximate, because
+settings, the larger final fit and the cluster's speed all change the time per fit,
+and it leaves out work after the last fit, such as the MLflow export. Counters for
+rows and bytes show no estimate. A panel that keeps showing elapsed time means the
+reporting thread is alive; it does not prove the model is making progress. Updates
+normally happen every ten seconds.
 
 Both registration and model runs choose their logging level in this order:
 

@@ -25,11 +25,14 @@ from autoforecast._execution import (
     _stage_event,
     bind_identity,
     callable_name,
+    model_fit,
     note,
+    plan_model_fits,
     record_result,
     report_workflow,
     resolve_display,
     resolve_level,
+    share_model_fits,
     validate_model_label,
 )
 from autoforecast.benchmark import bound_input_path, digest, verify_benchmark
@@ -50,6 +53,7 @@ from autoforecast.study_tuning import (
     FitPredictRequest,
     FitPredictResult,
     _config,
+    _fit_periods,
     _fit_window,
     _implementation_record,
     _json_bytes,
@@ -606,7 +610,9 @@ def run_study(
                         "log_level": settings["log_level"],
                         "audit_path": str(audit),
                     }
-                    with _stage(audit, "workflow", study_id=study_id) as outcome:
+                    # The run's panel shows the same model fits as the workflow's.
+                    with _stage(audit, "workflow", study_id=study_id) as outcome, \
+                            share_model_fits():
                         result = run_forecast_workflow(
                             study,
                             fit_predict=cast(
@@ -918,6 +924,7 @@ def run_forecast_workflow(
         bundle.write_json("metadata/work-estimate.json", estimate)
         note("Planned work", **estimate, trial_budget="maximum",
              unit="callback fits, not individual series models")
+        plan_model_fits(estimate["total_callback_fits"])
         with ExitStack() as stack:
             if preflight.study_id != study.study_id:
                 phase = "load_and_verify"
@@ -1158,21 +1165,25 @@ def run_forecast_workflow(
                     }
                     result["score"] = score
                 else:
-                    result = _fit_window(
-                        study._spark,
-                        fit_predict,
-                        inputs,
-                        directory,
-                        model_id=spec.model_id,
-                        model_parameters=grouped["model"],
-                        training_parameters=grouped["training"],
-                        seed=seed,
-                        metrics=options["metrics"],
-                        breakdown=options["workflow_breakdown"],
-                        purpose="validation" if stage == "validation" else "refit",
-                        run_id=bundle.path.name,
-                        implementation_capture=capture,
+                    label = ("Test fit · " if stage == "test" else "Validation fit · ") + (
+                        _fit_periods(study, stage, origin, horizon, report)
                     )
+                    with model_fit(label, window=stage, origin=origin):
+                        result = _fit_window(
+                            study._spark,
+                            fit_predict,
+                            inputs,
+                            directory,
+                            model_id=spec.model_id,
+                            model_parameters=grouped["model"],
+                            training_parameters=grouped["training"],
+                            seed=seed,
+                            metrics=options["metrics"],
+                            breakdown=options["workflow_breakdown"],
+                            purpose="validation" if stage == "validation" else "refit",
+                            run_id=bundle.path.name,
+                            implementation_capture=capture,
+                        )
                 phase = "artifact_retention"
                 result["forecast"]["path"] = stage + "/forecasts"
                 result["model_path"] = stage + "/model"
