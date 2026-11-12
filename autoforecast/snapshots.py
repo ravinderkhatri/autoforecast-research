@@ -22,6 +22,7 @@ from typing import Any, Protocol
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from mlops import _volume_files
 
 from autoforecast import _logical_hash
 
@@ -677,11 +678,18 @@ def input_scope(scope=None, *, connections=None, scratch_root=None, spark=None):
 
 
 def study_inputs(function):
-    """Use the same retained inputs through method and module-level study entry points."""
+    """Use the same retained inputs through method and module-level study entry points.
+
+    The study's frozen files are downloaded once for the whole call, including nested
+    entry points; a stage's final check reads them again (``_volume_files.fresh_reads``).
+    """
     @wraps(function)
     def call(study, *args, **kwargs):
         scope = getattr(study, "_native_inputs", None)
-        with scope.active() if scope is not None else nullcontext():
+        with (scope.active() if scope is not None else nullcontext(),
+              _volume_files.frozen_reads()):
+            if getattr(study, "_path", None) is not None:
+                _volume_files.mark_frozen(study._path.parent)
             return function(study, *args, **kwargs)
     return call
 

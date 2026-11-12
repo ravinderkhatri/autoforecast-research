@@ -90,6 +90,8 @@ def _completed_run_snapshot(
             snapshot_regular_files(source, snapshot, relative_paths)
         except SafeFileError as error:
             raise RunMLflowError("could not snapshot completed run bundle") from error
+        # Written once: the check below and the caller's reload share one download.
+        _volume_files.mark_frozen(snapshot)
         try:
             completion = load_completed_run_bundle(snapshot)
         except ProvenanceError as error:

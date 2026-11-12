@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import functools
 import hashlib
 import itertools
 import json
@@ -14,8 +15,9 @@ import shutil
 import tempfile
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, suppress
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
+from mlops import _volume_files
 from mlops._safe_files import (
     _platform_absolute,
     is_regular_file,
@@ -74,8 +76,13 @@ from autoforecast.study_horizon_metrics import (
     ForecastAccuracyBreakdown,
     validate_forecast_accuracy_breakdown,
 )
-from autoforecast.study_preflight import preflight_study
-from autoforecast.study_scoring import SELECTION_METRICS, score_study, validate_study_metrics
+from autoforecast.study_preflight import PreflightResult, preflight_study, reuses
+from autoforecast.study_scoring import (
+    SELECTION_METRICS,
+    score_study,
+    validate_study_metrics,
+    verify_owned_copies,
+)
 from autoforecast.tuning import (
     TuningError,
     TuningSpec,
@@ -630,6 +637,9 @@ def _prepare_window(
         mapping_path = scope.materialize(bindings["mapping"]["snapshot"])
         context["native_inputs"] = bindings
     else:
+        # Written once above: every later read in this run reuses one download.
+        _volume_files.mark_frozen(training)
+        _volume_files.mark_frozen(mapping_path)
         context.update(training_sha256=directory_digest(training, suffixes=(".parquet",)),
                        mapping_sha256=directory_digest(mapping_path, suffixes=(".parquet",)))
     return _WindowInput(
@@ -730,6 +740,8 @@ def _fit_window(
             with suppress(Exception):
                 _retain_callback_artifacts(work, output)
             raise
+        # The callback has returned: its outputs are read once from here on.
+        _volume_files.mark_frozen(work)
         if implementation_capture is not None:
             implementation_capture.verify()
         with _stage(output / "events.jsonl", "artifact_retention", model_id=model_id,
@@ -771,6 +783,9 @@ def _fit_window(
             )
             forecast = dataclasses.replace(forecast, path=str(retained))
             forecast.validate()
+            # Retained copies are written once; scoring and the trial end reuse their bytes.
+            for name in ("model", "forecasts", "artifacts"):
+                _volume_files.mark_frozen(output / name)
     fixed = context["evaluation_contract"]
     with _stage(output / "events.jsonl", "scoring", model_id=model_id,
                 metrics=metrics, breakdown=breakdown,
@@ -982,6 +997,16 @@ def _output_root(study: Study, supplied: str | pathlib.Path | None, name: str) -
     return root
 
 
+def _applies_file_checks(function):
+    """Apply the call's ``file_checks`` choice to everything the call does."""
+    @functools.wraps(function)
+    def call(*args, **kwargs):
+        with _volume_files.file_checks(kwargs.get("file_checks")):
+            return function(*args, **kwargs)
+    return call
+
+
+@_applies_file_checks
 @study_inputs
 def tune_study(
     study: Study,
@@ -992,8 +1017,17 @@ def tune_study(
     tuning_origin: str | None = None,
     output_dir: str | pathlib.Path | None = None,
     reuse_tuning: str | pathlib.Path | None = None,
+    file_checks: Literal["once", "every_stage"] | None = None,
+    _preflight: tuple[PreflightResult, dict] | None = None,
 ) -> TuningResult:
-    """Select one parameter configuration across frozen windows, or verify a completed search."""
+    """Select one parameter configuration across frozen windows, or verify a completed search.
+
+    ``file_checks``: "once" checks each saved file once per run; "every_stage" also ends
+    the search with a fresh check of every file it used. None keeps the caller's choice
+    (``run_study`` passes its own), and "once" applies when nothing chose.
+    ``_preflight`` is a workflow's coverage check of this study and the options it used;
+    the search reuses it when it answers the same question, instead of checking again.
+    """
     from autoforecast.study import load_study
 
     if not callable(fit_predict):
@@ -1014,7 +1048,12 @@ def tune_study(
     capture = implementation if isinstance(implementation, CapturedImplementation) else None
     options = _resolve_options(study, controls, tuning_origin)
     root = _output_root(study, output_dir, "study-tuning")
-    preflight = preflight_study(study, options, output_dir=root / "preflight")
+    handed, checked = _preflight if _preflight is not None else (None, {})
+    if handed is not None and reuses(handed, study, options, checked):
+        preflight = handed
+        note("Coverage check reused", report=str(preflight.report_path))
+    else:
+        preflight = preflight_study(study, options, output_dir=root / "preflight")
     with ExitStack() as stack:
         # Selection, the search report and the reload below check each trial once.
         stack.enter_context(attempts_checked_once())
@@ -1152,7 +1191,13 @@ def tune_study(
                     sealed=False,
                 ).decode())
             raise
-        return load_tuning_result(search_path)
+        # The search's final check: every input and the study are read once more, fresh,
+        # before its result is used. Between fits nothing is downloaded or checked twice.
+        with _volume_files.fresh_reads():
+            for item in inputs:
+                item.verify()
+            verify_owned_copies()
+            return load_tuning_result(search_path)
 
 
 def _validate_workflow_configuration(

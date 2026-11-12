@@ -147,6 +147,8 @@ class RunBundle:
             for file, kind in descendants.items()
             if kind == "file" and file not in {manifest_path, completion_path}
         )
+        # These files are final: a run reads each once from here on, including its reload.
+        _volume_files.mark_frozen(self.path)
         try:
             identities = regular_file_identities(files)
         except SafeFileError as exc:

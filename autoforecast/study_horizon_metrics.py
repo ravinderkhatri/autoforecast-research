@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from typing import Literal
 
+from mlops import _volume_files
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
@@ -36,6 +37,9 @@ def score_horizon_metrics(
     reduction. An unscoreable retained series makes that diagnostic WRMSSE unavailable.
     The caller has already enforced the full-window missing-actual policy.
     """
+    # The caller just wrote these sums; this check and the one after Spark's reads share
+    # one download, since nothing else runs in between.
+    _volume_files.mark_frozen(path)
     digest = directory_digest(path, suffixes=(".parquet",))
     cadence = parse_frequency(forecast.frequency)
     points = period_points(forecast.origin, cadence, forecast.horizon)

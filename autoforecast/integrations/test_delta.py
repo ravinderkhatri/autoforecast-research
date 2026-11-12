@@ -1672,3 +1672,80 @@ def test_reused_file_capture_publishes_its_study_binding_and_survives_capture_re
         with registry.load_study(study_id) as study:
             assert study.n_series == 2
             assert study.testing_data.count() == 4
+
+
+def test_published_run_reads_each_saved_file_once(store, tmp_path, monkeypatch):
+    """A run that publishes to Delta downloads every saved file once on a volume.
+
+    By default a run checks each file once, publication included: the sealed workflow and
+    its copy are read once each, however many steps consult them, and a file the run
+    wrote is never downloaded again after its read-back.
+    """
+    import collections
+    import contextlib
+    from urllib.parse import unquote
+
+    import mlflow
+    import yaml
+    from mlops import _volume_files
+
+    from autoforecast import register_study, run_mlflow, run_study
+    from autoforecast.study_registration import StudyRegistry
+    from autoforecast.test_request_budget import _volume
+    from autoforecast.test_study_registration import configuration
+    from autoforecast.test_study_tuning import config, implementation, predict
+
+    root = tmp_path.resolve()
+    files = _volume(root, monkeypatch)
+    stage, downloads, uploads = [0], collections.Counter(), collections.Counter()
+    download, put = files.download, files.do
+
+    def counted_download(path):
+        downloads[(path, stage[0])] += 1
+        return download(path)
+
+    def counted_put(method, path, **kwargs):
+        uploads[(unquote(path.removeprefix("/api/2.0/fs/files")), stage[0])] += 1
+        return put(method, path, **kwargs)
+
+    files.download, files.do = counted_download, counted_put
+    fresh = _volume_files.fresh_reads
+
+    @contextlib.contextmanager
+    def staged():
+        reads = _volume_files._FROZEN.get()
+        if reads is not None and not reads.depth:
+            stage[0] += 1
+        with fresh():
+            yield
+
+    monkeypatch.setattr(_volume_files, "fresh_reads", staged)
+    path = configuration(root / "config")
+    value = yaml.safe_load(path.read_text())
+    value["recipe"]["tuning_windows"] = [{"origin": "2024-01-02", "horizon": 2},
+                                         {"origin": "2024-01-03", "horizon": 2}]
+    path.write_text(yaml.safe_dump(value))
+    registry = StudyRegistry(root / "registry", spark=store.spark, namespace=store.namespace)
+    study_id = register_study(path, registry=registry)
+    profile = config(root, budget=2)
+    settings = yaml.safe_load(profile.read_text())
+    settings["selection"] = {"stage": "tuning", "origins": "all", "aggregation": "mean"}
+    profile.write_text(yaml.safe_dump(settings))
+    uri = "sqlite:///" + str(root / "tracking.db")
+    mlflow.tracking.MlflowClient(tracking_uri=uri).create_experiment(
+        "published", artifact_location=str(root / "mlflow-artifacts"))
+    monkeypatch.setattr(run_mlflow, "_mlflow", lambda: mlflow)
+    downloads.clear()
+    uploads.clear()
+    result = run_study(study_id, predict, registry=registry, model_config=profile,
+                       implementation=implementation(), tracking="mlflow", tracking_uri=uri,
+                       mlflow_experiment="published", publish=True)
+    assert result.publication["status"] == "published"
+    # Audit events and lock files are not data checks.
+    saved = {key: count for key, count in downloads.items()
+             if ".jsonl" not in key[0] and not key[0].endswith(".lock")}
+    per_file = collections.Counter()
+    for (name, _stage), count in saved.items():
+        per_file[name] += count
+    extra = {name: count for name, count in per_file.items() if count > 1}
+    assert extra == {}, sorted((name.replace(str(root), ""), n) for name, n in extra.items())[:10]

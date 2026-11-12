@@ -338,7 +338,8 @@ print(result.study_id)
 
 Keep the printed ID. To run on the same saved data, pass that ID and set
 `create_study=False`. Leave out `config` and `prepare`: reuse reads the frozen
-study, not the original source. The dictionary must contain all three keys.
+study, not the original source. The dictionary must contain all three keys, and it
+may also set `file_checks` (see "Keeping saved runs safe").
 
 ```python
 # Use the saved study without reading its source again.
@@ -681,6 +682,22 @@ either run is reading it. If you change the data, save a new version.
   against their previously frozen hashes. Hashing a newly copied file alone does
   not prove the source stayed unchanged during the copy. Keep source snapshots
   unchanged throughout reads, including failed writes and retries.
+- **Each file is checked once per run.** Inside a run, a saved file that does not
+  change (the frozen study, window inputs, saved models, forecasts and sealed
+  results) is downloaded and its SHA-256 checked once. Later steps reuse those
+  checked bytes, so nothing is downloaded or hashed again between fits. The run
+  trusts that nothing changes its files while it runs. A change to the saved study
+  is found by the next run that loads it.
+- **Every-stage checks are optional.** Add `"file_checks": "every_stage"` to
+  `study_info` (or pass `file_checks="every_stage"` to `tune_study`) when other
+  people or model code may change files during a run. Each stage then also ends
+  with a fresh download and check: after the coverage check, at the end of the
+  parameter search, at the end of the workflow and before results are published.
+  A file changed during a stage, for example by model code between fits, stops
+  the run there. The run records which checks it made in its configuration stage.
+- **Registration keeps its own checks** whatever the run chooses. It checks again,
+  from fresh bytes, everything its `prepare` hook could have changed. Outside a run,
+  every read downloads and checks fresh bytes.
 
 For a cleanup example, do not delete Monday's study while Tuesday's run still
 reads it. Wait until all readers and writers have stopped, then follow your

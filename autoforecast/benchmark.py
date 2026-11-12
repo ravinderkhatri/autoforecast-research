@@ -15,6 +15,7 @@ import tempfile
 from contextlib import ExitStack, contextmanager
 from functools import partial
 
+from mlops import _volume_files
 from mlops._safe_files import is_regular_file, read_path_bytes
 
 from autoforecast import _logical_hash
@@ -1033,12 +1034,16 @@ def _freeze_benchmark(
         write_few_files(key_map, scratch / "source-keys")
         for name, frame in frames.items():
             write_few_files(frame, scratch / name, rows=counts[name]["written_rows"])
+        # Written once: the hashing and identity steps below share one download of each.
+        for name in ("dataset.yaml", "source-keys", *frames):
+            _volume_files.mark_frozen(scratch / name)
         artifact_roles = [*sorted(sources), "source-keys"]
         if scoring_references is not None:
             references = _prepare_scoring_references(
                 read_paths["scoring_references"], key_map, keys, recipe, spark,
             )
             write_few_files(references, scratch / "scoring_references")
+            _volume_files.mark_frozen(scratch / "scoring_references")
             artifact_roles.append("scoring_references")
         logical_hashes = {}
         physical_hashes = {}
@@ -1069,6 +1074,7 @@ def _freeze_benchmark(
                 time_col=panel.time_col,
                 frequency=cadence.code,
             )
+            _volume_files.mark_frozen(path)
             grids[key] = {
                 "path": relative,
                 **({} if native_inputs is not None else {
@@ -1117,6 +1123,7 @@ def _freeze_benchmark(
             assert totals is not None
             coverage_path = "coverage/" + key
             write_few_files(per_series, scratch / coverage_path)
+            _volume_files.mark_frozen(scratch / coverage_path)
             coverage_identities[key] = {
                 ("snapshot" if native_inputs is not None else "content_sha256"):
                     content_hash(scratch / coverage_path, "coverage/" + key),
@@ -1328,6 +1335,8 @@ def _publish_frozen_benchmark(
     finally:
         if scratch.exists():
             shutil.rmtree(scratch)
+    # Published: the checks that follow in this run share one download of each file.
+    _volume_files.mark_frozen(destination)
     read_benchmark_manifest(destination / "benchmark.json", original_sha)
     return original_sha
 

@@ -535,3 +535,51 @@ def test_fit_periods_say_when_actuals_are_missing(status, suffix):
                           benchmark.boundary("validation", "2024-01-09", 2, "D"): {
                               "status": "pending_actuals"}}}
     assert _fit_periods(study, "test", "2024-01-09", 2, report).endswith(suffix)
+
+
+def test_search_reuses_a_coverage_check_only_for_the_same_question(tmp_path):
+    from types import SimpleNamespace
+
+    from autoforecast.study_preflight import CHECKED_OPTIONS, PreflightResult, reuses
+
+    study = SimpleNamespace(study_id="s" * 64, _sha256="a" * 64, _path=tmp_path / "benchmark.json")
+    options = {"series_policy": "error", "minimum_history": 1, "metric": "mae",
+               "metrics": ["mae"], "selection_boundaries": ["tuning|2024-01-03|2|D"],
+               "windows": [{"origin": "2024-01-03", "horizon": 2}]}
+    result = PreflightResult(study._path, study.study_id, study._sha256, tmp_path / "r.json", {})
+    assert reuses(result, study, options, dict(options))
+    # Options the coverage check does not read may differ.
+    assert reuses(result, study, options, {**options, "windows": []})
+    # Another study, version or location, or any option it reads, needs its own check.
+    for changed in ({"study_id": "t" * 64}, {"_sha256": "b" * 64},
+                    {"_path": tmp_path / "other.json"}):
+        assert not reuses(result, SimpleNamespace(**{**vars(study), **changed}), options, options)
+    for name in CHECKED_OPTIONS:
+        assert not reuses(result, study, options, {**options, name: "different"}), name
+
+
+def test_scoring_inputs_are_copied_once_per_run_and_scratch_folder(tmp_path):
+    from mlops import _volume_files
+
+    from autoforecast.study_scoring import _scoring_input
+    from provenance.lineage import directory_digest
+
+    source = tmp_path / "source"
+    source.mkdir()
+    pq.write_table(pa.table({"x": [1, 2]}), source / "part-0.parquet")
+    binding = {"path": str(source), "sha256": directory_digest(source, suffixes=(".parquet",))}
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    with _volume_files.frozen_reads():
+        kept = _scoring_input(binding, first / "one", first)
+        # Later scores in the same folder read the checked copy made by the first.
+        assert _scoring_input(binding, first / "two", first) == kept
+        assert kept.is_relative_to(first) and not (first / "two").exists()
+        # A copy never serves another folder: that folder may outlive or outrun it.
+        other = _scoring_input(binding, second / "one", second)
+        assert other != kept and other.is_relative_to(second)
+        assert _volume_files.owned_copies() == [(kept, binding["sha256"]),
+                                                (other, binding["sha256"])]
+    # Outside a run every score gets its own copy.
+    assert _scoring_input(binding, first / "three", first) == first / "three"
