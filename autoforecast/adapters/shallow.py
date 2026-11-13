@@ -17,6 +17,7 @@ a deliberate ceiling, not an oversight; see the marker on `fit_predict`.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import gc
 import pathlib
@@ -56,6 +57,31 @@ FEATURES = (
     "days_since_last_sale",
     "history_days",
 )
+
+
+STUDY_SETTINGS = ("num_leaves", "learning_rate", "min_data_in_leaf", "num_boost_round")
+"""The settings a saved-study profile gives this model; the defaults are `fit_predict`'s."""
+
+
+def fit_study_shallow_global(request):
+    """LightGBM global on a saved study; both fitted LightGBM files are the saved model.
+
+    Training rows come from earlier origins inside the fit's history (see `fit_predict`), so
+    every study fit, including each tuning window, trains only on data up to its own origin.
+    """
+    from autoforecast.study_tuning import FitPredictResult
+
+    if set(request.model_parameters) != set(STUDY_SETTINGS) or request.training_parameters:
+        raise ValueError("shallow_global study settings require exactly "
+                         + ", ".join(f"model.{name}" for name in STUDY_SETTINGS))
+    forecast = fit_predict(
+        request.panel, request.origin, len(request.forecast_dates),
+        spark=request.training_data.sparkSession, out_dir=request.output_dir / "forecasts",
+        seed=request.seed, checkpoint_dir=request.output_dir / "model",
+        **request.model_parameters,
+    )
+    return FitPredictResult(dataclasses.replace(forecast, adapter=request.model_id),
+                            "lightgbm-hurdle-v1")
 
 
 def fit_predict(
@@ -445,4 +471,5 @@ def _predict(
     ).validate()
 
 
-__all__ = ["FEATURES", "LAG_WINDOWS", "NAME", "fit_predict"]
+__all__ = ["FEATURES", "LAG_WINDOWS", "NAME", "STUDY_SETTINGS", "fit_predict",
+           "fit_study_shallow_global"]

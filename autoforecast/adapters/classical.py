@@ -19,7 +19,9 @@ problem rather than an environment one.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import functools
 import os
 import pathlib
 from collections.abc import Callable
@@ -31,7 +33,7 @@ from statsforecast import StatsForecast
 from statsforecast.models import AutoETS, AutoTheta, CrostonClassic
 
 from autoforecast import resources
-from autoforecast.adapters import _validate_daily_span
+from autoforecast.adapters import _validate_daily_span, fit_on_retained_history
 from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 
 
@@ -181,6 +183,35 @@ def forecast_with(
         labelled.unpersist()
 
 
+def _fit_study(model: str, request):
+    """Fit one of `MODELS` on a saved study; the fit's history is kept as its fitted state.
+
+    Fitting the same history again gives the same forecast, so the history (with the model name
+    and season length in `panel.json`) is the saved model.
+    """
+    if set(request.model_parameters) != {"season_length"} or request.training_parameters:
+        raise ValueError(f"{model} study settings require only model.season_length")
+    panel = dataclasses.replace(request.panel,
+                                season_length=request.model_parameters["season_length"])
+    return fit_on_retained_history(request, panel, functools.partial(forecast_with, model),
+                                   "statsforecast-history-v1", model=model)
+
+
+def fit_study_croston(request):
+    """Croston (classic) on a saved study."""
+    return _fit_study("croston", request)
+
+
+def fit_study_auto_ets(request):
+    """AutoETS on a saved study."""
+    return _fit_study("auto_ets", request)
+
+
+def fit_study_auto_theta(request):
+    """AutoTheta on a saved study."""
+    return _fit_study("auto_theta", request)
+
+
 def _eligible_history(panel: Panel, spark: SparkSession, origin: str) -> DataFrame:
     """Eligible cells at or before `origin`, renamed to statsforecast's column contract."""
     df = spark.read.parquet(panel.path).filter(
@@ -230,4 +261,5 @@ def _expected_grid(panel: Panel, spark: SparkSession, origin: str, horizon: int,
             .drop("_h_sid", "_n"))
 
 
-__all__ = ["MODELS", "forecast_with"]
+__all__ = ["MODELS", "fit_study_auto_ets", "fit_study_auto_theta", "fit_study_croston",
+           "forecast_with"]

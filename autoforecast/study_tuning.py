@@ -86,6 +86,7 @@ from autoforecast.study_scoring import (
 from autoforecast.tuning import (
     TuningError,
     TuningSpec,
+    exhaustive_grid,
     loads_external_tuning_spec,
     materialize_runtime_parameters,
 )
@@ -259,6 +260,11 @@ def _config(
         raise TuningError("external profile requires finite JSON-compatible values") from error
     spec = loads_external_tuning_spec(profile, source_path=path)
     spec = dataclasses.replace(spec, source_sha256=hashlib.sha256(raw).hexdigest())
+    # A search whose every combination fits the budget tries each one once instead of drawing
+    # at random, which can repeat some and miss others.
+    grid = exhaustive_grid(spec, budget)
+    if grid is not None:
+        budget = math.prod(len(values) for values in grid.values())
     return raw, spec, budget, seed, controls
 
 

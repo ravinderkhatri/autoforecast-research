@@ -26,6 +26,7 @@ __all__ = [
     "TuningError",
     "TuningParameter",
     "TuningSpec",
+    "exhaustive_grid",
     "load_tuning_spec",
     "loads_tuning_spec",
     "loads_external_tuning_spec",
@@ -315,6 +316,31 @@ def suggest_optuna_parameters(spec: TuningSpec, trial: _OptunaTrial) -> dict[str
             raise AssertionError(f"unsupported validated domain kind {domain.kind!r}")
     materialize_trial_parameters(spec, values)
     return values
+
+
+def exhaustive_grid(spec: TuningSpec, budget: int) -> dict[str, list[str | int | float]] | None:
+    """Every searched value per parameter, when trying each combination fits ``budget``.
+
+    Only listed values (categorical) and bounded integer ranges can be enumerated, and only
+    without cross-parameter constraints, which could make some combinations invalid. ``None``
+    keeps the seeded random search.
+    """
+    if spec.constraints or not spec.parameters:
+        return None
+    grid: dict[str, list[str | int | float]] = {}
+    for parameter in spec.parameters:
+        domain = parameter.search
+        if domain.kind == "categorical":
+            assert domain.values is not None
+            # Loading allows only built-in strings and numbers here.
+            grid[parameter.name] = cast(list[str | int | float], list(domain.values))
+        elif domain.kind == "int" and domain.high is not None:
+            assert isinstance(domain.low, int) and isinstance(domain.high, int)
+            assert isinstance(domain.step, int)
+            grid[parameter.name] = list(range(domain.low, domain.high + 1, domain.step))
+        else:
+            return None
+    return grid if math.prod(len(values) for values in grid.values()) <= budget else None
 
 
 def ray_param_space(spec: TuningSpec) -> dict[str, object]:

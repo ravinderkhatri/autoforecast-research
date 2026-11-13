@@ -48,6 +48,7 @@ from autoforecast.implementation import (
 )
 from autoforecast.project import library_revision
 from autoforecast.snapshots import study_inputs, worker_inputs
+from autoforecast.study_builtins import BUILTIN_STUDY_MODELS, builtin_profile, builtin_study_model
 from autoforecast.study_preflight import preflight_study
 from autoforecast.study_scoring import score_study, verify_owned_copies
 from autoforecast.study_tuning import (
@@ -321,7 +322,7 @@ def run_study(
     model_label=None,
     **registration_inputs,
 ) -> ForecastWorkflowResult:
-    """Create or reuse a study, then run a callback, StudyModel, or seasonal_naive.
+    """Create or reuse a study, then run a callback, StudyModel, or built-in model by name.
 
     Supply study_info with exactly study_id, create_study and publish_results, and
     optionally file_checks ("once" by default, or "every_stage"; see StudyInfo).
@@ -335,6 +336,8 @@ def run_study(
     controls override environment and runtime settings. Defaults are no tracking,
     no table publication and INFO logging. An HPO block explicitly enables tuning;
     otherwise the existing workflow uses profile defaults without a search.
+    A model name runs a library model (BUILTIN_STUDY_MODELS in study_builtins, for
+    example "auto_ets"); without model_config its settings stay at their defaults.
     model_label is an optional public name shown only in operational logs.
     Read result.study_id, result.run_id, result.path and result.publication for
     outputs. A failure after registration carries error.registered_study_id so a
@@ -481,25 +484,16 @@ def run_study(
                         callback = model
                         if model_config is None:
                             raise ValueError("callbacks require model_config=")
-                    elif model == "seasonal_naive":
-                        from autoforecast.adapters import naive
-
-                        callback = naive.fit_study_baseline
-                        implementation = {
-                            "name": "seasonal_naive",
-                            "version": "1",
-                            "source_sha256": hashlib.sha256(
-                                pathlib.Path(naive.__file__).read_bytes(),
-                            ).hexdigest(),
-                            "dependencies": {},
-                        }
+                    elif isinstance(model, str) and model in BUILTIN_STUDY_MODELS:
+                        if implementation is not None:
+                            raise ValueError("a built-in model declares its own implementation")
+                        callback, implementation = builtin_study_model(model)
                     else:
-                        raise ValueError("model must be a callback, StudyModel or seasonal_naive")
-                    if (
-                        create
-                        and model_config is None
-                        and not (isinstance(model, str) and model == "seasonal_naive")
-                    ):
+                        raise ValueError(
+                            "model must be a callback, StudyModel or a built-in model name: "
+                            + ", ".join(sorted(BUILTIN_STUDY_MODELS))
+                        )
+                    if create and model_config is None and not isinstance(model, str):
                         raise ValueError("model_config is required")
                     if (
                         fixed_parameters is not _UNSET
@@ -579,7 +573,8 @@ def run_study(
                         registration_sha = registered["sha256"]
                     # Show where the inputs and saved study data are before training starts.
                     data_outputs = _data_outputs(registry, study_id, registered)
-                    if model == "seasonal_naive" and model_config is None:
+                    if isinstance(model, str) and model_config is None:
+                        # A built-in model without a profile uses its default settings.
                         folder = pathlib.Path(
                             stack.enter_context(
                                 tempfile.TemporaryDirectory(
@@ -589,22 +584,8 @@ def run_study(
                             )
                         )
                         model_config = folder / "model.json"
-                        m = study.panel.season_length
-                        domain = {"kind": "int", "low": m, "high": m, "step": 1}
                         model_config.write_text(
-                            json.dumps(
-                                {
-                                    "schema_version": 2,
-                                    "model": {"id": "seasonal_naive", "adapter": "external"},
-                                    "hyperparameters": {
-                                        "model.season_length": {
-                                            "default": m,
-                                            "valid": domain,
-                                            "search": domain,
-                                        }
-                                    },
-                                }
-                            )
+                            json.dumps(builtin_profile(model, study.panel))
                         )
                     if model_config is None:
                         raise ValueError("model_config is required")

@@ -11,10 +11,12 @@ import pytest
 
 from autoforecast.model_catalog import discover_candidates
 from autoforecast.tuning import (
+    ParameterConstraint,
     SearchDomain,
     TuningError,
     TuningParameter,
     TuningSpec,
+    exhaustive_grid,
     load_tuning_spec,
     loads_tuning_spec,
     materialize_manual_parameters,
@@ -537,3 +539,39 @@ def test_every_registered_adapter_declares_whether_outer_loop_hpo_is_honest() ->
         else:
             with pytest.raises(TuningError, match="intentionally not tuneable"):
                 load_tuning_spec(candidate.source_path)
+
+
+def _spec(*domains: SearchDomain, constraints: tuple[ParameterConstraint, ...] = ()) -> TuningSpec:
+    parameters = tuple(
+        TuningParameter(f"model.p{index}", domain.values[0] if domain.values else domain.low,
+                        domain, domain)
+        for index, domain in enumerate(domains)
+    )
+    return TuningSpec("m", "external", parameters, constraints, pathlib.Path("m.yaml"), "0" * 64)
+
+
+def test_exhaustive_grid_lists_every_value_when_all_combinations_fit() -> None:
+    """Listed values and bounded integer ranges enumerate; the budget must hold the product."""
+    windows = SearchDomain(kind="categorical", values=(7, 14, 21, 28))
+    lags = SearchDomain(kind="int", low=1, high=3, step=1)
+    assert exhaustive_grid(_spec(windows, lags), 12) == {
+        "model.p0": [7, 14, 21, 28], "model.p1": [1, 2, 3]}
+    assert exhaustive_grid(_spec(windows, lags), 11) is None
+    assert exhaustive_grid(_spec(SearchDomain(kind="int", low=2, high=8, step=3)), 3) == {
+        "model.p0": [2, 5, 8]}
+
+
+@pytest.mark.parametrize("domain", [
+    SearchDomain(kind="float", low=0.0, high=1.0),
+    SearchDomain(kind="int", low=1, step=1),  # no upper bound
+])
+def test_exhaustive_grid_leaves_ranges_it_cannot_list_to_random_draws(domain) -> None:
+    windows = SearchDomain(kind="categorical", values=(7, 14))
+    assert exhaustive_grid(_spec(windows, domain), 10_000) is None
+
+
+def test_exhaustive_grid_leaves_constrained_or_empty_searches_to_random_draws() -> None:
+    windows = SearchDomain(kind="categorical", values=(7, 14))
+    constraint = ParameterConstraint("divisible", "model.p0", "model.p1")
+    assert exhaustive_grid(_spec(windows, windows, constraints=(constraint,)), 100) is None
+    assert exhaustive_grid(_spec(), 100) is None

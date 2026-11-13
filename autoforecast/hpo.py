@@ -11,6 +11,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -42,6 +43,7 @@ from autoforecast.mlflow_export import MLflowTrainingRun, start_training_trackin
 from autoforecast.tuning import (
     PARAMETER_EXECUTION_COMPATIBILITY,
     TuningSpec,
+    exhaustive_grid,
     load_tuning_spec,
     materialize_trial_parameters,
     ray_param_space,
@@ -616,6 +618,20 @@ def _evaluate(
         raise
 
 
+def _sampler(study: HPOStudySpec, optuna: Any) -> Any:
+    """Each combination once, in a seeded order, or seeded random draws.
+
+    Study searches (the ``external:fit_predict`` evaluator) cap their budget at the number of
+    combinations when all of them fit, so a grid exactly that size is tried in full. Every
+    other search, and any grid of another size, keeps the seeded TPE draws.
+    """
+    grid = (exhaustive_grid(study.tuning, study.max_trials)
+            if study.evaluator == "external:fit_predict" else None)
+    if grid is not None and math.prod(len(values) for values in grid.values()) == study.max_trials:
+        return optuna.samplers.GridSampler(grid, seed=study.seed)
+    return optuna.samplers.TPESampler(seed=study.seed)
+
+
 def _run_optuna(
     study: HPOStudySpec,
     root: pathlib.Path,
@@ -630,9 +646,8 @@ def _run_optuna(
         raise HPOError(
             "Optuna runner requires the standard AutoForecast installation with dependencies"
         ) from exc
-    sampler = optuna.samplers.TPESampler(seed=study.seed)
     direction = cast(Literal["minimize", "maximize"], study.direction)
-    optuna_study = optuna.create_study(direction=direction, sampler=sampler)
+    optuna_study = optuna.create_study(direction=direction, sampler=_sampler(study, optuna))
 
     def objective(trial: Any) -> float:
         parameters = suggest_optuna_parameters(study.tuning, trial)
