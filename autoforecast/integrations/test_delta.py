@@ -489,8 +489,11 @@ def test_prepared_registration_owns_audit_query_evidence_and_links_before_public
     record = yaml.safe_load((registry.root / definition["admission_evidence"]["path"]).read_text())
     assert record["identity"]["population_query"] == "population"
     assert record["identity"]["sources"]["population"]["rows"] == 2
-    for source in record["identity"]["sources"].values():
+    # The identity names only the rows each read returned; the full reads are provenance.
+    assert set(record["provenance"]["sources"]) == set(record["identity"]["sources"])
+    for name, source in record["provenance"]["sources"].items():
         assert {item["version"] for item in source["tables"].values()} == {0}
+        assert "tables" not in record["identity"]["sources"][name]
     issues = store.spark.table(store.tables["study_data_issues"])
     successful = [p.parent.name for p in (registry.root / "checks").glob("*/registration.yaml")]
     assert len(successful) == 1
@@ -609,6 +612,99 @@ def test_source_version_identity_names_the_pinned_read_without_hashing_rows(
     # Rewriting identical rows makes a new version, which names a different read.
     rows.write.format("delta").mode("overwrite").saveAsTable(table)
     assert register_study(path, registry=registry, prepare=hook) != first
+
+
+@pytest.mark.parametrize("prepared", [False, True], ids=["plain", "prepared"])
+def test_the_same_rows_name_the_same_study_whatever_read_returned_them(
+    store, tmp_path, prepared,
+):
+    """Row identity: a new table version, or another query returning the same rows, keeps
+    the study; the study keeps the provenance of its first read; other rows name another."""
+    import yaml
+    from pyspark.sql import functions as F
+
+    from autoforecast import register_study
+    from autoforecast.study_registration import StudyRegistry
+    from autoforecast.test_study_preparation import SensorPreparation
+    from autoforecast.test_study_registration import configuration
+
+    path = configuration(tmp_path)
+    table = store.namespace + ".sensors"
+
+    def write(rows, mode="errorifexists"):
+        rows.write.format("delta").mode(mode).saveAsTable(table)
+
+    write(store.spark.read.parquet(str(tmp_path / "source.parquet")))
+    (tmp_path / "primary.sql").write_text("SELECT item, day, value FROM measurements")
+    (tmp_path / "population.sql").write_text("SELECT DISTINCT item FROM inventory")
+    value = yaml.safe_load(path.read_text())
+    value["source"] = {"kind": "delta", "sql": "primary.sql", "tables": {"measurements": table}}
+    if prepared:
+        value["source"]["tables"]["inventory"] = table
+        value["source"].update(audit_queries={"population": "population.sql"},
+                               population="population")
+    path.write_text(yaml.safe_dump(value))
+    registry = StudyRegistry(tmp_path / "registry", spark=store.spark,
+                             namespace=store.namespace if prepared else None)
+    hook = SensorPreparation() if prepared else None
+    first = register_study(path, registry=registry, prepare=hook)
+    # Identical rows written again: a new table version, with new files.
+    write(store.spark.read.parquet(str(tmp_path / "source.parquet")), "overwrite")
+    assert register_study(path, registry=registry, prepare=hook) == first
+    # Another query that returns the same rows names the same study.
+    (tmp_path / "primary.sql").write_text(
+        "SELECT item, day, value FROM measurements WHERE value IS NULL OR value IS NOT NULL")
+    assert register_study(path, registry=registry, prepare=hook) == first
+    # So does another table holding the same rows.
+    copy = table + "_copy"
+    store.spark.read.parquet(str(tmp_path / "source.parquet")).write.format("delta") \
+        .saveAsTable(copy)
+    value["source"]["tables"] = {alias: copy for alias in value["source"]["tables"]}
+    path.write_text(yaml.safe_dump(value))
+    assert register_study(path, registry=registry, prepare=hook) == first
+    value["source"]["tables"] = {alias: table for alias in value["source"]["tables"]}
+    path.write_text(yaml.safe_dump(value))
+    # The study keeps the provenance of its first read, and still loads.
+    definition = registry.definition(first)[0]
+    source = definition["source"]
+    assert source["tables"]["measurements"]["version"] == 0
+    assert source["sql"] == "SELECT item, day, value FROM measurements"
+    if prepared:
+        evidence = yaml.safe_load((registry.root / definition["admission_evidence"]["path"])
+                                  .read_text())
+        reads = evidence["provenance"]["sources"]
+        assert {pin["version"] for read in reads.values() for pin in read["tables"].values()} == {0}
+    with registry.load_study(first) as study:
+        assert study.training_data.count()
+    # Other rows name another study.
+    write(store.spark.read.parquet(str(tmp_path / "source.parquet"))
+          .withColumn("value", F.col("value") + 1), "overwrite")
+    assert register_study(path, registry=registry, prepare=hook) != first
+
+
+def test_supplied_stages_with_the_same_rows_name_the_same_study(store, tmp_path):
+    """A supplied stage is named by its rows: a new Delta version, or the same rows supplied
+    as a DataFrame, keeps the study and the provenance of its first read."""
+    from autoforecast import DeltaTable, register_study
+    from autoforecast.study_registration import StudyRegistry
+    from autoforecast.test_explicit_study import stages
+
+    args = stages(store.spark, validation=False)
+    table = store.namespace + ".explicit_testing"
+    testing = args["testing_data"]
+    testing.write.format("delta").saveAsTable(table)
+    args["testing_data"] = DeltaTable(table, version=0)
+    registry = StudyRegistry(tmp_path / "registry", spark=store.spark, namespace=store.namespace)
+    first = register_study(registry=registry, **args)
+    testing.write.format("delta").mode("overwrite").saveAsTable(table)
+    args["testing_data"] = DeltaTable(table, version=1)
+    assert register_study(registry=registry, **args) == first
+    args["testing_data"] = store.spark.read.table(table)
+    assert register_study(registry=registry, **args) == first
+    stage = registry.definition(first)[0]["source"]["stages"]["testing"]
+    assert stage["kind"] == "delta" and stage["source"]["tables"]["testing"]["version"] == 0
+    with registry.load_study(first) as study:
+        assert study.testing_data.count() == 4
 
 
 @pytest.mark.parametrize("restored", [False, True], ids=["lasting", "restored"])
@@ -922,9 +1018,9 @@ def test_sql_registration_partial_definition_recovery_and_live_source_changes(st
     before, before_sha = registry.definition(study_id)
     assert before["source"]["tables"]["observations"]["version"] == 0
     baseline_bytes = baseline.read_bytes()
+    # Another query returning the same rows names the same study and keeps its record.
     sql.write_text(sql.read_text() + "\n")
-    with pytest.raises(ValueError, match="conflicting immutable study registration"):
-        register_study(path, registry=registry)
+    assert register_study(path, registry=registry) == study_id
     assert baseline.read_bytes() == baseline_bytes
     assert registry.definition(study_id) == (before, before_sha)
     store.spark.sql(f"UPDATE {table} SET value = 123.0 WHERE item = 'A'")
