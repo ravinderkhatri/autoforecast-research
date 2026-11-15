@@ -9,9 +9,9 @@ import json
 import os
 import pathlib
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, suppress
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, Never, NotRequired, TypedDict, cast, overload
 
 from mlops import _volume_files
 from mlops._safe_files import SafeFileError, read_regular_bytes
@@ -83,6 +83,7 @@ from provenance.lineage import directory_digest, snapshot_parquet_directory
 if TYPE_CHECKING:
     from autoforecast.study import Study
     from autoforecast.study_campaign import StudyModel
+    from autoforecast.study_model_list import StudyCampaignResult
 
 
 @dataclasses.dataclass(frozen=True)
@@ -302,11 +303,30 @@ def _file_checks(study_info) -> str:
     return mode
 
 
+@overload
+def run_study(study_id=..., model=..., *, models: Never = ..., **options) -> ForecastWorkflowResult:
+    ...
+
+
+@overload
+def run_study(study_id=..., *, models: Sequence[str | StudyModel],
+              **options) -> StudyCampaignResult:
+    ...
+
+
 def run_study(
     study_id=_UNSET,
     model: Callable[[FitPredictRequest], FitPredictResult] | StudyModel | str = _UNSET,
     *,
     study_info: StudyInfo = _UNSET,
+    models=_UNSET,
+    model_options=_UNSET,
+    execution=_UNSET,
+    max_parallel_models=_UNSET,
+    final_evaluation=_UNSET,
+    ray_address=_UNSET,
+    timeout_seconds=_UNSET,
+    max_attempts=_UNSET,
     config=_UNSET,
     prepare=_UNSET,
     registry=None,
@@ -321,7 +341,7 @@ def run_study(
     output_dir=None,
     model_label=None,
     **registration_inputs,
-) -> ForecastWorkflowResult:
+) -> ForecastWorkflowResult | StudyCampaignResult:
     """Create or reuse a study, then run a callback, StudyModel, or built-in model by name.
 
     Supply study_info with exactly study_id, create_study and publish_results, and
@@ -346,11 +366,40 @@ def run_study(
     fitting again. An earlier workflow_path is kept as prior_workflow_path when
     it differs from the completed result. Existing audit evidence is preserved. The returned
     object owns no open Study resources.
+
+    Supply models=["seasonal_naive", "auto_ets"] for a StudyCampaignResult with a
+    separate workflow per candidate. model_options holds per-name configuration and
+    resources. execution is sequential (default), local (separate Ray processes), or
+    cluster (requires ray_address). max_parallel_models bounds simultaneous candidates.
+    timeout_seconds and max_attempts apply to each campaign phase. Reload with
+    load_study_campaign(result.path); retry the same call to reuse verified completed
+    work. Publication failures expose error.campaign_path and campaign_result.
     """
+    from autoforecast.study_model_list import prepare_candidates, run_registered_campaign
+
+    campaign_options = {
+        key: value for key, value in {
+            "execution": execution, "max_parallel_models": max_parallel_models,
+            "final_evaluation": final_evaluation, "ray_address": ray_address,
+            "timeout_seconds": timeout_seconds, "max_attempts": max_attempts,
+        }.items() if value is not _UNSET
+    }
+    candidates = None
+    if models is not _UNSET:
+        if model is not _UNSET:
+            raise ValueError("supply exactly one of model or models")
+        if (model_config is not None or implementation is not None
+                or fixed_parameters is not _UNSET or model_label is not None):
+            raise ValueError("models requires per-candidate settings, not singular model options")
+        candidates = prepare_candidates(
+            models, {} if model_options is _UNSET else model_options, campaign_options,
+        )
+    elif campaign_options or model_options is not _UNSET:
+        raise ValueError("campaign options require models")
     owns_registry = registry is None
     try:
         from autoforecast._exact_yaml import loads_exact_yaml, read_record
-        from autoforecast.study_campaign import StudyModel, _entrypoint
+        from autoforecast.study_campaign import StudyModel, _entrypoint, _module_hash
         from autoforecast.study_registration import StudyRegistry, _runtime, register_study
 
         study_id, create, publish = _study_choice(study_id, study_info, publish)
@@ -471,67 +520,84 @@ def run_study(
                         registry.store.validate_destinations()
                         outcome["table_destinations"] = dict(getattr(registry.store, "tables", {}))
                         bind_identity(table_destinations=outcome["table_destinations"])
-                    if isinstance(model, StudyModel):
-                        if implementation is not None or model_config is not None:
-                            raise ValueError(
-                                "StudyModel already declares implementation and config"
+                    if candidates is not None:
+                        for candidate in candidates:
+                            declaration = candidate["declaration"]
+                            candidate_callback, _ = _entrypoint(declaration.entrypoint)
+                            candidate_implementation = resolve_implementation(
+                                declaration.implementation, settings.get("implementation"),
+                                candidate_callback, candidate["id"],
                             )
-                        callback, _ = _entrypoint(model.entrypoint)
-                        implementation, model_config = model.implementation, model.config
-                        if fixed_parameters is _UNSET and model.fixed_parameters is not None:
-                            fixed_parameters = model.fixed_parameters
-                    elif callable(model):
-                        callback = model
-                        if model_config is None:
-                            raise ValueError("callbacks require model_config=")
-                    elif isinstance(model, str) and model in BUILTIN_STUDY_MODELS:
-                        if implementation is not None:
-                            raise ValueError("a built-in model declares its own implementation")
-                        callback, implementation = builtin_study_model(model)
+                            _implementation_record(candidate_implementation)
+                            for module in declaration.source_modules:
+                                _module_hash(module)
+                            candidate["declaration"] = dataclasses.replace(
+                                declaration, implementation=candidate_implementation,
+                            )
+                        outcome["models"] = [candidate["id"] for candidate in candidates]
                     else:
-                        raise ValueError(
-                            "model must be a callback, StudyModel or a built-in model name: "
-                            + ", ".join(sorted(BUILTIN_STUDY_MODELS))
-                        )
-                    if create and model_config is None and not isinstance(model, str):
-                        raise ValueError("model_config is required")
-                    if (
-                        fixed_parameters is not _UNSET
-                        and fixed_parameters is not None
-                        and not isinstance(fixed_parameters, Mapping)
-                    ):
-                        raise ValueError("fixed_parameters must be a mapping or None")
-                    if create and model_config is None and fixed_parameters is None:
-                        raise ValueError("parameter search requires an hpo mapping in model_config")
-                    if create and model_config is not None:
-                        raw, spec, _, _, controls = _config(
-                            pathlib.Path(model_config),
-                            require_hpo=fixed_parameters is None,
-                        )
-                        manual = fixed_parameters
-                        if manual is _UNSET:
-                            profile = cast(dict, loads_exact_yaml(raw))
-                            manual = None if "hpo" in profile else {}
-                        if manual is not None:
-                            materialize_manual_parameters(spec, dict(manual))
-                            controls = _validation_controls(controls)
-                        _validate_controls(controls)
-                        implementation = resolve_implementation(
-                            implementation,
-                            settings.get("implementation"),
-                            callback,
-                            spec.model_id,
-                        )
-                    if create:
-                        if implementation is not None:
-                            _implementation_record(implementation)
-                        elif settings.get("implementation") is None:
+                        if isinstance(model, StudyModel):
+                            if implementation is not None or model_config is not None:
+                                raise ValueError(
+                                    "StudyModel already declares implementation and config"
+                                )
+                            callback, _ = _entrypoint(model.entrypoint)
+                            implementation, model_config = model.implementation, model.config
+                            if fixed_parameters is _UNSET and model.fixed_parameters is not None:
+                                fixed_parameters = model.fixed_parameters
+                        elif callable(model):
+                            callback = model
+                            if model_config is None:
+                                raise ValueError("callbacks require model_config=")
+                        elif isinstance(model, str) and model in BUILTIN_STUDY_MODELS:
+                            if implementation is not None:
+                                raise ValueError("a built-in model declares its own implementation")
+                            callback, implementation = builtin_study_model(model)
+                        else:
                             raise ValueError(
-                                "supply implementation= or configure "
-                                "runtime.implementation.source_roots",
+                                "model must be a callback, StudyModel or a built-in model name: "
+                                + ", ".join(sorted(BUILTIN_STUDY_MODELS))
                             )
-                    outcome["model"] = callable_name(callback)
-                    bind_identity(model=outcome["model"])
+                        if create and model_config is None and not isinstance(model, str):
+                            raise ValueError("model_config is required")
+                        if (
+                            fixed_parameters is not _UNSET
+                            and fixed_parameters is not None
+                            and not isinstance(fixed_parameters, Mapping)
+                        ):
+                            raise ValueError("fixed_parameters must be a mapping or None")
+                        if create and model_config is None and fixed_parameters is None:
+                            raise ValueError(
+                                "parameter search requires an hpo mapping in model_config")
+                        if create and model_config is not None:
+                            raw, spec, _, _, controls = _config(
+                                pathlib.Path(model_config),
+                                require_hpo=fixed_parameters is None,
+                            )
+                            manual = fixed_parameters
+                            if manual is _UNSET:
+                                profile = cast(dict, loads_exact_yaml(raw))
+                                manual = None if "hpo" in profile else {}
+                            if manual is not None:
+                                materialize_manual_parameters(spec, dict(manual))
+                                controls = _validation_controls(controls)
+                            _validate_controls(controls)
+                            implementation = resolve_implementation(
+                                implementation,
+                                settings.get("implementation"),
+                                callback,
+                                spec.model_id,
+                            )
+                        if create:
+                            if implementation is not None:
+                                _implementation_record(implementation)
+                            elif settings.get("implementation") is None:
+                                raise ValueError(
+                                    "supply implementation= or configure "
+                                    "runtime.implementation.source_roots",
+                                )
+                        outcome["model"] = callable_name(callback)
+                        bind_identity(model=outcome["model"])
                 experiment_id = None
                 if settings["tracking"] == "mlflow":
                     from mlops import sanitize_web_url
@@ -573,6 +639,15 @@ def run_study(
                         registration_sha = registered["sha256"]
                     # Show where the inputs and saved study data are before training starts.
                     data_outputs = _data_outputs(registry, study_id, registered)
+                    if candidates is not None:
+                        result = run_registered_campaign(
+                            study, registry=registry, candidates=candidates,
+                            options=campaign_options, settings=settings,
+                            experiment_id=experiment_id, audit=audit,
+                            output_dir=output_dir, data_outputs=data_outputs,
+                        )
+                        execution.flush_audit(audit)
+                        return result
                     if isinstance(model, str) and model_config is None:
                         # A built-in model without a profile uses its default settings.
                         folder = pathlib.Path(
@@ -708,15 +783,16 @@ def run_study(
                 with suppress(BaseException):
                     error.__dict__.setdefault("workflow_path", None)
                     error.__dict__.setdefault("audit_path", audit)
-                    if result is not None:
+                    if result is not None and candidates is None:
                         prior = error.__dict__.get("workflow_path")
                         if prior is not None and prior != result.path:
                             error.__dict__["prior_workflow_path"] = prior
                         error.__dict__["workflow_path"] = result.path
-                    error.__dict__.update(
-                        study_id=result.study_id if result else study_id,
-                        registered_study_id=study_id,
-                    )
+                    if candidates is None or "study_id" not in error.__dict__:
+                        error.__dict__["study_id"] = result.study_id if result else study_id
+                    error.__dict__["registered_study_id"] = study_id
+                    if candidates is not None and result is not None:
+                        error.__dict__.update(campaign_path=result.path, campaign_result=result)
                 with suppress(BaseException):
                     _stage_event(
                         audit,

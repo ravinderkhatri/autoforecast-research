@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import hashlib
 import importlib
 import importlib.metadata
@@ -18,12 +19,14 @@ import pathlib
 import platform
 import socket
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from typing import Any, cast
 
+from mlops import _volume_files
 from mlops._safe_files import publish_bytes, read_regular_bytes
 
 from autoforecast._exact_json import load_exact_json
@@ -138,6 +141,42 @@ def _entrypoint(
     return cast(Callable[[FitPredictRequest], FitPredictResult], function), sha
 
 
+def validate_model_resources(model: StudyModel, execution: str) -> None:
+    """Validate finite per-job reservations before registration, loading or scheduling."""
+    if (
+        type(model.cpus) is not int
+        or model.cpus < 1
+        or type(model.gpus) is not int
+        or model.gpus < 0
+    ):
+        raise ValueError("model CPUs must be positive and GPUs nonnegative integers")
+    if (
+        type(model.memory_gib) not in (int, float)
+        or not math.isfinite(model.memory_gib)
+        or model.memory_gib <= 0
+    ):
+        raise ValueError("model memory_gib must be positive and finite")
+    if execution == "sequential" and model.gpus:
+        raise ValueError("GPU reservations require local or cluster execution")
+    if execution == "sequential" and model.cpus > (os.cpu_count() or 1):
+        raise ValueError("model CPU request exceeds this machine's capacity")
+    if not isinstance(model.source_modules, tuple) or any(
+        not isinstance(module, str) or not module for module in model.source_modules
+    ):
+        raise ValueError("source_modules must be a tuple of importable module names")
+    if model.node_labels is not None and (
+        not isinstance(model.node_labels, Mapping)
+        or any(
+            not isinstance(key, str) or not key or not isinstance(value, str) or not value
+            for key, value in model.node_labels.items()
+        )
+    ):
+        raise ValueError("node_labels must map nonempty strings to exact label values")
+    labels = dict(model.node_labels or {})
+    if labels and execution != "cluster":
+        raise ValueError("node_labels require an explicitly supplied cluster")
+
+
 @study_inputs
 def run_study_campaign(
     study,
@@ -153,6 +192,8 @@ def run_study_campaign(
     max_attempts: int = 1,
     tracking_uri: str | None = None,
     experiment_id: str | None = None,
+    _registration: dict | None = None,
+    _public_settings: dict | None = None,
 ) -> dict:
     """Run custom models through durable validation, comparison and final stages.
 
@@ -190,38 +231,7 @@ def run_study_campaign(
     for model in models:
         if type(model) is not StudyModel:
             raise TypeError("models must contain StudyModel declarations")
-        if (
-            type(model.cpus) is not int
-            or model.cpus < 1
-            or type(model.gpus) is not int
-            or model.gpus < 0
-        ):
-            raise ValueError("model CPUs must be positive and GPUs nonnegative integers")
-        if (
-            type(model.memory_gib) not in (int, float)
-            or not math.isfinite(model.memory_gib)
-            or model.memory_gib <= 0
-        ):
-            raise ValueError("model memory_gib must be positive and finite")
-        if execution == "sequential" and model.gpus:
-            raise ValueError("GPU reservations require local or cluster execution")
-        if execution == "sequential" and model.cpus > (os.cpu_count() or 1):
-            raise ValueError("model CPU request exceeds this machine's capacity")
-        if not isinstance(model.source_modules, tuple) or any(
-            not isinstance(module, str) or not module for module in model.source_modules
-        ):
-            raise ValueError("source_modules must be a tuple of importable module names")
-        if model.node_labels is not None and (
-            not isinstance(model.node_labels, Mapping)
-            or any(
-                not isinstance(key, str) or not key or not isinstance(value, str) or not value
-                for key, value in model.node_labels.items()
-            )
-        ):
-            raise ValueError("node_labels must map nonempty strings to exact label values")
-        labels = dict(model.node_labels or {})
-        if labels and execution != "cluster":
-            raise ValueError("node_labels require an explicitly supplied cluster")
+        validate_model_resources(model, execution)
         if model.config is None:
             raise ValueError("StudyModel requires config")
         raw, spec, _, _, controls = _config(
@@ -271,7 +281,7 @@ def run_study_campaign(
                 "memory_gib": model.memory_gib,
                 "gpus": model.gpus,
                 "source_modules": {name: _module_hash(name) for name in model.source_modules},
-                "node_labels": labels,
+                "node_labels": dict(model.node_labels or {}),
             }
         )
     if len({model["id"] for model in resolved}) != len(resolved):
@@ -296,7 +306,18 @@ def run_study_campaign(
     prepared = preflight_study(study, common, output_dir=root / "preflight")
     for model in resolved:
         model["profile"]["minimum_history"] = common["minimum_history"]
+    registration_fields = {}
+    if _registration is not None:
+        registered = study.registration
+        if (registered is None or registered["sha256"] != _registration["sha256"]
+                or study.study_id != _registration["study_id"]):
+            raise ValueError("campaign registration differs from loaded study")
+        registration_fields = {
+            "registration": dict(_registration), "registration_record": registered,
+            "public_settings": dict(_public_settings or {}),
+        }
     request = {
+        **registration_fields,
         "schema": "autoforecast.study-campaign.v1",
         "name": name,
         "study": {"path": str(prepared.study_path.resolve()), "sha256": prepared.study_sha256},
@@ -350,7 +371,10 @@ def run_study_campaign(
                 "timeout_seconds": timeout_seconds,
                 "max_attempts": max_attempts,
                 "retry_mode": "restart",
-                "required_outputs": ["summary.json"],
+                "required_outputs": ["summary.json", *(
+                    ["worker-admission.json"] if execution == "cluster"
+                    and _registration is not None else []
+                )],
                 "resources": resources,
             }
         )
@@ -440,6 +464,9 @@ def _load_model_result(
     ):
         raise ValueError("model result belongs to a different campaign task")
     workflow = load_forecast_workflow(record["workflow_path"])
+    if ("registration" in request
+            and workflow.provenance.get("registration") != request["registration"]):
+        raise ValueError("model registration binding differs from campaign")
     if (
         workflow.provenance["study"] != request["study"]
         or workflow.provenance["implementation"] != model["implementation"]
@@ -511,6 +538,23 @@ def _validation_results(root: pathlib.Path, request: dict) -> dict:
     return summary["results"]
 
 
+def _select_validation_candidate(request: dict, records: dict) -> int:
+    """Choose by the requested validation metric after checking comparison contracts."""
+    comparisons, contracts = [], set()
+    for index, model in enumerate(request["models"]):
+        run = load_forecast_workflow(records[str(index)]["workflow_path"])
+        if run.validation is None:
+            raise ValueError("candidate has no outer validation result")
+        contracts.add(digest(run.validation["evaluation_contract"]))
+        value = run.validation["score"].get(request["metric"])
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError("candidate validation objective is unavailable")
+        comparisons.append((value, model["id"], index))
+    if len(contracts) != 1:
+        raise ValueError("candidate validation contracts differ; refusing comparison")
+    return min(comparisons)[2]
+
+
 def _watch_memory(stop: threading.Event, folder: pathlib.Path, limit_gib: float) -> None:
     """Stop a job when its process tree exceeds the limit or cannot be measured."""
     import signal
@@ -534,14 +578,16 @@ def _watch_memory(stop: threading.Event, folder: pathlib.Path, limit_gib: float)
             return
 
 
-@worker_inputs
-def _model_job(
-    request_path: str, request_sha: str, index: int, phase: str, campaign_root: str,
-    validation_record: dict | None, parent_attempt: str | None = None,
-) -> dict:
-    """Worker boundary: inert references in, authenticated retained result out."""
+def _verified_model_inputs(request_path, request_sha, index):
+    """Authenticate inert worker inputs before importing a model or opening its study."""
     request = _read(request_path, request_sha)
     model = request["models"][index]
+    if "registration" in request:
+        envelope = request["registration_record"]
+        if (digest(envelope["definition"]) != request["registration"]["sha256"]
+                or envelope["sha256"] != request["registration"]["sha256"]
+                or envelope["definition"]["study_id"] != request["registration"]["study_id"]):
+            raise ValueError("worker registration identity differs from campaign")
     if _runtime_identity() != request["runtime"]:
         raise ValueError("worker library or numerical runtime differs from the campaign")
     implementation = (worker_implementation(model["implementation_source"])
@@ -556,7 +602,38 @@ def _model_job(
         if importlib.metadata.version(package) != version:
             raise ValueError(f"worker dependency differs: {package}")
     path = pathlib.Path(request["study"]["path"])
-    verify_benchmark(path, request["study"]["sha256"], _reuse_verified=True)
+    verified = verify_benchmark(path, request["study"]["sha256"], _reuse_verified=True)
+    if "registration" in request:
+        _, manifest = verified
+        definition = request["registration_record"]["definition"]
+        parent = manifest.get("parent", {})
+        if not ((manifest["study_id"] == definition["study_id"]
+                 and request["study"]["sha256"] == definition["library_sha256"])
+                or (parent.get("sha256") == definition["library_sha256"]
+                    and parent.get("study_id") == definition["study_id"])):
+            raise ValueError("worker study differs from registered parent")
+    return request, model, callback, implementation, path
+
+
+def _campaign_file_checks(function):
+    @functools.wraps(function)
+    def call(request_path, request_sha, *args, **kwargs):
+        request = _read(request_path, request_sha)
+        with _volume_files.file_checks(request.get("public_settings", {}).get("file_checks")):
+            return function(request_path, request_sha, *args, **kwargs)
+    return call
+
+
+@worker_inputs
+@_campaign_file_checks
+def _model_job(
+    request_path: str, request_sha: str, index: int, phase: str, campaign_root: str,
+    validation_record: dict | None, parent_attempt: str | None = None,
+) -> dict:
+    """Worker boundary: inert references in, authenticated retained result out."""
+    request, model, callback, implementation, path = _verified_model_inputs(
+        request_path, request_sha, index,
+    )
     # Workers receive paths and IDs, then establish their own logging context.
     with standalone_attempt(pathlib.Path(campaign_root) / "progress", "Model job",
                             campaign_id=pathlib.Path(campaign_root).name,
@@ -628,6 +705,8 @@ def _model_job(
                             fit_predict=callback,
                             implementation=implementation,
                             config=config_path,
+                            **({"_registration": request["registration"]}
+                               if "registration" in request else {}),
                             fixed_parameters=model["fixed_parameters"],
                             validation_only=phase == "validation",
                             output_dir=folder / "runs",
@@ -642,6 +721,8 @@ def _model_job(
                             fit_predict=callback,
                             implementation=implementation,
                             validation_run=previous["workflow_path"],
+                            **({"_registration": request["registration"]}
+                               if "registration" in request else {}),
                             output_dir=folder / "runs",
                         )
                 record_result(study_id=run.study_id, workflow_id=run.run_id,
@@ -670,6 +751,53 @@ def _model_job(
                     spark.stop()
 
 
+@worker_inputs
+@_campaign_file_checks
+def _probe_worker(request_path, request_sha, indices, probe_path):
+    """Check each eligible remote candidate and shared storage before any phase fit."""
+    from pyspark.sql import SparkSession
+
+    from autoforecast.campaign import _open_lock
+    from autoforecast.study import load_study
+
+    if not indices:
+        raise ValueError("worker admission requires candidates")
+    for index in indices:
+        request, _, _, _, path = _verified_model_inputs(request_path, request_sha, index)
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+    stop_watch = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_memory, args=(stop_watch, pathlib.Path(probe_path), 2.0), daemon=True,
+    )
+    spark = None
+    watcher.start()
+    try:
+        spark = (SparkSession.builder.master("local[1]").appName("autoforecast-worker-admission")
+                 .config("spark.ui.enabled", "false").config("spark.driver.memory", "512m")
+                 .getOrCreate())
+        with load_study(path.parent.name, registry_root=path.parent.parent, spark=spark,
+                        _expected_sha256=request["study"]["sha256"]):
+            folder = pathlib.Path(probe_path)
+            if read_regular_bytes(folder, "coordinator") != request_sha.encode():
+                raise ValueError("worker cannot read coordinator output storage")
+            import fcntl
+
+            with _open_lock(folder / ".lock") as lock:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass  # The coordinator holds this same lock across the remote call.
+                else:
+                    raise ValueError("output storage does not share locks with coordinator")
+            publish_bytes(folder, "worker", request_sha.encode())
+    finally:
+        stop_watch.set()
+        watcher.join(timeout=2)
+        if spark is not None:
+            spark.stop()
+    return {"host": socket.gethostname(), "candidates": indices, "request_sha256": request_sha}
+
+
 def _run_phase(
     request_path: str, request_sha: str, phase: str, campaign_root: str, attempt: str
 ) -> None:
@@ -683,21 +811,7 @@ def _run_phase(
         raise ValueError("campaign without validation supports only final all-model reporting")
     if phase == "final" and request.get("validation_configured", True):
         validation_records = _validation_results(pathlib.Path(campaign_root), request)
-        comparisons = []
-        contracts = set()
-        for index in candidates:
-            record = validation_records[str(index)]
-            run = load_forecast_workflow(record["workflow_path"])
-            if run.validation is None:
-                raise ValueError("candidate has no outer validation result")
-            contracts.add(digest(run.validation["evaluation_contract"]))
-            value = run.validation["score"].get(request["metric"])
-            if type(value) not in (int, float) or not math.isfinite(value):
-                raise ValueError("candidate validation objective is unavailable")
-            comparisons.append((value, request["models"][index]["id"], index))
-        if len(contracts) != 1:
-            raise ValueError("candidate validation contracts differ; refusing comparison")
-        selected = min(comparisons)[2]
+        selected = _select_validation_candidate(request, validation_records)
         if request["final_evaluation"] == "validation_winner":
             candidates = [selected]
     audit = pathlib.Path(attempt) / "progress.jsonl"
@@ -744,6 +858,7 @@ def _run_phase(
                 )
                 ray.init(address="local", num_cpus=cpus, include_dashboard=False)
             pending = {}
+            admitted_nodes = {}
             waiting = list(candidates)
             deadline = time.monotonic() + request["timeout_seconds"]
             try:
@@ -763,6 +878,58 @@ def _run_phase(
                         raise ValueError(
                             "no worker node can satisfy the model resources and exact node labels"
                         )
+                if request["execution"] == "cluster" and "registration" in request:
+                    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+                    from autoforecast.study_campaign import _probe_worker as probe_worker
+
+                    # Probe one node at a time to bound Spark startup overhead. Every node that
+                    # may receive a candidate must authenticate it before any fit is submitted.
+                    probes = []
+                    for node in nodes:
+                        eligible = [i for i in candidates if (
+                            request["models"][i]["cpus"] <= node["Resources"].get("CPU", 0)
+                            and request["models"][i]["gpus"] <= node["Resources"].get("GPU", 0)
+                            and request["models"][i]["memory_gib"] * 1024**3
+                            <= node["Resources"].get("memory", 0)
+                            and all(node.get("Labels", {}).get(k) == v for k, v in
+                                    request["models"][i].get("node_labels", {}).items())
+                        )]
+                        if not eligible:
+                            continue
+                        if node.get("Labels", {}).get("ray.io/node-id") != node["NodeID"]:
+                            raise ValueError("worker requires its unique Ray node ID label")
+                        import fcntl
+
+                        from autoforecast.campaign import _open_lock
+
+                        with tempfile.TemporaryDirectory(
+                            prefix="worker-probe-", dir=campaign_root,
+                        ) as probe_path:
+                            folder = pathlib.Path(probe_path)
+                            publish_bytes(folder, "coordinator", request_sha.encode())
+                            with _open_lock(folder / ".lock") as lock:
+                                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                                probe_task = ray.remote(max_calls=1, max_retries=0)(probe_worker)
+                                probe = probe_task.options(
+                                    num_cpus=1, memory=2 * 1024**3,
+                                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                                        node["NodeID"], soft=False),
+                                ).remote(request_path, request_sha, eligible, probe_path)
+                                try:
+                                    admission = ray.get(
+                                        probe, timeout=max(0, deadline - time.monotonic()),
+                                    )
+                                    if read_regular_bytes(folder, "worker") != request_sha.encode():
+                                        raise ValueError("coordinator cannot read worker output")
+                                    probes.append({**admission, "node_id": node["NodeID"]})
+                                finally:
+                                    ray.cancel(probe, force=True)
+                        for i in eligible:
+                            admitted_nodes.setdefault(i, []).append(node["NodeID"])
+                    _write_new_json(
+                        pathlib.Path(attempt) / "worker-admission.json", {"nodes": probes},
+                    )
                 # A phase can run as __main__. Import the worker by its canonical name
                 # so Ray resolves the installed module on each host instead of copying
                 # __main__ globals, including the coordinator's installation path.
@@ -776,15 +943,22 @@ def _run_phase(
                         index = waiting.pop(0)
                         model = request["models"][index]
                         placement = {}
-                        if model.get("node_labels"):
+                        if model.get("node_labels") or admitted_nodes:
                             from ray.util.scheduling_strategies import (
                                 In,
+                                LabelMatchExpressionsT,
                                 NodeLabelSchedulingStrategy,
                             )
 
                             # Keep caller labels literal; selector strings parse operators.
+                            hard: LabelMatchExpressionsT = {
+                                key: In(value)
+                                for key, value in model.get("node_labels", {}).items()
+                            }
+                            if admitted_nodes:
+                                hard["ray.io/node-id"] = In(*admitted_nodes[index])
                             placement["scheduling_strategy"] = NodeLabelSchedulingStrategy(
-                                hard={key: In(value) for key, value in model["node_labels"].items()}
+                                hard=hard,
                             )
                         ref = worker.options(
                             **placement,

@@ -418,6 +418,81 @@ and the budget becomes the number of combinations. Otherwise trials are drawn at
 the seed, which can repeat some values and miss others. This applies to every model run by
 `run_study`.
 
+
+## Several models on one saved study
+
+Use `models` instead of `model` to create a campaign. Each candidate keeps its own run ID,
+forecasts and model artifacts. The saved input study is reused.
+
+```python
+campaign = run_study(
+    study_id=saved_study_id,
+    registry=registry,
+    models=["seasonal_naive", "window_average", "auto_ets"],
+    execution="sequential",
+    output_dir=work / "model-comparison",
+)
+print(campaign.summary())
+```
+
+Sequential is the default. `execution="local", max_parallel_models=2` runs at most two
+candidate jobs concurrently in separate Ray processes on this machine. All candidates
+finish validation before the final phase begins. `final_evaluation="all_models"` evaluates
+every candidate; `"validation_winner"` refits only the validation winner and requires a
+study with outer validation. Hyperparameter trials remain sequential within each model.
+
+Pass built-in settings using `model_options`, keyed by model name:
+
+```python
+model_options = {
+    "auto_ets": {"cpus": 2, "memory_gib": 8.0},
+    "window_average": {"model_config": work / "window-profile.yaml"},
+}
+```
+
+These memory values illustrate the syntax; measure your own model and data. Omitted profiles
+use the same defaults as single-model calls. A profile with `hpo` enables tuning; explicit
+`fixed_parameters={}` uses profile defaults without search. Importable custom models can
+join the list as `StudyModel` entries with their own profiles and resource declarations.
+Named profiles must retain the built-in name as their model ID. Distinct variants use
+StudyModel entries with distinct profile model IDs. A raw callback or notebook closure is
+not a campaign declaration.
+
+The campaign checks candidate eligibility together. It reports the requested registered ID
+as `campaign.requested_study_id` and the effective comparison ID as `campaign.study_id`.
+An explicit exclusion/availability policy may derive a study. Compare candidate coverage
+alongside scores; unavailable actuals are not a completed evaluation.
+
+`execution="cluster"` requires an existing `ray_address`. Every worker needs compatible code,
+dependencies, retained-input access, credentials and shared campaign storage. Each candidate
+must fit on one node and creates its own local Spark session. The scheduler can place several
+candidates on one node; `node_labels` restrict eligible nodes when required. This does not
+split an individual model's training across machines. A Spark cluster alone does not create
+a Ray cluster. Physical-machine and Databricks deployment validation remain pending for this
+public interface; do not treat local Ray tests as deployment evidence.
+Campaign output requires a POSIX filesystem with working cross-process locks; `/Volumes`
+output is refused. Registered cluster runs check each eligible node's inputs and shared
+storage before fitting, and schedule only onto those checked nodes for that phase.
+
+Repeating the same request with the same output directory verifies and reuses completed
+candidate workflows. Changing the candidate list, configuration or execution settings creates
+a different campaign. Partial training failures retain completed peers. A publication failure
+carries `error.campaign_path`; retry the unchanged request to publish retained workflows
+without fitting again. Training and publication status are reported separately.
+`timeout_seconds` and `max_attempts` apply to each phase, rather than each model fit.
+An exhausted retry budget remains a failed campaign when the same request is repeated.
+
+```python
+from autoforecast import load_study_campaign
+
+saved = load_study_campaign(campaign.path)
+print(saved.candidates)
+```
+
+Reload checks workflow identities and artifacts. Native table inputs require the same
+connection aliases in `AUTOFORECAST_CONFIG`. Existing `model=...` calls still return a
+single workflow; `models=[...]` always returns a `StudyCampaignResult`, even for one candidate.
+
 ## Progress and logs
 
 Registration and model runs show progress automatically. At the default INFO level,
