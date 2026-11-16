@@ -337,6 +337,8 @@ def exhaustive_grid(spec: TuningSpec, budget: int) -> dict[str, list[str | int |
         elif domain.kind == "int" and domain.high is not None:
             assert isinstance(domain.low, int) and isinstance(domain.high, int)
             assert isinstance(domain.step, int)
+            if (domain.high - domain.low) // domain.step + 1 > budget:
+                return None
             grid[parameter.name] = list(range(domain.low, domain.high + 1, domain.step))
         else:
             return None

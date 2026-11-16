@@ -575,3 +575,8 @@ def test_exhaustive_grid_leaves_constrained_or_empty_searches_to_random_draws() 
     constraint = ParameterConstraint("divisible", "model.p0", "model.p1")
     assert exhaustive_grid(_spec(windows, windows, constraints=(constraint,)), 100) is None
     assert exhaustive_grid(_spec(), 100) is None
+
+
+def test_exhaustive_grid_checks_budget_before_expanding_large_integer_ranges() -> None:
+    domain = SearchDomain(kind="int", low=1, high=10**30, step=1)
+    assert exhaustive_grid(_spec(domain), 1) is None
