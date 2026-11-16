@@ -22,7 +22,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from autoforecast.adapters.last_value import fit_predict as last_value
-from autoforecast.adapters.naive import NAME, seasonal_naive
+from autoforecast.adapters.naive import NAME, seasonal_naive, window_average
 from autoforecast.frequency import advance, parse_origin, period_points
 from autoforecast.panel import Forecast, Panel
 
@@ -404,6 +404,36 @@ def test_write_failure_releases_cached_labelled_frame(tmp_path, monkeypatch) -> 
         )
     assert len(cached) == 1
     assert not cached[0].is_cached, "aborted seasonal-naive call retained its labelled cache"
+
+
+def test_window_average_is_the_mean_of_the_eligible_cells_in_the_window(tmp_path):
+    """Each series' forecast is the mean of its eligible cells among the last three days."""
+    source = tmp_path / "panel"
+    rows = [("a", day, float(day), "exact") for day in range(1, 11)]          # mean(8, 9, 10)
+    rows += [("b", 8, 4.0, "exact"), ("b", 9, 2.0, "lower_bound"),             # unobserved left out
+             ("b", 10, 100.0, "unobserved")]
+    rows += [("c", day, 5.0, "exact") for day in range(1, 6)]                  # nothing in window
+    rows += [("d", 8, 6.0, "exact"), ("d", 10, 8.0, "exact")]                  # day 9 absent
+    (spark().createDataFrame(
+        [(sid, f"2024-01-{day:02d}", qty, state) for sid, day, qty, state in rows],
+        "id string, date string, qty double, state string")
+     .selectExpr("id", "to_date(date) as date", "qty", "state")
+     .write.parquet(str(source)))
+    described = Panel(source, "id", "date", "qty", exposure_col="state", season_length=7)
+    forecast = window_average(described, "2024-01-10", 3, window=3, spark=spark(),
+                              out_dir=tmp_path / "forecast")
+    assert forecast.adapter == "window_average" and forecast.n_series == 4
+    assert forecast.disposition == {"emitted": 6, "emitted_from_lower_bound": 3,
+                                    "declined_no_source": 3}
+    rows = spark().read.parquet(str(tmp_path / "forecast")).collect()
+    assert sorted({(row.series_id, row.yhat, row.source_state) for row in rows}) == [
+        ("a", 9.0, "emitted"), ("b", 3.0, "emitted_from_lower_bound"), ("d", 7.0, "emitted")]
+    assert sorted({row.date.isoformat() for row in rows}) == [
+        "2024-01-11", "2024-01-12", "2024-01-13"]
+    for window in (0, True, 2.0):
+        with pytest.raises(ValueError, match="window must be a positive integer"):
+            window_average(described, "2024-01-10", 3, window=window, spark=spark(),
+                           out_dir=tmp_path / "refused")
 
 
 if __name__ == "__main__":

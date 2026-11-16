@@ -6,12 +6,13 @@ daily panel with `m = 7` and a 28-day horizon that is "repeat the last complete 
 
 from __future__ import annotations
 
+import functools
 import pathlib
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from autoforecast.adapters import _validate_span
+from autoforecast.adapters import _validate_span, fit_on_retained_history
 from autoforecast.column_names import fresh_internal_names
 from autoforecast.frequency import (
     advance,
@@ -21,7 +22,7 @@ from autoforecast.frequency import (
     period_points,
 )
 from autoforecast.grid import canonical_key, period_membership, read_time_parquet, time_literal
-from autoforecast.panel import Forecast, Panel
+from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 
 REUSE_EXEMPTION = (
     "seasonal naive is LAG(y, m) OVER (PARTITION BY series ORDER BY date) -- a definition, not "
@@ -31,39 +32,30 @@ REUSE_EXEMPTION = (
 )
 
 NAME = "seasonal_naive"
+WINDOW_AVERAGE = "window_average"
 
 
 def fit_study_baseline(request):
-    """Bridge the existing adapter to study runs and retain its complete fitted state."""
+    """Seasonal naive on a saved study; the fit's history is kept as its fitted state."""
     import dataclasses
-    import json
-
-    from autoforecast.study_tuning import FitPredictResult
-    from provenance.lineage import directory_digest, snapshot_parquet_directory
 
     if set(request.model_parameters) != {"season_length"} or request.training_parameters:
         raise ValueError("seasonal_naive study settings require only model.season_length")
     panel = dataclasses.replace(request.panel,
                                 season_length=request.model_parameters["season_length"])
-    model = request.output_dir / "model"
-    model.mkdir()
-    # The learned state is the observed history, not merely the parameter value.
-    snapshot_parquet_directory(
-        pathlib.Path(panel.path), model / "history",
-        expected_sha256=directory_digest(panel.path, suffixes=(".parquet",)),
-        label="seasonal naive fitted history",
+    return fit_on_retained_history(request, panel, seasonal_naive, "seasonal-naive-history-v1")
+
+
+def fit_study_window_average(request):
+    """Window average on a saved study; the fit's history and window are its fitted state."""
+    if set(request.model_parameters) != {"window"} or request.training_parameters:
+        raise ValueError("window_average study settings require only model.window")
+    window = request.model_parameters["window"]
+    return fit_on_retained_history(
+        request, request.panel, functools.partial(window_average, window=window),
+        "window-average-history-v1", window=window,
     )
-    (model / "panel.json").write_text(json.dumps(
-        {**dataclasses.asdict(panel), "path": "history", "origin": request.origin},
-        sort_keys=True,
-    ))
-    fitted_panel = dataclasses.replace(panel, path=str(model / "history"))
-    forecast = seasonal_naive(
-        fitted_panel, request.origin, len(request.forecast_dates),
-        spark=request.training_data.sparkSession, out_dir=request.output_dir / "forecasts",
-    )
-    return FitPredictResult(dataclasses.replace(forecast, adapter=request.model_id),
-                            "seasonal-naive-history-v1")
+
 
 EMITTED = "emitted"
 EMITTED_CENSORED = "emitted_from_lower_bound"
@@ -113,25 +105,7 @@ def seasonal_naive(
     _validate_span(panel, origin, horizon, adapter=NAME)
     panel.validate()
     m = panel.season_length
-
-    cadence = parse_frequency(panel.frequency)
-    time_key, valid_time_key = canonical_key(panel.time_col, cadence)
-    raw_source = read_time_parquet(spark, panel.path, panel.time_col)
-    if cadence.key_kind == "timestamp" and (
-        raw_source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
-    ):
-        raise ValueError(
-            f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type; "
-            "timezone-sensitive timestamp storage is lossy for wall-clock keys"
-        )
-    time_name, valid_time_name = fresh_internal_names(
-        raw_source.columns, ("__af_naive_time", "__af_naive_valid_time")
-    )
-    raw = raw_source.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time_key)
-    if raw.filter(~F.col(valid_time_name)).limit(1).count():
-        raise ValueError(
-            f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
-        )
+    raw, time_name = _keyed_history(panel, spark)
     source = _source_window(raw, panel, origin, m, normalized_time_col=time_name)
     grid = _future_grid(
         spark, raw, panel, origin, horizon, m, normalized_time_col=time_name
@@ -176,6 +150,101 @@ def seasonal_naive(
         ).validate()
     finally:
         labelled.unpersist()
+
+
+def window_average(
+    panel: Panel,
+    origin: str,
+    horizon: int,
+    *,
+    window: int,
+    spark: SparkSession,
+    out_dir: str | pathlib.Path,
+) -> Forecast:
+    """Forecast every period after `origin` as the mean of the last `window` periods.
+
+    The mean covers the eligible cells (`exact` and `lower_bound`) among the `window` periods
+    ending at `origin`, so `window = 7` on a daily panel averages the last week and weighs every
+    weekday once. Absent and `unobserved` cells are left out, never counted as zero.
+
+    | eligible cells in the window | disposition |
+    |---|---|
+    | none | `declined_no_source` |
+    | at least one `lower_bound` | `emitted_from_lower_bound` (the mean is biased low) |
+    | otherwise | `emitted` |
+
+    Args:
+        panel: Validated panel; it supports the same cadences as `seasonal_naive`.
+        origin: Last date the adapter may see, ISO. Exclusive lower bound of the forecast window.
+        horizon: Periods to forecast; every one gets the same mean.
+        window: Number of periods ending at `origin` to average, a positive integer.
+        spark: Active session.
+        out_dir: Where the forecast Parquet is written. Overwritten.
+
+    Returns:
+        A validated `Forecast` of `series_id · date · yhat · source_state`.
+    """
+    if type(window) is not int or window < 1:
+        raise ValueError(f"window must be a positive integer, got {window!r}")
+    # The same Spark window and grid as seasonal naive, so the same cadences are supported.
+    _validate_span(panel, origin, horizon, adapter=NAME)
+    panel.validate()
+    raw, time_name = _keyed_history(panel, spark)
+    source = _source_window(raw, panel, origin, window, normalized_time_col=time_name)
+    state = F.col("_state") if panel.has_exposure else F.lit("exact")
+    means = (source.filter(F.col("_y").isNotNull() & state.isin(*sorted(ELIGIBLE_STATES)))
+             .groupBy("_sid")
+             .agg(F.avg(F.col("_y").cast("double")).alias("_mean"),
+                  F.max((state == F.lit("lower_bound")).cast("int")).alias("_censored")))
+    grid = _future_grid(spark, raw, panel, origin, horizon, 1, normalized_time_col=time_name)
+    bucket = (F.when(F.col("_mean").isNull(), F.lit(DECLINED_NO_SOURCE))
+              .when(F.col("_censored") == 1, F.lit(EMITTED_CENSORED))
+              .otherwise(F.lit(EMITTED)))
+    labelled = (grid.join(means, grid["series_id"] == means["_sid"], "left")
+                .withColumn("_bucket", bucket).cache())
+    try:
+        disposition = {r["_bucket"]: r["count"] for r in
+                       labelled.groupBy("_bucket").count().collect()}
+        (labelled
+         .filter(F.col("_bucket").startswith("emitted"))
+         .select(F.col("series_id"), F.col("ds").alias("date"), F.col("_mean").alias("yhat"),
+                 F.col("_bucket").alias("source_state"))
+         .write.mode("overwrite").parquet(str(out_dir)))
+        return Forecast(
+            adapter=WINDOW_AVERAGE,
+            path=str(out_dir),
+            origin=origin,
+            horizon=horizon,
+            n_series=grid.select("series_id").distinct().count(),
+            disposition=disposition,
+            target_estimand=panel.target_estimand,
+            frequency=panel.frequency,
+        ).validate()
+    finally:
+        labelled.unpersist()
+
+
+def _keyed_history(panel: Panel, spark: SparkSession) -> tuple[DataFrame, str]:
+    """The panel with a canonical time key column added, refusing malformed keys."""
+    cadence = parse_frequency(panel.frequency)
+    time_key, valid_time_key = canonical_key(panel.time_col, cadence)
+    raw_source = read_time_parquet(spark, panel.path, panel.time_col)
+    if cadence.key_kind == "timestamp" and (
+        raw_source.schema[panel.time_col].dataType.typeName() != "timestamp_ntz"
+    ):
+        raise ValueError(
+            f"hourly panel time column {panel.time_col!r} must have timestamp_ntz physical type; "
+            "timezone-sensitive timestamp storage is lossy for wall-clock keys"
+        )
+    time_name, valid_time_name = fresh_internal_names(
+        raw_source.columns, ("__af_naive_time", "__af_naive_valid_time")
+    )
+    raw = raw_source.withColumn(time_name, time_key).withColumn(valid_time_name, valid_time_key)
+    if raw.filter(~F.col(valid_time_name)).limit(1).count():
+        raise ValueError(
+            f"panel contains a malformed, lossy, or off-anchor {cadence.code} time key"
+        )
+    return raw, time_name
 
 
 def _source_window(
@@ -273,4 +342,4 @@ def _future_grid(
     return series.crossJoin(F.broadcast(steps))
 
 
-__all__ = ["NAME", "REUSE_EXEMPTION", "seasonal_naive"]
+__all__ = ["NAME", "REUSE_EXEMPTION", "WINDOW_AVERAGE", "seasonal_naive", "window_average"]

@@ -664,3 +664,22 @@ def test_search_checks_each_trial_once_and_clears_checks_before_model_code(monke
         assert reusable == [{}, {}]
         # Selection checks both trials; the report and its selection reload reuse those checks.
         assert len(checked) == 2
+
+
+@pytest.mark.parametrize("evaluator, budget, expected", [
+    ("external:fit_predict", 4, "GridSampler"),   # a study search whose grid is the budget
+    ("external:fit_predict", 3, "TPESampler"),    # the grid does not fit
+    ("external:fit_predict", 5, "TPESampler"),    # a budget the study path would have capped
+    ("campaign", 4, "TPESampler"),                # other searches keep their random draws
+])
+def test_sampler_tries_each_combination_only_for_study_searches(evaluator, budget, expected):
+    import optuna
+
+    from autoforecast.tuning import SearchDomain, TuningParameter, TuningSpec
+
+    windows = SearchDomain(kind="categorical", values=(7, 14, 21, 28))
+    tuning = TuningSpec("m", "external", (TuningParameter("model.window", 7, windows, windows),),
+                        (), pathlib.Path("m.yaml"), "0" * 64)
+    study = SimpleNamespace(tuning=tuning, evaluator=evaluator, max_trials=budget, seed=42)
+    sampler = hpo_module._sampler(study, optuna)
+    assert type(sampler).__name__ == expected
