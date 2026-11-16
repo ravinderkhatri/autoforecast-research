@@ -285,7 +285,8 @@ def test_ci_keeps_required_checks_and_acceptance_variants():
         "postgres or release", "not (postgres or release)",
     }
     assert len(database_groups) == 2
-    assert sum(row["minimum"] for row in database_groups) == 603
+    assert sum(row["minimum"] for row in database_groups) == 605
+    assert "autoforecast/integrations/test_model_list_snapshots.py" in database_step["run"]
     assert '-k "not bigquery and (${{ matrix.filter }})"' in database_step["run"]
     regression_step = next(step for step in jobs["regressions"]["steps"]
                            if step.get("name") == "Unit and workflow regressions")

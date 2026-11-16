@@ -298,7 +298,7 @@ jobs:
         include:
           - shard: 1
             filter: postgres or release
-            minimum: 177
+            minimum: 179
           - shard: 2
             filter: not (postgres or release)
             minimum: 426
@@ -365,6 +365,7 @@ jobs:
         run: |
           test "$(uname -m)" = x86_64
           uv run --no-sync python -m pytest -q -rs -x autoforecast/integrations/test_snapshots.py \
+            autoforecast/integrations/test_model_list_snapshots.py \
             -k "not bigquery and (${{ matrix.filter }})" --junitxml="$RUNNER_TEMP/database-inputs.xml"
           uv run --no-sync python - <<'PY'
           import os

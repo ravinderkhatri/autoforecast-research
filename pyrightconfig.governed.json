@@ -58,6 +58,7 @@
     "provenance/lineage.py",
     "autoforecast/score_spark.py",
     "autoforecast/study_campaign.py",
+    "autoforecast/study_model_list.py",
     "autoforecast/preparation.py",
     "autoforecast/study_references.py",
     "autoforecast/study_registration.py",

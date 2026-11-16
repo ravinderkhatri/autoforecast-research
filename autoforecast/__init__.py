@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Never, overload
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
     from autoforecast.integrations.delta import DeltaTable
+    from autoforecast.study_campaign import StudyModel
+    from autoforecast.study_model_list import StudyCampaignResult, load_study_campaign
     from autoforecast.study_registration import (
         DateRange,
         PreparationContext,
@@ -118,10 +121,24 @@ def study_config_schema() -> dict:
     return schema()
 
 
+@overload
+def run_study(study_id=..., model=..., *, models: Never = ..., **options) -> ForecastWorkflowResult:
+    ...
+
+
+@overload
+def run_study(study_id=..., *, models: Sequence[str | StudyModel],
+              **options) -> StudyCampaignResult:
+    ...
+
+
 def run_study(
     study_id: str = _RUN_UNSET, model=_RUN_UNSET,
-    *, study_info: StudyInfo = _RUN_UNSET, **options,
-) -> ForecastWorkflowResult:
+    *, study_info: StudyInfo = _RUN_UNSET, models=_RUN_UNSET,
+    model_options=_RUN_UNSET, execution=_RUN_UNSET, max_parallel_models=_RUN_UNSET,
+    final_evaluation=_RUN_UNSET, ray_address=_RUN_UNSET, timeout_seconds=_RUN_UNSET,
+    max_attempts=_RUN_UNSET, **options,
+) -> ForecastWorkflowResult | StudyCampaignResult:
     """Create or reuse a study and run a model; see study_workflow.run_study.
 
     For creation, pass study_info={"study_id": None, "create_study": True,
@@ -133,6 +150,10 @@ def run_study(
 
     supplied = {key: value for key, value in {
         "study_id": study_id, "model": model, "study_info": study_info,
+        "models": models, "model_options": model_options, "execution": execution,
+        "max_parallel_models": max_parallel_models, "final_evaluation": final_evaluation,
+        "ray_address": ray_address, "timeout_seconds": timeout_seconds,
+        "max_attempts": max_attempts,
     }.items() if value is not _RUN_UNSET}
     return run(**supplied, **options)
 
@@ -158,6 +179,8 @@ __all__ = [
     "register_study",
     "run_study",
     "StudyInfo",
+    "StudyCampaignResult",
+    "load_study_campaign",
     "configure_logging",
     "read_execution_events",
     "DeltaTable",
@@ -170,6 +193,9 @@ __all__ = [
 
 
 def __getattr__(name):
+    if name in {"StudyCampaignResult", "load_study_campaign"}:
+        from autoforecast import study_model_list
+        return getattr(study_model_list, name)
     if name == "StudyInfo":
         from autoforecast.study_workflow import StudyInfo
         return StudyInfo

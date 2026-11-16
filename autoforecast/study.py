@@ -404,6 +404,7 @@ class Study:
         validation_only: bool = False,
         validation_run: str | pathlib.Path | None = None,
         model_label: str | None = None,
+        _registration: Mapping[str, object] | None = None,
     ) -> ForecastWorkflowResult:
         """Tune, validate and refit, or use fixed/reused settings without HPO.
 
@@ -419,7 +420,8 @@ class Study:
             config=config, tuning_origin=tuning_origin, output_dir=output_dir,
             reuse_tuning=reuse_tuning, selected_config=selected_config,
             fixed_parameters=fixed_parameters, validation_only=validation_only,
-            validation_run=validation_run, model_label=model_label)
+            validation_run=validation_run, model_label=model_label,
+            registration=_registration)
 
     @_study_inputs
     def run_campaign(self, *, models, output_dir=None, **execution) -> dict:
