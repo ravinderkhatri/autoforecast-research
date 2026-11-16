@@ -1,4 +1,4 @@
-"""Fitted classical baselines through statsforecast, distributed by Fugue onto Spark.
+"""Fitted classical baselines through statsforecast, distributed with Spark grouped pandas.
 
 NAMED `classical`, NOT `statsforecast`: a module named after the package it wraps shadows that
 package for anything run from this directory, and `test_naive.py` already runs from here.
@@ -7,14 +7,11 @@ Seasonal naive needed no library because it is a definition. These are different
 inter-arrival times and demand sizes separately, ETS fits level/trend/season by maximum likelihood.
 Maintained implementations keep these comparisons independent of custom model code.
 
-Dispatch is automatic in statsforecast 2.x: passing a SPARK DataFrame (rather than pandas) routes
-through Fugue onto the cluster. There is no `backend` argument any more.
-
-REQUIRES `PYSPARK_PYTHON` to point at the interpreter that has `fugue` installed. Unlike the naive
-adapter -- native Catalyst, no Python in the loop -- these run a Python UDF per series, so the
-EXECUTOR's interpreter must have the dependencies. Without it the failure is a
-`ModuleNotFoundError: No module named 'fugue'` raised inside a worker, which reads as a Spark
-problem rather than an environment one.
+Spark distributes one eligible series per pandas call on both classic Spark and Spark Connect.
+StatsForecast receives only pandas frames, so Fugue is not used for distribution. It remains an
+import dependency of StatsForecast and must be installed with it on every Python worker.
+Spark's configured Python runtime and SQL shuffle settings govern execution; a client's local
+interpreter path and core count do not describe remote workers. Each series must fit worker memory.
 """
 
 from __future__ import annotations
@@ -22,17 +19,17 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import functools
-import os
 import pathlib
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import pandas as pd
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, StructField, StructType, TimestampType
 from statsforecast import StatsForecast
 from statsforecast.models import AutoETS, AutoTheta, CrostonClassic
 
-from autoforecast import resources
 from autoforecast.adapters import _validate_daily_span, fit_on_retained_history
 from autoforecast.panel import ELIGIBLE_STATES, Forecast, Panel
 
@@ -120,19 +117,12 @@ def forecast_with(
         A validated `Forecast`.
 
     Raises:
-        ValueError: unknown model, non-positive horizon, `PYSPARK_PYTHON` unset, or no series
+        ValueError: unknown model, non-positive horizon, or no series
             meeting the model's minimum history.
     """
     if model not in MODELS:
         raise ValueError(f"unknown model {model!r}; available: {sorted(MODELS)}")
     _validate_daily_span(panel, origin, horizon, adapter=model)
-    if not os.environ.get("PYSPARK_PYTHON"):
-        raise ValueError(
-            "PYSPARK_PYTHON is not set. These models run a Python UDF per series, so the Spark "
-            "EXECUTOR needs the interpreter that has fugue and statsforecast installed. Without "
-            "it the failure surfaces as ModuleNotFoundError inside a worker and reads as a Spark "
-            "fault rather than an environment one")
-
     spec = MODELS[model]
     floor = spec.min_history(panel.season_length)
     train = _long_enough(_eligible_history(panel, spark, origin), floor)
@@ -142,22 +132,18 @@ def forecast_with(
             f"no series has {floor} eligible observations at or before {origin}, which is "
             f"{model}'s minimum. Nothing can be fitted")
 
-    # Size workers at execution time, so importing or registering models needs no host probes.
-    # Repartition by series instead of inheriting potentially oversized disk partitions.
-    series_per_partition = resources.spark_profile().series_per_partition
-    # Enough tasks to keep every core fed several times over, then narrowed by the per-partition
-    # ceiling. The adapter is the only place that knows n_fitted, so the parallelism half of the
-    # rule can only be applied here.
-    by_parallelism = spark.sparkContext.defaultParallelism * resources.TASKS_PER_CORE
-    by_size = -(-n_fitted // series_per_partition)
-    parts = max(spark.sparkContext.defaultParallelism, by_parallelism, by_size)
-    raw = StatsForecast(models=[spec.build(panel.season_length)], freq="D").forecast(
-        h=horizon, df=train.repartition(parts, "unique_id"))
+    # Grouped pandas works on classic Spark and Connect. Keep the series ID's input type;
+    # dispatching a Spark frame directly into StatsForecast would invoke Fugue instead.
+    schema = StructType([train.schema["unique_id"], StructField("ds", TimestampType()),
+                         StructField("prediction", DoubleType())])
+    fit_series = functools.partial(_forecast_series, model=model,
+                                   season_length=panel.season_length, horizon=horizon)
+    raw = train.groupBy("unique_id").applyInPandas(fit_series, schema=schema)
     grid = _expected_grid(panel, spark, origin, horizon, floor)
     joined = grid.join(
         raw.select(F.col("unique_id").alias("_uid"),
                    F.to_date(F.col("ds")).alias("_d"),
-                   F.col(raw.columns[-1]).cast("double").alias("_yhat")),
+                   F.col("prediction").alias("_yhat")),
         (grid["series_id"] == F.col("_uid")) & (grid["date"] == F.col("_d")), "left")
 
     bucket = (F.when(F.col("_history_days") == 0, F.lit(DECLINED_NO_HISTORY))
@@ -181,6 +167,14 @@ def forecast_with(
                         frequency=panel.frequency).validate()
     finally:
         labelled.unpersist()
+
+
+def _forecast_series(history: pd.DataFrame, *, model: str, season_length: int,
+                     horizon: int) -> pd.DataFrame:
+    """Fit one worker-local series without nested multiprocessing or a Spark backend."""
+    fitted = MODELS[model].build(season_length)
+    result = StatsForecast(models=[fitted], freq="D", n_jobs=1).forecast(h=horizon, df=history)
+    return result.rename(columns={str(fitted): "prediction"})[["unique_id", "ds", "prediction"]]
 
 
 def _fit_study(model: str, request):

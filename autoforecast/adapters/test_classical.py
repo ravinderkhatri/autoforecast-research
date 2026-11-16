@@ -12,7 +12,6 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent.parent))
 
@@ -134,34 +133,8 @@ with mock.patch.object(resources, "detect", side_effect=AssertionError("host was
     assert completed.returncode == 0, completed.stderr
 
 
-def test_classical_partition_size_uses_the_current_runtime_profile(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Stop at the model handoff; no Spark session or forecast is required for sizing."""
-    class ReachedForecast(Exception):
-        pass
-
-    train = mock.Mock()
-    train.select.return_value.distinct.return_value.count.return_value = 1001
-    runtime = mock.Mock()
-    runtime.sparkContext.defaultParallelism = 1
-    model = mock.Mock()
-    model.forecast.side_effect = ReachedForecast
-    monkeypatch.setenv("PYSPARK_PYTHON", sys.executable)
-    monkeypatch.setenv("FORECAST_SPARK_MEMORY", "1g")
-    monkeypatch.setenv("FORECAST_SPARK_CORES", "1")
-    with mock.patch.object(classical, "_eligible_history", return_value=train), \
-            mock.patch.object(classical, "_long_enough", return_value=train), \
-            mock.patch.object(classical, "StatsForecast", return_value=model), \
-            mock.patch.object(classical.resources, "detect", return_value=
-                              classical.resources.MachineProfile(8 * 1024**3, 2, "test")):
-        for size, expected_partitions in ((50, 21), (25, 41)):
-            monkeypatch.setenv("FORECAST_SERIES_PER_PARTITION", str(size))
-            with pytest.raises(ReachedForecast):
-                classical.forecast_with("croston", _panel_contract(), ORIGIN, HORIZON,
-                                        spark=runtime, out_dir="unused")
-            train.repartition.assert_called_with(expected_partitions, "unique_id")
-    assert model.forecast.call_count == 2
+# The former partition-sizing test mocked SparkContext and Fugue. Native grouped pandas
+# delegates task sizing to Spark SQL; test_classical_execution exercises both real sessions.
 
 
 def test_forecast_with_croston_accounts_for_every_cell_on_real_m5() -> None:
@@ -279,8 +252,6 @@ def test_daily_adapter_refuses_weekly_panel_before_runtime_io() -> None:
 
 def test_write_failure_releases_cached_labelled_frame(tmp_path, monkeypatch) -> None:
     """A failed output write must release the adapter-owned Spark cache."""
-    import datetime as dt
-
     source = tmp_path / "panel"
     rows = [("a", f"2024-01-{day:02d}", float(day)) for day in range(1, 4)]
     (spark().createDataFrame(rows, "id string, date string, qty double")
@@ -288,19 +259,11 @@ def test_write_failure_releases_cached_labelled_frame(tmp_path, monkeypatch) -> 
      .write.parquet(str(source)))
     described = Panel(source, "id", "date", "qty", season_length=1)
 
-    class FakeStatsForecast:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
-
-        def forecast(self, *, h: int, df: DataFrame) -> DataFrame:
-            assert h == 2 and df.select("unique_id").distinct().count() == 1
-            return spark().createDataFrame(
-                [
-                    ("a", dt.date(2024, 1, 4), 1.0),
-                    ("a", dt.date(2024, 1, 5), 1.0),
-                ],
-                "unique_id string, ds date, CrostonClassic double",
-            )
+    def fake_forecast(history, **kwargs):
+        import pandas as pd
+        return pd.DataFrame({"unique_id": ["a", "a"],
+                             "ds": pd.to_datetime(["2024-01-04", "2024-01-05"]),
+                             "prediction": [1.0, 1.0]})
 
     cached: list[DataFrame] = []
     frame_type = type(spark().range(1))
@@ -314,7 +277,7 @@ def test_write_failure_releases_cached_labelled_frame(tmp_path, monkeypatch) -> 
     def fail_write(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("injected forecast write failure")
 
-    monkeypatch.setattr(classical, "StatsForecast", FakeStatsForecast)
+    monkeypatch.setattr(classical, "_forecast_series", fake_forecast)
     monkeypatch.setattr(frame_type, "cache", record_cache)
     monkeypatch.setattr(writer_type, "parquet", fail_write)
     with pytest.raises(RuntimeError, match="injected forecast write failure"):
@@ -330,24 +293,32 @@ def test_write_failure_releases_cached_labelled_frame(tmp_path, monkeypatch) -> 
     assert not cached[0].is_cached, "aborted classical call retained its labelled cache"
 
 
-def test_a_missing_executor_interpreter_is_named_rather_than_left_to_spark() -> None:
-    """Without PYSPARK_PYTHON the failure is a ModuleNotFoundError raised inside a Spark worker,
-    which reads as a Spark fault. It cost real time once; the adapter now says what is wrong."""
-    session = spark()  # start it BEFORE unsetting the variable it needs to start
-    saved = os.environ.pop("PYSPARK_PYTHON")
-    try:
-        forecast_with(
-            "croston", _panel_contract(), ORIGIN, HORIZON, spark=session, out_dir="/tmp/never"
-        )
-    except ValueError as e:
-        assert "PYSPARK_PYTHON" in str(e) and "EXECUTOR" in str(e); return
-    finally:
-        os.environ["PYSPARK_PYTHON"] = saved
-    raise AssertionError("ran without naming the executor interpreter requirement")
+# An unset client PYSPARK_PYTHON no longer implies a broken executor runtime.
+# test_classical_execution runs both real Spark modes with this variable unset at fit time.
 
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+def test_classical_worker_preserves_provider_negative_values(monkeypatch):
+    import pandas as pd
+
+    class Provider:
+        def __init__(self, **kwargs):
+            assert kwargs["n_jobs"] == 1
+
+        def forecast(self, *, h, df):
+            assert isinstance(df, pd.DataFrame) and h == 2
+            return pd.DataFrame({"unique_id": ["a", "a"],
+                                 "ds": pd.to_datetime(["2024-01-04", "2024-01-05"]),
+                                 "CrostonClassic": [-2.0, -6.7e-15]})
+
+    monkeypatch.setattr(classical, "StatsForecast", Provider)
+    result = classical._forecast_series(pd.DataFrame(), model="croston", season_length=1,
+                                        horizon=2)
+    assert list(result.columns) == ["unique_id", "ds", "prediction"]
+    assert result.prediction.tolist() == [-2.0, -6.7e-15]
 
 
 def test_classical_adapter_preserves_provider_negative_values(tmp_path, monkeypatch):
@@ -361,16 +332,14 @@ def test_classical_adapter_preserves_provider_negative_values(tmp_path, monkeypa
         {"id": "a", "date": dt.date(2024, 1, day), "qty": float(day)}
         for day in range(1, 4)
     ]), path)
-    class Provider:
-        def __init__(self, **kwargs):
-            pass
 
-        def forecast(self, *, h, df):
-            return spark().createDataFrame([
-                ("a", dt.date(2024, 1, 4), -2.0),
-                ("a", dt.date(2024, 1, 5), -6.7e-15),
-            ], "unique_id string, ds date, CrostonClassic double")
-    monkeypatch.setattr(classical, "StatsForecast", Provider)
+    def negative_forecast(history, **kwargs):
+        import pandas as pd
+        return pd.DataFrame({"unique_id": ["a", "a"],
+                             "ds": pd.to_datetime(["2024-01-04", "2024-01-05"]),
+                             "prediction": [-2.0, -6.7e-15]})
+
+    monkeypatch.setattr(classical, "_forecast_series", negative_forecast)
     result = forecast_with("croston", Panel(path, "id", "date", "qty", season_length=1),
                            "2024-01-03", 2, spark=spark(), out_dir=tmp_path / "forecast")
     rows = sorted(pq.read_table(result.path).to_pylist(), key=lambda row: row["date"])
