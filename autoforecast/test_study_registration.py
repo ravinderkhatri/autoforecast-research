@@ -14,7 +14,7 @@ import yaml
 from pyspark.sql import functions as F
 
 from autoforecast import _execution as events
-from autoforecast.study_registration import StudyRegistry, register_study
+from autoforecast.study_registration import StudyRegistry, _bytes, register_study
 from autoforecast.test_study_tuning import config as model_profile
 from autoforecast.test_study_tuning import implementation, predict
 from autoforecast.test_study_tuning import spark as _spark
@@ -660,6 +660,21 @@ def test_input_identity_setting_is_checked_before_source_access(tmp_path, identi
     value["storage"]["input_identity"] = "rows"
     path.write_text(yaml.safe_dump(value))
     assert validate_study_config(path).input_storage["input_identity"] == "rows"
+
+
+@pytest.mark.parametrize("identity", ["rows", "source_version"])
+def test_registry_reads_a_config_that_sets_input_identity(spark, tmp_path, identity):
+    """A study config that sets input_identity also builds its registry; a wrong value is refused."""
+    path = configuration(tmp_path)
+    value = yaml.safe_load(path.read_text())
+    value["storage"]["input_identity"] = identity
+    path.write_text(yaml.safe_dump(value))
+    registry = StudyRegistry.from_config(path, spark=spark)
+    assert registry.root == (tmp_path / value["storage"]["root"]).absolute()
+    value["storage"]["input_identity"] = "versions"
+    path.write_text(yaml.safe_dump(value))
+    with pytest.raises(ValueError, match="storage.input_identity must be rows or source_version"):
+        StudyRegistry.from_config(path, spark=spark)
 
 
 def test_source_version_claim_requires_its_frozen_identity(spark, tmp_path):
@@ -1511,6 +1526,100 @@ def test_registration_upgrade_names_a_fresh_destination(tmp_path, old, new, form
     with pytest.raises(ValueError, match="new registry root"):
         registry._publish_definition(new_definition, format=format)
     assert path.read_bytes() == before
+
+
+_ROWS = {"algorithm": "autoforecast.bucket-sha256.v1", "bucket_count": 256,
+         "encoding": "typed-ascii.v1", "rows": 3, "schema": [["item", "i64"]], "sha256": "1" * 64}
+
+
+def _source_reads(logical=_ROWS, read=0):
+    """The same rows as each source kind records them, read at moment ``read``."""
+    rows = {"logical_hash": logical, "logical_sha256": logical["sha256"], "rows": 3,
+            "schema": {"type": "struct", "fields": [{"name": "item", "nullable": bool(read)}]}}
+    return {
+        "delta": {**rows, "sql": f"SELECT * FROM t{read}",
+                  "tables": {"t": {"table": f"c.s.t{read}", "version": read}},
+                  "resolved_tables": {f"c.s.t{read}": {"id": str(read), "location": str(read)}}},
+        "bigquery": {**rows, "kind": "bigquery", "sql": "SELECT 1", "capture_time": str(read),
+                     "tables": {"t": {"table": "p.d.t", "created": str(read)}}},
+        "postgresql": {**rows, "kind": "postgresql", "sql": "SELECT 1", "snapshot": str(read),
+                       "tables": {"t": {"table": "s.t", "oid": read}}},
+        "mysql": {**rows, "kind": "mysql", "sql": "SELECT 1", "observed_at": str(read),
+                  "tables": {"t": {"table": "d.t", "definition": str(read)}}},
+        "sqlserver": {**rows, "kind": "sqlserver", "sql": "SELECT 1",
+                      "tables": {"t": {"table": "d.t", "object_id": read,
+                                       "modified_at": str(read)}}},
+        "capture": {**rows, "kind": "capture", "capture_id": str(read),
+                    "capture_sha256": str(read)},
+        "parquet": {**rows, "kind": "parquet"},
+    }
+
+
+def test_the_same_rows_name_the_same_read_whatever_source_returned_them():
+    from autoforecast.study_registration import _read_identity
+
+    first, again = _source_reads(), _source_reads(read=7)
+    identities = {_bytes(_read_identity(record)) for record in [*first.values(), *again.values()]}
+    assert len(identities) == 1
+    assert json.loads(identities.pop()) == {"logical_hash": _ROWS, "logical_sha256": "1" * 64,
+                                            "rows": 3}
+    other = _source_reads(logical={**_ROWS, "sha256": "2" * 64})
+    assert all(_read_identity(first[kind]) != _read_identity(other[kind]) for kind in first)
+    # Where the read itself is the identity, nothing is dropped.
+    version = {"source_version": {"tables": {"t": {"version": 1}}}, "rows": 3}
+    snapshot = {"snapshot": {"id": "a"}, "rows": 3}
+    both = {**first["delta"], "snapshot": {"id": "a"}}
+    assert _read_identity(version) == version and _read_identity(snapshot) == snapshot
+    assert _read_identity(both) == both
+
+
+def test_supplied_stages_are_named_by_the_rows_each_stage_returned():
+    from autoforecast.study_registration import _read_identity
+
+    def supplied(logical, read):
+        stage = {"planned_range": ["2024-01-01", "2024-01-02"], "columns": ["item"],
+                 "frozen_role": "final_score", "observed_range": ["2024-01-01", "2024-01-02"],
+                 "rows": 3, "logical_hash": logical, "snapshot_sha256": logical["sha256"],
+                 "kind": "delta" if read else "dataframe", "schema": {"read": read},
+                 "captured_schema": {"read": read}}
+        if read:
+            stage["source"] = {"tables": {"testing": {"table": "c.s.t", "version": read}}}
+        return {"kind": "supplied_stages", "stages": {"training": stage, "validation": None}}
+
+    assert _read_identity(supplied(_ROWS, 0)) == _read_identity(supplied(_ROWS, 3))
+    assert _read_identity(supplied(_ROWS, 0)) != _read_identity(
+        supplied({**_ROWS, "sha256": "2" * 64}, 0))
+    assert _read_identity(supplied(_ROWS, 3))["stages"]["validation"] is None
+
+
+def test_registering_the_same_rows_again_keeps_the_first_record(tmp_path):
+    from autoforecast.benchmark import digest
+
+    registry = StudyRegistry(tmp_path, spark=object())
+    study_id = "a" * 64
+
+    def definition(source):
+        return {"schema": "autoforecast.registration.v3", "study_id": study_id,
+                "registry_backend": "files", "source": source}
+
+    first = definition(_source_reads()["delta"])
+    assert registry._publish_definition(first) == study_id
+    path = tmp_path / "registrations" / (study_id + ".json")
+    before = path.read_bytes()
+    # The same rows from a newer table version: the saved study and its provenance stay.
+    assert registry._publish_definition(definition(_source_reads(read=4)["delta"])) == study_id
+    assert path.read_bytes() == before
+    # Other rows under the same study ID conflict.
+    other = _source_reads(logical={**_ROWS, "sha256": "2" * 64})["delta"]
+    with pytest.raises(ValueError, match="conflicting immutable study registration"):
+        registry._publish_definition(definition(other))
+    # A saved record that no longer matches its own SHA is never treated as the same study.
+    saved = json.loads(before)
+    saved["definition"]["source"]["tables"]["t"]["version"] = 9
+    path.write_text(json.dumps(saved))
+    assert saved["sha256"] != digest(saved["definition"])
+    with pytest.raises(ValueError, match="conflicting immutable study registration"):
+        registry._publish_definition(definition(_source_reads(read=4)["delta"]))
 
 
 @pytest.mark.parametrize("schema", ["v3", "v4"])

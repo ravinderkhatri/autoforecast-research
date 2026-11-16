@@ -1344,7 +1344,7 @@ def _publish_frozen_benchmark(
 def _validate_admission_identity(value):
     if (not isinstance(value, dict) or set(value) != {"schema", "sha256"}
             or value["schema"] not in {"autoforecast.admission-identity.v1",
-                                       "autoforecast.supplied-stage-identity.v1",
+                                       "autoforecast.supplied-stage-identity.v2",
                                        "autoforecast.source-version-identity.v1"}
             or not isinstance(value["sha256"], str) or len(value["sha256"]) != 64
             or any(c not in "0123456789abcdef" for c in value["sha256"])):
