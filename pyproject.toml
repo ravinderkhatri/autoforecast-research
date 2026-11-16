@@ -62,6 +62,10 @@ timesfm3 = [
 
 [dependency-groups]
 ci = [
+    # Connect client dependencies beyond the standard runtime. Keep the lightweight
+    # preflight tools install from pulling in the full Spark distribution.
+    "grpcio-status==1.83.1",
+    "zstandard==0.25.0",
     "pytest==9.1.1",
     "ruff==0.6.9",
     "pyright==1.1.413",
