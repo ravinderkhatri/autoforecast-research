@@ -191,6 +191,22 @@ def _spark_type(spec):
     return types[spec]()
 
 
+def _arrow_schema(schema):
+    """Convert a Spark schema to Arrow with TimestampType as UTC on every PySpark.
+
+    PySpark 4.2 added ``timezone`` and requires it for TimestampType. Earlier
+    releases, which Databricks runtimes ship, reject that option and already map
+    TimestampType to UTC (3.5 always; 4.0 and 4.1 through ``timestamp_utc=True``).
+    """
+    import inspect
+
+    from pyspark.sql.pandas.types import to_arrow_schema
+
+    if "timezone" in inspect.signature(to_arrow_schema).parameters:
+        return to_arrow_schema(schema, timezone="UTC")
+    return to_arrow_schema(schema)
+
+
 def _wrap(payload):
     return f"v{len(payload)}:{payload}"
 
@@ -401,12 +417,11 @@ def validate_metadata(record):
     ):
         raise ValueError("unsupported or malformed logical hash metadata")
     try:
-        from pyspark.sql.pandas.types import to_arrow_schema
         from pyspark.sql.types import StructType
 
         declared = _spark_type({"struct": record["schema"]})
         assert isinstance(declared, StructType)
-        normalized = _schema(to_arrow_schema(declared, timezone="UTC"))
+        normalized = _schema(_arrow_schema(declared))
         if normalized != record["schema"]:
             raise ValueError("noncanonical schema")
     except (KeyError, TypeError, ValueError, OverflowError,
@@ -623,9 +638,7 @@ def fingerprint_frame(frame):
     This function does not turn a mutable query or an evictable cache into a
     snapshot. Its canonical format is identical to the Parquet implementations.
     """
-    from pyspark.sql.pandas.types import to_arrow_schema
-
-    schema = _schema(to_arrow_schema(frame.schema, timezone="UTC"))
+    schema = _schema(_arrow_schema(frame.schema))
     return _fingerprint_frame(frame, schema)
 
 

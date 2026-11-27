@@ -494,6 +494,48 @@ def test_canonical_schema_identity_contract(tmp_path):
     ]))]))
 
 
+def test_logical_identity_supports_pyspark_releases_before_timezone_option(
+    tmp_path, spark, monkeypatch,
+):
+    # Databricks runtimes ship PySpark 3.5 to 4.1, whose to_arrow_schema has no
+    # timezone option and maps TimestampType to UTC by default. PySpark 4.2 requires it.
+    import inspect
+
+    from pyspark.sql.pandas import types
+
+    current = types.to_arrow_schema
+    # The stand-ins convert with the installed release, which may itself predate the option.
+    utc = {"timezone": "UTC"} if "timezone" in inspect.signature(current).parameters else {}
+
+    def pyspark_3_5(schema):
+        return current(schema, **utc)
+
+    def pyspark_4_1(schema, error_on_duplicated_field_names_in_struct=False,
+                    timestamp_utc=True, prefers_large_types=False):
+        assert timestamp_utc
+        return current(schema, **utc)
+
+    def pyspark_4_2(schema, *, error_on_duplicated_field_names_in_struct=False,
+                    timezone=None, prefers_large_types=False):
+        assert timezone == "UTC"
+        return current(schema, **utc)
+
+    instant = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
+    path = tmp_path / "times.parquet"
+    pq.write_table(pa.table({
+        "instant": pa.array([instant], pa.timestamp("us", tz="UTC")),
+        "wall": pa.array([instant.replace(tzinfo=None)], pa.timestamp("us")),
+        "nested": pa.array([{"at": [instant]}],
+                           pa.struct([("at", pa.list_(pa.timestamp("us", tz="UTC")))])),
+    }), path)
+    record = logical.fingerprint(path)
+    frame = spark.read.parquet(str(path))
+    for release in (current, pyspark_3_5, pyspark_4_1, pyspark_4_2):
+        monkeypatch.setattr(types, "to_arrow_schema", release)
+        logical.validate_metadata(record)
+        assert logical.fingerprint_frame(frame) == record
+
+
 def test_v1_offline_spill_matches_reference_and_cleans_failure(tmp_path, monkeypatch):
     from autoforecast import benchmark
 
